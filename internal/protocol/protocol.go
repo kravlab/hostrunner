@@ -2,8 +2,9 @@
 // the hostrunner daemon.
 //
 // A connection carries a sequence of frames, each encoded as
-// [type:1][length:4, big-endian][payload:length]. The client opens with one
-// FrameRequest, then streams FrameStdin/FrameStdinClose; the daemon streams
+// [type:1][length:4, big-endian][payload:length]. A connection either arms
+// the daemon (FrameArm, answered by FrameArmed or FrameError) or runs one
+// command: the client opens with one FrameRequest, then streams FrameStdin/FrameStdinClose; the daemon streams
 // FrameStdout/FrameStderr and, when it has a result to report, ends the
 // exchange with one FrameExit or FrameError. If the exchange is cancelled
 // (client gone, daemon shutting down) the connection just closes.
@@ -49,8 +50,10 @@ const (
 	FrameExit                             // daemon → client, JSON Exit
 	FrameError                            // daemon → client, JSON Error
 	FrameStdinCredit                      // daemon → client, JSON Credit
+	FrameArm                              // `hostrunner up` → daemon, JSON Arm
+	FrameArmed                            // daemon → `hostrunner up`, JSON Arm
 
-	lastFrameType = FrameStdinCredit
+	lastFrameType = FrameArmed
 )
 
 // Exit codes for failures of hostrun itself rather than of the command,
@@ -80,6 +83,13 @@ type Request struct {
 	Version int      `json:"version"`
 	Argv    []string `json:"argv"`
 	Cwd     string   `json:"cwd"`
+}
+
+// Arm asks a running daemon to wait for its devcontainer (again), as
+// `hostrunner up` does on every container start; the daemon echoes its own
+// version in FrameArmed.
+type Arm struct {
+	Version int `json:"version"`
 }
 
 // Exit reports the exit code of a command that ran.

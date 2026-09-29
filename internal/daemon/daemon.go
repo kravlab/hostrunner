@@ -38,6 +38,7 @@ type Server struct {
 	mapper         *workspace.Mapper
 	log            *slog.Logger
 	requestTimeout time.Duration
+	onArm          func() // called for every FrameArm; nil ignores arming
 }
 
 // Option customizes a Server.
@@ -47,6 +48,13 @@ type Option func(*Server)
 // request before it is rejected (default 10 s).
 func WithRequestTimeout(d time.Duration) Option {
 	return func(s *Server) { s.requestTimeout = d }
+}
+
+// WithArmHandler sets what the Server does when `hostrunner up` arms it on
+// a devcontainer start (e.g. rearm the container watcher). It is called
+// from connection goroutines, so it must be safe for concurrent use.
+func WithArmHandler(f func()) Option {
+	return func(s *Server) { s.onArm = f }
 }
 
 // New returns a Server that confines commands to mapper's workspace.
@@ -109,8 +117,9 @@ func isTemporary(err error) bool {
 	return false
 }
 
-// handle serves one connection. Cancelling ctx, or the client going away,
-// kills the command without reporting a result.
+// handle serves one connection: an arm request or one command. Cancelling
+// ctx, or the client going away, kills the command without reporting a
+// result.
 func (s *Server) handle(ctx context.Context, conn net.Conn) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -120,12 +129,35 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 
 	out := &frameWriter{conn: conn}
 	_ = conn.SetReadDeadline(time.Now().Add(s.requestTimeout))
-	req, err := readRequest(conn)
+	f, err := readOpening(conn)
 	_ = conn.SetReadDeadline(time.Time{})
 	if err != nil {
 		s.reject(out, protocol.ExitHostrunError, err.Error(), err)
 		return
 	}
+	if f.Type == protocol.FrameArm {
+		s.arm(out)
+		return
+	}
+	req, err := decodeRequest(f)
+	if err != nil {
+		s.reject(out, protocol.ExitHostrunError, err.Error(), err)
+		return
+	}
+	s.run(ctx, cancel, conn, out, req)
+}
+
+// arm handles FrameArm from `hostrunner up`.
+func (s *Server) arm(out *frameWriter) {
+	s.log.Info("armed by hostrunner up")
+	if s.onArm != nil {
+		s.onArm()
+	}
+	_ = out.writeJSON(protocol.FrameArmed, protocol.Arm{Version: protocol.Version})
+}
+
+// run executes req on the connection; cancel stops it early.
+func (s *Server) run(ctx context.Context, cancel context.CancelFunc, conn net.Conn, out *frameWriter, req protocol.Request) {
 	// Known gap: the directory is checked here but entered by path later in
 	// Start, so a container racing a symlink swap in between can escape the
 	// workspace. Harmless while every command is allowed; must be closed
@@ -188,27 +220,33 @@ func cwdMessage(cwd string, err error) string {
 	return fmt.Sprintf("working directory %s does not exist on the host", cwd)
 }
 
-// readRequest reads and validates the opening frame of a connection.
-func readRequest(conn net.Conn) (protocol.Request, error) {
-	var req protocol.Request
+// readOpening reads the opening frame of a connection (FrameRequest or
+// FrameArm) and checks its protocol version before anything else, so a
+// frame shaped by a newer protocol is reported as a version mismatch rather
+// than a decoding error.
+func readOpening(conn net.Conn) (protocol.Frame, error) {
 	f, err := protocol.ReadFrame(conn)
 	if err != nil {
-		return req, fmt.Errorf("read request: %w", err)
+		return f, fmt.Errorf("read request: %w", err)
 	}
-	if f.Type != protocol.FrameRequest {
-		return req, fmt.Errorf("expected a request frame, got type %d", f.Type)
+	if f.Type != protocol.FrameRequest && f.Type != protocol.FrameArm {
+		return f, fmt.Errorf("expected a request frame, got type %d", f.Type)
 	}
-	// Check the version before the rest, so a request shaped by a newer
-	// protocol is reported as a version mismatch, not a decoding error.
 	var header struct {
 		Version int `json:"version"`
 	}
 	if err := protocol.DecodeJSON(f, &header); err != nil {
-		return req, err
+		return f, err
 	}
 	if header.Version != protocol.Version {
-		return req, fmt.Errorf("protocol version mismatch: client %d, daemon %d", header.Version, protocol.Version)
+		return f, fmt.Errorf("protocol version mismatch: client %d, daemon %d", header.Version, protocol.Version)
 	}
+	return f, nil
+}
+
+// decodeRequest decodes and validates a FrameRequest.
+func decodeRequest(f protocol.Frame) (protocol.Request, error) {
+	var req protocol.Request
 	if err := protocol.DecodeJSON(f, &req); err != nil {
 		return req, err
 	}
