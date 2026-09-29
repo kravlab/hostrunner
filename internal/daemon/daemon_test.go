@@ -167,3 +167,44 @@ func TestServeStopsRunningCommandsOnPermanentAcceptError(t *testing.T) {
 		t.Fatal("Serve did not return after a permanent accept error")
 	}
 }
+
+func TestServeRearmsOnArmRequest(t *testing.T) {
+	armed := make(chan struct{}, 1)
+	srv := newServer(t, daemon.WithArmHandler(func() { armed <- struct{}{} }))
+	client, server := net.Pipe()
+	defer client.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.Serve(ctx, newChanListener(acceptResult{conn: server}))
+
+	client.SetDeadline(time.Now().Add(5 * time.Second))
+	if err := protocol.WriteJSON(client, protocol.FrameArm, protocol.Arm{Version: protocol.Version}); err != nil {
+		t.Fatal(err)
+	}
+	f, err := protocol.ReadFrame(client)
+	if err != nil || f.Type != protocol.FrameArmed {
+		t.Fatalf("got frame %v, err %v; want FrameArmed", f.Type, err)
+	}
+	select {
+	case <-armed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("arm handler was not called")
+	}
+}
+
+func TestServeRejectsArmWithOtherVersion(t *testing.T) {
+	srv := newServer(t, daemon.WithArmHandler(func() { t.Error("arm handler called for a bad version") }))
+	client, server := net.Pipe()
+	defer client.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.Serve(ctx, newChanListener(acceptResult{conn: server}))
+
+	client.SetDeadline(time.Now().Add(5 * time.Second))
+	if err := protocol.WriteJSON(client, protocol.FrameArm, protocol.Arm{Version: protocol.Version + 1}); err != nil {
+		t.Fatal(err)
+	}
+	if f := statusFrame(t, client); f.Type != protocol.FrameError {
+		t.Fatalf("got frame type %d, want FrameError", f.Type)
+	}
+}
