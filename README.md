@@ -21,14 +21,15 @@ stops. Linux hosts; Docker and Podman.
 ## Install
 
 ```sh
-make install            # builds with CGO_ENABLED=0 into ~/.local/bin
-make install PREFIX=/usr/local
+mise install                        # the pinned toolchain (see mise.toml)
+mise run install                    # builds with CGO_ENABLED=0 into ~/.local/bin
+PREFIX=/usr/local mise run install
 ```
 
 `hostrunner` must be in the `PATH` of the process that starts your
 devcontainer (VS Code, the devcontainer CLI). The `hostrun` client is
-installed next to it; it must stay statically linked, which `make install`
-guarantees.
+installed next to it; it must stay statically linked, which
+`mise run install` guarantees.
 
 ## Use in a devcontainer
 
@@ -156,9 +157,9 @@ How it works:
 ## Development
 
 ```sh
-make test   # unit and integration tests (go test -race ./...)
-make e2e    # brings up examples/devcontainer on docker
-HOSTRUNNER_E2E_PODMAN=1 make e2e   # also on podman
+mise run test   # unit and integration tests (go test -race ./...)
+mise run e2e    # brings up examples/devcontainer on docker
+HOSTRUNNER_E2E_PODMAN=1 mise run e2e   # also on podman
 ```
 
 The podman run is opt-in because devcontainer CLI 0.89 sometimes waits

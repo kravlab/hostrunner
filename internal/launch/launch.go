@@ -229,7 +229,7 @@ func checkStatic(path string) error {
 	defer f.Close()
 	for _, p := range f.Progs {
 		if p.Type == elf.PT_INTERP {
-			return fmt.Errorf("client %s is dynamically linked; rebuild it with CGO_ENABLED=0 (make install)", path)
+			return fmt.Errorf("client %s is dynamically linked; rebuild it with CGO_ENABLED=0 (mise run install)", path)
 		}
 	}
 	return nil

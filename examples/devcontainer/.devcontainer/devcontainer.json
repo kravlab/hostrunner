@@ -1,6 +1,6 @@
 // Minimal devcontainer wired to hostrunner. Copy the initializeCommand,
 // mounts and remoteEnv entries into your own devcontainer.json; the image is
-// only an example. Requires `make install` on the host (hostrunner in PATH).
+// only an example. Requires `mise run install` on the host (hostrunner in PATH).
 {
   "name": "hostrunner example",
   "image": "docker.io/library/alpine:3",
