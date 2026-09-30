@@ -5,7 +5,7 @@
 //
 //	hostrunner up --dir <runtime-dir> --workspace <host-path> --container-workspace <path>
 //	hostrunner serve --socket <path> --workspace <host-path> --container-workspace <path>
-//	    [--watch [--startup-timeout 30m] [--grace 15s]]
+//	    [--config <path>] [--watch [--startup-timeout 30m] [--grace 15s]]
 //
 // `up` is meant for devcontainer's initializeCommand: it installs the client
 // into the runtime directory and starts a detached `serve --watch` there,
@@ -27,6 +27,8 @@ import (
 
 	"github.com/kravlab/hostrunner/internal/daemon"
 	"github.com/kravlab/hostrunner/internal/launch"
+	"github.com/kravlab/hostrunner/internal/protocol"
+	"github.com/kravlab/hostrunner/internal/rules"
 	"github.com/kravlab/hostrunner/internal/transport"
 	"github.com/kravlab/hostrunner/internal/watch"
 	"github.com/kravlab/hostrunner/internal/workspace"
@@ -35,7 +37,7 @@ import (
 const (
 	usage      = "usage: hostrunner up|serve [flags]; see `hostrunner <command> -h`"
 	upUsage    = "usage: hostrunner up --dir <runtime-dir> --workspace <host-path> --container-workspace <path>"
-	serveUsage = "usage: hostrunner serve --socket <path> --workspace <host-path> --container-workspace <path> [--watch]"
+	serveUsage = "usage: hostrunner serve --socket <path> --workspace <host-path> --container-workspace <path> [--config <path>] [--watch]"
 )
 
 // Defaults for following the container; see internal/watch.
@@ -95,6 +97,11 @@ type workspaceFlags struct {
 	containerWorkspace string // the same workspace's path inside the container
 }
 
+// rulesFile is the default rules file of a host workspace.
+func (w *workspaceFlags) rulesFile() string {
+	return filepath.Join(w.workspace, ".devcontainer", "hostrun.yaml")
+}
+
 // register adds --workspace and --container-workspace to fs.
 func (w *workspaceFlags) register(fs *flag.FlagSet) {
 	fs.StringVar(&w.workspace, "workspace", "", "workspace directory on the host")
@@ -134,6 +141,7 @@ func parseUp(args []string, exe string, output io.Writer) (launch.Config, error)
 		Dir:                dir,
 		Workspace:          ws.workspace,
 		ContainerWorkspace: ws.containerWorkspace,
+		Rules:              ws.rulesFile(),
 		Daemon:             exe,
 		Client:             filepath.Join(filepath.Dir(exe), launch.ClientName),
 		ReadyTimeout:       readyTimeout,
@@ -144,6 +152,7 @@ func parseUp(args []string, exe string, output io.Writer) (launch.Config, error)
 type serveConfig struct {
 	socket string // Unix socket to listen on
 	workspaceFlags
+	config         string        // rules file; default <workspace>/.devcontainer/hostrun.yaml
 	watch          bool          // exit once the devcontainer stops
 	startupTimeout time.Duration // with watch: wait this long for the container
 	grace          time.Duration // with watch: tolerate its absence this long
@@ -158,6 +167,7 @@ func parseServe(args []string, output io.Writer) (serveConfig, error) {
 	fs.SetOutput(output)
 	fs.StringVar(&cfg.socket, "socket", "", "Unix socket path to listen on")
 	cfg.workspaceFlags.register(fs)
+	fs.StringVar(&cfg.config, "config", "", "rules file (default <workspace>/.devcontainer/hostrun.yaml)")
 	fs.BoolVar(&cfg.watch, "watch", false, "exit once the workspace's devcontainer stops")
 	fs.DurationVar(&cfg.startupTimeout, "startup-timeout", defaultStartupTimeout, "with --watch: how long to wait for the container to start")
 	fs.DurationVar(&cfg.grace, "grace", defaultGrace, "with --watch: how long the container may be gone before exiting")
@@ -167,13 +177,24 @@ func parseServe(args []string, output io.Writer) (serveConfig, error) {
 	if cfg.socket == "" || cfg.workspace == "" || cfg.containerWorkspace == "" {
 		return cfg, errors.New(serveUsage)
 	}
+	if cfg.config == "" {
+		cfg.config = cfg.rulesFile()
+	}
 	return cfg, nil
 }
 
 // serve runs the daemon until ctx is cancelled or, with watch, until the
 // devcontainer has stopped (as reported by runtimes). An arm request from
 // `hostrunner up` puts the watcher back into waiting for the container.
+//
+// The rules file is read once, here: an invalid file stops the daemon from
+// starting (fail closed), a missing one makes it deny every command. Later
+// edits, e.g. by a `git pull` on the host, take effect only on restart.
 func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []watch.Runtime) error {
+	policy, err := rules.Load(cfg.config)
+	if err != nil {
+		return err
+	}
 	mapper, err := workspace.NewMapper(cfg.workspace, cfg.containerWorkspace)
 	if err != nil {
 		return err
@@ -182,20 +203,19 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 	if err != nil {
 		return err
 	}
-	log.Info("listening", "socket", cfg.socket, "workspace", cfg.workspace, "container_workspace", cfg.containerWorkspace, "watch", cfg.watch)
+	log.Info("listening", "socket", cfg.socket, "workspace", cfg.workspace, "container_workspace", cfg.containerWorkspace, "config", cfg.config, "rules_digest", policy.Digest(), "watch", cfg.watch)
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	var opts []daemon.Option
+	var watcher *watch.Watcher
 	if cfg.watch {
-		watcher := watch.New(runtimes, watch.Config{
+		watcher = watch.New(runtimes, watch.Config{
 			Workspace:      cfg.workspace,
 			PollInterval:   cfg.pollInterval,
 			QueryTimeout:   queryTimeout,
 			StartupTimeout: cfg.startupTimeout,
 			Grace:          cfg.grace,
 		}, log)
-		opts = append(opts, daemon.WithArmHandler(watcher.Rearm))
 		go func() {
 			defer cancel()
 			if err := watcher.Run(ctx); err != nil && ctx.Err() == nil {
@@ -203,5 +223,19 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 			}
 		}()
 	}
-	return daemon.New(mapper, log, opts...).Serve(ctx, l)
+	// `hostrunner up` arms the daemon on every container start with the
+	// digest of the rules it validated: other rules mean this daemon is
+	// stale and steps aside for a fresh one; the same rules mean a (re)start
+	// of the container, which the watcher must wait for.
+	onArm := func(a protocol.Arm) (restart bool) {
+		if a.ConfigDigest != policy.Digest() {
+			log.Info("rules file changed; stopping for a fresh daemon", "config", cfg.config)
+			return true
+		}
+		if watcher != nil {
+			watcher.Rearm()
+		}
+		return false
+	}
+	return daemon.New(mapper, policy, log, daemon.WithArmHandler(onArm)).Serve(ctx, l)
 }

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/kravlab/hostrunner/internal/protocol"
+	"github.com/kravlab/hostrunner/internal/rules"
 )
 
 // fakeDaemonEnv makes the test binary act as the daemon when Up spawns it.
@@ -36,6 +37,7 @@ func TestMain(m *testing.M) {
 		os.Setenv(fakeDaemonEnv, "serve")
 		err := Up(context.Background(), Config{
 			Dir: dir, Workspace: "/w", ContainerWorkspace: "/c",
+			Rules:  filepath.Join(dir, "missing-rules.yaml"),
 			Daemon: os.Args[0], Client: client, ReadyTimeout: 5 * time.Second,
 		})
 		if err != nil {
@@ -54,16 +56,23 @@ func TestMain(m *testing.M) {
 }
 
 // runFakeDaemon records its pid in fake.pids and, in "serve" mode, listens
-// on --socket and answers every FrameArm, logging it to fake.armed. It
-// insists on --watch, which `up` must always pass.
+// on --socket and answers every FrameArm, logging it to fake.armed. Like the
+// real daemon it compares the arm's rules digest with the rules it started
+// with and, on a mismatch, answers with a restart and exits. It insists on
+// --watch, which `up` must always pass.
 func runFakeDaemon(mode string) {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	socket := fs.String("socket", "", "")
 	fs.String("workspace", "", "")
 	fs.String("container-workspace", "", "")
+	config := fs.String("config", "", "")
 	watch := fs.Bool("watch", false, "")
-	if len(os.Args) < 2 || os.Args[1] != "serve" || fs.Parse(os.Args[2:]) != nil || !*watch {
+	if len(os.Args) < 2 || os.Args[1] != "serve" || fs.Parse(os.Args[2:]) != nil || !*watch || *config == "" {
 		os.Exit(2)
+	}
+	policy, err := rules.Load(*config)
+	if err != nil {
+		os.Exit(3)
 	}
 	dir := filepath.Dir(*socket)
 	appendLine(filepath.Join(dir, "fake.pids"), strconv.Itoa(os.Getpid()))
@@ -82,8 +91,16 @@ func runFakeDaemon(mode string) {
 		}
 		c.SetDeadline(time.Now().Add(5 * time.Second))
 		if f, err := protocol.ReadFrame(c); err == nil && f.Type == protocol.FrameArm {
-			appendLine(filepath.Join(dir, "fake.armed"), "armed")
-			_ = protocol.WriteJSON(c, protocol.FrameArmed, protocol.Arm{Version: protocol.Version})
+			var a protocol.Arm
+			_ = protocol.DecodeJSON(f, &a)
+			restart := a.ConfigDigest != policy.Digest()
+			appendLine(filepath.Join(dir, "fake.armed"), map[bool]string{false: "armed", true: "restart"}[restart])
+			_ = protocol.WriteJSON(c, protocol.FrameArmed, protocol.Armed{Version: protocol.Version, Restart: restart})
+			if restart {
+				c.Close()
+				l.Close()
+				os.Exit(0)
+			}
 		}
 		c.Close()
 	}
@@ -159,10 +176,12 @@ func shortDir(t *testing.T) string {
 // kills every fake daemon started into its Dir when the test ends.
 func fakeConfig(t *testing.T, mode string) Config {
 	t.Helper()
+	base := shortDir(t)
 	cfg := Config{
-		Dir:                filepath.Join(shortDir(t), "rt", "id"),
+		Dir:                filepath.Join(base, "rt", "id"),
 		Workspace:          "/home/u/app",
 		ContainerWorkspace: "/workspaces/app",
+		Rules:              filepath.Join(base, "hostrun.yaml"),
 		Daemon:             os.Args[0],
 		Client:             mustStatic(t),
 		ReadyTimeout:       5 * time.Second,
@@ -431,5 +450,45 @@ func TestCheckStatic(t *testing.T) {
 	}
 	if err := checkStatic(notELF); err == nil {
 		t.Error("non-ELF file accepted")
+	}
+}
+
+func TestUpRejectsInvalidRules(t *testing.T) {
+	cfg := fakeConfig(t, "serve")
+	if err := os.WriteFile(cfg.Rules, []byte("rules:\n  - command: git\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := Up(context.Background(), cfg); err == nil || !strings.Contains(err.Error(), cfg.Rules) {
+		t.Fatalf("got %v, want an error naming the rules file", err)
+	}
+	if pids := lines(t, filepath.Join(cfg.Dir, "fake.pids")); len(pids) != 0 {
+		t.Fatalf("a daemon was started despite invalid rules: %v", pids)
+	}
+}
+
+func TestUpRestartsDaemonWhenRulesChange(t *testing.T) {
+	cfg := fakeConfig(t, "serve")
+	if err := os.WriteFile(cfg.Rules, []byte("rules:\n  - command: git status\n    args: any\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := Up(context.Background(), cfg); err != nil {
+		t.Fatalf("first Up: %v", err)
+	}
+	first := onlyPid(t, cfg.Dir)
+
+	if err := os.WriteFile(cfg.Rules, []byte("rules:\n  - command: git status\n    args: none\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := Up(context.Background(), cfg); err != nil {
+		t.Fatalf("Up after the rules changed: %v", err)
+	}
+	waitGone(t, first)
+	pids := lines(t, filepath.Join(cfg.Dir, "fake.pids"))
+	if len(pids) != 2 {
+		t.Fatalf("want a second daemon, got pids %v", pids)
+	}
+	second, _ := strconv.Atoi(pids[1])
+	if !alivePid(second) {
+		t.Fatal("the new daemon is not running")
 	}
 }

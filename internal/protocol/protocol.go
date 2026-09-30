@@ -51,7 +51,7 @@ const (
 	FrameError                            // daemon → client, JSON Error
 	FrameStdinCredit                      // daemon → client, JSON Credit
 	FrameArm                              // `hostrunner up` → daemon, JSON Arm
-	FrameArmed                            // daemon → `hostrunner up`, JSON Arm
+	FrameArmed                            // daemon → `hostrunner up`, JSON Armed
 
 	lastFrameType = FrameArmed
 )
@@ -86,10 +86,19 @@ type Request struct {
 }
 
 // Arm asks a running daemon to wait for its devcontainer (again), as
-// `hostrunner up` does on every container start; the daemon echoes its own
-// version in FrameArmed.
+// `hostrunner up` does on every container start. ConfigDigest identifies the
+// rules file `up` just validated (rules.Policy.Digest), so a daemon running
+// older rules can step aside.
 type Arm struct {
-	Version int `json:"version"`
+	Version      int    `json:"version"`
+	ConfigDigest string `json:"config_digest"`
+}
+
+// Armed answers Arm. Restart means the daemon is shutting down (its rules
+// are stale) and `up` must start a new one once the socket is free.
+type Armed struct {
+	Version int  `json:"version"`
+	Restart bool `json:"restart"`
 }
 
 // Exit reports the exit code of a command that ran.

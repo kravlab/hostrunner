@@ -5,8 +5,10 @@ package workspace
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 // ErrOutsideWorkspace means the requested directory does not lie inside the
@@ -34,28 +36,45 @@ func NewMapper(hostRoot, containerRoot string) (*Mapper, error) {
 	return &Mapper{hostRoot: resolved, containerRoot: filepath.Clean(containerRoot)}, nil
 }
 
-// HostPath returns the real host directory for containerCwd.
+// Open opens the host directory for containerCwd and returns it with its
+// real host path. The caller must close it.
 //
-// The check runs twice: first lexically in the container namespace (so ".."
-// cannot climb out), then on the resolved host path (so a symlink the
-// container planted inside the workspace cannot point the command at an
-// arbitrary host directory). The directory must exist on the host.
-func (m *Mapper) HostPath(containerCwd string) (string, error) {
+// The path is checked lexically in the container namespace (so ".." cannot
+// climb out) and then opened through an os.Root at the host workspace, which
+// refuses any symlink leading outside it. Because the caller gets an open
+// directory rather than a path, a symlink the container swaps in after the
+// check cannot redirect the command: run it in the directory itself (e.g.
+// via /proc/self/fd), not by path.
+func (m *Mapper) Open(containerCwd string) (*os.File, string, error) {
 	if !filepath.IsAbs(containerCwd) {
-		return "", fmt.Errorf("%w: %q is not absolute", ErrOutsideWorkspace, containerCwd)
+		return nil, "", fmt.Errorf("%w: %q is not absolute", ErrOutsideWorkspace, containerCwd)
 	}
 	rel, ok := within(m.containerRoot, filepath.Clean(containerCwd))
 	if !ok {
-		return "", fmt.Errorf("%w: %s", ErrOutsideWorkspace, containerCwd)
+		return nil, "", fmt.Errorf("%w: %s", ErrOutsideWorkspace, containerCwd)
 	}
-	resolved, err := filepath.EvalSymlinks(filepath.Join(m.hostRoot, rel))
+	root, err := os.OpenRoot(m.hostRoot)
 	if err != nil {
-		return "", fmt.Errorf("resolve %s on the host: %w", containerCwd, err)
+		return nil, "", fmt.Errorf("open host workspace: %w", err)
 	}
-	if _, ok := within(m.hostRoot, resolved); !ok {
-		return "", fmt.Errorf("%w: %s resolves outside it on the host", ErrOutsideWorkspace, containerCwd)
+	defer root.Close()
+	// O_DIRECTORY: opening a FIFO the container planted would block forever.
+	dir, err := root.OpenFile(rel, os.O_RDONLY|syscall.O_DIRECTORY, 0)
+	var errno syscall.Errno
+	switch {
+	case errors.As(err, &errno):
+		// ENOENT, ENOTDIR, EACCES, ELOOP, …: the directory is not usable.
+		return nil, "", fmt.Errorf("open %s on the host: %w", containerCwd, err)
+	case err != nil:
+		// os.Root reports escapes (via ".." or symlinks) without an errno.
+		return nil, "", fmt.Errorf("%w: %s: %v", ErrOutsideWorkspace, containerCwd, err)
 	}
-	return resolved, nil
+	hostPath, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", dir.Fd()))
+	if err != nil {
+		dir.Close()
+		return nil, "", fmt.Errorf("open %s on the host: %w", containerCwd, err)
+	}
+	return dir, hostPath, nil
 }
 
 // within reports whether path equals root or lies below it, and returns path

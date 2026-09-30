@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/kravlab/hostrunner/internal/protocol"
+	"github.com/kravlab/hostrunner/internal/rules"
 	"github.com/kravlab/hostrunner/internal/transport"
 )
 
@@ -54,12 +55,16 @@ type Config struct {
 	Dir                string        // runtime directory, e.g. $XDG_RUNTIME_DIR/hostrunner/<devcontainerId>
 	Workspace          string        // workspace folder on the host
 	ContainerWorkspace string        // the same folder inside the container
+	Rules              string        // the rules file (.devcontainer/hostrun.yaml)
 	Daemon             string        // hostrunner executable to start as the daemon
 	Client             string        // hostrun binary to install into Dir
 	ReadyTimeout       time.Duration // how long to wait for the daemon's socket
 }
 
-// Up makes sure an armed daemon serves cfg.Dir, starting one if needed. It
+// Up makes sure an armed daemon serves cfg.Dir with the current rules. It
+// validates cfg.Rules first (invalid rules are an error), arms a running
+// daemon, and starts a new one if there is none or the running one loaded
+// other rules (it steps aside when armed with a different digest). It
 // returns once the daemon has answered an arm request, or an error carrying
 // the daemon's log output if it did not come up. Concurrent calls for the
 // same directory are serialized, so they end up sharing one daemon.
@@ -71,23 +76,50 @@ func Up(ctx context.Context, cfg Config) error {
 	if err := prepareDir(cfg.Dir); err != nil {
 		return err
 	}
+	// Invalid rules must fail `devcontainer up` visibly, even when a daemon
+	// with older rules is still running.
+	policy, err := rules.Load(cfg.Rules)
+	if err != nil {
+		return fmt.Errorf("rules file: %w", err)
+	}
+	digest := policy.Digest()
 	unlock, err := lockDir(cfg.Dir)
 	if err != nil {
 		return err
 	}
 	defer unlock()
 
-	err = arm(ctx, socket)
-	if err == nil {
+	restart, err := arm(ctx, socket, digest)
+	switch {
+	case err == nil && !restart:
 		return nil
-	}
-	if !errors.Is(err, errNotListening) {
+	case err == nil: // the daemon runs stale rules and is stepping aside
+		if err := waitStopped(ctx, socket, cfg.ReadyTimeout); err != nil {
+			return err
+		}
+	case !errors.Is(err, errNotListening):
 		return fmt.Errorf("%w; stop the process serving %s and retry", err, socket)
 	}
 	if err := installClient(cfg.Client, cfg.Dir); err != nil {
 		return err
 	}
-	return startDaemon(ctx, cfg, socket)
+	return startDaemon(ctx, cfg, socket, digest)
+}
+
+// waitStopped waits until nothing accepts connections on socket.
+func waitStopped(ctx context.Context, socket string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		c, err := transport.Unix{Path: socket}.Dial(ctx)
+		if err != nil {
+			return nil
+		}
+		c.Close()
+		if time.Now().After(deadline) {
+			return fmt.Errorf("the daemon on %s did not stop within %v to apply changed rules", socket, timeout)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 // prepareDir creates dir owner-only; the mode is enforced even when the
@@ -117,36 +149,42 @@ func lockDir(dir string) (func(), error) {
 	return func() { f.Close() }, nil
 }
 
-// arm asks the daemon on socket to wait for its devcontainer again. It
-// returns errNotListening (wrapped) when nothing accepts connections, and
-// another error when something listens but does not arm.
-func arm(ctx context.Context, socket string) error {
+// arm asks the daemon on socket to wait for its devcontainer again, telling
+// it the digest of the current rules. restart reports that the daemon runs
+// other rules and is shutting down. err wraps errNotListening when nothing
+// accepts connections, and is another error when something listens but does
+// not arm.
+func arm(ctx context.Context, socket, digest string) (restart bool, err error) {
 	ctx, cancel := context.WithTimeout(ctx, armTimeout)
 	defer cancel()
 	c, err := transport.Unix{Path: socket}.Dial(ctx)
 	if err != nil {
-		return fmt.Errorf("%w: %v", errNotListening, err)
+		return false, fmt.Errorf("%w: %v", errNotListening, err)
 	}
 	defer c.Close()
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = c.SetDeadline(deadline)
 	}
-	if err := protocol.WriteJSON(c, protocol.FrameArm, protocol.Arm{Version: protocol.Version}); err != nil {
-		return fmt.Errorf("daemon on %s did not accept the arm request: %w", socket, err)
+	if err := protocol.WriteJSON(c, protocol.FrameArm, protocol.Arm{Version: protocol.Version, ConfigDigest: digest}); err != nil {
+		return false, fmt.Errorf("daemon on %s did not accept the arm request: %w", socket, err)
 	}
 	f, err := protocol.ReadFrame(c)
 	if err != nil {
-		return fmt.Errorf("daemon on %s did not answer the arm request: %w", socket, err)
+		return false, fmt.Errorf("daemon on %s did not answer the arm request: %w", socket, err)
 	}
 	switch f.Type {
 	case protocol.FrameArmed:
-		return nil
+		var a protocol.Armed
+		if err := protocol.DecodeJSON(f, &a); err != nil {
+			return false, fmt.Errorf("daemon on %s: %w", socket, err)
+		}
+		return a.Restart, nil
 	case protocol.FrameError:
 		var e protocol.Error
 		_ = protocol.DecodeJSON(f, &e)
-		return fmt.Errorf("daemon on %s refused to arm: %s", socket, e.Message)
+		return false, fmt.Errorf("daemon on %s refused to arm: %s", socket, e.Message)
 	default:
-		return fmt.Errorf("daemon on %s answered the arm request with frame type %d", socket, f.Type)
+		return false, fmt.Errorf("daemon on %s answered the arm request with frame type %d", socket, f.Type)
 	}
 }
 
@@ -200,7 +238,7 @@ func checkStatic(path string) error {
 // startDaemon spawns the daemon in its own session with output going to the
 // log, so it outlives `hostrunner up` and never holds the caller's stdio
 // (which would make devcontainer wait for it), then waits until it arms.
-func startDaemon(ctx context.Context, cfg Config, socket string) error {
+func startDaemon(ctx context.Context, cfg Config, socket, digest string) error {
 	logPath := filepath.Join(cfg.Dir, LogName)
 	logFile, err := openLog(logPath)
 	if err != nil {
@@ -212,6 +250,7 @@ func startDaemon(ctx context.Context, cfg Config, socket string) error {
 		"--socket", socket,
 		"--workspace", cfg.Workspace,
 		"--container-workspace", cfg.ContainerWorkspace,
+		"--config", cfg.Rules,
 		"--watch")
 	cmd.Dir = cfg.Dir // do not keep the workspace busy
 	cmd.Stdout = logFile
@@ -239,9 +278,12 @@ func startDaemon(ctx context.Context, cfg Config, socket string) error {
 			_ = cmd.Process.Kill()
 			return ctx.Err()
 		case <-ticker.C:
-			err := arm(ctx, socket)
-			if err == nil {
+			restart, err := arm(ctx, socket, digest)
+			if err == nil && !restart {
 				return nil
+			}
+			if err == nil { // the rules changed again while it started
+				err = errors.New("the new daemon loaded other rules than up validated; retry")
 			}
 			if !errors.Is(err, errNotListening) {
 				_ = cmd.Process.Kill()
