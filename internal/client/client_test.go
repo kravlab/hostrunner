@@ -18,6 +18,7 @@ import (
 	"github.com/kravlab/hostrunner/internal/client"
 	"github.com/kravlab/hostrunner/internal/daemon"
 	"github.com/kravlab/hostrunner/internal/protocol"
+	"github.com/kravlab/hostrunner/internal/rules"
 	"github.com/kravlab/hostrunner/internal/transport"
 	"github.com/kravlab/hostrunner/internal/workspace"
 )
@@ -32,7 +33,15 @@ type harness struct {
 	stop      func() // shuts the daemon down; safe to call more than once
 }
 
-func startDaemon(t *testing.T) harness {
+// allowAll is a policy that allows every command, for tests about
+// everything but the rules.
+type allowAll struct{}
+
+func (allowAll) Check([]string) error { return nil }
+
+// startDaemon starts a daemon with the given policy, or one allowing every
+// command.
+func startDaemon(t *testing.T, policies ...daemon.Policy) harness {
 	t.Helper()
 	base, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
@@ -53,7 +62,11 @@ func startDaemon(t *testing.T) harness {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	srv := daemon.New(mapper, slog.New(slog.DiscardHandler))
+	var p daemon.Policy = allowAll{}
+	if len(policies) > 0 {
+		p = policies[0]
+	}
+	srv := daemon.New(mapper, p, slog.New(slog.DiscardHandler))
 	go func() { done <- srv.Serve(ctx, l) }()
 	stop := sync.OnceFunc(func() {
 		cancel()
@@ -465,5 +478,78 @@ func TestRunRejectsNonExecutableFile(t *testing.T) {
 	got := h.run(t, containerRoot, "", "./script")
 	if got.code != protocol.ExitRejected || got.stdout != "" || !strings.HasPrefix(got.stderr, "hostrun: ") {
 		t.Fatalf("got %+v, want code %d with a hostrun error", got, protocol.ExitRejected)
+	}
+}
+
+// policy parses a rules config for a test.
+func policy(t *testing.T, config string) daemon.Policy {
+	t.Helper()
+	p, err := rules.Parse([]byte(config))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+const echoOnly = `
+rules:
+  - command: echo
+    args: any
+  - command: sh
+    flags:
+      allow: [-c]
+`
+
+func TestRunAllowsCommandPermittedByRules(t *testing.T) {
+	h := startDaemon(t, policy(t, echoOnly))
+	if got := h.run(t, containerRoot, "", "echo", "hi"); got != (result{stdout: "hi\n"}) {
+		t.Fatalf("got %+v", got)
+	}
+}
+
+func TestRunRejectsCommandDeniedByRules(t *testing.T) {
+	h := startDaemon(t, policy(t, echoOnly))
+	for argv, want := range map[string]string{
+		"rm -rf /tmp/x": "hostrun: no rule allows \"rm -rf\"\n",
+		"sh -x script":  "hostrun: denied by rule \"sh\": flag -x is not allowed\n",
+	} {
+		got := h.run(t, containerRoot, "", strings.Fields(argv)...)
+		if got != (result{code: protocol.ExitRejected, stderr: want}) {
+			t.Errorf("%s: got %+v, want code %d and %q", argv, got, protocol.ExitRejected, want)
+		}
+	}
+}
+
+func TestRunChecksRulesBeforeTheWorkingDirectory(t *testing.T) {
+	h := startDaemon(t, policy(t, echoOnly))
+	got := h.run(t, "/etc", "", "rm", "x")
+	if got.code != protocol.ExitRejected || !strings.Contains(got.stderr, "no rule allows") {
+		t.Fatalf("got %+v, want the rule denial", got)
+	}
+}
+
+func TestRunDeniesEverythingWithoutConfig(t *testing.T) {
+	p, err := rules.Load(filepath.Join(t.TempDir(), "hostrun.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := startDaemon(t, p)
+	got := h.run(t, containerRoot, "", "echo", "hi")
+	if got.code != protocol.ExitRejected || !strings.Contains(got.stderr, "no rules file") {
+		t.Fatalf("got %+v, want the missing-config denial", got)
+	}
+}
+
+func TestRunSetsPhysicalAndLogicalWorkingDirectory(t *testing.T) {
+	t.Setenv("PWD", "/daemon/started/elsewhere") // must not leak into the command
+	h := startDaemon(t)
+	want := filepath.Join(h.hostRoot, "sub")
+	if got := h.run(t, containerRoot+"/sub", "", "pwd", "-P"); got != (result{stdout: want + "\n"}) {
+		t.Fatalf("physical: got %+v, want %s", got, want)
+	}
+	// printenv reads the environment as given; a shell would repair a bad
+	// PWD by itself and hide the difference.
+	if got := h.run(t, containerRoot+"/sub", "", "printenv", "PWD"); got != (result{stdout: want + "\n"}) {
+		t.Fatalf("logical: got %+v, want %s", got, want)
 	}
 }

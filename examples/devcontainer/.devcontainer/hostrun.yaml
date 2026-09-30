@@ -1,0 +1,36 @@
+# Rules for `hostrun`: which host commands the container may run.
+# A command no rule matches is denied; the rule with the longest matching
+# command prefix decides. See the README for the full reference.
+#
+# Prefer `allow` lists for flags: git has flags that make it run a command
+# of your choosing (--upload-pack, --receive-pack, --exec), and a deny list
+# would have to know them all.
+#
+# Rules restrict argv only. git also reads .git/config and hooks from the
+# workspace, which the container can write, so allowing git against a
+# hostile agent is a conscious risk of host code execution.
+rules:
+  - command: git status
+    args: any
+  - command: git rev-parse
+    args: any
+
+  - command: git fetch
+    flags:
+      allow: [--prune, -p, --tags, --all, --quiet, -q, --verbose, -v]
+    positional:
+      # remotes by name only: no URLs, scp-style addresses or local paths
+      deny: ["*://*", "*@*:*", "/*", ".*", "~*", "ext::*", "file:*"]
+
+  - command: git pull
+    flags:
+      allow: [--ff-only, --rebase, -r, --no-rebase, --prune, -p, --tags, --quiet, -q, --verbose, -v]
+    positional:
+      deny: ["*://*", "*@*:*", "/*", ".*", "~*", "ext::*", "file:*"]
+
+  - command: git push
+    flags:
+      allow: [-u, --set-upstream, --tags, --follow-tags, --dry-run, -n, --quiet, -q, --verbose, -v]
+    positional:
+      # force refspecs (+ref), deletions (:ref), and remotes other than by name
+      deny: ["+*", ":*", "*://*", "*@*:*", "/*", ".*", "~*", "ext::*", "file:*"]

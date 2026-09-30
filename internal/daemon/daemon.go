@@ -16,6 +16,9 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"runtime/debug"
+	"slices"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -38,7 +41,18 @@ type Server struct {
 	mapper         *workspace.Mapper
 	log            *slog.Logger
 	requestTimeout time.Duration
-	onArm          func() // called for every FrameArm; nil ignores arming
+	onArm          func(protocol.Arm) (restart bool) // nil: arming changes nothing
+	policy         Policy
+
+	mu        sync.Mutex
+	stopServe context.CancelFunc // stops the running Serve; nil when not serving
+}
+
+// Policy decides whether a command may run; rules.Policy implements it. A
+// non-nil error denies the command, and its message is shown to the client,
+// so it must not reveal host paths.
+type Policy interface {
+	Check(argv []string) error
 }
 
 // Option customizes a Server.
@@ -51,30 +65,44 @@ func WithRequestTimeout(d time.Duration) Option {
 }
 
 // WithArmHandler sets what the Server does when `hostrunner up` arms it on
-// a devcontainer start (e.g. rearm the container watcher). It is called
-// from connection goroutines, so it must be safe for concurrent use.
-func WithArmHandler(f func()) Option {
+// a devcontainer start (e.g. rearm the container watcher). If f returns
+// true, the Server answers that it is restarting and then stops Serve, so
+// `up` can start a daemon with fresh rules. f is called from connection
+// goroutines, so it must be safe for concurrent use.
+func WithArmHandler(f func(protocol.Arm) (restart bool)) Option {
 	return func(s *Server) { s.onArm = f }
 }
 
-// New returns a Server that confines commands to mapper's workspace.
-func New(mapper *workspace.Mapper, log *slog.Logger, opts ...Option) *Server {
-	s := &Server{mapper: mapper, log: log, requestTimeout: defaultRequestTimeout}
+// New returns a Server that runs the commands policy allows, confined to
+// mapper's workspace. The policy is required so that no Server can run
+// commands unchecked by accident.
+func New(mapper *workspace.Mapper, policy Policy, log *slog.Logger, opts ...Option) *Server {
+	if policy == nil {
+		panic("daemon: nil Policy")
+	}
+	s := &Server{mapper: mapper, policy: policy, log: log, requestTimeout: defaultRequestTimeout}
 	for _, opt := range opts {
 		opt(s)
 	}
 	return s
 }
 
-// Serve accepts connections on l until ctx is cancelled or l fails, then
-// closes l, kills running commands and returns once every connection is
-// finished. Temporary accept errors (e.g. out of file descriptors) are
-// retried with backoff. It returns nil on cancellation and the accept error
-// otherwise.
+// Serve accepts connections on l until ctx is cancelled, an arm handler asks
+// for a restart, or l fails; then it closes l, kills running commands and
+// returns once every connection is finished. Temporary accept errors (e.g.
+// out of file descriptors) are retried with backoff. It returns nil when
+// stopped by cancellation or a restart, and the accept error otherwise.
 func (s *Server) Serve(ctx context.Context, l net.Listener) error {
-	parent := ctx
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	s.mu.Lock()
+	s.stopServe = cancel
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.stopServe = nil
+		s.mu.Unlock()
+	}()
 	stop := context.AfterFunc(ctx, func() { l.Close() })
 	defer stop()
 
@@ -94,9 +122,10 @@ func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 				case <-ctx.Done():
 				}
 			}
+			stopped := ctx.Err() != nil // cancelled by the caller or a restart
 			cancel()
 			wg.Wait()
-			if parent.Err() != nil {
+			if stopped {
 				return nil
 			}
 			return err
@@ -128,6 +157,13 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 	defer stop()
 
 	out := &frameWriter{conn: conn}
+	// A bug triggered by one request (e.g. in the policy) must not take the
+	// whole daemon down with every other container's session.
+	defer func() {
+		if r := recover(); r != nil {
+			s.reject(out, protocol.ExitHostrunError, "internal error in the hostrunner daemon", fmt.Errorf("panic: %v\n%s", r, debug.Stack()))
+		}
+	}()
 	_ = conn.SetReadDeadline(time.Now().Add(s.requestTimeout))
 	f, err := readOpening(conn)
 	_ = conn.SetReadDeadline(time.Time{})
@@ -136,7 +172,7 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 		return
 	}
 	if f.Type == protocol.FrameArm {
-		s.arm(out)
+		s.arm(out, f)
 		return
 	}
 	req, err := decodeRequest(f)
@@ -147,28 +183,45 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 	s.run(ctx, cancel, conn, out, req)
 }
 
-// arm handles FrameArm from `hostrunner up`.
-func (s *Server) arm(out *frameWriter) {
-	s.log.Info("armed by hostrunner up")
-	if s.onArm != nil {
-		s.onArm()
+// arm handles FrameArm from `hostrunner up`. When the handler asks for a
+// restart, the answer is written before Serve is stopped, since stopping
+// closes every connection.
+func (s *Server) arm(out *frameWriter, f protocol.Frame) {
+	var a protocol.Arm
+	if err := protocol.DecodeJSON(f, &a); err != nil {
+		s.reject(out, protocol.ExitHostrunError, err.Error(), err)
+		return
 	}
-	_ = out.writeJSON(protocol.FrameArmed, protocol.Arm{Version: protocol.Version})
+	restart := s.onArm != nil && s.onArm(a)
+	s.log.Info("armed by hostrunner up", "restart", restart)
+	_ = out.writeJSON(protocol.FrameArmed, protocol.Armed{Version: protocol.Version, Restart: restart})
+	if restart {
+		s.mu.Lock()
+		stop := s.stopServe
+		s.stopServe = nil
+		s.mu.Unlock()
+		if stop != nil {
+			stop()
+		}
+	}
 }
 
-// run executes req on the connection; cancel stops it early.
+// run executes req on the connection if the policy allows it; cancel stops
+// it early. The rules are checked first, so a denied command is reported as
+// such whatever its working directory.
 func (s *Server) run(ctx context.Context, cancel context.CancelFunc, conn net.Conn, out *frameWriter, req protocol.Request) {
-	// Known gap: the directory is checked here but entered by path later in
-	// Start, so a container racing a symlink swap in between can escape the
-	// workspace. Harmless while every command is allowed; must be closed
-	// (e.g. os.Root + /proc/self/fd) before rules gate commands.
-	dir, err := s.mapper.HostPath(req.Cwd)
+	if err := s.policy.Check(req.Argv); err != nil {
+		s.reject(out, protocol.ExitRejected, err.Error(), err)
+		return
+	}
+	dir, hostPath, err := s.mapper.Open(req.Cwd)
 	if err != nil {
 		s.reject(out, protocol.ExitRejected, cwdMessage(req.Cwd, err), err)
 		return
 	}
+	defer dir.Close()
 
-	cmd := newCommand(ctx, req.Argv, dir, out)
+	cmd := newCommand(ctx, req.Argv, dir, hostPath, out)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		s.reject(out, protocol.ExitHostrunError, "cannot start the command", err)
@@ -196,10 +249,10 @@ func (s *Server) run(ctx context.Context, cancel context.CancelFunc, conn net.Co
 	waitErr := cmd.Wait()
 	if ctx.Err() == nil {
 		code := exitCode(cmd.ProcessState)
-		s.log.Info("command finished", "argv", req.Argv, "dir", dir, "code", code, "wait_error", waitErr)
+		s.log.Info("command finished", "argv", req.Argv, "dir", hostPath, "code", code, "wait_error", waitErr)
 		_ = out.writeJSON(protocol.FrameExit, protocol.Exit{Code: code})
 	} else {
-		s.log.Info("command cancelled", "argv", req.Argv, "dir", dir)
+		s.log.Info("command cancelled", "argv", req.Argv, "dir", hostPath)
 	}
 	conn.Close()
 	streams.Wait()
@@ -217,7 +270,7 @@ func cwdMessage(cwd string, err error) string {
 	if errors.Is(err, workspace.ErrOutsideWorkspace) {
 		return fmt.Sprintf("working directory %s is outside the workspace", cwd)
 	}
-	return fmt.Sprintf("working directory %s does not exist on the host", cwd)
+	return fmt.Sprintf("working directory %s is not available on the host", cwd)
 }
 
 // readOpening reads the opening frame of a connection (FrameRequest or
@@ -256,13 +309,20 @@ func decodeRequest(f protocol.Frame) (protocol.Request, error) {
 	return req, nil
 }
 
-// newCommand prepares argv to run in dir. A nil Env makes the command inherit
-// the daemon's (host) environment; nothing comes from the container. The
-// command gets its own process group so cancellation also kills whatever it
-// spawned (e.g. git's ssh).
-func newCommand(ctx context.Context, argv []string, dir string, out *frameWriter) *exec.Cmd {
+// newCommand prepares argv to run in the open directory dir, whose real
+// path is hostPath. The child changes into the directory through
+// /proc/self/fd (it inherits the descriptor until exec), so a symlink the
+// container swaps into the path after the check cannot redirect it; PWD is
+// set to hostPath because the /proc path is meaningless once the child runs.
+// The environment is otherwise the daemon's (host) environment; nothing
+// comes from the container. The command gets its own process group so
+// cancellation also kills whatever it spawned (e.g. git's ssh).
+func newCommand(ctx context.Context, argv []string, dir *os.File, hostPath string, out *frameWriter) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
-	cmd.Dir = dir
+	cmd.Dir = fmt.Sprintf("/proc/self/fd/%d", dir.Fd())
+	cmd.Env = append(slices.DeleteFunc(os.Environ(), func(kv string) bool {
+		return strings.HasPrefix(kv, "PWD=")
+	}), "PWD="+hostPath)
 	cmd.Stdout = streamWriter{out: out, frame: protocol.FrameStdout}
 	cmd.Stderr = streamWriter{out: out, frame: protocol.FrameStderr}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -272,9 +332,7 @@ func newCommand(ctx context.Context, argv []string, dir string, out *frameWriter
 }
 
 // startFailure classifies why program could not start and describes it
-// without host paths. Known limitation: if the working directory vanishes
-// between the cwd check and Start, the chdir ENOENT is indistinguishable
-// from a missing program and is reported as not found.
+// without host paths.
 func startFailure(program string, err error) (int, string) {
 	if errors.Is(err, exec.ErrNotFound) || errors.Is(err, fs.ErrNotExist) {
 		return protocol.ExitNotFound, fmt.Sprintf("command %s not found on the host", program)

@@ -6,11 +6,17 @@ the container's current directory, with the host's environment and
 credentials. Stdin, stdout and stderr are streamed; the exit code is
 propagated.
 
-The host side (`hostrunner`) starts with the devcontainer and exits after
-the container stops. Linux hosts; Docker and Podman.
+Only commands allowed by `.devcontainer/hostrun.yaml` run. The host side
+(`hostrunner`) starts with the devcontainer and exits after the container
+stops. Linux hosts; Docker and Podman.
 
-> Status: MVP in progress. There are no rules yet: every command the
-> container sends is run. Rules in `.devcontainer/hostrun.yaml` are next.
+> **Rules restrict argv only.** A host tool that reads configuration or
+> hooks from the workspace — git (`.git/config`, `.git/hooks`), fakehost
+> (`fakehost.json` predeploy scripts), … — can be steered by the container,
+> which can write the workspace. Read-only mounts of such files do not help
+> (the container can rename the directory around them or create a nested
+> repository). Allowing such a tool against an agent you do not trust is a
+> conscious risk of code execution on the host.
 
 ## Install
 
@@ -48,12 +54,61 @@ workspace paths with spaces work. `XDG_RUNTIME_DIR` must be set for the
 process that starts the devcontainer (it is in a normal desktop session).
 If `hostrunner up` fails, `devcontainer up` fails with its message.
 
-Then, inside the container:
+Add the rules as `.devcontainer/hostrun.yaml` (start from
+[the example](examples/devcontainer/.devcontainer/hostrun.yaml)), then,
+inside the container:
 
 ```sh
 hostrun git push
-hostrun fakehost deploy --only hosting
+hostrun git push --force   # hostrun: denied by rule "git push": flag --force is not allowed
 ```
+
+## Rules
+
+```yaml
+rules:
+  - command: git status        # argv prefix; the longest matching one decides
+    args: any                  # any flags and arguments
+  - command: tix pr list
+    args: none                 # the bare command only
+  - command: git push
+    flags:
+      allow: [-u, --set-upstream, --tags]   # or deny: [...], never both
+      values:                  # flags that take a value, with a value filter
+        -o: { allow: [ci.skip] }
+        --repo: {}             # any value
+    positional:
+      deny: [main, "+*"]       # or allow: [...], never both
+```
+
+- A command no rule matches is denied, and so is everything when the file
+  is missing. An invalid file (unknown key, both `allow` and `deny`, `args`
+  together with `flags`/`positional`, an empty section, a rule without any
+  of them, a relative program path, …) makes `hostrunner up` fail, and with
+  it `devcontainer up`.
+- Changes apply on the next container start (reopen, restart or rebuild):
+  `hostrunner up` notices that the file differs from what the running
+  daemon loaded and replaces the daemon. The file lives in `.devcontainer/`,
+  which is read-only inside the container, so the agent can read but not
+  change its rules.
+- Matching is literal on argv: `/usr/bin/git push` and `git -C dir push` do
+  not match `git push`. The program must be a name or an absolute path.
+- Arguments are parsed like getopt: `--flag=value`, `--flag value`,
+  `-abc` (= `-a -b -c`), `-ovalue`, and `--` ending the flags. Only flags
+  listed under `values` take a value; that is how flag values are told
+  apart from positional arguments.
+- `flags.allow` is strict: an unlisted flag is denied. `flags.deny` is
+  best effort: it also catches abbreviations (`--forc`) and combined short
+  flags, but a tool may offer other ways to the same effect (e.g. git's
+  `+refspec` for a force push, or `--upload-pack`, which makes git run a
+  command you name), so prefer `allow`, especially for git.
+- Flag names are `-x` or `--name`. Filters apply to the names listed only:
+  list every spelling of a flag, e.g. both `-P` and `--project` under
+  `values`. An abbreviated value flag must carry its value inline
+  (`--proj=dev`), otherwise it is denied.
+- Values and positional arguments are matched with globs: `*` matches
+  anything, including `/`; `?` one character. Under `allow` every argument
+  must match; under `deny` none may.
 
 How it works:
 
@@ -68,7 +123,10 @@ How it works:
   container of a rebuild, however long the image build takes. Its log is
   `daemon.log` in the runtime directory.
 - `.devcontainer/` is read-only inside the container, so the container
-  cannot rewrite the rules that will govern it.
+  cannot rewrite the rules that govern it.
+- The working directory is opened, not re-resolved, when the command
+  starts, so a symlink swapped in by the container cannot redirect it.
+  Symlinks inside the workspace must be relative.
 
 ## Exit codes
 
@@ -77,7 +135,7 @@ How it works:
 | command's own | the command ran |
 | 128+N | the command was killed by signal N |
 | 125 | hostrun failed: daemon unreachable, protocol error, or no command given |
-| 126 | refused: working directory outside the workspace, or not executable |
+| 126 | refused: denied by the rules, working directory outside the workspace, or not executable |
 | 127 | command not found on the host |
 | 130 | interrupted (Ctrl+C); the host command is killed |
 
@@ -99,5 +157,10 @@ How it works:
 
 ```sh
 make test   # unit and integration tests (go test -race ./...)
-make e2e    # brings up examples/devcontainer on docker and podman
+make e2e    # brings up examples/devcontainer on docker
+HOSTRUNNER_E2E_PODMAN=1 make e2e   # also on podman
 ```
+
+The podman run is opt-in because devcontainer CLI 0.89 sometimes waits
+forever for the container's start event from `podman events`, even
+without hostrunner.

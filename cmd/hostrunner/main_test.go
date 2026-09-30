@@ -7,12 +7,15 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/kravlab/hostrunner/internal/client"
 	"github.com/kravlab/hostrunner/internal/launch"
 	"github.com/kravlab/hostrunner/internal/protocol"
+	"github.com/kravlab/hostrunner/internal/rules"
 	"github.com/kravlab/hostrunner/internal/transport"
 	"github.com/kravlab/hostrunner/internal/watch"
 )
@@ -25,6 +28,7 @@ func TestParseServeAcceptsAllFlags(t *testing.T) {
 	want := serveConfig{
 		socket:         "/run/h.sock",
 		workspaceFlags: workspaceFlags{workspace: "/home/u/app", containerWorkspace: "/workspaces/app"},
+		config:         "/home/u/app/.devcontainer/hostrun.yaml",
 		startupTimeout: 30 * time.Minute,
 		grace:          15 * time.Second,
 		pollInterval:   2 * time.Second,
@@ -79,6 +83,7 @@ func TestParseUpBuildsLaunchConfig(t *testing.T) {
 		Dir:                "/run/user/1000/hostrunner/abc",
 		Workspace:          "/home/u/app",
 		ContainerWorkspace: "/workspaces/app",
+		Rules:              "/home/u/app/.devcontainer/hostrun.yaml",
 		Daemon:             exe,
 		Client:             filepath.Join("/home/u/.local/bin", "hostrun"),
 		ReadyTimeout:       10 * time.Second,
@@ -195,17 +200,9 @@ func TestServeWatchWaitsAgainWhenArmed(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	rt.present.Store(false) // rebuild: old container removed, image building
-	c, err := transport.Unix{Path: cfg.socket}.Dial(context.Background())
-	if err != nil {
-		t.Fatal(err)
+	if restart := armServe(t, cfg, rulesDigest(t, cfg)); restart {
+		t.Fatal("serve asked for a restart although the rules did not change")
 	}
-	if err := protocol.WriteJSON(c, protocol.FrameArm, protocol.Arm{Version: protocol.Version}); err != nil {
-		t.Fatal(err)
-	}
-	if f, err := protocol.ReadFrame(c); err != nil || f.Type != protocol.FrameArmed {
-		t.Fatalf("arm: frame %v, err %v", f.Type, err)
-	}
-	c.Close()
 
 	select {
 	case err := <-done:
@@ -220,5 +217,104 @@ func TestServeWatchWaitsAgainWhenArmed(t *testing.T) {
 	default:
 	}
 	rt.present.Store(false)
+	expectServeExit(t, done, cfg.socket)
+}
+
+func TestParseServeAcceptsConfigPath(t *testing.T) {
+	got, err := parseServe([]string{"--socket", "/s", "--workspace", "/w", "--container-workspace", "/c", "--config", "/etc/rules.yaml"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.config != "/etc/rules.yaml" {
+		t.Fatalf("config = %q, want /etc/rules.yaml", got.config)
+	}
+}
+
+func TestServeRefusesInvalidConfig(t *testing.T) {
+	cfg := watchConfig(t)
+	cfg.watch = false
+	cfg.config = filepath.Join(cfg.workspace, "hostrun.yaml")
+	if err := os.WriteFile(cfg.config, []byte("rules:\n  - command: git\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := serve(context.Background(), cfg, slog.New(slog.DiscardHandler), nil)
+	if err == nil || !strings.Contains(err.Error(), cfg.config) {
+		t.Fatalf("got %v, want an error naming the config", err)
+	}
+	if _, err := os.Stat(cfg.socket); !os.IsNotExist(err) {
+		t.Fatal("serve listened despite an invalid config")
+	}
+}
+
+func TestServeEnforcesConfig(t *testing.T) {
+	cfg := watchConfig(t)
+	cfg.watch = false
+	cfg.config = filepath.Join(cfg.workspace, "hostrun.yaml")
+	if err := os.WriteFile(cfg.config, []byte("rules:\n  - command: true\n    args: none\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- serve(ctx, cfg, slog.New(slog.DiscardHandler), nil) }()
+	defer func() { cancel(); <-done }()
+	tr := transport.Unix{Path: cfg.socket}
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		if c, err := tr.Dial(ctx); err == nil {
+			c.Close()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("serve did not listen")
+		}
+	}
+	run := func(argv ...string) int {
+		return client.Run(ctx, tr, argv, cfg.containerWorkspace, strings.NewReader(""), io.Discard, io.Discard)
+	}
+	if code := run("true"); code != 0 {
+		t.Errorf("allowed command exited %d", code)
+	}
+	if code := run("false"); code != protocol.ExitRejected {
+		t.Errorf("unlisted command exited %d, want %d", code, protocol.ExitRejected)
+	}
+}
+
+// rulesDigest is the digest of the rules serve loaded for cfg.
+func rulesDigest(t *testing.T, cfg serveConfig) string {
+	t.Helper()
+	p, err := rules.Load(cfg.config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p.Digest()
+}
+
+// armServe arms the daemon as `hostrunner up` would and returns whether it
+// asked for a restart.
+func armServe(t *testing.T, cfg serveConfig, digest string) bool {
+	t.Helper()
+	c, err := transport.Unix{Path: cfg.socket}.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if err := protocol.WriteJSON(c, protocol.FrameArm, protocol.Arm{Version: protocol.Version, ConfigDigest: digest}); err != nil {
+		t.Fatal(err)
+	}
+	f, err := protocol.ReadFrame(c)
+	var reply protocol.Armed
+	if err != nil || f.Type != protocol.FrameArmed || protocol.DecodeJSON(f, &reply) != nil {
+		t.Fatalf("arm: frame %v, err %v", f.Type, err)
+	}
+	return reply.Restart
+}
+
+func TestServeStepsAsideWhenRulesChanged(t *testing.T) {
+	cfg := watchConfig(t)
+	rt := &fakeRuntime{}
+	rt.present.Store(true)
+	done := startServe(t, cfg, rt)
+	if restart := armServe(t, cfg, "some other digest"); !restart {
+		t.Fatal("serve kept running with stale rules")
+	}
 	expectServeExit(t, done, cfg.socket)
 }
