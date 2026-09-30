@@ -1,0 +1,35 @@
+# Host commands this repository's devcontainer may run with `hostrun`.
+# git as in examples/devcontainer (flag allow lists, remotes by name only),
+# plus gh issue/pr for the issue tracker. `gh api` stays denied: it can do
+# anything the host's token allows.
+#
+# Rules restrict argv only: git reads .git/config and hooks from the
+# workspace, which the container can write (see the README).
+rules:
+  - command: git status
+    args: any
+  - command: git rev-parse
+    args: any
+
+  - command: git fetch
+    flags:
+      allow: [--prune, -p, --tags, --all, --quiet, -q, --verbose, -v]
+    positional:
+      deny: ["*://*", "*@*:*", "/*", ".*", "~*", "ext::*", "file:*"]
+
+  - command: git pull
+    flags:
+      allow: [--ff-only, --rebase, -r, --no-rebase, --prune, -p, --tags, --quiet, -q, --verbose, -v]
+    positional:
+      deny: ["*://*", "*@*:*", "/*", ".*", "~*", "ext::*", "file:*"]
+
+  - command: git push
+    flags:
+      allow: [-u, --set-upstream, --tags, --follow-tags, --dry-run, -n, --quiet, -q, --verbose, -v]
+    positional:
+      deny: ["+*", ":*", "*://*", "*@*:*", "/*", ".*", "~*", "ext::*", "file:*"]
+
+  - command: gh issue
+    args: any
+  - command: gh pr
+    args: any

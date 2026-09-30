@@ -156,6 +156,14 @@ How it works:
 
 ## Development
 
+The repository has its own devcontainer (`.devcontainer/`), wired to
+hostrunner: the toolchain comes from `mise.toml`, and the container may
+run the host's `git` (as in the example rules) and `gh issue`/`gh pr`
+through `hostrun`. Run `mise run install` on the host first so
+`hostrunner` is in `PATH`. The e2e suite needs Docker or Podman on the
+host, so run it there, not through `hostrun`: `go test` would execute
+workspace code the container can change.
+
 ```sh
 mise run test   # unit and integration tests (go test -race ./...)
 mise run e2e    # brings up examples/devcontainer on docker
