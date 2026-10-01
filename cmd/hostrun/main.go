@@ -34,6 +34,7 @@ func run() int {
 	// connection drops, and the daemon kills the host command.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	client.WarnWritableRules(cwd, os.Stderr)
 	tr := transport.Unix{Path: socketPath(os.Getenv)}
 	return client.Run(ctx, tr, os.Args[1:], cwd, os.Stdin, os.Stdout, os.Stderr)
 }
