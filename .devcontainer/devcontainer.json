@@ -15,8 +15,20 @@
   // The toolchain comes from mise.toml, like on the host (mise is in the image).
   "postCreateCommand": "mise trust && mise run setup-dev",
 
+  // Runs on the host: copies user.name and user.email from the host's
+  // global git config into the directory mounted at /run/host-config
+  // (docs/specs/devcontainer-host-config.md).
+  "initializeCommand": [
+    "${localWorkspaceFolder}/.devcontainer/git-identity.sh",
+    "${localEnv:XDG_RUNTIME_DIR}/hostrunner-host-config/${devcontainerId}"
+  ],
+
   "mounts": [
     // Bash history survives rebuilds (see the Dockerfile).
-    "source=hostrunner-bashhistory-${devcontainerId},target=/home/vscode/.commandhistory,type=volume"
+    "source=hostrunner-bashhistory-${devcontainerId},target=/home/vscode/.commandhistory,type=volume",
+    // The host's git identity, included from the image's system git config.
+    // A directory: the script replaces the file, and a single-file mount
+    // would keep showing the old one.
+    "source=${localEnv:XDG_RUNTIME_DIR}/hostrunner-host-config/${devcontainerId},target=/run/host-config,type=bind,readonly"
   ]
 }
