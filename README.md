@@ -124,7 +124,10 @@ How it works:
   container of a rebuild, however long the image build takes. Its log is
   `daemon.log` in the runtime directory.
 - `.devcontainer/` is read-only inside the container, so the container
-  cannot rewrite the rules that govern it.
+  cannot rewrite the rules that govern it. `hostrun` warns on stderr when
+  the nearest `.devcontainer/` above its working directory, or the
+  `hostrun.yaml` in it, is writable (the default location only, not a
+  `--config` file).
 - The working directory is opened, not re-resolved, when the command
   starts, so a symlink swapped in by the container cannot redirect it.
   Symlinks inside the workspace must be relative.
