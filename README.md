@@ -156,13 +156,34 @@ How it works:
 
 ## Development
 
-The repository has its own devcontainer (`.devcontainer/`), wired to
-hostrunner: the toolchain comes from `mise.toml`, and the container may
-run the host's `git` (as in the example rules) and `gh issue`/`gh pr`
-through `hostrun`. Run `mise run install` on the host first so
-`hostrunner` is in `PATH`. The e2e suite needs Docker or Podman on the
-host, so run it there, not through `hostrun`: `go test` would execute
-workspace code the container can change.
+The repository has two devcontainers; both take the toolchain from
+`mise.toml` and keep bash history across rebuilds:
+
+- `.devcontainer/devcontainer.json` — everyday development, without
+  hostrunner (`devcontainer up`).
+- `.devcontainer/claude/devcontainer.json` — the same image plus Claude
+  Code (pinned in `.devcontainer/Dockerfile`), wired to hostrunner: the
+  container may run the host's `git` (as in the example rules) and
+  `gh issue`/`gh pr` through `hostrun`. Claude's login and settings
+  survive rebuilds. Run `mise run install` on the host first so
+  `hostrunner` is in `PATH`, then
+  `devcontainer up --config .devcontainer/claude/devcontainer.json`
+  (or pick it in VS Code). It needs a regular clone (`.git` a directory).
+
+In the Claude container `.git/config` and `.git/hooks` are read-only, so
+the agent cannot edit them in place. That does not make `hostrun git`
+safe (see the warning at the top): the agent can still point host git at
+a config and hooks it writes with a `.git/commondir` file, rename `.git`
+and create a new one, or `hostrun git` from a nested repository. Writing
+the git config from inside the container (`git config`,
+`git remote add`, `git branch --set-upstream-to`) fails, and since
+`.git/config` is a single-file mount, host-side config changes (e.g. the
+upstream set by `hostrun git push -u`) show up in the container only
+after a restart.
+
+The e2e suite needs Docker or Podman on the host, so run it there, not
+through `hostrun`: `go test` would execute workspace code the container
+can change.
 
 ```sh
 mise run test   # unit and integration tests (go test -race ./...)

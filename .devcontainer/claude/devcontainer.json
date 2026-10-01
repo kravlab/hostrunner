@@ -1,0 +1,42 @@
+// Devcontainer for running Claude Code on the hostrunner repository, wired
+// to hostrunner itself so the container can run the host commands allowed
+// in .devcontainer/hostrun.yaml (git, gh). Requires `mise run install` on
+// the host (hostrunner in PATH) and a regular clone (.git a directory).
+{
+  "name": "hostrunner (Claude Code)",
+  "build": { "dockerfile": "../Dockerfile", "context": "..", "target": "claude" },
+
+  // The toolchain comes from mise.toml, like on the host (mise is in the image).
+  "postCreateCommand": "mise trust && mise install",
+
+  // Starts the host daemon for this container, or re-arms the running one,
+  // and installs the hostrun client into the runtime directory mounted below.
+  // The rules are the default .devcontainer/hostrun.yaml.
+  "initializeCommand": [
+    "hostrunner", "up",
+    "--dir", "${localEnv:XDG_RUNTIME_DIR}/hostrunner/${devcontainerId}",
+    "--workspace", "${localWorkspaceFolder}",
+    "--container-workspace", "${containerWorkspaceFolder}"
+  ],
+
+  "mounts": [
+    // The daemon's socket and the hostrun client (read-only).
+    "source=${localEnv:XDG_RUNTIME_DIR}/hostrunner/${devcontainerId},target=/run/hostrunner,type=bind,readonly",
+    // .devcontainer (with the rules and this file) stays read-only inside the container.
+    "source=${localWorkspaceFolder}/.devcontainer,target=${containerWorkspaceFolder}/.devcontainer,type=bind,readonly",
+    // The repository's git config and hooks, which host git reads on
+    // `hostrun git`, cannot be edited in place. Not a guarantee: see the
+    // README (.git/commondir, renaming .git, nested repositories). The
+    // config is a single-file mount, so the container sees host-side
+    // config changes only after a restart.
+    "source=${localWorkspaceFolder}/.git/config,target=${containerWorkspaceFolder}/.git/config,type=bind,readonly",
+    "source=${localWorkspaceFolder}/.git/hooks,target=${containerWorkspaceFolder}/.git/hooks,type=bind,readonly",
+    // Bash history and Claude Code's login and settings survive rebuilds
+    // (see the Dockerfile).
+    "source=hostrunner-bashhistory-${devcontainerId},target=/home/vscode/.commandhistory,type=volume",
+    "source=hostrunner-claude-${devcontainerId},target=/home/vscode/.claude,type=volume"
+  ],
+
+  // /run/hostrunner for `hostrun`; the rest of PATH comes from the image.
+  "remoteEnv": { "PATH": "${containerEnv:PATH}:/run/hostrunner" }
+}
