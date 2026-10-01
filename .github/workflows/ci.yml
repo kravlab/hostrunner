@@ -1,0 +1,70 @@
+# CI for pull requests into main (docs/specs/ci.md). The job names
+# `check` and `e2e` are the required status checks of the main ruleset,
+# so renaming a job means updating the ruleset too. No path filters: a
+# required check that never starts would block the pull request forever.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# A newer push to the same pull request cancels the older run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# An explicit bash runs steps with -eo pipefail, so a failure piped into
+# tee still fails the step.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Versions come from mise.toml; only go is needed here.
+      - uses: jdx/mise-action@7a4e45a543138629540c9a1616d08632b893e492 # v5.0.1
+        with:
+          install_args: go
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          [ -z "$unformatted" ] || { printf 'not gofmt-formatted:\n%s\n' "$unformatted"; exit 1; }
+      # Same as the pre-commit hook: the e2e tag also vets e2e/.
+      - name: vet
+        run: go vet -tags e2e ./...
+      - name: tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+      - name: build
+        run: mise run build
+      - name: test
+        run: mise run test
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: jdx/mise-action@7a4e45a543138629540c9a1616d08632b893e492 # v5.0.1
+        with:
+          install_args: go node npm:@devcontainers/cli
+      # The test skips without XDG_RUNTIME_DIR, which runners do not set.
+      # A short path: the daemon socket lives under it, and Unix socket
+      # paths are length-limited (internal/launch).
+      - name: runtime dir
+        run: echo "XDG_RUNTIME_DIR=$(mktemp -d /tmp/xdg.XXXXXX)" >> "$GITHUB_ENV"
+      # The test skips instead of failing when a prerequisite is missing,
+      # so a green run must show the docker subtest actually passed.
+      - name: e2e
+        run: |
+          mise run e2e 2>&1 | tee "$RUNNER_TEMP/e2e.log"
+          grep -q -- '--- PASS: TestDevcontainerIntegration/docker' "$RUNNER_TEMP/e2e.log" \
+            || { echo 'docker e2e did not run'; exit 1; }
