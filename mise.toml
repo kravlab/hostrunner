@@ -1,12 +1,28 @@
 # Toolchain and tasks for hostrunner.
-#   mise install        # the pinned tools below
+#   mise run setup      # the pinned tools below, without gh
+#   mise run setup-dev  # the same plus gh
 #   mise run <task>     # build, install, test, e2e
 # Docker and/or Podman come from the system; mise does not manage them.
+
+[settings]
+# Tasks install tools explicitly; otherwise `mise run` would install
+# every tool below (gh included) before any task.
+task.run_auto_install = false
 
 [tools]
 go = "1.27.1"
 node = "26.8.2"                      # runs the devcontainer CLI (e2e only)
 "npm:@devcontainers/cli" = "0.89.0"  # e2e brings up examples/devcontainer with it
+gh = "2.101.0"                       # optional: only `mise run setup-dev` installs it
+
+[tasks.setup]
+description = "Install the toolchain without gh"
+run = "mise install go node npm:@devcontainers/cli"
+
+[tasks.setup-dev]
+description = "Install the toolchain and gh"
+depends = ["setup"]
+run = "mise install gh"
 
 [tasks.build]
 description = "Build hostrunner and the hostrun client into bin/"
