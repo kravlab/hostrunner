@@ -65,8 +65,10 @@ one without publishing it anywhere:
   full development toolchain with gh; the container has no `hostrun`).
 - Mount: volume `hostrunner-bashhistory-${devcontainerId}` at
   `/home/vscode/.commandhistory`.
-- No `initializeCommand`, no `/run/hostrunner` mount, no `.devcontainer`
-  read-only mount, no `remoteEnv` (`PATH` comes from the image).
+- No hostrunner `initializeCommand` (the git identity one is in
+  `devcontainer-host-config.md`), no `/run/hostrunner` mount, no
+  `.devcontainer` read-only mount, no `remoteEnv` (`PATH` comes from the
+  image).
 
 ## `.devcontainer/claude/devcontainer.json`
 
@@ -79,7 +81,9 @@ one without publishing it anywhere:
   read-only runtime directory at `/run/hostrunner`, the read-only
   `.devcontainer` mount (which also covers `.devcontainer/claude/`), and
   `/run/hostrunner` in `PATH`. The rules stay in `.devcontainer/hostrun.yaml`,
-  the default path `hostrunner up` uses; no Go change.
+  the default path `hostrunner up` uses; no Go change. The host's git
+  identity and global instructions add `initializeCommand` entries and
+  mounts: see `devcontainer-host-config.md`.
 - Read-only mounts of the workspace's `.git/config` and `.git/hooks`.
 - Volumes: `hostrunner-bashhistory-${devcontainerId}` at
   `/home/vscode/.commandhistory`, `hostrunner-claude-${devcontainerId}` at

@@ -174,11 +174,16 @@ The repository has two devcontainers; both take the toolchain from
   so `hostrunner` is in `PATH`, then
   `devcontainer up --config .devcontainer/claude/devcontainer.json`
   (or pick it in VS Code). It needs a regular clone (`.git` a directory).
-  It also needs `user.name` and `user.email` in the host's global git
-  config, which the container's git uses for commits (nothing else of
-  the host's git config is copied), and `~/.claude/CLAUDE.md` on the
-  host (it may be a symlink, e.g. to a global `AGENTS.md`), mounted
-  read-only as Claude's global instructions.
+  Optionally, set `HOSTRUNNER_AGENTS_MD` on the host to the absolute
+  path of a global instructions file (e.g. `AGENTS.md`): it is mounted
+  read-only as Claude's `~/.claude/CLAUDE.md`, and edits written in
+  place show up in the running container (a save that renames a new
+  file over it does not, until a restart). Unset, Claude gets no global
+  instructions.
+
+Both containers' git uses `user.name` and `user.email` from the host's
+global git config, when set, for commits; nothing else of the host's git
+config is copied.
 
 `mise run dev` brings the everyday container up and opens bash in it;
 `mise run agent` brings the Claude container up and runs `claude` in it
