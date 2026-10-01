@@ -1,10 +1,12 @@
-# Host commands this repository's devcontainer may run with `hostrun`.
+# Host commands the Claude Code devcontainer (claude/devcontainer.json)
+# may run with `hostrun`.
 # git as in examples/devcontainer (flag allow lists, remotes by name only),
 # plus gh issue/pr for the issue tracker. `gh api` stays denied: it can do
 # anything the host's token allows.
 #
 # Rules restrict argv only: git reads .git/config and hooks from the
-# workspace, which the container can write (see the README).
+# workspace. The container mounts both read-only, but can still redirect
+# host git to a config and hooks it writes (see the README).
 rules:
   - command: git status
     args: any

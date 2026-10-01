@@ -1,34 +1,15 @@
-// Devcontainer for developing hostrunner, wired to hostrunner itself so the
-// container can run the host commands allowed in hostrun.yaml (git, gh).
-// Requires `mise run install` on the host (hostrunner in PATH).
+// Devcontainer for everyday development of hostrunner. It does not use
+// hostrunner; the Claude Code container wired to it is
+// .devcontainer/claude/devcontainer.json.
 {
   "name": "hostrunner",
-  "image": "mcr.microsoft.com/devcontainers/base:trixie",
+  "build": { "dockerfile": "Dockerfile", "target": "base" },
 
-  // The toolchain comes from mise.toml, like on the host.
-  "features": {
-    "ghcr.io/devcontainers-extra/features/mise:1": { "version": "2026.9.11" }
-  },
+  // The toolchain comes from mise.toml, like on the host (mise is in the image).
   "postCreateCommand": "mise trust && mise install",
 
-  // Starts the host daemon for this container, or re-arms the running one,
-  // and installs the hostrun client into the runtime directory mounted below.
-  "initializeCommand": [
-    "hostrunner", "up",
-    "--dir", "${localEnv:XDG_RUNTIME_DIR}/hostrunner/${devcontainerId}",
-    "--workspace", "${localWorkspaceFolder}",
-    "--container-workspace", "${containerWorkspaceFolder}"
-  ],
-
   "mounts": [
-    // The daemon's socket and the hostrun client (read-only).
-    "source=${localEnv:XDG_RUNTIME_DIR}/hostrunner/${devcontainerId},target=/run/hostrunner,type=bind,readonly",
-    // .devcontainer (with the rules) stays read-only inside the container.
-    "source=${localWorkspaceFolder}/.devcontainer,target=${containerWorkspaceFolder}/.devcontainer,type=bind,readonly"
-  ],
-
-  // mise shims for the toolchain; /run/hostrunner for `hostrun`.
-  "remoteEnv": {
-    "PATH": "/home/vscode/.local/share/mise/shims:${containerEnv:PATH}:/run/hostrunner"
-  }
+    // Bash history survives rebuilds (see the Dockerfile).
+    "source=hostrunner-bashhistory-${devcontainerId},target=/home/vscode/.commandhistory,type=volume"
+  ]
 }
