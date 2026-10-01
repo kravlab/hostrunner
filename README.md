@@ -159,6 +159,10 @@ How it works:
 
 ## Development
 
+`mise run setup` installs the toolchain and a pre-commit hook
+([lefthook.yml](lefthook.yml)): a commit with staged `.go` files fails
+when they are not gofmt-formatted or `go vet` reports a problem.
+
 ```sh
 mise run test   # unit and integration tests (go test -race ./...)
 mise run e2e    # brings up examples/devcontainer on docker

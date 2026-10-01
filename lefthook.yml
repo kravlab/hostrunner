@@ -1,0 +1,14 @@
+# Git hooks, installed by `mise run setup` (docs/specs/pre-commit-hook.md).
+pre-commit:
+  parallel: true
+  jobs:
+    # Checks, never rewrites: the working-tree copy of each staged file.
+    - name: gofmt
+      glob: "*.go"
+      run: |
+        unformatted="$(gofmt -l {staged_files})"
+        [ -z "$unformatted" ] || { printf 'not gofmt-formatted:\n%s\n' "$unformatted"; exit 1; }
+    # The e2e tag also vets e2e/.
+    - name: go vet
+      glob: "*.go"
+      run: go vet -tags e2e ./...
