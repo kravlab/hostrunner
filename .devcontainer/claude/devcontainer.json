@@ -1,7 +1,9 @@
 // Devcontainer for running Claude Code on the hostrunner repository, wired
 // to hostrunner itself so the container can run the host commands allowed
 // in .devcontainer/hostrun.yaml (git, gh). Requires `mise run install` on
-// the host (hostrunner in PATH) and a regular clone (.git a directory).
+// the host (hostrunner in PATH), a regular clone (.git a directory),
+// user.name and user.email in the host's global git config, and
+// ~/.claude/CLAUDE.md on the host (docs/specs/devcontainer-host-config.md).
 {
   "name": "hostrunner (Claude Code)",
   "build": { "dockerfile": "../Dockerfile", "context": "..", "target": "claude" },
@@ -16,15 +18,24 @@
   // Only go from mise.toml (mise is in the image): see the setup-agent task.
   "postCreateCommand": "mise trust && mise run setup-agent",
 
-  // Starts the host daemon for this container, or re-arms the running one,
-  // and installs the hostrun client into the runtime directory mounted below.
-  // The rules are the default .devcontainer/hostrun.yaml.
-  "initializeCommand": [
-    "hostrunner", "up",
-    "--dir", "${localEnv:XDG_RUNTIME_DIR}/hostrunner/${devcontainerId}",
-    "--workspace", "${localWorkspaceFolder}",
-    "--container-workspace", "${containerWorkspaceFolder}"
-  ],
+  // Both run on the host, in parallel; either failing fails `devcontainer up`.
+  "initializeCommand": {
+    // Starts the host daemon for this container, or re-arms the running one,
+    // and installs the hostrun client into the runtime directory mounted below.
+    // The rules are the default .devcontainer/hostrun.yaml.
+    "hostrunner": [
+      "hostrunner", "up",
+      "--dir", "${localEnv:XDG_RUNTIME_DIR}/hostrunner/${devcontainerId}",
+      "--workspace", "${localWorkspaceFolder}",
+      "--container-workspace", "${containerWorkspaceFolder}"
+    ],
+    // Copies user.name and user.email from the host's global git config
+    // into the directory mounted at /run/git-identity (see the script).
+    "git-identity": [
+      "${localWorkspaceFolder}/.devcontainer/claude/git-identity.sh",
+      "${localEnv:XDG_RUNTIME_DIR}/hostrunner-git/${devcontainerId}"
+    ]
+  },
 
   "mounts": [
     // The daemon's socket and the hostrun client (read-only).
@@ -41,7 +52,16 @@
     // Bash history and Claude Code's login and settings survive rebuilds
     // (see the Dockerfile).
     "source=hostrunner-bashhistory-${devcontainerId},target=/home/vscode/.commandhistory,type=volume",
-    "source=hostrunner-claude-${devcontainerId},target=/home/vscode/.claude,type=volume"
+    "source=hostrunner-claude-${devcontainerId},target=/home/vscode/.claude,type=volume",
+    // The host's git identity, included from the image's system git config.
+    // A directory: the script replaces the file, and a single-file mount
+    // would keep showing the old one.
+    "source=${localEnv:XDG_RUNTIME_DIR}/hostrunner-git/${devcontainerId},target=/run/git-identity,type=bind,readonly",
+    // The host user's global instructions (may be a symlink, e.g. to a
+    // global AGENTS.md), read-only so the agent cannot rewrite them. Required
+    // on the host; a single-file mount, so an edit saved by renaming a new
+    // file over it shows up after a restart.
+    "source=${localEnv:HOME}/.claude/CLAUDE.md,target=/home/vscode/.claude/CLAUDE.md,type=bind,readonly"
   ],
 
   // /run/hostrunner for `hostrun`; the rest of PATH comes from the image.
