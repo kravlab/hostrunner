@@ -2,7 +2,7 @@
 #   mise run setup      # the pinned tools below, without gh
 #   mise run setup-dev  # the same plus gh
 #   mise run setup-agent  # go only, for the agent's devcontainer
-#   mise run <task>     # build, install, test, e2e
+#   mise run <task>     # build, install, test, e2e, dev, agent
 # Docker and/or Podman come from the system; mise does not manage them.
 
 [settings]
@@ -51,6 +51,23 @@ install -m 0755 bin/hostrunner bin/hostrun "$prefix/bin/"
 [tasks.test]
 description = "Unit and integration tests"
 run = "go test -race ./..."
+
+# The devcontainer tasks bring a container up and open bash in it; raw
+# hands the terminal to that shell. They need the devcontainer CLI
+# (`mise run setup`); `agent` also needs hostrunner (`mise run install`).
+[tasks.dev]
+description = "Start the everyday devcontainer and open bash in it"
+raw = true
+run = "devcontainer up --workspace-folder . && devcontainer exec --workspace-folder . bash"
+
+[tasks.agent]
+description = "Start the Claude Code devcontainer and open bash in it"
+raw = true
+run = """
+config=.devcontainer/claude/devcontainer.json
+devcontainer up --workspace-folder . --config "$config"
+devcontainer exec --workspace-folder . --config "$config" bash
+"""
 
 [tasks.e2e]
 description = "Bring up examples/devcontainer on docker (HOSTRUNNER_E2E_PODMAN=1: also podman)"

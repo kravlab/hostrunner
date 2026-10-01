@@ -172,6 +172,9 @@ The repository has two devcontainers; both take the toolchain from
   `devcontainer up --config .devcontainer/claude/devcontainer.json`
   (or pick it in VS Code). It needs a regular clone (`.git` a directory).
 
+`mise run dev` and `mise run agent` bring the respective container up
+and open bash in it (the devcontainer CLI comes from `mise run setup`).
+
 The container names are unique per host, so two clones with the same
 folder name cannot run the same configuration at once.
 
