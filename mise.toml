@@ -1,7 +1,7 @@
 # Toolchain and tasks for hostrunner.
-#   mise run setup      # the pinned tools below, without gh
+#   mise run setup      # the pinned tools below, without gh, and the git hook
 #   mise run setup-dev  # the same plus gh
-#   mise run setup-agent  # go only, for the agent's devcontainer
+#   mise run setup-agent  # go and lefthook, for the agent's devcontainer
 #   mise run <task>     # build, install, test, e2e, dev, agent
 # Docker and/or Podman come from the system; mise does not manage them.
 
@@ -15,10 +15,15 @@ go = "1.27.1"
 node = "26.8.2"                      # runs the devcontainer CLI (e2e only)
 "npm:@devcontainers/cli" = "0.89.0"  # e2e brings up examples/devcontainer with it
 gh = "2.101.0"                       # optional: only `mise run setup-dev` installs it
+lefthook = "2.1.14"                  # runs the pre-commit hook (lefthook.yml)
 
 [tasks.setup]
-description = "Install the toolchain without gh"
-run = "mise install go node npm:@devcontainers/cli"
+description = "Install the toolchain without gh and the pre-commit hook"
+# mise exec: the task's PATH predates the lefthook just installed.
+run = """
+mise install go node npm:@devcontainers/cli lefthook
+mise exec -- lefthook install
+"""
 
 [tasks.setup-dev]
 description = "Install the toolchain and gh"
@@ -26,10 +31,12 @@ depends = ["setup"]
 run = "mise install gh"
 
 [tasks.setup-agent]
-description = "Install go only, for the agent's devcontainer"
+description = "Install go and lefthook, for the agent's devcontainer"
 # The agent builds and tests; e2e (node, devcontainer CLI) runs on the
-# host, and gh reaches the host's through hostrun.
-run = "mise install go"
+# host, and gh reaches the host's through hostrun. lefthook runs the
+# host-installed pre-commit hook, which the container mounts read-only
+# with .git/hooks, so it is not installed here.
+run = "mise install go lefthook"
 
 [tasks.build]
 description = "Build hostrunner and the hostrun client into bin/"

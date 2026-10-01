@@ -16,7 +16,8 @@
     "--hostname", "${localWorkspaceFolderBasename}-agent"
   ],
 
-  // Only go from mise.toml (mise is in the image): see the setup-agent task.
+  // Only go and lefthook from mise.toml (mise is in the image): see the
+  // setup-agent task.
   "postCreateCommand": "mise trust && mise run setup-agent",
 
   // All run on the host, in parallel; any failing fails `devcontainer up`.

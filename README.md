@@ -159,6 +159,14 @@ How it works:
 
 ## Development
 
+`mise run setup` installs the toolchain and a pre-commit hook
+([lefthook.yml](lefthook.yml)): a commit with staged `.go` files fails
+when they are not gofmt-formatted or `go vet` reports a problem. The
+Claude container runs the host's hook too, through its `.git/hooks`
+mount. `lefthook.yml` is in the workspace, which the containers can
+write, so a plain `git commit` on the host runs whatever they put there:
+the same risk as `.git/hooks` (see the warning at the top).
+
 The repository has two devcontainers; both take the toolchain from
 `mise.toml` and keep bash history across rebuilds:
 
@@ -169,8 +177,8 @@ The repository has two devcontainers; both take the toolchain from
   Code (pinned in `.devcontainer/Dockerfile`), wired to hostrunner: the
   container may run the host's `git` (as in the example rules) and
   `gh issue`/`gh pr` through `hostrun`. Claude's login and settings
-  survive rebuilds. Container and host name `<folder>-agent`; only go,
-  from `mise run setup-agent`. Run `mise run install` on the host first
+  survive rebuilds. Container and host name `<folder>-agent`; only go
+  and lefthook, from `mise run setup-agent`. Run `mise run install` on the host first
   so `hostrunner` is in `PATH`, then
   `devcontainer up --config .devcontainer/claude/devcontainer.json`
   (or pick it in VS Code). It needs a regular clone (`.git` a directory).
