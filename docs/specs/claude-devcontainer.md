@@ -152,6 +152,14 @@ Checked with the devcontainer CLI on the host:
   `devcontainer up --remove-existing-container`.
 - Claude login survives the same rebuild.
 
+## mise tasks
+
+`mise run dev` and `mise run agent` run `devcontainer up` for the
+respective configuration, then `devcontainer exec … bash` (`raw`, so the
+shell gets the terminal). They are interactive: while `initializeCommand`
+(`hostrunner up`) runs, the devcontainer CLI forwards its stdin to it, so
+input piped into `mise run agent` never reaches the shell.
+
 ## Docs
 
 README, Development: the two configurations, how to pick the Claude one,
