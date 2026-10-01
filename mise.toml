@@ -1,6 +1,7 @@
 # Toolchain and tasks for hostrunner.
 #   mise run setup      # the pinned tools below, without gh
 #   mise run setup-dev  # the same plus gh
+#   mise run setup-agent  # go only, for the agent's devcontainer
 #   mise run <task>     # build, install, test, e2e
 # Docker and/or Podman come from the system; mise does not manage them.
 
@@ -23,6 +24,12 @@ run = "mise install go node npm:@devcontainers/cli"
 description = "Install the toolchain and gh"
 depends = ["setup"]
 run = "mise install gh"
+
+[tasks.setup-agent]
+description = "Install go only, for the agent's devcontainer"
+# The agent builds and tests; e2e (node, devcontainer CLI) runs on the
+# host, and gh reaches the host's through hostrun.
+run = "mise install go"
 
 [tasks.build]
 description = "Build hostrunner and the hostrun client into bin/"

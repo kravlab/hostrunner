@@ -5,8 +5,15 @@
   "name": "hostrunner",
   "build": { "dockerfile": "Dockerfile", "target": "base" },
 
+  // A recognizable container name and shell prompt host name. Names are
+  // unique per host: two clones with the same folder name cannot run at once.
+  "runArgs": [
+    "--name", "${localWorkspaceFolderBasename}-dev",
+    "--hostname", "${localWorkspaceFolderBasename}-dev"
+  ],
+
   // The toolchain comes from mise.toml, like on the host (mise is in the image).
-  "postCreateCommand": "mise trust && mise install",
+  "postCreateCommand": "mise trust && mise run setup-dev",
 
   "mounts": [
     // Bash history survives rebuilds (see the Dockerfile).

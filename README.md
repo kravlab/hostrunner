@@ -160,15 +160,20 @@ The repository has two devcontainers; both take the toolchain from
 `mise.toml` and keep bash history across rebuilds:
 
 - `.devcontainer/devcontainer.json` — everyday development, without
-  hostrunner (`devcontainer up`).
+  hostrunner (`devcontainer up`). Container and host name
+  `<folder>-dev`; tools from `mise run setup-dev`.
 - `.devcontainer/claude/devcontainer.json` — the same image plus Claude
   Code (pinned in `.devcontainer/Dockerfile`), wired to hostrunner: the
   container may run the host's `git` (as in the example rules) and
   `gh issue`/`gh pr` through `hostrun`. Claude's login and settings
-  survive rebuilds. Run `mise run install` on the host first so
-  `hostrunner` is in `PATH`, then
+  survive rebuilds. Container and host name `<folder>-agent`; only go,
+  from `mise run setup-agent`. Run `mise run install` on the host first
+  so `hostrunner` is in `PATH`, then
   `devcontainer up --config .devcontainer/claude/devcontainer.json`
   (or pick it in VS Code). It needs a regular clone (`.git` a directory).
+
+The container names are unique per host, so two clones with the same
+folder name cannot run the same configuration at once.
 
 In the Claude container `.git/config` and `.git/hooks` are read-only, so
 the agent cannot edit them in place. That does not make `hostrun git`
