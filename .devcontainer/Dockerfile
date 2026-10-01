@@ -45,3 +45,9 @@ USER vscode
 RUN install -d /home/vscode/.claude \
  && curl -fsSL https://claude.ai/install.sh | bash -s "$CLAUDE_CODE_VERSION"
 USER root
+
+# The host's user.name and user.email, written by
+# .devcontainer/claude/git-identity.sh and mounted at /run/git-identity.
+# git skips a missing include, so the image works without the mount; the
+# system level leaves ~/.gitconfig, which overrides it, to the container.
+RUN git config --system include.path /run/git-identity/gitconfig
