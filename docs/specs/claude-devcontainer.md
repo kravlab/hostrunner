@@ -59,7 +59,10 @@ one without publishing it anywhere:
 ## `.devcontainer/devcontainer.json` (everyday)
 
 - `build`: `Dockerfile`, target `base`.
-- Toolchain: `postCreateCommand` `mise trust && mise install`.
+- `runArgs`: `--name` and `--hostname` `${localWorkspaceFolderBasename}-dev`,
+  so the container is recognizable in `docker ps` and the shell prompt.
+- Toolchain: `postCreateCommand` `mise trust && mise run setup-dev` (the
+  full development toolchain with gh; the container has no `hostrun`).
 - Mount: volume `hostrunner-bashhistory-${devcontainerId}` at
   `/home/vscode/.commandhistory`.
 - No `initializeCommand`, no `/run/hostrunner` mount, no `.devcontainer`
@@ -68,7 +71,10 @@ one without publishing it anywhere:
 ## `.devcontainer/claude/devcontainer.json`
 
 - `build`: `../Dockerfile` with context `..`, target `claude`.
-- Toolchain as in the everyday configuration.
+- `runArgs`: `--name` and `--hostname` `${localWorkspaceFolderBasename}-agent`.
+- Toolchain: `postCreateCommand` `mise trust && mise run setup-agent`, a
+  mise task that installs go only: e2e (node, devcontainer CLI) runs on
+  the host, and gh is the host's, through `hostrun`.
 - hostrunner wiring as today: `initializeCommand` (`hostrunner up …`), the
   read-only runtime directory at `/run/hostrunner`, the read-only
   `.devcontainer` mount (which also covers `.devcontainer/claude/`), and
@@ -122,6 +128,10 @@ A real fix (hostrunner running git with forced `-c core.hooksPath=…`,
 - Rebuild: both volumes survive; a changed `CLAUDE_CODE_VERSION` installs
   the new version. Removing the volumes (`docker|podman volume rm`) resets
   history and the Claude login.
+- A container with the same name already exists (another clone with the
+  same folder name): `docker|podman run` fails, and so does
+  `devcontainer up`. A rebuild is not affected: the CLI removes the old
+  container before creating the new one.
 - Host UID other than 1000: `updateRemoteUserUID` chowns the home folder,
   history directory and `~/.claude` included, so both volumes stay
   writable.

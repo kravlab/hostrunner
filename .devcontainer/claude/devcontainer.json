@@ -6,8 +6,15 @@
   "name": "hostrunner (Claude Code)",
   "build": { "dockerfile": "../Dockerfile", "context": "..", "target": "claude" },
 
-  // The toolchain comes from mise.toml, like on the host (mise is in the image).
-  "postCreateCommand": "mise trust && mise install",
+  // A recognizable container name and shell prompt host name. Names are
+  // unique per host: two clones with the same folder name cannot run at once.
+  "runArgs": [
+    "--name", "${localWorkspaceFolderBasename}-agent",
+    "--hostname", "${localWorkspaceFolderBasename}-agent"
+  ],
+
+  // Only go from mise.toml (mise is in the image): see the setup-agent task.
+  "postCreateCommand": "mise trust && mise run setup-agent",
 
   // Starts the host daemon for this container, or re-arms the running one,
   // and installs the hostrun client into the runtime directory mounted below.
