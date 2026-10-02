@@ -20,6 +20,22 @@ stops. Linux hosts; Docker and Podman.
 
 ## Install
 
+From a [release](https://github.com/kravlab/hostrunner/releases)
+(`gh release download` or the Releases page):
+
+```sh
+v=0.1.0 arch=amd64                  # the release, without the v; amd64 or arm64
+archive=hostrunner_${v}_linux_${arch}.tar.gz
+gh release download "v$v" --repo kravlab/hostrunner -p "$archive" -p checksums.txt
+sha256sum -c --ignore-missing checksums.txt
+gh attestation verify "$archive" --repo kravlab/hostrunner  # optional: built by this repo's CI
+mkdir -p ~/.local/bin               # any directory in PATH
+tar -xzf "$archive" -C ~/.local/bin hostrunner hostrun
+hostrunner version
+```
+
+From source:
+
 ```sh
 mise install                        # the pinned toolchain (see mise.toml)
 mise run install                    # builds with CGO_ENABLED=0 into ~/.local/bin
@@ -224,3 +240,12 @@ HOSTRUNNER_E2E_PODMAN=1 mise run e2e   # also on podman
 The podman run is opt-in because devcontainer CLI 0.89 sometimes waits
 forever for the container's start event from `podman events`, even
 without hostrunner.
+
+A pushed `vX.Y.Z` tag on `main` publishes a release: CI runs again, then
+GoReleaser ([.goreleaser.yaml](.goreleaser.yaml)) uploads the archives,
+`checksums.txt` and a build provenance attestation.
+
+```sh
+git tag v0.1.0 && git push origin v0.1.0
+mise exec goreleaser -- goreleaser release --snapshot --clean   # local dry run into dist/
+```

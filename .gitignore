@@ -34,3 +34,5 @@ go.work.sum
 
 # Build output
 /bin/
+# GoReleaser output; untracked files there would stamp builds +dirty
+/dist/
