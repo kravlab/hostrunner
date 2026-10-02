@@ -15,20 +15,30 @@
   // The toolchain comes from mise.toml, like on the host (mise is in the image).
   "postCreateCommand": "mise trust && mise run setup-dev",
 
-  // Runs on the host: copies user.name and user.email from the host's
-  // global git config into the directory mounted at /run/host-config
-  // (docs/specs/devcontainer-host-config.md).
-  "initializeCommand": [
-    "${localWorkspaceFolder}/.devcontainer/git-identity.sh",
-    "${localEnv:XDG_RUNTIME_DIR}/hostrunner-host-config/${devcontainerId}"
-  ],
+  // All run on the host, in parallel; any failing fails `devcontainer up`.
+  "initializeCommand": {
+    // Copies user.name and user.email from the host's global git config
+    // into the directory mounted at /run/host-config
+    // (docs/specs/devcontainer-host-config.md).
+    "git-identity": [
+      "${localWorkspaceFolder}/.devcontainer/git-identity.sh",
+      "${localEnv:XDG_RUNTIME_DIR}/hostrunner-host-config/${devcontainerId}"
+    ],
+    // Copies the host's global git excludes file there too; the image links
+    // ~/.config/git/ignore to it (docs/specs/devcontainer-git-excludes.md).
+    "git-excludes": [
+      "${localWorkspaceFolder}/.devcontainer/git-excludes.sh",
+      "${localEnv:XDG_RUNTIME_DIR}/hostrunner-host-config/${devcontainerId}"
+    ]
+  },
 
   "mounts": [
     // Bash history survives rebuilds (see the Dockerfile).
     "source=hostrunner-bashhistory-${devcontainerId},target=/home/vscode/.commandhistory,type=volume",
-    // The host's git identity, included from the image's system git config.
-    // A directory: the script replaces the file, and a single-file mount
-    // would keep showing the old one.
+    // The host's git identity, included from the image's system git config,
+    // and its global excludes, linked from ~/.config/git/ignore.
+    // A directory: the scripts replace the files, and a single-file mount
+    // would keep showing the old ones.
     "source=${localEnv:XDG_RUNTIME_DIR}/hostrunner-host-config/${devcontainerId},target=/run/host-config,type=bind,readonly"
   ]
 }

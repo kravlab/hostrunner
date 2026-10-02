@@ -206,13 +206,26 @@ The repository has two devcontainers; both take the toolchain from
   instructions.
 
 Both containers' git uses `user.name` and `user.email` from the host's
-global git config, when set, for commits; nothing else of the host's git
-config is copied.
+global git config, when set, for commits, and both git and ripgrep (so
+Claude Code's searches) ignore what the host's global excludes file
+(`core.excludesFile`, or `~/.config/git/ignore`) ignores; it is copied on
+every `devcontainer up`, so host edits show up after the next one.
+Nothing else of the host's git config is copied. In VS Code, set
+`"dev.containers.copyGitConfig": false` in your user settings: otherwise
+the Dev Containers extension copies the whole host `~/.gitconfig` into
+the container, and a `core.excludesFile` set there points to a host path
+the container lacks, which hides the excludes.
 
 `mise run dev` brings the everyday container up and opens bash in it;
 `mise run agent` brings the Claude container up and runs `claude` in it
-(the devcontainer CLI comes from `mise run setup`). To run something in
-the everyday container from the host (bringing it up first):
+(the devcontainer CLI comes from `mise run setup`).
+`mise run dev-recreate` and `mise run agent-recreate` replace the
+container with a new one, rebuilding the image where
+`.devcontainer/Dockerfile` changed; named volumes (bash history,
+Claude's login) survive.
+
+To run something in the everyday container from the host (bringing it
+up first):
 
 ```sh
 mise run dc -- go test ./internal/rules/        # a command, run without a shell

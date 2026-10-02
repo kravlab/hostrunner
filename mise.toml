@@ -4,6 +4,7 @@
 #   mise run setup-agent  # go, lefthook and bats, for the agent's devcontainer
 #   mise run <task>     # build, install, fmt, lint, test, test-scripts, check, pre-commit, e2e, release
 #   mise run dc -- <cmd>, dc-task -- <task>, dev, agent  # in a devcontainer
+#   mise run dev-recreate, agent-recreate  # recreate a devcontainer
 # Docker and/or Podman come from the system; mise does not manage them.
 
 [settings]
@@ -131,6 +132,21 @@ config=.devcontainer/claude/devcontainer.json
 devcontainer up --workspace-folder . --config "$config" </dev/null
 devcontainer exec --workspace-folder . --config "$config" claude
 """
+
+# The recreate tasks replace a devcontainer with a new one, so an image
+# change reaches it (`devcontainer up` keeps an existing container). The
+# image is rebuilt where the Dockerfile changed, with the build cache;
+# named volumes (bash history, ~/.claude) survive, anything else written in
+# the old container does not. Nothing is started in the new container: dev
+# and agent attach to it. </dev/null as in dc; the JSON result is the
+# output.
+[tasks.dev-recreate]
+description = "Recreate the everyday devcontainer (rebuilding its image if needed)"
+run = "devcontainer up --workspace-folder . --remove-existing-container </dev/null"
+
+[tasks.agent-recreate]
+description = "Recreate the Claude Code devcontainer (rebuilding its image if needed)"
+run = "devcontainer up --workspace-folder . --config .devcontainer/claude/devcontainer.json --remove-existing-container </dev/null"
 
 [tasks.e2e]
 description = "Bring up examples/devcontainer on docker (HOSTRUNNER_E2E_PODMAN=1: also podman)"

@@ -33,6 +33,18 @@ RUN install -d -o vscode -g vscode /home/vscode/.commandhistory \
 # system level leaves ~/.gitconfig, which overrides it, to the container.
 RUN git config --system include.path /run/host-config/gitconfig
 
+# The host's global git excludes, copied by .devcontainer/git-excludes.sh
+# to /run/host-config/gitignore (docs/specs/devcontainer-git-excludes.md).
+# ~/.config/git/ignore is git's and ripgrep's default excludes path, so
+# neither needs core.excludesFile; ripgrep, which Claude Code searches
+# with, reads neither the system config nor includes. Created as vscode,
+# so other tools can still write to ~/.config. Without the mount the link
+# dangles, which both treat as no excludes.
+USER vscode
+RUN mkdir -p /home/vscode/.config/git \
+ && ln -s /run/host-config/gitignore /home/vscode/.config/git/ignore
+USER root
+
 FROM base AS claude
 
 # Pinned rather than the `stable` channel: a channel name would make the
