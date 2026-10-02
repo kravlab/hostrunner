@@ -7,7 +7,8 @@
    container's own git uses the host user's `user.name` and `user.email`.
    Only these two values reach the container, not the rest of the host's
    git config (credential helpers, signing, `includeIf` with host paths).
-   A host without them is not an error.
+   A host without them is not an error. The host's global excludes file
+   reaches it too: see `devcontainer-git-excludes.md`.
 2. In the Claude Code devcontainer only, Claude Code reads the host user's
    global instructions from the file named by `HOSTRUNNER_AGENTS_MD` on
    the host (e.g. a global `AGENTS.md`). Edits to that file reach the
@@ -144,7 +145,9 @@ the container starts and bind-mount the original file itself.
   `.git/config` is ignored (see `--global` above).
 - VS Code's Dev Containers extension copies the host's `~/.gitconfig` into
   the container's `~/.gitconfig`; that copy overrides the system include,
-  with the same values in the usual case.
+  with the same values in the usual case. Users turn it off with
+  `"dev.containers.copyGitConfig": false` (see
+  `devcontainer-git-excludes.md`).
 - `XDG_RUNTIME_DIR` is cleared at logout; the next `devcontainer up`
   writes the directory again.
 
