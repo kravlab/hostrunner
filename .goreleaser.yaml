@@ -1,0 +1,58 @@
+# Release build, run by .github/workflows/release.yml on a vX.Y.Z tag
+# (docs/specs/release.md). Locally: goreleaser release --snapshot --clean.
+version: 2
+
+# Both binaries are static (CGO_ENABLED=0): hostrun is copied into
+# containers with arbitrary images, and `hostrunner up` refuses a dynamic
+# one. ldflags replace GoReleaser's default -X main.version: the version
+# comes from the Go toolchain's build info (hostrunner version).
+builds:
+  - &build
+    id: hostrunner
+    main: ./cmd/hostrunner
+    binary: hostrunner
+    env: [CGO_ENABLED=0]
+    flags: [-trimpath]
+    ldflags: [-s -w]
+    goos: [linux]
+    goarch: [amd64, arm64]
+  - <<: *build
+    id: hostrun
+    main: ./cmd/hostrun
+    binary: hostrun
+
+# One archive per architecture with both binaries side by side:
+# `hostrunner up` installs the hostrun found next to it.
+archives:
+  - ids: [hostrunner, hostrun]
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files: [LICENSE, README.md]
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+changelog:
+  use: git
+  sort: asc
+  filters:
+    exclude:
+      - "^Merge "
+  groups:
+    - title: Features
+      regexp: '^feat(\(.+\))?!?:'
+      order: 0
+    - title: Fixes
+      regexp: '^fix(\(.+\))?!?:'
+      order: 1
+    - title: Other
+      order: 999
+
+# Re-running the release job for the same tag replaces the uploaded
+# assets instead of failing on them, so a run that failed after publishing
+# (e.g. at the attestation step) can be completed. Release tags cannot
+# move (tag ruleset), so a re-run rebuilds the same commit.
+release:
+  prerelease: auto
+  replace_existing_artifacts: true

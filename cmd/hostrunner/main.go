@@ -6,10 +6,12 @@
 //	hostrunner up --dir <runtime-dir> --workspace <host-path> --container-workspace <path>
 //	hostrunner serve --socket <path> --workspace <host-path> --container-workspace <path>
 //	    [--config <path>] [--watch [--startup-timeout 30m] [--grace 15s]]
+//	hostrunner version
 //
 // `up` is meant for devcontainer's initializeCommand: it installs the client
 // into the runtime directory and starts a detached `serve --watch` there,
-// which exits by itself once the devcontainer stops.
+// which exits by itself once the devcontainer stops. `version` prints the
+// module version Go stamped into the binary (see buildVersion).
 package main
 
 import (
@@ -22,6 +24,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"syscall"
 	"time"
 
@@ -35,9 +38,10 @@ import (
 )
 
 const (
-	usage      = "usage: hostrunner up|serve [flags]; see `hostrunner <command> -h`"
-	upUsage    = "usage: hostrunner up --dir <runtime-dir> --workspace <host-path> --container-workspace <path>"
-	serveUsage = "usage: hostrunner serve --socket <path> --workspace <host-path> --container-workspace <path> [--config <path>] [--watch]"
+	usage        = "usage: hostrunner up|serve|version [flags]; see `hostrunner <command> -h`"
+	upUsage      = "usage: hostrunner up --dir <runtime-dir> --workspace <host-path> --container-workspace <path>"
+	serveUsage   = "usage: hostrunner serve --socket <path> --workspace <host-path> --container-workspace <path> [--config <path>] [--watch]"
+	versionUsage = "usage: hostrunner version"
 )
 
 // Defaults for following the container; see internal/watch.
@@ -50,14 +54,14 @@ const (
 )
 
 func main() {
-	if err := run(os.Args[1:]); err != nil {
+	if err := run(os.Args[1:], os.Stdout); err != nil {
 		fmt.Fprintf(os.Stderr, "hostrunner: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-// run dispatches the subcommand in args.
-func run(args []string) error {
+// run dispatches the subcommand in args; stdout receives `version`'s output.
+func run(args []string, stdout io.Writer) error {
 	if len(args) == 0 {
 		return errors.New(usage)
 	}
@@ -86,9 +90,26 @@ func run(args []string) error {
 			}
 		}
 		return serve(ctx, cfg, slog.New(slog.NewTextHandler(os.Stderr, nil)), runtimes)
+	case "version":
+		if err := parseVersion(args[1:], os.Stderr); err != nil {
+			return err
+		}
+		_, err := fmt.Fprintln(stdout, buildVersion(debug.ReadBuildInfo()))
+		return err
 	default:
 		return errors.New(usage)
 	}
+}
+
+// buildVersion is the main module version the Go toolchain stamped into the
+// binary, as returned by debug.ReadBuildInfo: the tag for a release or
+// `go install …@vX.Y.Z`, a pseudo-version between tags. A build without
+// VCS data reports "(devel)" or nothing, which becomes "dev".
+func buildVersion(info *debug.BuildInfo, ok bool) string {
+	if !ok || info.Main.Version == "" || info.Main.Version == "(devel)" {
+		return "dev"
+	}
+	return info.Main.Version
 }
 
 // workspaceFlags are the flags `up` and `serve` share.
@@ -181,6 +202,14 @@ func parseServe(args []string, output io.Writer) (serveConfig, error) {
 		cfg.config = cfg.rulesFile()
 	}
 	return cfg, nil
+}
+
+// parseVersion parses the arguments of `hostrunner version`, which takes
+// none; output receives the usage for -h.
+func parseVersion(args []string, output io.Writer) error {
+	fs := flag.NewFlagSet("version", flag.ContinueOnError)
+	fs.SetOutput(output)
+	return parseFlags(fs, args, versionUsage)
 }
 
 // serve runs the daemon until ctx is cancelled or, with watch, until the
