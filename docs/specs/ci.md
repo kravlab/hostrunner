@@ -25,13 +25,13 @@ ruleset itself is configured by the repository owner, not by this change.
 
 Installs `go` and `goreleaser`, then, failing on the first error:
 
-1. gofmt: `gofmt -l .`; non-empty output lists the files and fails.
-2. vet: `go vet -tags e2e ./...`, as in `lefthook.yml`; the tag also vets
-   `e2e/`.
-3. tidy: `go mod tidy`, then `git diff --exit-code go.mod go.sum`.
-4. build: `mise run build` (`CGO_ENABLED=0`).
-5. test: `mise run test` (`go test -race ./...`).
-6. goreleaser config: `goreleaser check`, so a broken
+1. lint: `mise run lint` — `gofmt -l .` (non-empty output lists the
+   files and fails) and `go vet -tags e2e ./...` (the tag also vets
+   `e2e/`); see [mise-tasks.md](mise-tasks.md).
+2. tidy: `go mod tidy`, then `git diff --exit-code go.mod go.sum`.
+3. build: `mise run build` (`CGO_ENABLED=0`).
+4. test: `mise run test` (`go test -race ./...`).
+5. goreleaser config: `goreleaser check`, so a broken
    `.goreleaser.yaml` fails the pull request, not the release.
 
 ### Job `e2e` (ubuntu-latest)

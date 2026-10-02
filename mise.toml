@@ -1,7 +1,7 @@
 # Toolchain and tasks for hostrunner.
 #   mise run setup      # the pinned tools below, without gh and goreleaser, and the git hook
 #   mise run setup-dev  # the same plus gh
-#   mise run <task>     # build, install, test, e2e
+#   mise run <task>     # build, install, fmt, lint, test, check, pre-commit, e2e
 # Docker and/or Podman come from the system; mise does not manage them.
 
 [settings]
@@ -50,6 +50,30 @@ install -m 0755 bin/hostrunner bin/hostrun "$prefix/bin/"
 [tasks.test]
 description = "Unit and integration tests"
 run = "go test -race ./..."
+
+# fmt and lint cover the same files (.), so whatever lint's gofmt check
+# reports, fmt fixes (go vet findings need code changes).
+[tasks.fmt]
+description = "Format the Go files (gofmt -w)"
+run = "gofmt -w ."
+
+[tasks.lint]
+description = "Check gofmt formatting and go vet, without rewriting"
+# The e2e tag also vets e2e/. lefthook.yml runs the same checks on commit
+# (gofmt on the staged files only, go vet on the module); keep the two in
+# step.
+run = [
+  'unformatted="$(gofmt -l .)"; [ -z "$unformatted" ] || { printf "not gofmt-formatted:\n%s\n" "$unformatted"; exit 1; }',
+  "go vet -tags e2e ./...",
+]
+
+[tasks.check]
+description = "Run lint and test: the quick check before a pull request"
+depends = ["lint", "test"]
+
+[tasks.pre-commit]
+description = "Run the pre-commit hook's jobs on the staged files (-- --all-files: on all)"
+run = "lefthook run pre-commit"
 
 [tasks.e2e]
 description = "Bring up examples/devcontainer on docker (HOSTRUNNER_E2E_PODMAN=1: also podman)"

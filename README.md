@@ -180,7 +180,11 @@ How it works:
 when they are not gofmt-formatted or `go vet` reports a problem.
 
 ```sh
+mise run fmt    # gofmt -w .
+mise run lint   # gofmt check and go vet, as CI runs them
 mise run test   # unit and integration tests (go test -race ./...)
+mise run check  # lint and test
+mise run pre-commit   # the hook's jobs on the staged files (-- --all-files: all)
 mise run e2e    # brings up examples/devcontainer on docker
 HOSTRUNNER_E2E_PODMAN=1 mise run e2e   # also on podman
 ```
