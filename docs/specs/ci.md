@@ -9,7 +9,9 @@ ruleset itself is configured by the repository owner, not by this change.
 
 ## Workflow: `.github/workflows/ci.yml`
 
-- Triggers: `pull_request`, `push` to `main`, `workflow_dispatch`.
+- Triggers: `pull_request`, `push` to `main`, `workflow_dispatch`, and
+  `workflow_call` (the release workflow runs CI first; see
+  [release.md](release.md)).
 - `concurrency`: one group per workflow and ref; a newer run cancels an
   older one on the same pull request.
 - `permissions: contents: read`.
@@ -21,7 +23,7 @@ ruleset itself is configured by the repository owner, not by this change.
 
 ### Job `check` (ubuntu-latest)
 
-Installs `go` only, then, failing on the first error:
+Installs `go` and `goreleaser`, then, failing on the first error:
 
 1. gofmt: `gofmt -l .`; non-empty output lists the files and fails.
 2. vet: `go vet -tags e2e ./...`, as in `lefthook.yml`; the tag also vets
@@ -29,6 +31,8 @@ Installs `go` only, then, failing on the first error:
 3. tidy: `go mod tidy`, then `git diff --exit-code go.mod go.sum`.
 4. build: `mise run build` (`CGO_ENABLED=0`).
 5. test: `mise run test` (`go test -race ./...`).
+6. goreleaser config: `goreleaser check`, so a broken
+   `.goreleaser.yaml` fails the pull request, not the release.
 
 ### Job `e2e` (ubuntu-latest)
 
@@ -60,8 +64,8 @@ the task enables it only with `HOSTRUNNER_E2E_PODMAN=1`.
 
 ## Out of scope
 
-golangci-lint (a new dependency), coverage upload, release pipelines, the
-ruleset itself.
+golangci-lint (a new dependency), coverage upload, the ruleset itself.
+Releases: [release.md](release.md).
 
 ## Edge cases
 
