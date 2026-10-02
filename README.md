@@ -211,7 +211,14 @@ config is copied.
 
 `mise run dev` brings the everyday container up and opens bash in it;
 `mise run agent` brings the Claude container up and runs `claude` in it
-(the devcontainer CLI comes from `mise run setup`).
+(the devcontainer CLI comes from `mise run setup`). To run something in
+the everyday container from the host (bringing it up first):
+
+```sh
+mise run dc -- go test ./internal/rules/        # a command, run without a shell
+mise run dc -- bash -c 'go vet ./... | head'    # pipes etc. need bash -c
+mise run dc-task -- check                       # a mise task
+```
 
 The container names are unique per host, so two clones with the same
 folder name cannot run the same configuration at once.
@@ -232,7 +239,11 @@ through `hostrun`: `go test` would execute workspace code the container
 can change.
 
 ```sh
+mise run fmt    # gofmt -w .
+mise run lint   # gofmt check and go vet, as CI runs them
 mise run test   # unit and integration tests (go test -race ./...)
+mise run check  # lint and test
+mise run pre-commit   # the hook's jobs on the staged files (-- --all-files: all)
 mise run e2e    # brings up examples/devcontainer on docker
 HOSTRUNNER_E2E_PODMAN=1 mise run e2e   # also on podman
 ```
