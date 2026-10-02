@@ -9,7 +9,9 @@ was built from.
 
 ## Cutting a release
 
-By hand, from an up-to-date `main`:
+`mise run release -- <version>` tags a commit chosen from a list of
+the latest commits of `origin/main` and pushes the tag, after checking
+the version (`release-script.md`). By hand, from an up-to-date `main`:
 
 ```sh
 git tag v0.1.0
