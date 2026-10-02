@@ -1,5 +1,5 @@
 # Toolchain and tasks for hostrunner.
-#   mise run setup      # the pinned tools below, without gh, and the git hook
+#   mise run setup      # the pinned tools below, without gh and goreleaser, and the git hook
 #   mise run setup-dev  # the same plus gh
 #   mise run setup-agent  # go and lefthook, for the agent's devcontainer
 #   mise run <task>     # build, install, test, e2e, dev, agent
@@ -16,9 +16,10 @@ node = "26.8.2"                      # runs the devcontainer CLI (e2e only)
 "npm:@devcontainers/cli" = "0.89.0"  # e2e brings up examples/devcontainer with it
 gh = "2.101.0"                       # optional: only `mise run setup-dev` installs it
 lefthook = "2.1.14"                  # runs the pre-commit hook (lefthook.yml)
+goreleaser = "2.18.2"                # builds releases (.goreleaser.yaml); CI installs it
 
 [tasks.setup]
-description = "Install the toolchain without gh and the pre-commit hook"
+description = "Install the toolchain without gh and goreleaser, and the pre-commit hook"
 # mise exec: the task's PATH predates the lefthook just installed.
 run = """
 mise install go node npm:@devcontainers/cli lefthook

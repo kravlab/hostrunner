@@ -2,6 +2,7 @@
 # `check` and `e2e` are the required status checks of the main ruleset,
 # so renaming a job means updating the ruleset too. No path filters: a
 # required check that never starts would block the pull request forever.
+# release.yml calls this workflow (workflow_call) before it publishes.
 name: CI
 
 on:
@@ -9,8 +10,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+  workflow_call:
 
-# A newer push to the same pull request cancels the older run.
+# A newer push to the same pull request cancels the older run. When
+# called, github.workflow is the caller's name; the caller must not use
+# the same group, or the two runs would wait on each other.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -29,10 +33,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # Versions come from mise.toml; only go is needed here.
+      # Versions come from mise.toml.
       - uses: jdx/mise-action@7a4e45a543138629540c9a1616d08632b893e492 # v5.0.1
         with:
-          install_args: go
+          install_args: go goreleaser
       - name: gofmt
         run: |
           unformatted="$(gofmt -l .)"
@@ -48,6 +52,9 @@ jobs:
         run: mise run build
       - name: test
         run: mise run test
+      # A broken .goreleaser.yaml fails here, not on the release tag.
+      - name: goreleaser config
+        run: goreleaser check
 
   e2e:
     runs-on: ubuntu-latest
