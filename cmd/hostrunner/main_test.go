@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
+	"flag"
 	"io"
 	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -19,6 +22,55 @@ import (
 	"github.com/kravlab/hostrunner/internal/transport"
 	"github.com/kravlab/hostrunner/internal/watch"
 )
+
+func TestBuildVersionReportsTheModuleVersion(t *testing.T) {
+	tests := []struct {
+		name string
+		info *debug.BuildInfo
+		ok   bool
+		want string
+	}{
+		{"release tag", &debug.BuildInfo{Main: debug.Module{Version: "v0.1.0"}}, true, "v0.1.0"},
+		{"pseudo-version", &debug.BuildInfo{Main: debug.Module{Version: "v0.1.1-0.20261001120000-abcdef123456+dirty"}}, true, "v0.1.1-0.20261001120000-abcdef123456+dirty"},
+		{"no VCS data", &debug.BuildInfo{Main: debug.Module{Version: "(devel)"}}, true, "dev"},
+		{"empty version", &debug.BuildInfo{}, true, "dev"},
+		{"no build info", nil, false, "dev"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := buildVersion(tt.info, tt.ok); got != tt.want {
+				t.Fatalf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// A test binary carries no VCS data, so its version is "dev".
+func TestRunVersionPrintsTheVersion(t *testing.T) {
+	var out strings.Builder
+	if err := run([]string{"version"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if got := out.String(); got != "dev\n" {
+		t.Fatalf("got %q, want %q", got, "dev\n")
+	}
+}
+
+func TestRunVersionRejectsArguments(t *testing.T) {
+	var out strings.Builder
+	if err := run([]string{"version", "extra"}, &out); err == nil {
+		t.Fatal("expected an error for an unexpected argument")
+	}
+	if out.Len() != 0 {
+		t.Fatalf("printed %q despite the error", out.String())
+	}
+}
+
+func TestParseVersionHelpIsTheFlagHelp(t *testing.T) {
+	if err := parseVersion([]string{"-h"}, io.Discard); !errors.Is(err, flag.ErrHelp) {
+		t.Fatalf("got %v, want flag.ErrHelp", err)
+	}
+}
 
 func TestParseServeAcceptsAllFlags(t *testing.T) {
 	got, err := parseServe([]string{"--socket", "/run/h.sock", "--workspace", "/home/u/app", "--container-workspace", "/workspaces/app"}, io.Discard)
