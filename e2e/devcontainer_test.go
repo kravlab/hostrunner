@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -27,6 +28,10 @@ const (
 	cliTimeout = 5 * time.Minute
 	// stopTimeout covers the daemon's 2 s poll plus its 15 s grace period.
 	stopTimeout = 60 * time.Second
+	// attachTimeout bounds waitAttached, which runs once `up` has returned
+	// and hostrun works: a few 2 s polls, plus what is left of the 15 s
+	// grace after the rearm if the container came up sooner than that.
+	attachTimeout = 30 * time.Second
 	// slowBuild makes an image build outlast the daemon's 15 s grace period,
 	// as real rebuilds often do.
 	slowBuild = "FROM docker.io/library/alpine:3\nRUN sleep 20\n"
@@ -194,14 +199,81 @@ func (e env) runtimeDirOf(t *testing.T, container string) string {
 	return dir
 }
 
-// daemonStarts counts how many daemons have started in the runtime dir.
-func daemonStarts(t *testing.T, runtimeDir string) int {
+// daemonLog returns the runtime dir's daemon log, which every daemon
+// started there appends to.
+func daemonLog(t *testing.T, runtimeDir string) string {
 	t.Helper()
 	data, err := os.ReadFile(filepath.Join(runtimeDir, "daemon.log"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	return strings.Count(string(data), "msg=listening")
+	return string(data)
+}
+
+// daemonStarts counts how many daemons have started in the runtime dir.
+func daemonStarts(t *testing.T, runtimeDir string) int {
+	t.Helper()
+	return strings.Count(daemonLog(t, runtimeDir), "msg=listening")
+}
+
+// attachedSinceRearm reports whether a daemon log shows the watcher
+// attached after its last rearm, i.e. after the latest `up`
+// (internal/watch logs both events).
+func attachedSinceRearm(log string) bool {
+	return strings.LastIndex(log, `msg="devcontainer is running"`) >
+		strings.LastIndex(log, `msg="rearmed: waiting for the devcontainer"`)
+}
+
+// waitAttached waits until the watcher has attached after the latest
+// `up`'s rearm; only an attached watcher notices the container stop.
+func waitAttached(t *testing.T, runtimeDir string) {
+	t.Helper()
+	eventually(t, attachTimeout,
+		func() bool { return attachedSinceRearm(daemonLog(t, runtimeDir)) },
+		func() string {
+			return fmt.Sprintf("daemon did not attach to the container within %v; log:\n%s", attachTimeout, daemonLog(t, runtimeDir))
+		})
+}
+
+// eventually polls cond every 500 ms until it holds, and fails the test
+// with describe's message once timeout has passed.
+func eventually(t *testing.T, timeout time.Duration, cond func() bool, describe func() string) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal(describe())
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+// TestAttachedSinceRearm checks the log reading waitAttached relies on; it
+// needs no containers.
+func TestAttachedSinceRearm(t *testing.T) {
+	const (
+		attach = `level=INFO msg="devcontainer is running" workspace=/w` + "\n"
+		rearm  = `level=INFO msg="rearmed: waiting for the devcontainer" workspace=/w` + "\n"
+	)
+	tests := []struct {
+		name string
+		log  string
+		want bool
+	}{
+		{"empty log", "", false},
+		{"attached, never rearmed", attach, true},
+		{"rearmed, never attached", rearm, false},
+		{"rearmed, not attached yet", attach + rearm, false},
+		{"attached after the last rearm", attach + rearm + attach, true},
+		{"rearmed again after attaching", rearm + attach + rearm, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := attachedSinceRearm(tt.log); got != tt.want {
+				t.Fatalf("got %v, want %v for log:\n%s", got, tt.want, tt.log)
+			}
+		})
+	}
 }
 
 func TestDevcontainerIntegration(t *testing.T) {
@@ -351,22 +423,21 @@ func testLifecycle(t *testing.T, e env) {
 		if n := daemonStarts(t, runtimeDir); n != before {
 			t.Fatalf("%d daemon starts, want %d (none during the rebuild)", n, before)
 		}
+		// The watcher polls every 2 s and the next subtest stops this
+		// container at once: a container stopped before any poll saw it is
+		// never attached to, so the daemon would not notice the stop.
+		waitAttached(t, runtimeDir)
 	})
 
 	t.Run("daemon exits after the container stops", func(t *testing.T) {
 		if _, err := run(t, os.Environ(), e.runtime, "stop", container); err != nil {
 			t.Fatalf("stop: %v", err)
 		}
-		deadline := time.Now().Add(stopTimeout)
-		for {
-			if _, err := os.Stat(socket); os.IsNotExist(err) {
-				break
-			}
-			if time.Now().After(deadline) {
-				t.Fatalf("daemon still serving %s %v after the container stopped", socket, stopTimeout)
-			}
-			time.Sleep(500 * time.Millisecond)
-		}
+		eventually(t, stopTimeout,
+			func() bool { _, err := os.Stat(socket); return os.IsNotExist(err) },
+			func() string {
+				return fmt.Sprintf("daemon still serving %s %v after the container stopped", socket, stopTimeout)
+			})
 	})
 
 	t.Run("restart brings a new daemon", func(t *testing.T) {
