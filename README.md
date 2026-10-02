@@ -183,6 +183,7 @@ when they are not gofmt-formatted or `go vet` reports a problem.
 mise run fmt    # gofmt -w .
 mise run lint   # gofmt check and go vet, as CI runs them
 mise run test   # unit and integration tests (go test -race ./...)
+mise run test-scripts  # the release script's tests (bats, from setup-dev)
 mise run check  # lint and test
 mise run pre-commit   # the hook's jobs on the staged files (-- --all-files: all)
 mise run e2e    # brings up examples/devcontainer on docker
@@ -195,9 +196,13 @@ without hostrunner.
 
 A pushed `vX.Y.Z` tag on `main` publishes a release: CI runs again, then
 GoReleaser ([.goreleaser.yaml](.goreleaser.yaml)) uploads the archives,
-`checksums.txt` and a build provenance attestation.
+`checksums.txt` and a build provenance attestation. `mise run release`
+lists the last commits of `origin/main` (`-n N`, default 10), asks which
+one to tag, checks the version, and pushes the tag after a confirmation
+([spec](docs/specs/release-script.md)).
 
 ```sh
-git tag v0.1.0 && git push origin v0.1.0
+mise run release -- v0.2.0               # pick the commit from the list
+git tag v0.1.0 && git push origin v0.1.0 # by hand, on the current commit
 mise exec goreleaser -- goreleaser release --snapshot --clean   # local dry run into dist/
 ```
