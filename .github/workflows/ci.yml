@@ -37,13 +37,9 @@ jobs:
       - uses: jdx/mise-action@7a4e45a543138629540c9a1616d08632b893e492 # v5.0.1
         with:
           install_args: go goreleaser
-      - name: gofmt
-        run: |
-          unformatted="$(gofmt -l .)"
-          [ -z "$unformatted" ] || { printf 'not gofmt-formatted:\n%s\n' "$unformatted"; exit 1; }
-      # Same as the pre-commit hook: the e2e tag also vets e2e/.
-      - name: vet
-        run: go vet -tags e2e ./...
+      # gofmt check and go vet, as developers run them (mise.toml).
+      - name: lint
+        run: mise run lint
       - name: tidy
         run: |
           go mod tidy

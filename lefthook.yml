@@ -1,6 +1,8 @@
 # Git hooks, installed by `mise run setup` (docs/specs/pre-commit-hook.md).
 # The Claude container runs the host-installed hook too, so every command
-# here must work with only go and lefthook (the setup-agent task).
+# here must work with only go and lefthook (the setup-agent task). The
+# lint task in mise.toml runs the same checks on all files; keep the two
+# in step.
 pre-commit:
   parallel: true
   jobs:

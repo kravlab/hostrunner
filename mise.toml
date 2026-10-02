@@ -2,7 +2,8 @@
 #   mise run setup      # the pinned tools below, without gh and goreleaser, and the git hook
 #   mise run setup-dev  # the same plus gh
 #   mise run setup-agent  # go and lefthook, for the agent's devcontainer
-#   mise run <task>     # build, install, test, e2e, dev, agent
+#   mise run <task>     # build, install, fmt, lint, test, check, pre-commit, e2e
+#   mise run dc -- <cmd>, dc-task -- <task>, dev, agent  # in a devcontainer
 # Docker and/or Podman come from the system; mise does not manage them.
 
 [settings]
@@ -60,14 +61,60 @@ install -m 0755 bin/hostrunner bin/hostrun "$prefix/bin/"
 description = "Unit and integration tests"
 run = "go test -race ./..."
 
-# The devcontainer tasks bring a container up and run bash (dev) or
-# Claude Code (agent) in it; raw hands it the terminal. They need the
+# fmt and lint cover the same files (.), so whatever lint's gofmt check
+# reports, fmt fixes (go vet findings need code changes).
+[tasks.fmt]
+description = "Format the Go files (gofmt -w)"
+run = "gofmt -w ."
+
+[tasks.lint]
+description = "Check gofmt formatting and go vet, without rewriting"
+# The e2e tag also vets e2e/. lefthook.yml runs the same checks on commit
+# (gofmt on the staged files only, go vet on the module); keep the two in
+# step.
+run = [
+  'unformatted="$(gofmt -l .)"; [ -z "$unformatted" ] || { printf "not gofmt-formatted:\n%s\n" "$unformatted"; exit 1; }',
+  "go vet -tags e2e ./...",
+]
+
+[tasks.check]
+description = "Run lint and test: the quick check before a pull request"
+depends = ["lint", "test"]
+
+[tasks.pre-commit]
+description = "Run the pre-commit hook's jobs on the staged files (-- --all-files: on all)"
+run = "lefthook run pre-commit"
+
+# The devcontainer tasks bring a container up (idempotent; a first run
+# builds the image) and run a command (dc, dc-task), bash (dev) or Claude
+# Code (agent) in it; raw hands it the terminal. They need the
 # devcontainer CLI (`mise run setup`); `agent` also needs hostrunner
 # (`mise run install`).
+#
+# dc and dc-task get their arguments the plain way: mise appends them,
+# shell-quoted, to the last command, so the command receives them exactly
+# and without a shell. No usage spec and no eval: with -h/--help among the
+# arguments mise skips usage, and an eval would run them as shell code.
+[tasks.dc]
+description = "Run a command in the everyday devcontainer: mise run dc -- <cmd> [args…]"
+raw = true
+# devcontainer up reads stdin to the end; </dev/null leaves it for the
+# command (e.g. `echo … | mise run dc -- bash`). >/dev/null drops its JSON
+# result; build logs still go to stderr.
+run = """
+devcontainer up --workspace-folder . >/dev/null </dev/null &&
+  devcontainer exec --workspace-folder .
+"""
+
+[tasks.dc-task]
+description = "Run a mise task in the everyday devcontainer: mise run dc-task -- <task> [args…]"
+raw = true
+run = "mise run dc -- mise run"
+
 [tasks.dev]
 description = "Start the everyday devcontainer and open bash in it"
 raw = true
-run = "devcontainer up --workspace-folder . && devcontainer exec --workspace-folder . bash"
+run = "mise run dc -- bash"
 
 [tasks.agent]
 description = "Start the Claude Code devcontainer and run claude in it"
