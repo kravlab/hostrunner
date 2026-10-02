@@ -119,9 +119,11 @@ run = "mise run dc -- bash"
 [tasks.agent]
 description = "Start the Claude Code devcontainer and run claude in it"
 raw = true
+# </dev/null: devcontainer up reads stdin (see dc); on a terminal it would
+# consume what is typed while the container starts, before claude runs.
 run = """
 config=.devcontainer/claude/devcontainer.json
-devcontainer up --workspace-folder . --config "$config"
+devcontainer up --workspace-folder . --config "$config" </dev/null
 devcontainer exec --workspace-folder . --config "$config" claude
 """
 
