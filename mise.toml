@@ -1,8 +1,8 @@
 # Toolchain and tasks for hostrunner.
-#   mise run setup      # the pinned tools below, without gh and goreleaser, and the git hook
-#   mise run setup-dev  # the same plus gh
-#   mise run setup-agent  # go and lefthook, for the agent's devcontainer
-#   mise run <task>     # build, install, fmt, lint, test, check, pre-commit, e2e
+#   mise run setup      # the pinned tools below, without gh, goreleaser and bats, and the git hook
+#   mise run setup-dev  # the same plus gh and bats
+#   mise run setup-agent  # go, lefthook and bats, for the agent's devcontainer
+#   mise run <task>     # build, install, fmt, lint, test, test-scripts, check, pre-commit, e2e, release
 #   mise run dc -- <cmd>, dc-task -- <task>, dev, agent  # in a devcontainer
 # Docker and/or Podman come from the system; mise does not manage them.
 
@@ -18,9 +18,10 @@ node = "26.8.2"                      # runs the devcontainer CLI (e2e only)
 gh = "2.101.0"                       # optional: only `mise run setup-dev` installs it
 lefthook = "2.1.14"                  # runs the pre-commit hook (lefthook.yml)
 goreleaser = "2.18.2"                # builds releases (.goreleaser.yaml); CI installs it
+bats = "1.14.0"                      # tests scripts/; only setup-dev and setup-agent install it
 
 [tasks.setup]
-description = "Install the toolchain without gh and goreleaser, and the pre-commit hook"
+description = "Install the toolchain without gh, goreleaser and bats, and the pre-commit hook"
 # mise exec: the task's PATH predates the lefthook just installed.
 run = """
 mise install go node npm:@devcontainers/cli lefthook
@@ -28,17 +29,17 @@ mise exec -- lefthook install
 """
 
 [tasks.setup-dev]
-description = "Install the toolchain and gh"
+description = "Install the toolchain, gh and bats"
 depends = ["setup"]
-run = "mise install gh"
+run = "mise install gh bats"
 
 [tasks.setup-agent]
-description = "Install go and lefthook, for the agent's devcontainer"
+description = "Install go, lefthook and bats, for the agent's devcontainer"
 # The agent builds and tests; e2e (node, devcontainer CLI) runs on the
 # host, and gh reaches the host's through hostrun. lefthook runs the
 # host-installed pre-commit hook, which the container mounts read-only
 # with .git/hooks, so it is not installed here.
-run = "mise install go lefthook"
+run = "mise install go lefthook bats"
 
 [tasks.build]
 description = "Build hostrunner and the hostrun client into bin/"
@@ -60,6 +61,10 @@ install -m 0755 bin/hostrunner bin/hostrun "$prefix/bin/"
 [tasks.test]
 description = "Unit and integration tests"
 run = "go test -race ./..."
+
+[tasks.test-scripts]
+description = "Test the shell scripts in scripts/ (bats)"
+run = "bats scripts/"
 
 # fmt and lint cover the same files (.), so whatever lint's gofmt check
 # reports, fmt fixes (go vet findings need code changes).
@@ -130,3 +135,10 @@ devcontainer exec --workspace-folder . --config "$config" claude
 [tasks.e2e]
 description = "Bring up examples/devcontainer on docker (HOSTRUNNER_E2E_PODMAN=1: also podman)"
 run = "go test -tags e2e -count=1 -v ./e2e/"
+
+[tasks.release]
+description = "Tag a chosen commit of origin/main and push the tag: mise run release -- [-n N] <version>"
+# raw: the script prompts for the commit and a confirmation on the
+# terminal. Arguments are appended, shell-quoted, as in dc.
+raw = true
+run = "scripts/release.sh"
