@@ -43,7 +43,9 @@ task can be run inside the everyday devcontainer from the host.
   (`mise run dc -- mise run`).
 - `dev`: `mise run dc -- bash` (was its own `devcontainer up && exec
   bash`).
-- `agent`: unchanged.
+- `agent`: its `devcontainer up` also gets `</dev/null` (see the stdin
+  edge case), so what is typed while the container starts reaches
+  `claude`.
 
 Arguments: mise appends a task's arguments, shell-quoted, to its last
 command, so `dc`, `dc-task` and `pre-commit` pass them on exactly
@@ -83,7 +85,8 @@ gains a comment pointing at the `lint` task.
   the image).
 - stdin reaches the command (`echo … | mise run dc -- bash`):
   `devcontainer up` reads stdin to the end, so `dc` runs it with
-  `</dev/null`.
+  `</dev/null`. `agent` does the same: on a terminal, `up` would
+  otherwise consume what is typed while the container starts.
 - The command's exit code is `dc`'s exit code.
 - `lint` on a tree with an unformatted file: fails and names it; `fmt`
   then fixes it.
@@ -106,5 +109,9 @@ No Go code changes, so no unit tests. Acceptance:
 - `mise run dc-task -- <task> 'a b' --help` passes both arguments to the
   task unchanged.
 - `mise run dc-task -- lint` passes in the container.
+- `agent`: its script with `claude` replaced by `cat` passes piped stdin
+  through (`echo hi | …` prints `hi`; without `</dev/null` on `up` it
+  prints nothing). Typed-ahead input on a terminal is a manual check
+  only, since it needs an interactive terminal.
 - `actionlint` reports no errors; `check` and `e2e` pass on the pull
   request.
