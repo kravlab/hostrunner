@@ -204,6 +204,17 @@ The repository has two devcontainers; both take the toolchain from
   place show up in the running container (a save that renames a new
   file over it does not, until a restart). Unset, Claude gets no global
   instructions.
+  Claude in the container also loads the host's global skills
+  (`~/.claude/skills`, with symlinked skills copied as what they point
+  to) and runs the host's global hooks (the `hooks` key of
+  `~/.claude/settings.json`; a host that has this file needs `jq`). Both
+  are copied on every `devcontainer up`, read-only for the agent, and
+  nothing else of the host's `~/.claude` is: not the rest of the
+  settings, not the login, not the history.
+  A hook runs in the container, so it can use only what the image has; the
+  copy is also mounted at the host's `~/.claude` path, so a hook that
+  reads a skill through that path works unchanged
+  (`docs/specs/devcontainer-claude-skills-hooks.md`).
 
 Both containers' git uses `user.name` and `user.email` from the host's
 global git config, when set, for commits, and both git and ripgrep (so

@@ -14,7 +14,8 @@
    the host (e.g. a global `AGENTS.md`). Edits to that file reach the
    running container without recreating it or running `devcontainer up`.
    Without the variable the container starts with no global instructions:
-   no host has to have the file.
+   no host has to have the file. The host's global skills and hooks reach
+   it too: see `devcontainer-claude-skills-hooks.md`.
 
 Both scripts below run on the host from `initializeCommand`, so on every
 `devcontainer up`, and write into one per-container directory,

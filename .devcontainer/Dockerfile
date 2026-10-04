@@ -63,3 +63,15 @@ USER vscode
 RUN install -d /home/vscode/.claude \
  && curl -fsSL https://claude.ai/install.sh | bash -s "$CLAUDE_CODE_VERSION"
 USER root
+
+# The host user's global skills and hooks, copied by
+# .devcontainer/claude/skills.sh and hooks.sh to /run/host-config/claude
+# (docs/specs/devcontainer-claude-skills-hooks.md). /etc/claude-code is
+# Claude Code's system directory: it loads the skills in .claude/skills
+# there, and runs the hooks of a managed-settings.d file alongside the
+# container's own. Not in the ~/.claude volume, which Claude Code writes
+# itself (its settings, the account's synced skills), and not writable by
+# the agent. Without the mount the links dangle: no skills, no hooks.
+RUN install -d /etc/claude-code/.claude /etc/claude-code/managed-settings.d \
+ && ln -s /run/host-config/claude/skills /etc/claude-code/.claude/skills \
+ && ln -s /run/host-config/claude/hooks.json /etc/claude-code/managed-settings.d/host-hooks.json

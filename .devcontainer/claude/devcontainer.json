@@ -2,10 +2,12 @@
 // to hostrunner itself so the container can run the host commands allowed
 // in .devcontainer/hostrun.yaml (git, gh). Requires `mise run install` on
 // the host (hostrunner in PATH) and a regular clone (.git a directory).
-// The host's git identity, its global git excludes and, optionally, the
-// global instructions named by $HOSTRUNNER_AGENTS_MD reach the container
-// read-only (docs/specs/devcontainer-host-config.md,
-// docs/specs/devcontainer-git-excludes.md).
+// The host's git identity, its global git excludes, its global Claude Code
+// skills and hooks and, optionally, the global instructions named by
+// $HOSTRUNNER_AGENTS_MD reach the container read-only
+// (docs/specs/devcontainer-host-config.md,
+// docs/specs/devcontainer-git-excludes.md,
+// docs/specs/devcontainer-claude-skills-hooks.md).
 {
   "name": "hostrunner (Claude Code)",
   "build": { "dockerfile": "../Dockerfile", "context": "..", "target": "claude" },
@@ -50,6 +52,20 @@
       "${localWorkspaceFolder}/.devcontainer/claude/agents-md.sh",
       "${localEnv:XDG_RUNTIME_DIR}/hostrunner-host-config/${devcontainerId}",
       "${localEnv:HOSTRUNNER_AGENTS_MD}"
+    ],
+    // Copies the host's global skills (~/.claude/skills) into claude/skills
+    // there; the image links /etc/claude-code/.claude/skills to it
+    // (docs/specs/devcontainer-claude-skills-hooks.md).
+    "skills": [
+      "${localWorkspaceFolder}/.devcontainer/claude/skills.sh",
+      "${localEnv:XDG_RUNTIME_DIR}/hostrunner-host-config/${devcontainerId}"
+    ],
+    // Copies the host's global hooks (the hooks key of
+    // ~/.claude/settings.json) into claude/hooks.json there; the image
+    // links a /etc/claude-code/managed-settings.d file to it.
+    "hooks": [
+      "${localWorkspaceFolder}/.devcontainer/claude/hooks.sh",
+      "${localEnv:XDG_RUNTIME_DIR}/hostrunner-host-config/${devcontainerId}"
     ]
   },
 
@@ -70,10 +86,15 @@
     "source=hostrunner-bashhistory-${devcontainerId},target=/home/vscode/.commandhistory,type=volume",
     "source=hostrunner-claude-${devcontainerId},target=/home/vscode/.claude,type=volume",
     // The host's git identity, included from the image's system git config,
-    // and its global excludes, linked from ~/.config/git/ignore.
+    // its global excludes, linked from ~/.config/git/ignore, and its global
+    // skills and hooks (claude/), linked from /etc/claude-code.
     // A directory: the scripts replace the files, and a single-file mount
     // would keep showing the old ones.
     "source=${localEnv:XDG_RUNTIME_DIR}/hostrunner-host-config/${devcontainerId},target=/run/host-config,type=bind,readonly",
+    // The copied skills and hooks again, at the path the host's ~/.claude
+    // has on the host: a host hook that reads a skill through its absolute
+    // host path runs unchanged in the container.
+    "source=${localEnv:XDG_RUNTIME_DIR}/hostrunner-host-config/${devcontainerId}/claude,target=${localEnv:HOME}/.claude,type=bind,readonly",
     // The host user's global instructions, read-only so the agent cannot
     // rewrite them. The source is agents-md.sh's symlink, which the engine
     // resolves when the container starts: the original file itself is

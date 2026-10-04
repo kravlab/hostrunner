@@ -1,15 +1,18 @@
 // Package devcontainer holds tests for the host-side scripts that the
 // repository's devcontainer.json files run from initializeCommand
-// (docs/specs/devcontainer-host-config.md). The scripts live in
+// (docs/specs/devcontainer-host-config.md,
+// docs/specs/devcontainer-claude-skills-hooks.md). The scripts live in
 // .devcontainer/, which `go test ./...` does not walk, so their tests are
 // here; the package has no non-test code.
 package devcontainer
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -18,6 +21,8 @@ const (
 	gitIdentityScript = "../../.devcontainer/git-identity.sh"
 	gitExcludesScript = "../../.devcontainer/git-excludes.sh"
 	agentsMDScript    = "../../.devcontainer/claude/agents-md.sh"
+	skillsScript      = "../../.devcontainer/claude/skills.sh"
+	hooksScript       = "../../.devcontainer/claude/hooks.sh"
 )
 
 // result is what a script run left behind: its exit status and stderr.
@@ -498,4 +503,458 @@ func TestAgentsMDRejectsInvalidPath(t *testing.T) {
 			}
 		})
 	}
+}
+
+// writeSkill writes a skill, a directory with a SKILL.md of the given
+// content, at dir, creating its parent directories.
+func writeSkill(t *testing.T, dir, content string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(dir, "SKILL.md"), content)
+}
+
+// symlink makes link a symbolic link to target, failing the test on error.
+func symlink(t *testing.T, target, link string) {
+	t.Helper()
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// assertRegularFile fails unless path is a regular file, not a symlink to
+// one, with the given content.
+func assertRegularFile(t *testing.T, path, want string) {
+	t.Helper()
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	if !info.Mode().IsRegular() {
+		t.Errorf("%s has mode %v, want a regular file: a link would dangle in the container", path, info.Mode())
+	}
+	if got, err := os.ReadFile(path); err != nil || string(got) != want {
+		t.Errorf("%s = %q (%v), want %q", path, got, err, want)
+	}
+}
+
+func TestSkillsCopiesWhatSymlinksPointTo(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	skills := filepath.Join(home, ".claude", "skills")
+	elsewhere := t.TempDir()
+	writeSkill(t, filepath.Join(skills, "plain"), "plain\n")
+	// Skills installed outside ~/.claude and linked into it, relatively
+	// and absolutely, as skill installers do.
+	writeSkill(t, filepath.Join(home, ".agents", "skills", "relative"), "relative\n")
+	symlink(t, "../../.agents/skills/relative", filepath.Join(skills, "relative"))
+	writeSkill(t, filepath.Join(elsewhere, "absolute"), "absolute\n")
+	symlink(t, filepath.Join(elsewhere, "absolute"), filepath.Join(skills, "absolute"))
+	// A link inside a skill.
+	writeFile(t, filepath.Join(elsewhere, "shared.md"), "shared\n")
+	symlink(t, filepath.Join(elsewhere, "shared.md"), filepath.Join(skills, "plain", "shared.md"))
+	dir := filepath.Join(t.TempDir(), "host-config")
+
+	if r := runScript(t, home, skillsScript, dir); r.code != 0 {
+		t.Fatalf("exit %d, stderr %q", r.code, r.stderr)
+	}
+
+	copied := filepath.Join(dir, "claude", "skills")
+	for file, want := range map[string]string{
+		"plain/SKILL.md":    "plain\n",
+		"plain/shared.md":   "shared\n",
+		"relative/SKILL.md": "relative\n",
+		"absolute/SKILL.md": "absolute\n",
+	} {
+		assertRegularFile(t, filepath.Join(copied, file), want)
+	}
+	for _, skill := range []string{"relative", "absolute"} {
+		if info, err := os.Lstat(filepath.Join(copied, skill)); err != nil || !info.IsDir() {
+			t.Errorf("%s: %v (%v), want a directory: a link would dangle in the container", skill, info, err)
+		}
+	}
+	assertOnlyEntries(t, copied, "absolute", "plain", "relative")
+	assertOnlyEntries(t, filepath.Join(dir, "claude"), "skills")
+}
+
+func TestSkillsLeavesOutSyncedAccountSkills(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	skills := filepath.Join(home, ".claude", "skills")
+	writeSkill(t, filepath.Join(skills, "mine"), "mine\n")
+	writeSkill(t, filepath.Join(skills, "synced", "bucket", "account-skill"), "account\n")
+	dir := t.TempDir()
+
+	if r := runScript(t, home, skillsScript, dir); r.code != 0 {
+		t.Fatalf("exit %d, stderr %q", r.code, r.stderr)
+	}
+
+	// The container syncs the account's skills into its own volume.
+	assertOnlyEntries(t, filepath.Join(dir, "claude", "skills"), "mine")
+}
+
+func TestSkillsWritesEmptyDirectoryWithoutSkills(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		// skillsDirExists is whether ~/.claude/skills exists, empty.
+		skillsDirExists bool
+	}{
+		{name: "no skills directory", skillsDirExists: false},
+		{name: "empty skills directory", skillsDirExists: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			home := t.TempDir()
+			if tt.skillsDirExists {
+				if err := os.MkdirAll(filepath.Join(home, ".claude", "skills"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			dir := t.TempDir()
+
+			if r := runScript(t, home, skillsScript, dir); r.code != 0 {
+				t.Fatalf("exit %d, stderr %q; a host without skills must not fail devcontainer up", r.code, r.stderr)
+			}
+
+			assertOnlyEntries(t, filepath.Join(dir, "claude", "skills"))
+			assertOnlyEntries(t, filepath.Join(dir, "claude"), "skills")
+		})
+	}
+}
+
+func TestSkillsDropsSkillRemovedOnHost(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	skills := filepath.Join(home, ".claude", "skills")
+	writeSkill(t, filepath.Join(skills, "kept"), "old\n")
+	writeSkill(t, filepath.Join(skills, "removed"), "removed\n")
+	dir := t.TempDir()
+	runScript(t, home, skillsScript, dir)
+	if err := os.RemoveAll(filepath.Join(skills, "removed")); err != nil {
+		t.Fatal(err)
+	}
+	writeSkill(t, filepath.Join(skills, "kept"), "edited\n")
+
+	if r := runScript(t, home, skillsScript, dir); r.code != 0 {
+		t.Fatalf("exit %d, stderr %q", r.code, r.stderr)
+	}
+
+	copied := filepath.Join(dir, "claude", "skills")
+	assertOnlyEntries(t, copied, "kept")
+	assertRegularFile(t, filepath.Join(copied, "kept", "SKILL.md"), "edited\n")
+	assertOnlyEntries(t, filepath.Join(dir, "claude"), "skills")
+}
+
+func TestSkillsFailsOnDanglingLinkAndKeepsOldCopy(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	skills := filepath.Join(home, ".claude", "skills")
+	writeSkill(t, filepath.Join(skills, "kept"), "kept\n")
+	dir := t.TempDir()
+	runScript(t, home, skillsScript, dir)
+	writeSkill(t, filepath.Join(skills, "added"), "added\n")
+	symlink(t, filepath.Join(home, "gone"), filepath.Join(skills, "broken"))
+
+	r := runScript(t, home, skillsScript, dir)
+
+	if r.code == 0 {
+		t.Fatal("exit 0; a skill that cannot be copied must fail devcontainer up instead of silently disappearing")
+	}
+	if !strings.Contains(r.stderr, "cp:") || !strings.Contains(r.stderr, "broken") {
+		t.Errorf("stderr %q, want cp's error naming the broken skill", r.stderr)
+	}
+	copied := filepath.Join(dir, "claude", "skills")
+	assertOnlyEntries(t, copied, "kept")
+	assertRegularFile(t, filepath.Join(copied, "kept", "SKILL.md"), "kept\n")
+	assertOnlyEntries(t, filepath.Join(dir, "claude"), "skills")
+}
+
+func TestSkillsCopyIsReadableByOthers(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	skill := filepath.Join(home, ".claude", "skills", "private")
+	writeSkill(t, skill, "private\n")
+	if err := os.Chmod(skill, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(skill, "SKILL.md"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+
+	if r := runScript(t, home, skillsScript, dir); r.code != 0 {
+		t.Fatalf("exit %d, stderr %q", r.code, r.stderr)
+	}
+
+	// Rootless Podman's user namespace reads the mount as another user.
+	copied := filepath.Join(dir, "claude", "skills")
+	for path, want := range map[string]os.FileMode{
+		copied:                           0o005,
+		filepath.Join(copied, "private"): 0o005,
+		filepath.Join(copied, "private", "SKILL.md"): 0o004,
+	} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if mode := info.Mode().Perm(); mode&want != want {
+			t.Errorf("%s has mode %o, want others to have %o", path, mode, want)
+		}
+	}
+}
+
+// readHooks returns dir/claude/hooks.json, the hooks script's output,
+// decoded.
+func readHooks(t *testing.T, dir string) map[string]any {
+	t.Helper()
+	content, err := os.ReadFile(filepath.Join(dir, "claude", "hooks.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var settings map[string]any
+	if err := json.Unmarshal(content, &settings); err != nil {
+		t.Fatalf("hooks.json %q: %v", content, err)
+	}
+	return settings
+}
+
+// homeWithSettings returns a temporary HOME whose ~/.claude/settings.json
+// is content.
+func homeWithSettings(t *testing.T, content string) string {
+	t.Helper()
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, ".claude"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(home, ".claude", "settings.json"), content)
+	return home
+}
+
+// hostHooks is the hooks key of a host's settings.json.
+const hostHooks = `{"UserPromptSubmit": [{"hooks": [{"type": "command", "command": "sed 1d \"$HOME/x\" | jq -Rs .", "timeout": 5}]}]}`
+
+func TestHooksCopiesOnlyHooks(t *testing.T) {
+	t.Parallel()
+	home := homeWithSettings(t, `{"env": {"TOKEN": "secret"}, "permissions": {"allow": ["Bash(ls)"]}, "hooks": `+hostHooks+`}`)
+	dir := filepath.Join(t.TempDir(), "host-config")
+
+	if r := runScript(t, home, hooksScript, dir); r.code != 0 {
+		t.Fatalf("exit %d, stderr %q", r.code, r.stderr)
+	}
+
+	var wantHooks any
+	if err := json.Unmarshal([]byte(hostHooks), &wantHooks); err != nil {
+		t.Fatal(err)
+	}
+	// Only the hooks reach the container, not the host's environment or
+	// permissions.
+	if got, want := readHooks(t, dir), map[string]any{"hooks": wantHooks}; !reflect.DeepEqual(got, want) {
+		t.Errorf("hooks.json = %v, want %v", got, want)
+	}
+	assertOnlyEntries(t, filepath.Join(dir, "claude"), "hooks.json")
+}
+
+func TestHooksWritesEmptySettingsWithoutHooks(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		// settings is the content of ~/.claude/settings.json;
+		// settingsExists is whether the file exists.
+		settings       string
+		settingsExists bool
+	}{
+		{name: "no settings file", settingsExists: false},
+		{name: "no hooks key", settings: `{"env": {"TOKEN": "secret"}}`, settingsExists: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			home := t.TempDir()
+			if tt.settingsExists {
+				home = homeWithSettings(t, tt.settings)
+			}
+			dir := t.TempDir()
+
+			if r := runScript(t, home, hooksScript, dir); r.code != 0 {
+				t.Fatalf("exit %d, stderr %q; a host without hooks must not fail devcontainer up", r.code, r.stderr)
+			}
+
+			if got := readHooks(t, dir); len(got) != 0 {
+				t.Errorf("hooks.json = %v, want {}", got)
+			}
+			assertOnlyEntries(t, filepath.Join(dir, "claude"), "hooks.json")
+		})
+	}
+}
+
+func TestHooksDropsHooksRemovedOnHost(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	runScript(t, homeWithSettings(t, `{"hooks": `+hostHooks+`}`), hooksScript, dir)
+
+	if r := runScript(t, homeWithSettings(t, `{}`), hooksScript, dir); r.code != 0 {
+		t.Fatalf("exit %d, stderr %q", r.code, r.stderr)
+	}
+
+	if got := readHooks(t, dir); len(got) != 0 {
+		t.Errorf("hooks.json = %v after the hooks were removed on the host, want {}", got)
+	}
+}
+
+func TestHooksFailsOnMalformedSettingsAndKeepsOldFile(t *testing.T) {
+	t.Parallel()
+	withSettings := func(content string) func(*testing.T) string {
+		return func(t *testing.T) string { return homeWithSettings(t, content) }
+	}
+	tests := []struct {
+		name string
+		// home returns a HOME whose ~/.claude/settings.json is broken.
+		home func(t *testing.T) string
+	}{
+		{name: "not JSON", home: withSettings(`{"hooks": `)},
+		{name: "not an object", home: withSettings(`["hooks"]`)},
+		{name: "null", home: withSettings(`null`)},
+		{name: "empty file", home: withSettings(``)},
+		{name: "several values", home: withSettings(`{"hooks": {}} {"hooks": {}}`)},
+		{name: "dangling symlink", home: func(t *testing.T) string {
+			home := t.TempDir()
+			if err := os.Mkdir(filepath.Join(home, ".claude"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			symlink(t, filepath.Join(home, "gone.json"), filepath.Join(home, ".claude", "settings.json"))
+			return home
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			runScript(t, homeWithSettings(t, `{"hooks": `+hostHooks+`}`), hooksScript, dir)
+
+			r := runScript(t, tt.home(t), hooksScript, dir)
+
+			if r.code == 0 {
+				t.Fatal("exit 0; malformed settings must fail devcontainer up instead of silently dropping the hooks")
+			}
+			if !strings.Contains(r.stderr, "jq:") {
+				t.Errorf("stderr %q, want jq's error", r.stderr)
+			}
+			if _, ok := readHooks(t, dir)["hooks"]; !ok {
+				t.Error("hooks.json lost its hooks, want the previous file kept")
+			}
+			assertOnlyEntries(t, filepath.Join(dir, "claude"), "hooks.json")
+		})
+	}
+}
+
+func TestHooksFileIsReadableByOthers(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	if r := runScript(t, homeWithSettings(t, `{"hooks": `+hostHooks+`}`), hooksScript, dir); r.code != 0 {
+		t.Fatalf("exit %d, stderr %q", r.code, r.stderr)
+	}
+
+	info, err := os.Stat(filepath.Join(dir, "claude", "hooks.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode := info.Mode().Perm(); mode != 0o644 {
+		t.Errorf("mode %o, want 644 (readable through a user namespace)", mode)
+	}
+}
+
+func TestSkillsLeavesOutHiddenEntries(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	skills := filepath.Join(home, ".claude", "skills")
+	writeSkill(t, filepath.Join(skills, "mine"), "mine\n")
+	writeSkill(t, filepath.Join(skills, ".hidden"), "hidden\n")
+	writeFile(t, filepath.Join(skills, ".DS_Store"), "")
+	dir := t.TempDir()
+
+	if r := runScript(t, home, skillsScript, dir); r.code != 0 {
+		t.Fatalf("exit %d, stderr %q", r.code, r.stderr)
+	}
+
+	assertOnlyEntries(t, filepath.Join(dir, "claude", "skills"), "mine")
+}
+
+func TestSkillsReplacesCopyOfReadOnlySkill(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	skill := filepath.Join(home, ".claude", "skills", "readonly")
+	writeSkill(t, skill, "readonly\n")
+	// A skill linked from a read-only tree; the cleanup lets the test
+	// remove its own temporary directory.
+	if err := os.Chmod(skill, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(skill, 0o755) })
+	dir := t.TempDir()
+	if r := runScript(t, home, skillsScript, dir); r.code != 0 {
+		t.Fatalf("first run: exit %d, stderr %q", r.code, r.stderr)
+	}
+
+	// The second run has an old copy to remove.
+	if r := runScript(t, home, skillsScript, dir); r.code != 0 {
+		t.Fatalf("exit %d, stderr %q; the copy of a read-only skill must be removable", r.code, r.stderr)
+	}
+
+	copied := filepath.Join(dir, "claude", "skills")
+	assertRegularFile(t, filepath.Join(copied, "readonly", "SKILL.md"), "readonly\n")
+	assertOnlyEntries(t, filepath.Join(dir, "claude"), "skills")
+}
+
+// pathWithoutJq returns a PATH entry for runScriptEnv: a directory with the
+// tools hooks.sh runs except jq, as on a host that lacks it.
+func pathWithoutJq(t *testing.T) string {
+	t.Helper()
+	bin := t.TempDir()
+	for _, tool := range []string{"mkdir", "mktemp", "chmod", "mv", "rm"} {
+		path, err := exec.LookPath(tool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		symlink(t, path, filepath.Join(bin, tool))
+	}
+	return "PATH=" + bin
+}
+
+func TestHooksNeedsNoJqWithoutSettings(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	r := runScriptEnv(t, t.TempDir(), []string{pathWithoutJq(t)}, hooksScript, dir)
+
+	if r.code != 0 {
+		t.Fatalf("exit %d, stderr %q; a host with neither settings nor jq must not fail devcontainer up", r.code, r.stderr)
+	}
+	if got := readHooks(t, dir); len(got) != 0 {
+		t.Errorf("hooks.json = %v, want {}", got)
+	}
+}
+
+func TestHooksFailsWithoutJqAndKeepsOldFile(t *testing.T) {
+	t.Parallel()
+	home := homeWithSettings(t, `{"hooks": `+hostHooks+`}`)
+	dir := t.TempDir()
+	runScript(t, home, hooksScript, dir)
+
+	r := runScriptEnv(t, home, []string{pathWithoutJq(t)}, hooksScript, dir)
+
+	if r.code == 0 {
+		t.Fatal("exit 0; settings that cannot be read without jq must fail devcontainer up instead of silently dropping the hooks")
+	}
+	if !strings.Contains(r.stderr, "jq") {
+		t.Errorf("stderr %q, want the shell's error naming jq", r.stderr)
+	}
+	if _, ok := readHooks(t, dir)["hooks"]; !ok {
+		t.Error("hooks.json lost its hooks, want the previous file kept")
+	}
+	assertOnlyEntries(t, filepath.Join(dir, "claude"), "hooks.json")
 }
