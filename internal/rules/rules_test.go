@@ -106,19 +106,7 @@ func TestCheck(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.argv, func(t *testing.T) {
-			err := p.Check(strings.Fields(tc.argv))
-			switch {
-			case tc.deny == "" && err != nil:
-				t.Fatalf("denied: %v", err)
-			case tc.deny != "" && err == nil:
-				t.Fatalf("allowed, want %q", tc.deny)
-			case tc.deny != "" && err.Error() != tc.deny:
-				t.Fatalf("got %q, want %q", err.Error(), tc.deny)
-			}
-			var d *Denial
-			if err != nil && !errors.As(err, &d) {
-				t.Fatalf("error %T is not a *Denial", err)
-			}
+			expectCheck(t, p, strings.Fields(tc.argv), tc.deny)
 		})
 	}
 }
@@ -156,6 +144,15 @@ func TestParseRejectsInvalidConfig(t *testing.T) {
 		"relative program":         "rules:\n  - command: ./deploy.sh\n    args: any\n",
 		"relative program in dir":  "rules:\n  - command: bin/tool\n    args: any\n",
 		"second document":          "rules:\n  - command: git\n    args: any\n---\nrules:\n  - command: rm\n    args: any\n",
+
+		// A list is exactly one of allow, deny, allow_regex and deny_regex.
+		"allow and allow_regex":       "rules:\n  - command: git\n    positional:\n      allow: [a]\n      allow_regex: [a]\n",
+		"allow and deny_regex":        "rules:\n  - command: git\n    positional:\n      allow: [a]\n      deny_regex: [b]\n",
+		"deny and allow_regex":        "rules:\n  - command: git\n    positional:\n      deny: [b]\n      allow_regex: [a]\n",
+		"deny and deny_regex":         "rules:\n  - command: git\n    positional:\n      deny: [b]\n      deny_regex: [b]\n",
+		"allow_regex and deny_regex":  "rules:\n  - command: git\n    positional:\n      allow_regex: [a]\n      deny_regex: [b]\n",
+		"value flag list both regex":  "rules:\n  - command: git\n    flags:\n      values:\n        -o: { allow_regex: [a], deny_regex: [b] }\n",
+		"value flag list glob, regex": "rules:\n  - command: git\n    flags:\n      values:\n        -o: { allow: [a], allow_regex: [a] }\n",
 	}
 	for name, config := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -354,4 +351,219 @@ func TestExampleConfig(t *testing.T) {
 			t.Errorf("%s: allowed", argv)
 		}
 	}
+}
+
+// expectCheck checks argv against p. deny is the expected denial message,
+// or empty when argv must be allowed; a denial has to be a *Denial.
+func expectCheck(t *testing.T, p *Policy, argv []string, deny string) {
+	t.Helper()
+	err := p.Check(argv)
+	switch {
+	case deny == "" && err != nil:
+		t.Errorf("%q: denied: %v", argv, err)
+	case deny != "" && err == nil:
+		t.Errorf("%q: allowed, want %q", argv, deny)
+	case deny != "" && err.Error() != deny:
+		t.Errorf("%q: got %q, want %q", argv, err.Error(), deny)
+	}
+	var d *Denial
+	if err != nil && !errors.As(err, &d) {
+		t.Errorf("%q: error %T is not a *Denial", argv, err)
+	}
+}
+
+// The API path of issue #18: a glob cannot hold it inside the repository,
+// an anchored regex can.
+func TestAllowRegexConfinesPositionalArguments(t *testing.T) {
+	p := mustParse(t, `
+rules:
+  - command: tix api
+    positional:
+      allow_regex:
+        - '^/repos/example/example-app/issues(/[0-9]+)?(\?state=(open|closed))?$'
+`)
+	cases := []struct{ arg, deny string }{
+		{"/repos/example/example-app/issues", ""},
+		{"/repos/example/example-app/issues/42", ""},
+		{"/repos/example/example-app/issues?state=open", ""},
+
+		// The values a glob list let through.
+		{
+			"/repos/example/example-app/../../../user",
+			`denied by rule "tix api": argument "/repos/example/example-app/../../../user" is not allowed`,
+		},
+		{
+			"/repos/example/example-app/issues/%2e%2e/%2e%2e/keys",
+			`denied by rule "tix api": argument "/repos/example/example-app/issues/%2e%2e/%2e%2e/keys" is not allowed`,
+		},
+		{
+			"/repos/example/example-app/keys",
+			`denied by rule "tix api": argument "/repos/example/example-app/keys" is not allowed`,
+		},
+
+		// `\?` is a literal "?", not a wildcard that also matches "/".
+		{
+			"/repos/example/example-app/issues/state=open",
+			`denied by rule "tix api": argument "/repos/example/example-app/issues/state=open" is not allowed`,
+		},
+	}
+	for _, tc := range cases {
+		expectCheck(t, p, []string{"tix", "api", tc.arg}, tc.deny)
+	}
+}
+
+func TestDenyRegexDeniesAMatchAnywhereInTheValue(t *testing.T) {
+	p := mustParse(t, `
+rules:
+  - command: tix api
+    positional:
+      deny_regex: ['\.\.', '%']
+`)
+	cases := []struct{ arg, deny string }{
+		{"/repos/a/b/issues", ""},
+		{"/repos/a/b/v1.2", ""}, // one dot is not ".."
+		{"/repos/a/b/../../user", `denied by rule "tix api": argument "/repos/a/b/../../user" is denied`},
+		{"/repos/a/b/issues/%2e%2e/keys", `denied by rule "tix api": argument "/repos/a/b/issues/%2e%2e/keys" is denied`},
+	}
+	for _, tc := range cases {
+		expectCheck(t, p, []string{"tix", "api", tc.arg}, tc.deny)
+	}
+}
+
+func TestParseNamesTheRegexThatDoesNotCompile(t *testing.T) {
+	cases := map[string]struct {
+		config string
+		want   []string // parts the error has to contain
+	}{
+		"positional": {
+			"rules:\n  - command: git\n    args: any\n  - command: tix api\n    positional:\n      allow_regex: ['^/issues$', '^/issues/[0-9]++$']\n",
+			[]string{"rule 2", `"tix api" positional`, "allow_regex", "^/issues/[0-9]++$"},
+		},
+		"flag value": {
+			"rules:\n  - command: tix api\n    flags:\n      values:\n        --method: { deny_regex: ['^(GET$'] }\n",
+			[]string{"rule 1", `"tix api" flags`, "--method", "deny_regex", "^(GET$"},
+		},
+		// The pattern is shown as it is written in the rules file.
+		"backslash": {
+			"rules:\n  - command: tix api\n    positional:\n      allow_regex: ['^/issues\\?state=[a-z]++$']\n",
+			[]string{"`^/issues\\?state=[a-z]++$`"},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := Parse([]byte(tc.config))
+			if err == nil {
+				t.Fatalf("accepted:\n%s", tc.config)
+			}
+			for _, part := range tc.want {
+				if !strings.Contains(err.Error(), part) {
+					t.Errorf("error %q does not name %q", err, part)
+				}
+			}
+		})
+	}
+}
+
+func TestParseSaysWhichKeysAListTakes(t *testing.T) {
+	cases := map[string]struct{ config, want string }{
+		"null key": {
+			"rules:\n  - command: rm\n    positional:\n      allow_regex:\n",
+			`rule 1: "rm" positional: set allow, deny, allow_regex or deny_regex`,
+		},
+		"two keys": {
+			"rules:\n  - command: rm\n    positional:\n      allow: [a]\n      allow_regex: [a]\n",
+			`rule 1: "rm" positional: use only one of allow, allow_regex`,
+		},
+		"two keys of a value flag": {
+			"rules:\n  - command: rm\n    flags:\n      values:\n        -o: { allow_regex: [a], deny_regex: [b] }\n",
+			`rule 1: "rm" flags: value of -o: use only one of allow_regex, deny_regex`,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Parse([]byte(tc.config)); err == nil || err.Error() != tc.want {
+				t.Fatalf("got %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// Flag names are literal: a regex key directly under flags is an unknown
+// key, reported with its line like any other.
+func TestParseRejectsRegexKeysUnderFlags(t *testing.T) {
+	for _, key := range []string{"allow_regex", "deny_regex"} {
+		t.Run(key, func(t *testing.T) {
+			_, err := Parse([]byte("rules:\n  - command: git\n    flags:\n      allow: [-v]\n      " + key + ": ['^-v$']\n"))
+			if err == nil || !strings.Contains(err.Error(), "line 5") || !strings.Contains(err.Error(), key) {
+				t.Fatalf("got %v, want an error naming %s at line 5", err, key)
+			}
+		})
+	}
+}
+
+func TestRegexListFiltersEverySpellingOfAFlagValue(t *testing.T) {
+	p := mustParse(t, `
+rules:
+  - command: tix api
+    flags:
+      allow: []
+      values:
+        --method: { allow_regex: ['^(GET|HEAD)$'] }
+        -X: { allow_regex: ['^(GET|HEAD)$'] }
+        --field: { deny_regex: ['^token='] }
+`)
+	cases := []struct{ argv, deny string }{
+		{"tix api --method GET", ""},
+		{"tix api --method=HEAD", ""},
+		{"tix api -X GET", ""},
+		{"tix api -XHEAD", ""},
+		{"tix api --method POST", `denied by rule "tix api": value "POST" of flag --method is not allowed`},
+		{"tix api --method=POST", `denied by rule "tix api": value "POST" of flag --method is not allowed`},
+		{"tix api -X POST", `denied by rule "tix api": value "POST" of flag -X is not allowed`},
+		{"tix api -XPOST", `denied by rule "tix api": value "POST" of flag -X is not allowed`},
+		{"tix api --method GETS", `denied by rule "tix api": value "GETS" of flag --method is not allowed`},
+
+		// Every occurrence of a repeated flag is checked.
+		{"tix api --method GET --method DELETE", `denied by rule "tix api": value "DELETE" of flag --method is not allowed`},
+		{"tix api --field state=open", ""},
+		{"tix api --field state=open --field token=x", `denied by rule "tix api": value "token=x" of flag --field is denied`},
+	}
+	for _, tc := range cases {
+		expectCheck(t, p, strings.Fields(tc.argv), tc.deny)
+	}
+}
+
+// hostrunner adds no anchors: an allow pattern without ^…$ allows every
+// value that contains a match.
+func TestUnanchoredAllowRegexMatchesInsideTheValue(t *testing.T) {
+	p := mustParse(t, "rules:\n  - command: tix api\n    positional:\n      allow_regex: ['/repos/a/b/issues']\n")
+	expectCheck(t, p, []string{"tix", "api", "/repos/a/b/issues"}, "")
+	expectCheck(t, p, []string{"tix", "api", "/x/repos/a/b/issues/../../user"}, "")
+	expectCheck(t, p, []string{"tix", "api", "/repos/a/b/pulls"},
+		`denied by rule "tix api": argument "/repos/a/b/pulls" is not allowed`)
+}
+
+func TestAnyPatternOfARegexListMatches(t *testing.T) {
+	p := mustParse(t, "rules:\n  - command: tix api\n    positional:\n      allow_regex: ['^/issues$', '^/pulls$']\n")
+	expectCheck(t, p, []string{"tix", "api", "/issues"}, "")
+	expectCheck(t, p, []string{"tix", "api", "/pulls"}, "")
+	expectCheck(t, p, []string{"tix", "api", "/issues", "/keys"},
+		`denied by rule "tix api": argument "/keys" is not allowed`)
+}
+
+// ^ and $ are the ends of the value, not of a line in it.
+func TestAnchoredRegexDoesNotMatchAValueWithANewline(t *testing.T) {
+	p := mustParse(t, "rules:\n  - command: tix api\n    positional:\n      allow_regex: ['^/issues$']\n")
+	expectCheck(t, p, []string{"tix", "api", "/issues\n"},
+		`denied by rule "tix api": argument "/issues\n" is not allowed`)
+	expectCheck(t, p, []string{"tix", "api", "/issues\n/keys"},
+		`denied by rule "tix api": argument "/issues\n/keys" is not allowed`)
+	expectCheck(t, p, []string{"tix", "api", "/keys\n/issues"},
+		`denied by rule "tix api": argument "/keys\n/issues" is not allowed`)
+}
+
+func TestExplicitEmptyRegexAllowListAllowsNothing(t *testing.T) {
+	p := mustParse(t, "rules:\n  - command: ls\n    positional:\n      allow_regex: []\n")
+	expectCheck(t, p, []string{"ls"}, "")
+	expectCheck(t, p, []string{"ls", "x"}, `denied by rule "ls": argument "x" is not allowed`)
 }
