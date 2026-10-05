@@ -4,10 +4,16 @@
 // A rule is keyed by an argv prefix (`command: git push`); the rule with the
 // longest matching prefix decides, and a command no rule matches is denied.
 // A rule allows any arguments (`args: any`), none (`args: none`), or filters
-// flags and positional arguments with allow or deny lists of globs. Flags
-// that take a value are declared under `flags.values`, which is how argv is
-// split into flags, flag values and positional arguments without knowing the
-// command's grammar.
+// flags and positional arguments with allow or deny lists. Flag names are
+// listed literally; a list for positional arguments or for the values of a
+// flag holds globs (`allow`, `deny`) or regular expressions (`allow_regex`,
+// `deny_regex`). Flags that take a value are declared under `flags.values`,
+// which is how argv is split into flags, flag values and positional
+// arguments without knowing the command's grammar.
+//
+// A regex is used as written: hostrunner adds no anchors, so it matches
+// anywhere in a value unless the pattern says `^…$`. Like a glob it sees
+// only the text of an argument: it does not resolve a path.
 //
 // Rules restrict argv only. A tool that reads configuration or hooks from
 // the workspace can still be steered by whoever can write the workspace.
@@ -23,6 +29,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"unicode/utf8"
@@ -79,15 +86,20 @@ type flagFilter struct {
 	values map[string]*list // flags that take a value; nil list: any value
 }
 
-// list is an allow or deny list of glob patterns.
+// list is an allow or deny list of patterns: globs, or regexes when it was
+// written as a regex list. The names of a flagFilter are a list too, whose
+// patterns are flag names and are compared literally.
 type list struct {
 	allow    bool
-	patterns []string
+	patterns []string         // globs or flag names
+	regexps  []*regexp.Regexp // set instead of patterns in a regex list
 }
 
-// matches reports whether any pattern matches s.
+// matches reports whether any pattern matches s. A glob has to match all of
+// s; a regex matches as regexp does, anywhere in s unless it anchors itself.
 func (l *list) matches(s string) bool {
-	return slices.ContainsFunc(l.patterns, func(p string) bool { return glob(p, s) })
+	return slices.ContainsFunc(l.patterns, func(p string) bool { return glob(p, s) }) ||
+		slices.ContainsFunc(l.regexps, func(re *regexp.Regexp) bool { return re.MatchString(s) })
 }
 
 // Load reads the config at path. A missing file yields a Policy that denies
@@ -121,8 +133,10 @@ type (
 		Positional *rawList  `yaml:"positional"`
 	}
 	rawList struct {
-		Allow []string `yaml:"allow"`
-		Deny  []string `yaml:"deny"`
+		Allow      []string `yaml:"allow"`
+		Deny       []string `yaml:"deny"`
+		AllowRegex []string `yaml:"allow_regex"`
+		DenyRegex  []string `yaml:"deny_regex"`
 	}
 	rawFlags struct {
 		Allow  []string           `yaml:"allow"`
@@ -193,7 +207,7 @@ func newRule(rr rawRule) (*rule, error) {
 		}
 		if r.positional == nil {
 			// An empty section must not quietly mean "anything goes".
-			return nil, fmt.Errorf("%q positional: set allow or deny", r.name)
+			return nil, fmt.Errorf("%q positional: set allow, deny, allow_regex or deny_regex", r.name)
 		}
 	}
 	if rr.Flags != nil {
@@ -233,17 +247,55 @@ func newFlagFilter(rf rawFlags) (*flagFilter, error) {
 	return f, nil
 }
 
-// newList validates an allow/deny pair; it returns nil when neither is set.
+// newList validates a list, which is written with exactly one of its four
+// keys; it returns nil when none is set. A null key counts as not set, an
+// explicit empty one as set (`allow: []` allows nothing).
 func newList(rl rawList) (*list, error) {
-	switch {
-	case rl.Allow != nil && rl.Deny != nil:
-		return nil, errors.New("use either allow or deny, not both")
-	case rl.Allow != nil:
-		return &list{allow: true, patterns: rl.Allow}, nil
-	case rl.Deny != nil:
-		return &list{patterns: rl.Deny}, nil
+	type key struct {
+		name         string
+		patterns     []string
+		allow, regex bool
 	}
-	return nil, nil
+	written := slices.DeleteFunc([]key{
+		{name: "allow", patterns: rl.Allow, allow: true},
+		{name: "deny", patterns: rl.Deny},
+		{name: "allow_regex", patterns: rl.AllowRegex, allow: true, regex: true},
+		{name: "deny_regex", patterns: rl.DenyRegex, regex: true},
+	}, func(k key) bool { return k.patterns == nil })
+	if len(written) == 0 {
+		return nil, nil
+	}
+	if len(written) > 1 {
+		names := make([]string, len(written))
+		for i, k := range written {
+			names[i] = k.name
+		}
+		return nil, fmt.Errorf("use only one of %s", strings.Join(names, ", "))
+	}
+	k := written[0]
+	if !k.regex {
+		return &list{allow: k.allow, patterns: k.patterns}, nil
+	}
+	regexps, err := compileRegexps(k.patterns)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", k.name, err)
+	}
+	return &list{allow: k.allow, regexps: regexps}, nil
+}
+
+// compileRegexps compiles the patterns of a regex list as they are written.
+// An error names the whole pattern, unescaped so that it reads as in the
+// rules file, since regexp quotes only the part it could not parse.
+func compileRegexps(patterns []string) ([]*regexp.Regexp, error) {
+	regexps := make([]*regexp.Regexp, 0, len(patterns))
+	for _, pattern := range patterns {
+		re, err := regexp.Compile(pattern)
+		if err != nil {
+			return nil, fmt.Errorf("`%s`: %w", pattern, err)
+		}
+		regexps = append(regexps, re)
+	}
+	return regexps, nil
 }
 
 // checkFlagName accepts -x and --name. A single-dash long name (-name) is

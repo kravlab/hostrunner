@@ -96,13 +96,20 @@ rules:
         --repo: {}             # any value
     positional:
       deny: [main, "+*"]       # or allow: [...], never both
+  - command: tix api --repo example/example-app
+    flags:
+      allow: []                # no flags
+    positional:
+      allow_regex:             # regular expressions instead of globs
+        - '^/repos/example/example-app/issues(/[0-9]+)?(\?state=(open|closed))?$'
 ```
 
 - A command no rule matches is denied, and so is everything when the file
-  is missing. An invalid file (unknown key, both `allow` and `deny`, `args`
-  together with `flags`/`positional`, an empty section, a rule without any
-  of them, a relative program path, …) makes `hostrunner up` fail, and with
-  it `devcontainer up`.
+  is missing. An invalid file (unknown key, two keys on one list such as
+  both `allow` and `deny`, a regex that does not compile, `args` together
+  with `flags`/`positional`, an empty section, a rule without any of them,
+  a relative program path, …) makes `hostrunner up` fail, and with it
+  `devcontainer up`.
 - Changes apply on the next container start (reopen, restart or rebuild):
   `hostrunner up` notices that the file differs from what the running
   daemon loaded and replaces the daemon. The file lives in `.devcontainer/`,
@@ -119,13 +126,42 @@ rules:
   flags, but a tool may offer other ways to the same effect (e.g. git's
   `+refspec` for a force push, or `--upload-pack`, which makes git run a
   command you name), so prefer `allow`, especially for git.
+- A `flags` section with `values` only does not restrict the other flags:
+  it filters the values of the flags it lists and lets every other flag
+  pass. Add `allow: []` to deny all flags that are not under `values`:
+
+  ```yaml
+  flags:
+    allow: []                # no flag but --repo
+    values:
+      --repo: { allow: [my/repo] }
+  ```
 - Flag names are `-x` or `--name`. Filters apply to the names listed only:
   list every spelling of a flag, e.g. both `-P` and `--project` under
   `values`. An abbreviated value flag must carry its value inline
   (`--proj=dev`), otherwise it is denied.
-- Values and positional arguments are matched with globs: `*` matches
-  anything, including `/`; `?` one character. Under `allow` every argument
-  must match; under `deny` none may.
+- A token with one dash and several characters is read as short flags,
+  never as a long one: `-asap` is `-a -s -a -p`, or `-a` with the value
+  `git` when `-a` is under `values`. Some programs, such as those built on
+  urfave/cli, take it as the long flag `--asap` instead. A `flags.deny`
+  list does not catch that spelling, and a short flag under `values` lets
+  it through, so give such a program a `flags.allow` list, and `values`,
+  with long names only.
+- The patterns of an `allow` or `deny` list for values and positional
+  arguments are globs: `*` matches anything, including `/`; `?` one
+  character. Under `allow` every argument must match; under `deny` none
+  may.
+- A glob cannot keep a path inside a prefix: `/repos/x/*` also matches
+  `/repos/x/../../user`. For that, write the list as `allow_regex` or
+  `deny_regex` instead of `allow` or `deny` (one of the four per list).
+  Its patterns are [Go regular expressions](https://pkg.go.dev/regexp/syntax),
+  used as written: hostrunner adds no anchors, so a pattern matches anywhere
+  in the value, and an `allow_regex` pattern without `^…$` allows every
+  value that contains a match. Quote a regex with single quotes: in double
+  quotes YAML reads `\` as its own escape character.
+- A glob or a regex sees only the text of an argument. It does not resolve
+  symlinks, so it keeps a file argument inside a directory by its spelling
+  only.
 
 How it works:
 
