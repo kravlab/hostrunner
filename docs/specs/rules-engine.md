@@ -51,8 +51,9 @@ with `deny` (in `flags`, `positional`, or a value filter); a flag name in
 
 ## Argument parsing (per matched rule) ★
 
-Tokens after the command prefix, getopt-style, using the rule's
-`flags.values` to know which flags take a value:
+Tokens after the command prefix, getopt-style (unless the rule sets
+`flag_style: go`, see [rules-flag-style.md](rules-flag-style.md)), using
+the rule's `flags.values` to know which flags take a value:
 
 - `--` ends flags; everything after is positional. `-` alone is positional.
 - `--name=value` is flag `--name` with an inline value; `--name` with a
