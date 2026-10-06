@@ -109,14 +109,20 @@ rules:
     positional:
       allow: ["*.pkg"]
       path: open               # and a file inside the workspace
+  - command: tix pr
+    flag_style: go             # -name and --name are one flag (urfave/cli)
+    flags:
+      deny: [-asap]
+      values:
+        -repo: { allow: [my/repo] }
 ```
 
 - A command no rule matches is denied, and so is everything when the file
   is missing. An invalid file (unknown key, two keys on one list such as
   both `allow` and `deny`, a regex that does not compile, `args` together
-  with `flags`/`positional`, an empty section, a rule without any of them,
-  a relative program path, …) makes `hostrunner up` fail, and with it
-  `devcontainer up`.
+  with `flags`/`positional`/`flag_style`, an empty section, a rule
+  without any of them, a relative program path, …) makes `hostrunner up`
+  fail, and with it `devcontainer up`.
 - Changes apply on the next container start (reopen, restart or rebuild):
   `hostrunner up` notices that the file differs from what the running
   daemon loaded and replaces the daemon. The file lives in `.devcontainer/`,
@@ -124,8 +130,9 @@ rules:
   change its rules.
 - Matching is literal on argv: `/usr/bin/git push` and `git -C dir push` do
   not match `git push`. The program must be a name or an absolute path.
-- Arguments are parsed like getopt: `--flag=value`, `--flag value`,
-  `-abc` (= `-a -b -c`), `-ovalue`, and `--` ending the flags. Only flags
+- Arguments are parsed like getopt, unless the rule says `flag_style: go`
+  (below): `--flag=value`, `--flag value`, `-abc` (= `-a -b -c`),
+  `-ovalue`, and `--` ending the flags. Only flags
   listed under `values` take a value; that is how flag values are told
   apart from positional arguments.
 - `flags.allow` is strict: an unlisted flag is denied. `flags.deny` is
@@ -143,17 +150,40 @@ rules:
     values:
       --repo: { allow: [my/repo] }
   ```
-- Flag names are `-x` or `--name`. Filters apply to the names listed only:
+- Flag names are `-x` or `--name` (see `flag_style: go` below for
+  `-name`). Filters apply to the names listed only:
   list every spelling of a flag, e.g. both `-P` and `--project` under
   `values`. An abbreviated value flag must carry its value inline
   (`--proj=dev`), otherwise it is denied.
-- A token with one dash and several characters is read as short flags,
-  never as a long one: `-asap` is `-a -s -a -p`, or `-a` with the value
-  `git` when `-a` is under `values`. Some programs, such as those built on
-  urfave/cli, take it as the long flag `--asap` instead. A `flags.deny`
-  list does not catch that spelling, and a short flag under `values` lets
-  it through, so give such a program a `flags.allow` list, and `values`,
-  with long names only.
+- A token with one dash and several characters is read as short flags:
+  `-asap` is `-a -s -a -p`, or `-a` with the value `sap` when `-a` is
+  under `values`. Programs built on Go's `flag` package or on urfave/cli
+  (such as `tix`) take it as the long flag `--asap` instead: give their
+  rules `flag_style: go`. Programs built on cobra/pflag read flags like
+  getopt and need nothing.
+- Under `flag_style: go` (urfave/cli v1 to v3, with or without
+  `UseShortOptionHandling`):
+  - Flag names are `-name` or `--name`, any length; both spellings name
+    one flag, in the rule and in argv, so list it once. Names match
+    exactly: there are no abbreviations.
+  - A value flag takes `-name=value`, `--name=value` or the next token,
+    even one starting with `-`; `-nvalue` is not a value.
+  - An inline value on a flag not under `values` is denied
+    (`--dry-run=false` would turn a boolean flag off). To allow it, list
+    the flag under `values`, e.g. `--dry-run: { allow: ["false"] }`.
+  - A single-dash token the rule does not list whole may also be a
+    cluster of short flags: a `deny` list catches any of its letters, and
+    a letter under `values` denies the token.
+  - A token starting with `---` is denied, and `--` before any positional
+    argument ends the flags.
+  - These parsers disagree on what follows the first positional argument,
+    a single-dash token not followed by a letter (`-1`) or a lone `-`, and
+    on a token with whitespace around it: Go's `flag` and urfave/cli v1
+    and v2 read positional arguments there, v3 still reads flags. Such a
+    token must pass both the flag and the positional filters
+    (`tix pr view 5 --comments` needs `--comments` to pass the positional
+    list too), a value flag there may not be followed by a token starting
+    with `-`, and a path check denies it.
 - The patterns of an `allow` or `deny` list for values and positional
   arguments are globs: `*` matches anything, including `/`; `?` one
   character. Under `allow` every argument must match; under `deny` none

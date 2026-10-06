@@ -11,6 +11,11 @@
 // which is how argv is split into flags, flag values and positional
 // arguments without knowing the command's grammar.
 //
+// A rule reads argv like getopt unless it sets `flag_style: go`, for
+// programs built on Go's flag package or urfave/cli: there one or two dashes
+// name the same flag, and a token these parsers read differently has to
+// pass every reading (see checkGo).
+//
 // A regex is used as written: hostrunner adds no anchors, so it matches
 // anywhere in a value unless the pattern says `^…$`. Like a glob it sees
 // only the text of an argument: it does not resolve a path.
@@ -82,11 +87,13 @@ type rule struct {
 	command    []string
 	name       string // command joined with single spaces, for messages
 	args       string // "any", "none", or "" when flags/positional filter
+	style      flagStyle
 	flags      *flagFilter
 	positional *list // nil: positional arguments are unrestricted
 }
 
-// flagFilter restricts a rule's flags.
+// flagFilter restricts a rule's flags. Its names and the keys of values are
+// flag names as written under getopt, and flag keys (see flagKey) under go.
 type flagFilter struct {
 	names  *list            // nil: flags without a value are unrestricted
 	values map[string]*list // flags that take a value; nil list: any value
@@ -157,6 +164,7 @@ type (
 	rawRule struct {
 		Command    string    `yaml:"command"`
 		Args       string    `yaml:"args"`
+		FlagStyle  string    `yaml:"flag_style"`
 		Flags      *rawFlags `yaml:"flags"`
 		Positional *rawList  `yaml:"positional"`
 	}
@@ -215,10 +223,17 @@ func newRule(rr rawRule) (*rule, error) {
 		// container controls: it could plant any program there.
 		return nil, fmt.Errorf("%q: the program must be a name or an absolute path", r.name)
 	}
+	if rr.FlagStyle != "" {
+		var ok bool
+		if r.style, ok = flagStyles[rr.FlagStyle]; !ok {
+			return nil, fmt.Errorf("%q: flag_style must be getopt or go, not %q", r.name, rr.FlagStyle)
+		}
+	}
 	switch rr.Args {
 	case "any", "none":
-		if rr.Flags != nil || rr.Positional != nil {
-			return nil, fmt.Errorf("%q: args cannot be combined with flags or positional", r.name)
+		// argv is not parsed, so a flag style would only look like a restriction.
+		if rr.Flags != nil || rr.Positional != nil || rr.FlagStyle != "" {
+			return nil, fmt.Errorf("%q: args cannot be combined with flags, positional or flag_style", r.name)
 		}
 		r.args = rr.Args
 		return r, nil
@@ -240,15 +255,18 @@ func newRule(rr rawRule) (*rule, error) {
 		}
 	}
 	if rr.Flags != nil {
-		if r.flags, err = newFlagFilter(*rr.Flags); err != nil {
+		if r.flags, err = newFlagFilter(*rr.Flags, r.style); err != nil {
 			return nil, fmt.Errorf("%q flags: %w", r.name, err)
 		}
 	}
 	return r, nil
 }
 
-// newFlagFilter validates a rule's flags section.
-func newFlagFilter(rf rawFlags) (*flagFilter, error) {
+// newFlagFilter validates a rule's flags section for the rule's flag style.
+// Under go a flag's two spellings are one flag, so its names are stored as
+// flag keys, and a list (or values) naming one flag in both spellings is an
+// error: two entries for one flag could disagree.
+func newFlagFilter(rf rawFlags, style flagStyle) (*flagFilter, error) {
 	f := &flagFilter{values: make(map[string]*list)}
 	var err error
 	if f.names, err = newList(rawList{Allow: rf.Allow, Deny: rf.Deny}); err != nil {
@@ -259,21 +277,47 @@ func newFlagFilter(rf rawFlags) (*flagFilter, error) {
 		return nil, errors.New("set allow, deny or values")
 	}
 	if f.names != nil {
-		for _, name := range f.names.patterns {
-			if err := checkFlagName(name); err != nil {
+		spellings := make(map[string]string)
+		for i, name := range f.names.patterns {
+			if err := checkFlagName(name, style); err != nil {
+				return nil, err
+			}
+			if f.names.patterns[i], err = storedName(name, style, spellings); err != nil {
 				return nil, err
 			}
 		}
 	}
+	spellings := make(map[string]string)
 	for name, rl := range rf.Values {
-		if err := checkFlagName(name); err != nil {
+		if err := checkFlagName(name, style); err != nil {
 			return nil, err
 		}
-		if f.values[name], err = newList(rl); err != nil {
+		key, err := storedName(name, style, spellings)
+		if err != nil {
+			return nil, err
+		}
+		if f.values[key], err = newList(rl); err != nil {
 			return nil, fmt.Errorf("value of %s: %w", name, err)
 		}
 	}
 	return f, nil
+}
+
+// storedName returns the name a flag is stored under in a flagFilter, and
+// records its spelling in spellings (key to the first spelling seen) to
+// refuse a second spelling of the same flag under go.
+func storedName(name string, style flagStyle, spellings map[string]string) (string, error) {
+	if style != styleGo {
+		return name, nil
+	}
+	key := flagKey(name)
+	if other, ok := spellings[key]; ok && other != name {
+		pair := []string{name, other}
+		slices.Sort(pair)
+		return "", fmt.Errorf("%s and %s name the same flag", pair[0], pair[1])
+	}
+	spellings[key] = name
+	return key, nil
 }
 
 // newList validates a list, which is written with at most one of its four
@@ -337,10 +381,18 @@ func compileRegexps(patterns []string) ([]*regexp.Regexp, error) {
 	return regexps, nil
 }
 
-// checkFlagName accepts -x and --name. A single-dash long name (-name) is
-// refused because argv tokens like it are read as clusters of short flags,
-// so such a rule could never match; "=" would never match either.
-func checkFlagName(name string) error {
+// checkFlagName accepts -x and --name under getopt. A single-dash long name
+// (-name) is refused there because argv tokens like it are read as clusters
+// of short flags, so such a rule could never match; "=" would never match
+// either. Under go a name has one or two dashes and any length.
+func checkFlagName(name string, style flagStyle) error {
+	if style == styleGo {
+		if !strings.HasPrefix(name, "-") || strings.HasPrefix(name, "---") ||
+			flagKey(name) == "" || strings.Contains(name, "=") {
+			return fmt.Errorf("%q is not a flag name (use -name or --name)", name)
+		}
+		return nil
+	}
 	short := strings.HasPrefix(name, "-") && !strings.HasPrefix(name, "--") && utf8.RuneCountInString(name) == 2
 	long := strings.HasPrefix(name, "--") && len(name) > 2
 	if !(short || long) || strings.Contains(name, "=") {
@@ -402,6 +454,9 @@ func (r *rule) check(args []string, paths *[]PathArg) string {
 			return "arguments are not allowed"
 		}
 		return ""
+	}
+	if r.style == styleGo {
+		return r.checkGo(args, paths)
 	}
 	var positional []int // indexes into args
 	for i := 0; i < len(args); i++ {
@@ -473,19 +528,34 @@ func (r *rule) check(args []string, paths *[]PathArg) string {
 			}
 		}
 	}
-	if r.positional != nil {
-		for _, i := range positional {
-			arg := args[i]
-			switch m := r.positional.matches(arg); {
-			case r.positional.allow && !m:
-				return fmt.Sprintf("argument %q is not allowed", arg)
-			case !r.positional.allow && m:
-				return fmt.Sprintf("argument %q is denied", arg)
-			}
-			if r.positional.path != PathModeNone {
-				*paths = append(*paths, PathArg{Index: i, Mode: r.positional.path})
-			}
+	return r.checkPositionals(args, positional, paths)
+}
+
+// checkPositionals applies the positional list to args[i] for each i in
+// positional, and appends those arguments to paths if the list has a path
+// check.
+func (r *rule) checkPositionals(args []string, positional []int, paths *[]PathArg) string {
+	for _, i := range positional {
+		if reason := r.checkPositional(args[i]); reason != "" {
+			return reason
 		}
+		if r.positional != nil && r.positional.path != PathModeNone {
+			*paths = append(*paths, PathArg{Index: i, Mode: r.positional.path})
+		}
+	}
+	return ""
+}
+
+// checkPositional applies the positional list's patterns to one argument.
+func (r *rule) checkPositional(arg string) string {
+	if r.positional == nil {
+		return ""
+	}
+	switch m := r.positional.matches(arg); {
+	case r.positional.allow && !m:
+		return fmt.Sprintf("argument %q is not allowed", arg)
+	case !r.positional.allow && m:
+		return fmt.Sprintf("argument %q is denied", arg)
 	}
 	return ""
 }
@@ -569,6 +639,12 @@ func (f *flagFilter) checkDenied(flag string) string {
 // checkValue filters the value of a flag that takes one.
 func (f *flagFilter) checkValue(flag, value string) string {
 	l, _ := f.valuesFor(flag)
+	return checkFlagValue(l, flag, value)
+}
+
+// checkFlagValue applies l, the value list of flag, to one value; a nil list
+// allows any value.
+func checkFlagValue(l *list, flag, value string) string {
 	if l == nil {
 		return ""
 	}

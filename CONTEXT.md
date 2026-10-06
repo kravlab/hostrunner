@@ -18,6 +18,15 @@ An argument that is neither a flag nor a flag's value.
 **Value flag**:
 A flag a rule declares as taking a value.
 
+**Flag style**:
+The grammar a rule reads the program's argv
+with: `getopt` (`-abc` is three short flags,
+long flags take two dashes and may be
+abbreviated) or `go` (one or two dashes name
+the same flag, as Go's flag package and
+urfave/cli read it).
+_Avoid_: flag syntax, parser mode
+
 **List**:
 The allow or deny patterns a rule applies to positional
 arguments or to the values of one value flag, and the path
