@@ -335,3 +335,81 @@ func TestGoFlagStyleDoesNotReadAnAllowedTokenAsACluster(t *testing.T) {
 	expectCheck(t, p, []string{"tix", "--ab"}, "")
 	expectCheck(t, p, []string{"tix", "-ba"}, `denied by rule "tix": flag -ba is not allowed`)
 }
+
+// issue30Config holds the tix rules of issue #30, with flag_style: go added.
+const issue30Config = `
+rules:
+  - command: tix issues edit
+    flag_style: go
+    flags:
+      allow: []
+      values:
+        --title: {}
+        --description-file: { allow: ["-"] }
+  - command: tix issues list
+    flag_style: go
+    flags:
+      allow: []
+  - command: tix issues create
+    flag_style: go
+    flags:
+      allow: []
+      values:
+        --labels: {}
+`
+
+// expectIssue30Checks checks each argv, given as tokens so whitespace stays
+// inside one, against issue30Config.
+func expectIssue30Checks(t *testing.T, cases []struct {
+	argv []string
+	deny string
+}) {
+	t.Helper()
+	p := mustParse(t, issue30Config)
+	for _, tc := range cases {
+		t.Run(strings.Join(tc.argv, "|"), func(t *testing.T) {
+			expectCheck(t, p, tc.argv, tc.deny)
+		})
+	}
+}
+
+// Issue #30: urfave/cli v3 trims whitespace around a token, so it reads
+// " --description-file" as the flag; the value filter must still hold, also
+// after a positional argument.
+func TestGoFlagStyleDeniesWhitespaceLedFlagsOfIssue30(t *testing.T) {
+	expectIssue30Checks(t, []struct {
+		argv []string
+		deny string
+	}{
+		{[]string{"tix", "issues", "edit", "999999999", " --description-file", "/etc/hostname"},
+			`denied by rule "tix issues edit": value "/etc/hostname" of flag " --description-file" is not allowed`},
+		{[]string{"tix", "issues", "edit", "999999999", "\t--description-file", "/etc/hostname"},
+			`denied by rule "tix issues edit": value "/etc/hostname" of flag "\t--description-file" is not allowed`},
+		{[]string{"tix", "issues", "edit", " --description-file", "/etc/hostname"},
+			`denied by rule "tix issues edit": value "/etc/hostname" of flag " --description-file" is not allowed`},
+		{[]string{"tix", "issues", "edit", "999999999", "--description-file", "/etc/hostname"},
+			`denied by rule "tix issues edit": value "/etc/hostname" of flag --description-file is not allowed`},
+		{[]string{"tix", "issues", "edit", "--description-file", "-", "999999999"}, ""},
+		{[]string{"tix", "issues", "edit", "999999999", "--description-file", "-"},
+			`denied by rule "tix issues edit": flag --description-file is followed by "-": Go flag parsers disagree on its value here`},
+		{[]string{"tix", "issues", "list", " --login", "somename"},
+			`denied by rule "tix issues list": flag " --login" is not allowed`},
+		{[]string{"tix", "issues", "list", "--login", "somename"},
+			`denied by rule "tix issues list": flag --login is not allowed`},
+	})
+}
+
+// Issue #30: urfave/cli reads --l as -l and accepts no abbreviation, so --l
+// must not be taken for --labels.
+func TestGoFlagStyleDeniesOneLetterLongFlagsOfIssue30(t *testing.T) {
+	expectIssue30Checks(t, []struct {
+		argv []string
+		deny string
+	}{
+		{[]string{"tix", "issues", "create", "--l=name"}, `denied by rule "tix issues create": flag --l is not allowed`},
+		{[]string{"tix", "issues", "create", "--l", "name"}, `denied by rule "tix issues create": flag --l is not allowed`},
+		{[]string{"tix", "issues", "create", "-l", "name"}, `denied by rule "tix issues create": flag -l is not allowed`},
+		{[]string{"tix", "issues", "create", "--labels=bug"}, ""},
+		{[]string{"tix", "issues", "create", "--labels", "bug"}, ""},
+	})
+}
