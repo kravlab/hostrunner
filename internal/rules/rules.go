@@ -15,6 +15,12 @@
 // anywhere in a value unless the pattern says `^…$`. Like a glob it sees
 // only the text of an argument: it does not resolve a path.
 //
+// A list for positional arguments or flag values may add a path check
+// (`path: open` or `path: check`): every argument it applies to must name a
+// workspace file, besides passing the patterns, which see the argument as
+// given. This package cannot perform the check, which needs the workspace:
+// Check reports the arguments concerned, and the caller checks them.
+//
 // Rules restrict argv only. A tool that reads configuration or hooks from
 // the workspace can still be steered by whoever can write the workspace.
 package rules
@@ -89,11 +95,33 @@ type flagFilter struct {
 // list is an allow or deny list of patterns: globs, or regexes when it was
 // written as a regex list. The names of a flagFilter are a list too, whose
 // patterns are flag names and are compared literally.
+//
+// A list for positional arguments or flag values may also carry a path
+// check. Written without patterns, it is an empty deny list: the patterns
+// let every value through and only the path check applies.
 type list struct {
 	allow    bool
 	patterns []string         // globs or flag names
 	regexps  []*regexp.Regexp // set instead of patterns in a regex list
+	path     PathMode         // PathModeNone unless the list has a path check
 }
+
+// PathMode is how a path check hands a workspace file to the program.
+type PathMode int
+
+const (
+	// PathModeNone: the argument is not checked as a path.
+	PathModeNone PathMode = iota
+	// PathModeOpen (`path: open`): the program gets the file the check
+	// opened, so nothing swapped in after the check can redirect it.
+	PathModeOpen
+	// PathModeCheck (`path: check`): the program gets the argument as given
+	// and opens it itself, after the check.
+	PathModeCheck
+)
+
+// pathModes maps the values of a list's path key to their modes.
+var pathModes = map[string]PathMode{"open": PathModeOpen, "check": PathModeCheck}
 
 // matches reports whether any pattern matches s. A glob has to match all of
 // s; a regex matches as regexp does, anywhere in s unless it anchors itself.
@@ -137,6 +165,7 @@ type (
 		Deny       []string `yaml:"deny"`
 		AllowRegex []string `yaml:"allow_regex"`
 		DenyRegex  []string `yaml:"deny_regex"`
+		Path       string   `yaml:"path"`
 	}
 	rawFlags struct {
 		Allow  []string           `yaml:"allow"`
@@ -207,7 +236,7 @@ func newRule(rr rawRule) (*rule, error) {
 		}
 		if r.positional == nil {
 			// An empty section must not quietly mean "anything goes".
-			return nil, fmt.Errorf("%q positional: set allow, deny, allow_regex or deny_regex", r.name)
+			return nil, fmt.Errorf("%q positional: set allow, deny, allow_regex, deny_regex or path", r.name)
 		}
 	}
 	if rr.Flags != nil {
@@ -247,10 +276,18 @@ func newFlagFilter(rf rawFlags) (*flagFilter, error) {
 	return f, nil
 }
 
-// newList validates a list, which is written with exactly one of its four
-// keys; it returns nil when none is set. A null key counts as not set, an
-// explicit empty one as set (`allow: []` allows nothing).
+// newList validates a list, which is written with at most one of its four
+// pattern keys and an optional path check; it returns nil when nothing is
+// set. A null key counts as not set, an explicit empty one as set
+// (`allow: []` allows nothing).
 func newList(rl rawList) (*list, error) {
+	var mode PathMode
+	if rl.Path != "" {
+		var ok bool
+		if mode, ok = pathModes[rl.Path]; !ok {
+			return nil, fmt.Errorf("path must be open or check, not %q", rl.Path)
+		}
+	}
 	type key struct {
 		name         string
 		patterns     []string
@@ -262,10 +299,12 @@ func newList(rl rawList) (*list, error) {
 		{name: "allow_regex", patterns: rl.AllowRegex, allow: true, regex: true},
 		{name: "deny_regex", patterns: rl.DenyRegex, regex: true},
 	}, func(k key) bool { return k.patterns == nil })
-	if len(written) == 0 {
+	switch {
+	case len(written) == 0 && mode == PathModeNone:
 		return nil, nil
-	}
-	if len(written) > 1 {
+	case len(written) == 0:
+		return &list{path: mode}, nil
+	case len(written) > 1:
 		names := make([]string, len(written))
 		for i, k := range written {
 			names[i] = k.name
@@ -274,13 +313,13 @@ func newList(rl rawList) (*list, error) {
 	}
 	k := written[0]
 	if !k.regex {
-		return &list{allow: k.allow, patterns: k.patterns}, nil
+		return &list{allow: k.allow, patterns: k.patterns, path: mode}, nil
 	}
 	regexps, err := compileRegexps(k.patterns)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", k.name, err)
 	}
-	return &list{allow: k.allow, regexps: regexps}, nil
+	return &list{allow: k.allow, regexps: regexps, path: mode}, nil
 }
 
 // compileRegexps compiles the patterns of a regex list as they are written.
@@ -310,13 +349,24 @@ func checkFlagName(name string) error {
 	return nil
 }
 
-// Check returns nil if argv is allowed, or a *Denial.
-func (p *Policy) Check(argv []string) error {
+// PathArg is an argument of an allowed command that a path check applies
+// to. The path is argv[Index] without its first len(Prefix) bytes: Prefix
+// is empty when the whole token is the path.
+type PathArg struct {
+	Index  int    // position of the token in argv
+	Prefix string // what precedes the path in the token
+	Mode   PathMode
+}
+
+// Check returns nil if argv is allowed, or a *Denial. For an allowed argv
+// it also returns, in argv order, the arguments that a path check applies
+// to; the caller has to perform those checks before running the command.
+func (p *Policy) Check(argv []string) ([]PathArg, error) {
 	if len(argv) == 0 {
-		return &Denial{Reason: "empty command"}
+		return nil, &Denial{Reason: "empty command"}
 	}
 	if p.missing {
-		return &Denial{Reason: missingReason}
+		return nil, &Denial{Reason: missingReason}
 	}
 	var best *rule
 	for _, r := range p.rules {
@@ -326,17 +376,24 @@ func (p *Policy) Check(argv []string) error {
 		}
 	}
 	if best == nil {
-		return &Denial{Reason: fmt.Sprintf("no rule allows %q", strings.Join(argv[:min(2, len(argv))], " "))}
+		return nil, &Denial{Reason: fmt.Sprintf("no rule allows %q", strings.Join(argv[:min(2, len(argv))], " "))}
 	}
-	if reason := best.check(argv[len(best.command):]); reason != "" {
-		return &Denial{Rule: best.name, Reason: reason}
+	var paths []PathArg
+	if reason := best.check(argv[len(best.command):], &paths); reason != "" {
+		return nil, &Denial{Rule: best.name, Reason: reason}
 	}
-	return nil
+	// check finds flag values as it goes but positional arguments at the end.
+	slices.SortFunc(paths, func(a, b PathArg) int { return a.Index - b.Index })
+	for i := range paths {
+		paths[i].Index += len(best.command)
+	}
+	return paths, nil
 }
 
 // check applies the rule to the arguments after its command and returns
-// why they are denied, or "" if they are allowed.
-func (r *rule) check(args []string) string {
+// why they are denied, or "" if they are allowed. It appends to paths the
+// arguments a path check applies to, indexed into args.
+func (r *rule) check(args []string, paths *[]PathArg) string {
 	switch r.args {
 	case "any":
 		return ""
@@ -346,15 +403,17 @@ func (r *rule) check(args []string) string {
 		}
 		return ""
 	}
-	var positional []string
+	var positional []int // indexes into args
 	for i := 0; i < len(args); i++ {
 		tok := args[i]
 		switch {
 		case tok == "--":
-			positional = append(positional, args[i+1:]...)
+			for j := i + 1; j < len(args); j++ {
+				positional = append(positional, j)
+			}
 			i = len(args)
 		case tok == "-" || !strings.HasPrefix(tok, "-"):
-			positional = append(positional, tok)
+			positional = append(positional, i)
 		case strings.HasPrefix(tok, "--"):
 			name, value, inline := strings.Cut(tok, "=")
 			// A denied flag stays denied even if it also abbreviates a value
@@ -372,16 +431,18 @@ func (r *rule) check(args []string) string {
 				return fmt.Sprintf("abbreviated flag %s must be given its value as %s=value", name, name)
 			}
 			if _, takesValue := r.flags.valuesFor(flag); takesValue {
+				prefix := name + "="
 				if !inline {
 					if i+1 == len(args) {
 						return fmt.Sprintf("flag %s needs a value", flag)
 					}
 					i++
-					value = args[i]
+					value, prefix = args[i], ""
 				}
 				if reason := r.flags.checkValue(flag, value); reason != "" {
 					return reason
 				}
+				r.flags.addPath(paths, flag, i, prefix)
 				continue
 			}
 			if reason := r.flags.checkName(name, inline); reason != "" {
@@ -391,17 +452,19 @@ func (r *rule) check(args []string) string {
 			for j, c := range tok[1:] {
 				flag := "-" + string(c)
 				if _, takesValue := r.flags.valuesFor(flag); takesValue {
-					value := tok[1+j+utf8.RuneLen(c):]
+					prefix := tok[:1+j+utf8.RuneLen(c)]
+					value := tok[len(prefix):]
 					if value == "" {
 						if i+1 == len(args) {
 							return fmt.Sprintf("flag %s needs a value", flag)
 						}
 						i++
-						value = args[i]
+						value, prefix = args[i], ""
 					}
 					if reason := r.flags.checkValue(flag, value); reason != "" {
 						return reason
 					}
+					r.flags.addPath(paths, flag, i, prefix)
 					break
 				}
 				if reason := r.flags.checkName(flag, false); reason != "" {
@@ -411,12 +474,16 @@ func (r *rule) check(args []string) string {
 		}
 	}
 	if r.positional != nil {
-		for _, arg := range positional {
+		for _, i := range positional {
+			arg := args[i]
 			switch m := r.positional.matches(arg); {
 			case r.positional.allow && !m:
 				return fmt.Sprintf("argument %q is not allowed", arg)
 			case !r.positional.allow && m:
 				return fmt.Sprintf("argument %q is denied", arg)
+			}
+			if r.positional.path != PathModeNone {
+				*paths = append(*paths, PathArg{Index: i, Mode: r.positional.path})
 			}
 		}
 	}
@@ -512,6 +579,14 @@ func (f *flagFilter) checkValue(flag, value string) string {
 		return fmt.Sprintf("value %q of flag %s is denied", value, flag)
 	}
 	return ""
+}
+
+// addPath appends to paths the value of flag at args[i], after prefix in its
+// token, if the flag's list has a path check.
+func (f *flagFilter) addPath(paths *[]PathArg, flag string, i int, prefix string) {
+	if l, _ := f.valuesFor(flag); l != nil && l.path != PathModeNone {
+		*paths = append(*paths, PathArg{Index: i, Prefix: prefix, Mode: l.path})
+	}
 }
 
 // glob matches value against pattern, where * matches any sequence of

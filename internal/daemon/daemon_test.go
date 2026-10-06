@@ -14,6 +14,7 @@ import (
 
 	"github.com/kravlab/hostrunner/internal/daemon"
 	"github.com/kravlab/hostrunner/internal/protocol"
+	"github.com/kravlab/hostrunner/internal/rules"
 	"github.com/kravlab/hostrunner/internal/workspace"
 )
 
@@ -35,16 +36,16 @@ func newServer(t *testing.T, opts ...daemon.Option) *daemon.Server {
 // allowAll is a policy that allows every command.
 type allowAll struct{}
 
-func (allowAll) Check([]string) error { return nil }
+func (allowAll) Check([]string) ([]rules.PathArg, error) { return nil, nil }
 
 // panicky panics for "boom" and allows everything else.
 type panicky struct{}
 
-func (panicky) Check(argv []string) error {
+func (panicky) Check(argv []string) ([]rules.PathArg, error) {
 	if argv[0] == "boom" {
 		panic("policy bug")
 	}
-	return nil
+	return nil, nil
 }
 
 // chanListener returns whatever Accept results the test feeds it, in order,

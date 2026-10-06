@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/kravlab/hostrunner/internal/protocol"
+	"github.com/kravlab/hostrunner/internal/rules"
 	"github.com/kravlab/hostrunner/internal/workspace"
 )
 
@@ -50,9 +51,10 @@ type Server struct {
 
 // Policy decides whether a command may run; rules.Policy implements it. A
 // non-nil error denies the command, and its message is shown to the client,
-// so it must not reveal host paths.
+// so it must not reveal host paths. For an allowed command it returns the
+// arguments the daemon still has to check as workspace files.
 type Policy interface {
-	Check(argv []string) error
+	Check(argv []string) ([]rules.PathArg, error)
 }
 
 // Option customizes a Server.
@@ -208,9 +210,11 @@ func (s *Server) arm(out *frameWriter, f protocol.Frame) {
 
 // run executes req on the connection if the policy allows it; cancel stops
 // it early. The rules are checked first, so a denied command is reported as
-// such whatever its working directory.
+// such whatever its working directory; the path checks they ask for come
+// after the working directory is open, since paths are resolved from it.
 func (s *Server) run(ctx context.Context, cancel context.CancelFunc, conn net.Conn, out *frameWriter, req protocol.Request) {
-	if err := s.policy.Check(req.Argv); err != nil {
+	paths, err := s.policy.Check(req.Argv)
+	if err != nil {
 		s.reject(out, protocol.ExitRejected, err.Error(), err)
 		return
 	}
@@ -220,8 +224,17 @@ func (s *Server) run(ctx context.Context, cancel context.CancelFunc, conn net.Co
 		return
 	}
 	defer dir.Close()
+	argv, files, message, err := s.openPaths(req.Argv, paths, hostPath)
+	// The command inherits the files; the daemon's copies go once it has
+	// started (files is cleared then), or with the request on failure.
+	defer func() { closeAll(files) }()
+	if err != nil {
+		s.reject(out, protocol.ExitRejected, message, err)
+		return
+	}
 
-	cmd := newCommand(ctx, req.Argv, dir, hostPath, out)
+	cmd := newCommand(ctx, argv, dir, hostPath, out)
+	cmd.ExtraFiles = files
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		s.reject(out, protocol.ExitHostrunError, "cannot start the command", err)
@@ -232,6 +245,8 @@ func (s *Server) run(ctx context.Context, cancel context.CancelFunc, conn net.Co
 		s.reject(out, code, message, err)
 		return
 	}
+	closeAll(files)
+	files = nil
 
 	queue := newStdinQueue(protocol.StdinWindow)
 	var streams sync.WaitGroup
@@ -271,6 +286,69 @@ func cwdMessage(cwd string, err error) string {
 		return fmt.Sprintf("working directory %s is outside the workspace", cwd)
 	}
 	return fmt.Sprintf("working directory %s is not available on the host", cwd)
+}
+
+// openPaths performs the path checks the policy asked for on argv, whose
+// working directory is the host directory dirPath. It returns the argv to
+// run and the files to hand to the command as its descriptors 3, 4, …; the
+// caller closes the files, which it gets on failure too. A failed check
+// returns a message for the client, in container terms only, and an error
+// with host paths for the daemon log.
+//
+// A PathModeCheck argument is opened to check it and closed again; the
+// program gets it as given. A PathModeOpen argument stays open and is
+// replaced with the /proc/self/fd path of the descriptor the program
+// inherits, keeping the part of its token before the path (--file=, -f).
+func (s *Server) openPaths(argv []string, paths []rules.PathArg, dirPath string) ([]string, []*os.File, string, error) {
+	if len(paths) == 0 {
+		return argv, nil, "", nil
+	}
+	runArgv := slices.Clone(argv)
+	var files []*os.File
+	for _, p := range paths {
+		name := argv[p.Index][len(p.Prefix):]
+		f, err := s.mapper.OpenFile(dirPath, name)
+		if err != nil {
+			return nil, files, pathMessage(name, err), err
+		}
+		if p.Mode != rules.PathModeOpen {
+			f.Close()
+			continue
+		}
+		// ExtraFiles[i] becomes descriptor 3+i in the command.
+		runArgv[p.Index] = fmt.Sprintf("%s/proc/self/fd/%d", p.Prefix, 3+len(files))
+		files = append(files, f)
+	}
+	return runArgv, files, "", nil
+}
+
+// closeAll closes the daemon's copies of the files openPaths opened. Close
+// errors are ignored: the files were opened read-only, so nothing is lost.
+func closeAll(files []*os.File) {
+	for _, f := range files {
+		f.Close()
+	}
+}
+
+// pathMessage describes why the argument name is not a workspace file, in
+// container terms only.
+func pathMessage(name string, err error) string {
+	var reason string
+	switch {
+	case errors.Is(err, workspace.ErrEmptyPath):
+		reason = "it is empty"
+	case errors.Is(err, workspace.ErrAbsolutePath):
+		reason = "it is an absolute path"
+	case errors.Is(err, fs.ErrNotExist):
+		reason = "it does not exist"
+	case errors.Is(err, workspace.ErrNotRegularFile):
+		reason = "it is not a regular file"
+	case errors.Is(err, workspace.ErrOutsideWorkspace):
+		reason = "it leads outside the workspace"
+	default:
+		reason = "it cannot be opened on the host"
+	}
+	return fmt.Sprintf("argument %q is not a workspace file: %s", name, reason)
 }
 
 // readOpening reads the opening frame of a connection (FrameRequest or

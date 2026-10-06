@@ -5,16 +5,17 @@ package workspace
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
 )
 
-// ErrOutsideWorkspace means the requested directory does not lie inside the
-// workspace, either lexically in the container or after resolving symlinks
-// on the host.
-var ErrOutsideWorkspace = errors.New("working directory is outside the workspace")
+// ErrOutsideWorkspace means a requested directory or file does not lie
+// inside the workspace, either lexically in the container or after
+// resolving symlinks on the host.
+var ErrOutsideWorkspace = errors.New("outside the workspace")
 
 // Mapper translates container paths under containerRoot to host paths under
 // hostRoot. Both roots describe the same bind-mounted workspace.
@@ -75,6 +76,77 @@ func (m *Mapper) Open(containerCwd string) (*os.File, string, error) {
 		return nil, "", fmt.Errorf("open %s on the host: %w", containerCwd, err)
 	}
 	return dir, hostPath, nil
+}
+
+// Reasons OpenFile refuses a name, besides ErrOutsideWorkspace and
+// fs.ErrNotExist.
+var (
+	ErrEmptyPath      = errors.New("path is empty")
+	ErrAbsolutePath   = errors.New("path is absolute")
+	ErrNotRegularFile = errors.New("not a regular file")
+)
+
+// OpenFile opens the workspace file that name, a path relative to the host
+// directory dirPath (the real path Open returned), refers to, and returns
+// it open for reading. The caller must close it.
+//
+// The name is resolved as the kernel would resolve it from dirPath (".."
+// after a symlink climbs from the symlink's target), but through an
+// os.Root at the host workspace, so neither ".." nor a symlink can leave
+// the workspace: the confinement is the workspace, not dirPath. Only a
+// regular file is opened. The open is non-blocking and takes no
+// controlling terminal, so a FIFO or terminal swapped in after the type
+// check can neither stall the daemon nor be acted on beyond the open; the
+// type is checked again on the open file.
+func (m *Mapper) OpenFile(dirPath, name string) (*os.File, error) {
+	switch {
+	case name == "":
+		return nil, ErrEmptyPath
+	case filepath.IsAbs(name):
+		return nil, ErrAbsolutePath
+	}
+	dir, ok := within(m.hostRoot, dirPath)
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrOutsideWorkspace, dirPath)
+	}
+	// Not filepath.Join: cleaning "link/.." lexically would check another
+	// file than the one the program opens.
+	rel := dir + string(filepath.Separator) + name
+	root, err := os.OpenRoot(m.hostRoot)
+	if err != nil {
+		return nil, fmt.Errorf("open host workspace: %w", err)
+	}
+	defer root.Close()
+	fi, err := root.Stat(rel)
+	if err != nil {
+		return nil, fileError(name, err)
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, ErrNotRegularFile
+	}
+	f, err := root.OpenFile(rel, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOCTTY, 0)
+	if err != nil {
+		return nil, fileError(name, err)
+	}
+	if fi, err = f.Stat(); err != nil || !fi.Mode().IsRegular() {
+		f.Close()
+		return nil, ErrNotRegularFile
+	}
+	return f, nil
+}
+
+// fileError classifies why the os.Root could not reach name: a missing file
+// keeps fs.ErrNotExist, other errnos are reported as they are, and an error
+// without an errno is os.Root reporting an escape.
+func fileError(name string, err error) error {
+	var errno syscall.Errno
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return fmt.Errorf("%s: %w", name, fs.ErrNotExist)
+	case errors.As(err, &errno):
+		return fmt.Errorf("open %s on the host: %w", name, err)
+	}
+	return fmt.Errorf("%w: %s: %v", ErrOutsideWorkspace, name, err)
 }
 
 // within reports whether path equals root or lies below it, and returns path

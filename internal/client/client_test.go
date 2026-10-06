@@ -37,7 +37,7 @@ type harness struct {
 // everything but the rules.
 type allowAll struct{}
 
-func (allowAll) Check([]string) error { return nil }
+func (allowAll) Check([]string) ([]rules.PathArg, error) { return nil, nil }
 
 // startDaemon starts a daemon with the given policy, or one allowing every
 // command.

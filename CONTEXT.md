@@ -20,7 +20,8 @@ A flag a rule declares as taking a value.
 
 **List**:
 The allow or deny patterns a rule applies to positional
-arguments or to the values of one value flag.
+arguments or to the values of one value flag, and the path
+check it may add.
 _Avoid_: filter, matcher
 
 **Pattern**:
@@ -33,3 +34,15 @@ sequence of characters, `/` included.
 **Regex**:
 A pattern that is a regular expression, matched anywhere
 in the value unless it anchors itself.
+
+**Workspace file**:
+An existing regular file inside the workspace, named by a
+path relative to the working directory.
+
+**Path check**:
+The requirement a rule puts on positional arguments or on
+the values of one value flag that each names a workspace
+file. It is `open` (the program gets the file the check
+opened) or `check` (the program gets the argument as
+given).
+_Avoid_: path matcher
