@@ -14,6 +14,10 @@
 # through includeIf "gitdir:...". A missing value is left out rather than
 # failing `devcontainer up`: the container's git then asks for it on commit.
 # Any other git failure (e.g. a malformed config) fails it.
+#
+# From the devcontainer template (github.com/kravlab/devcontainer-template),
+# which owns this file: `copier update` updates it and merges local edits.
+# The specs named here are in its docs/specs/.
 set -eu
 
 dir=$1

@@ -1,6 +1,10 @@
-# Images for this repository's devcontainers (docs/specs/claude-devcontainer.md).
+# Images for the project's devcontainers (docs/specs/claude-devcontainer.md).
 # Each configuration picks a stage with build.target: `base` for everyday
 # development, `claude` for running Claude Code wired to hostrunner.
+#
+# From the devcontainer template (github.com/kravlab/devcontainer-template),
+# which owns this file: `copier update` updates it and merges local edits.
+# The specs named here are in its docs/specs/.
 
 FROM mcr.microsoft.com/devcontainers/base:trixie AS base
 
@@ -8,8 +12,8 @@ FROM mcr.microsoft.com/devcontainers/base:trixie AS base
 # script to sh.
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-# mise brings the toolchain pinned in mise.toml (postCreateCommand runs
-# `mise install`); its shims put the tools in PATH.
+# mise brings the toolchain pinned in mise.toml (postCreateCommand runs the
+# project's setup task, which installs it); its shims put the tools in PATH.
 ARG MISE_VERSION=v2026.9.11
 RUN curl -fsSL https://mise.run \
       | MISE_VERSION="$MISE_VERSION" MISE_INSTALL_PATH=/usr/local/bin/mise sh

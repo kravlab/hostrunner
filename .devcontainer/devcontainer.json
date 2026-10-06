@@ -1,12 +1,18 @@
-// Devcontainer for everyday development of hostrunner. It does not use
-// hostrunner; the Claude Code container wired to it is
+// Devcontainer for everyday development. It does not use hostrunner; the
+// Claude Code container wired to it is
 // .devcontainer/claude/devcontainer.json.
+//
+// From the devcontainer template (github.com/kravlab/devcontainer-template),
+// which owns this file: `copier update` updates it and merges local edits.
+// The specs named here are in its docs/specs/.
 {
-  "name": "hostrunner",
+  // The project's name is its folder's, here and in the names below.
+  "name": "${localWorkspaceFolderBasename}",
   "build": { "dockerfile": "Dockerfile", "target": "base" },
 
   // A recognizable container name and shell prompt host name. Names are
-  // unique per host: two clones with the same folder name cannot run at once.
+  // unique per host: of two projects in folders of the same name only one
+  // can have its container, running or stopped.
   "runArgs": [
     "--name", "${localWorkspaceFolderBasename}-dev",
     "--hostname", "${localWorkspaceFolderBasename}-dev"
@@ -34,7 +40,7 @@
 
   "mounts": [
     // Bash history survives rebuilds (see the Dockerfile).
-    "source=hostrunner-bashhistory-${devcontainerId},target=/home/vscode/.commandhistory,type=volume",
+    "source=${localWorkspaceFolderBasename}-bashhistory-${devcontainerId},target=/home/vscode/.commandhistory,type=volume",
     // The host's git identity, included from the image's system git config,
     // and its global excludes, linked from ~/.config/git/ignore.
     // A directory: the scripts replace the files, and a single-file mount

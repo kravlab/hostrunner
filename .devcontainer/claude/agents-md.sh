@@ -11,6 +11,10 @@
 # points to an empty file. Docker and Podman resolve it when the container
 # starts and mount the original itself, so in-place edits on the host are
 # seen in the running container; nothing is copied.
+#
+# From the devcontainer template (github.com/kravlab/devcontainer-template),
+# which owns this file: `copier update` updates it and merges local edits.
+# The specs named here are in its docs/specs/.
 set -eu
 
 dir=$1

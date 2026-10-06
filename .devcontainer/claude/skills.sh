@@ -11,6 +11,10 @@
 # A skill that cannot be copied (a dangling symlink, an unreadable file)
 # fails `devcontainer up` and keeps the old copy, rather than silently
 # dropping a skill the user installed.
+#
+# From the devcontainer template (github.com/kravlab/devcontainer-template),
+# which owns this file: `copier update` updates it and merges local edits.
+# The specs named here are in its docs/specs/.
 set -eu
 
 dir=$1

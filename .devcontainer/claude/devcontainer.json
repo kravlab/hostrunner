@@ -1,26 +1,32 @@
-// Devcontainer for running Claude Code on the hostrunner repository, wired
-// to hostrunner itself so the container can run the host commands allowed
-// in .devcontainer/hostrun.yaml (git, gh). Requires `mise run install` on
-// the host (hostrunner in PATH) and a regular clone (.git a directory).
+// Devcontainer for running Claude Code on the project, wired to hostrunner
+// so the container can run the host commands allowed in
+// .devcontainer/hostrun.yaml. Requires hostrunner in the host's PATH and a
+// regular clone (.git a directory).
 // The host's git identity, its global git excludes, its global Claude Code
 // skills and hooks and, optionally, the global instructions named by
 // $HOSTRUNNER_AGENTS_MD reach the container read-only
 // (docs/specs/devcontainer-host-config.md,
 // docs/specs/devcontainer-git-excludes.md,
 // docs/specs/devcontainer-claude-skills-hooks.md).
+//
+// From the devcontainer template (github.com/kravlab/devcontainer-template),
+// which owns this file: `copier update` updates it and merges local edits.
+// The specs named here are in its docs/specs/.
 {
-  "name": "hostrunner (Claude Code)",
+  // The project's name is its folder's, here and in the names below.
+  "name": "${localWorkspaceFolderBasename} (Claude Code)",
   "build": { "dockerfile": "../Dockerfile", "context": "..", "target": "claude" },
 
   // A recognizable container name and shell prompt host name. Names are
-  // unique per host: two clones with the same folder name cannot run at once.
+  // unique per host: of two projects in folders of the same name only one
+  // can have its container, running or stopped.
   "runArgs": [
     "--name", "${localWorkspaceFolderBasename}-agent",
     "--hostname", "${localWorkspaceFolderBasename}-agent"
   ],
 
-  // Only go and lefthook from mise.toml (mise is in the image): see the
-  // setup-agent task.
+  // The agent's part of the toolchain in mise.toml (mise is in the image):
+  // the project's setup-agent task.
   "postCreateCommand": "mise trust && mise run setup-agent",
 
   // All run on the host, in parallel; any failing fails `devcontainer up`.
@@ -75,16 +81,16 @@
     // .devcontainer (with the rules and this file) stays read-only inside the container.
     "source=${localWorkspaceFolder}/.devcontainer,target=${containerWorkspaceFolder}/.devcontainer,type=bind,readonly",
     // The repository's git config and hooks, which host git reads on
-    // `hostrun git`, cannot be edited in place. Not a guarantee: see the
-    // README (.git/commondir, renaming .git, nested repositories). The
-    // config is a single-file mount, so the container sees host-side
-    // config changes only after a restart.
+    // `hostrun git`, cannot be edited in place. Not a guarantee: see
+    // hostrunner's README (.git/commondir, renaming .git, nested
+    // repositories). The config is a single-file mount, so the container
+    // sees host-side config changes only after a restart.
     "source=${localWorkspaceFolder}/.git/config,target=${containerWorkspaceFolder}/.git/config,type=bind,readonly",
     "source=${localWorkspaceFolder}/.git/hooks,target=${containerWorkspaceFolder}/.git/hooks,type=bind,readonly",
     // Bash history and Claude Code's login and settings survive rebuilds
     // (see the Dockerfile).
-    "source=hostrunner-bashhistory-${devcontainerId},target=/home/vscode/.commandhistory,type=volume",
-    "source=hostrunner-claude-${devcontainerId},target=/home/vscode/.claude,type=volume",
+    "source=${localWorkspaceFolderBasename}-bashhistory-${devcontainerId},target=/home/vscode/.commandhistory,type=volume",
+    "source=${localWorkspaceFolderBasename}-claude-${devcontainerId},target=/home/vscode/.claude,type=volume",
     // The host's git identity, included from the image's system git config,
     // its global excludes, linked from ~/.config/git/ignore, and its global
     // skills and hooks (claude/), linked from /etc/claude-code.

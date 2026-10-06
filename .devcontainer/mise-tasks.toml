@@ -1,0 +1,71 @@
+# mise tasks for the project's devcontainers. A project gets them with
+#   [task_config]
+#   includes = [".devcontainer/mise-tasks.toml"]
+# in its mise.toml (which replaces mise's default task directories: a
+# project that uses one lists it there too).
+#   mise run dc -- <cmd>, dc-task -- <task>, dev, agent  # in a devcontainer
+#   mise run dev-recreate, agent-recreate  # recreate a devcontainer
+#
+# From the devcontainer template (github.com/kravlab/devcontainer-template),
+# which owns this file: `copier update` updates it and merges local edits.
+# The specs named here are in its docs/specs/.
+#
+# The tasks bring a container up (idempotent; a first run builds the
+# image) and run a command (dc, dc-task), bash (dev) or Claude Code (agent)
+# in it; raw hands it the terminal. They run on the host, in the project's
+# root, and need the devcontainer CLI there; `agent` also needs hostrunner
+# in the host's PATH (docs/specs/mise-tasks.md).
+#
+# dc and dc-task get their arguments the plain way: mise appends them,
+# shell-quoted, to the last command, so the command receives them exactly
+# and without a shell. No usage spec and no eval: with -h/--help among the
+# arguments mise skips usage, and an eval would run them as shell code.
+
+[dc]
+description = "Run a command in the everyday devcontainer: mise run dc -- <cmd> [args…]"
+raw = true
+# devcontainer up reads stdin to the end; </dev/null leaves it for the
+# command (e.g. `echo … | mise run dc -- bash`). >/dev/null drops its JSON
+# result; build logs still go to stderr.
+run = """
+devcontainer up --workspace-folder . >/dev/null </dev/null &&
+  devcontainer exec --workspace-folder .
+"""
+
+[dc-task]
+description = "Run a mise task in the everyday devcontainer: mise run dc-task -- <task> [args…]"
+raw = true
+run = "mise run dc -- mise run"
+
+[dev]
+description = "Start the everyday devcontainer and open bash in it"
+raw = true
+run = "mise run dc -- bash"
+
+[agent]
+description = "Start the Claude Code devcontainer and run claude in it"
+raw = true
+# </dev/null: devcontainer up reads stdin (see dc); on a terminal it would
+# consume what is typed while the container starts, before claude runs.
+# &&, as in dc: claude must not start in a container that did not come up,
+# whatever shell options mise runs the script with.
+run = """
+config=.devcontainer/claude/devcontainer.json
+devcontainer up --workspace-folder . --config "$config" </dev/null &&
+  devcontainer exec --workspace-folder . --config "$config" claude
+"""
+
+# The recreate tasks replace a devcontainer with a new one, so an image
+# change reaches it (`devcontainer up` keeps an existing container). The
+# image is rebuilt where the Dockerfile changed, with the build cache;
+# named volumes (bash history, ~/.claude) survive, anything else written in
+# the old container does not. Nothing is started in the new container: dev
+# and agent attach to it. </dev/null as in dc; the JSON result is the
+# output.
+[dev-recreate]
+description = "Recreate the everyday devcontainer (rebuilding its image if needed)"
+run = "devcontainer up --workspace-folder . --remove-existing-container </dev/null"
+
+[agent-recreate]
+description = "Recreate the Claude Code devcontainer (rebuilding its image if needed)"
+run = "devcontainer up --workspace-folder . --config .devcontainer/claude/devcontainer.json --remove-existing-container </dev/null"

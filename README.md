@@ -219,6 +219,15 @@ mount. `lefthook.yml` is in the workspace, which the containers can
 write, so a plain `git commit` on the host runs whatever they put there:
 the same risk as `.git/hooks` (see the warning at the top).
 
+The devcontainers come from a Copier template,
+[kravlab/devcontainer-template](https://github.com/kravlab/devcontainer-template).
+It owns `.devcontainer/` except `hostrun.yaml`, so those files are not
+edited here: a change is made in the template and taken with
+`uvx copier update`, run on the host with nothing uncommitted
+(`.copier-answers.yml` records the version in use). That needs
+[uv](https://docs.astral.sh/uv/), which `mise run setup` does not install.
+The template's README and `docs/specs/` have the details of what follows.
+
 The repository has two devcontainers; both take the toolchain from
 `mise.toml` and keep bash history across rebuilds:
 
@@ -250,7 +259,7 @@ The repository has two devcontainers; both take the toolchain from
   A hook runs in the container, so it can use only what the image has; the
   copy is also mounted at the host's `~/.claude` path, so a hook that
   reads a skill through that path works unchanged
-  (`docs/specs/devcontainer-claude-skills-hooks.md`).
+  (`docs/specs/devcontainer-claude-skills-hooks.md` in the template).
 
 Both containers' git uses `user.name` and `user.email` from the host's
 global git config, when set, for commits, and both git and ripgrep (so
@@ -262,6 +271,17 @@ Nothing else of the host's git config is copied. In VS Code, set
 the Dev Containers extension copies the whole host `~/.gitconfig` into
 the container, and a `core.excludesFile` set there points to a host path
 the container lacks, which hides the excludes.
+
+The mise tasks for the containers are the template's too. They are in
+`.devcontainer/mise-tasks.toml`, and `mise.toml` brings them in with
+
+```toml
+[task_config]
+includes = [".devcontainer/mise-tasks.toml"]
+```
+
+They run on the host; inside a container `mise tasks` lists them as well,
+but they cannot work there.
 
 `mise run dev` brings the everyday container up and opens bash in it;
 `mise run agent` brings the Claude container up and runs `claude` in it

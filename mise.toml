@@ -5,12 +5,20 @@
 #   mise run <task>     # build, install, fmt, lint, test, test-scripts, check, pre-commit, e2e, release
 #   mise run dc -- <cmd>, dc-task -- <task>, dev, agent  # in a devcontainer
 #   mise run dev-recreate, agent-recreate  # recreate a devcontainer
+#     (these six are in .devcontainer/mise-tasks.toml: see [task_config])
 # Docker and/or Podman come from the system; mise does not manage them.
 
 [settings]
 # Tasks install tools explicitly; otherwise `mise run` would install
 # every tool below (gh included) before any task.
 task.run_auto_install = false
+
+# The devcontainer tasks come with .devcontainer/ from the devcontainer
+# template (docs/specs/devcontainer-template.md): this is how mise finds
+# them. They run on the host and need the devcontainer CLI
+# (`mise run setup`); `agent` also needs hostrunner (`mise run install`).
+[task_config]
+includes = [".devcontainer/mise-tasks.toml"]
 
 [tools]
 go = "1.27.1"
@@ -91,63 +99,6 @@ depends = ["lint", "test"]
 description = "Run the pre-commit hook's jobs on the staged files (-- --all-files: on all)"
 run = "lefthook run pre-commit"
 
-# The devcontainer tasks bring a container up (idempotent; a first run
-# builds the image) and run a command (dc, dc-task), bash (dev) or Claude
-# Code (agent) in it; raw hands it the terminal. They need the
-# devcontainer CLI (`mise run setup`); `agent` also needs hostrunner
-# (`mise run install`).
-#
-# dc and dc-task get their arguments the plain way: mise appends them,
-# shell-quoted, to the last command, so the command receives them exactly
-# and without a shell. No usage spec and no eval: with -h/--help among the
-# arguments mise skips usage, and an eval would run them as shell code.
-[tasks.dc]
-description = "Run a command in the everyday devcontainer: mise run dc -- <cmd> [args…]"
-raw = true
-# devcontainer up reads stdin to the end; </dev/null leaves it for the
-# command (e.g. `echo … | mise run dc -- bash`). >/dev/null drops its JSON
-# result; build logs still go to stderr.
-run = """
-devcontainer up --workspace-folder . >/dev/null </dev/null &&
-  devcontainer exec --workspace-folder .
-"""
-
-[tasks.dc-task]
-description = "Run a mise task in the everyday devcontainer: mise run dc-task -- <task> [args…]"
-raw = true
-run = "mise run dc -- mise run"
-
-[tasks.dev]
-description = "Start the everyday devcontainer and open bash in it"
-raw = true
-run = "mise run dc -- bash"
-
-[tasks.agent]
-description = "Start the Claude Code devcontainer and run claude in it"
-raw = true
-# </dev/null: devcontainer up reads stdin (see dc); on a terminal it would
-# consume what is typed while the container starts, before claude runs.
-run = """
-config=.devcontainer/claude/devcontainer.json
-devcontainer up --workspace-folder . --config "$config" </dev/null
-devcontainer exec --workspace-folder . --config "$config" claude
-"""
-
-# The recreate tasks replace a devcontainer with a new one, so an image
-# change reaches it (`devcontainer up` keeps an existing container). The
-# image is rebuilt where the Dockerfile changed, with the build cache;
-# named volumes (bash history, ~/.claude) survive, anything else written in
-# the old container does not. Nothing is started in the new container: dev
-# and agent attach to it. </dev/null as in dc; the JSON result is the
-# output.
-[tasks.dev-recreate]
-description = "Recreate the everyday devcontainer (rebuilding its image if needed)"
-run = "devcontainer up --workspace-folder . --remove-existing-container </dev/null"
-
-[tasks.agent-recreate]
-description = "Recreate the Claude Code devcontainer (rebuilding its image if needed)"
-run = "devcontainer up --workspace-folder . --config .devcontainer/claude/devcontainer.json --remove-existing-container </dev/null"
-
 [tasks.e2e]
 description = "Bring up examples/devcontainer on docker (HOSTRUNNER_E2E_PODMAN=1: also podman)"
 run = "go test -tags e2e -count=1 -v ./e2e/"
@@ -155,6 +106,7 @@ run = "go test -tags e2e -count=1 -v ./e2e/"
 [tasks.release]
 description = "Tag a chosen commit of origin/main and push the tag: mise run release -- [-n N] <version>"
 # raw: the script prompts for the commit and a confirmation on the
-# terminal. Arguments are appended, shell-quoted, as in dc.
+# terminal. Arguments are appended, shell-quoted, as in dc
+# (.devcontainer/mise-tasks.toml).
 raw = true
 run = "scripts/release.sh"

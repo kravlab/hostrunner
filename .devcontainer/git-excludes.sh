@@ -13,8 +13,12 @@
 # --type=path expands "~/". Not set, it is git's default. A relative path is
 # resolved from the workspace, as host git run at the repository's root
 # resolves it. A missing file or an empty value is not an error, as for
-# host git: the copy is empty. Any other failure (a malformed config, a directory or unreadable
-# file) fails `devcontainer up`.
+# host git: the copy is empty. Any other failure (a malformed config, a
+# directory or unreadable file) fails `devcontainer up`.
+#
+# From the devcontainer template (github.com/kravlab/devcontainer-template),
+# which owns this file: `copier update` updates it and merges local edits.
+# The specs named here are in its docs/specs/.
 set -eu
 
 dir=$1

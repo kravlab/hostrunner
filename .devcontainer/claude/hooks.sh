@@ -12,6 +12,10 @@
 # not one JSON object (an empty file and a dangling symlink included), or
 # a missing jq, fail `devcontainer up` and keep the old file, rather than
 # silently dropping the hooks.
+#
+# From the devcontainer template (github.com/kravlab/devcontainer-template),
+# which owns this file: `copier update` updates it and merges local edits.
+# The specs named here are in its docs/specs/.
 set -eu
 
 dir=$1
