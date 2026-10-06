@@ -103,6 +103,12 @@ rules:
     positional:
       allow_regex:             # regular expressions instead of globs
         - '^/repos/example/example-app/issues(/[0-9]+)?(\?state=(open|closed))?$'
+  - command: abx install
+    flags:
+      allow: [-r]
+    positional:
+      allow: ["*.pkg"]
+      path: open               # and a file inside the workspace
 ```
 
 - A command no rule matches is denied, and so is everything when the file
@@ -163,6 +169,26 @@ rules:
 - A glob or a regex sees only the text of an argument. It does not resolve
   symlinks, so it keeps a file argument inside a directory by its spelling
   only.
+- To keep a file argument inside the workspace, add `path: open` or
+  `path: check` to its list, next to the patterns or alone (`positional:
+  { path: open }`, `--file: { path: check }`). Every argument the list
+  applies to (every positional argument of the rule, or every value of
+  the flag in any spelling) must then be a relative path, from the working
+  directory, to an existing regular file whose real location on the host,
+  symlinks followed, is inside the workspace. Absolute paths, missing
+  files, directories, FIFOs and devices are refused, and so is a symlink
+  that leads out of the workspace or is absolute. The patterns still see
+  the argument as given.
+  - `path: open`: the daemon opens the file, and the program gets
+    `/proc/self/fd/N` in its place (`--file=/proc/self/fd/3` for
+    `--file=app.pkg`), numbered in argument order. A symlink swapped in
+    after the check cannot redirect the program, but the program never
+    sees the file's name: one that looks at the name or its extension
+    needs `path: check`. The program's own children inherit the file.
+  - `path: check`: the program gets the argument as given and opens it
+    itself, after the check. Between the two the container can still swap
+    a symlink into the path and point it out of the workspace; `check`
+    only stops what is already there when the command starts.
 
 How it works:
 
@@ -192,7 +218,7 @@ How it works:
 | command's own | the command ran |
 | 128+N | the command was killed by signal N |
 | 125 | hostrun failed: daemon unreachable, protocol error, or no command given |
-| 126 | refused: denied by the rules, working directory outside the workspace, or not executable |
+| 126 | refused: denied by the rules, an argument not a workspace file, working directory outside the workspace, or not executable |
 | 127 | command not found on the host |
 | 130 | interrupted (Ctrl+C); the host command is killed |
 
@@ -209,6 +235,9 @@ How it works:
   `"runArgs": ["--security-opt", "label=disable"]`. Podman through the
   devcontainer tooling is not affected.
 - No TTY and no signal forwarding yet: interactive prompts do not work.
+- `path: check` checks a file argument when the command starts, not when
+  the program opens it: the container can swap a symlink in between. Use
+  `path: open` where the program accepts `/proc/self/fd/N`.
 
 ## Development
 

@@ -112,7 +112,7 @@ func TestCheck(t *testing.T) {
 }
 
 func TestCheckRejectsEmptyArgv(t *testing.T) {
-	if err := mustParse(t, exampleConfig).Check(nil); err == nil {
+	if _, err := mustParse(t, exampleConfig).Check(nil); err == nil {
 		t.Fatal("empty argv allowed")
 	}
 }
@@ -153,6 +153,14 @@ func TestParseRejectsInvalidConfig(t *testing.T) {
 		"allow_regex and deny_regex":  "rules:\n  - command: git\n    positional:\n      allow_regex: [a]\n      deny_regex: [b]\n",
 		"value flag list both regex":  "rules:\n  - command: git\n    flags:\n      values:\n        -o: { allow_regex: [a], deny_regex: [b] }\n",
 		"value flag list glob, regex": "rules:\n  - command: git\n    flags:\n      values:\n        -o: { allow: [a], allow_regex: [a] }\n",
+
+		// A path check is open or check, and only where a list is allowed.
+		"path mode unknown":    "rules:\n  - command: abx install\n    positional:\n      path: resolve\n",
+		"path mode upper case": "rules:\n  - command: abx install\n    positional:\n      path: Open\n",
+		"flag value path mode": "rules:\n  - command: abx install\n    flags:\n      values:\n        -o: { path: yes }\n",
+		"path with args any":   "rules:\n  - command: abx install\n    args: any\n    positional:\n      path: open\n",
+		"path under flags":     "rules:\n  - command: abx install\n    flags:\n      allow: [-r]\n      path: open\n",
+		"path with two lists":  "rules:\n  - command: abx install\n    positional:\n      allow: [a]\n      deny: [b]\n      path: open\n",
 	}
 	for name, config := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -175,7 +183,7 @@ func TestLoadMissingFileDeniesEverything(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	err = p.Check([]string{"git", "status"})
+	_, err = p.Check([]string{"git", "status"})
 	if err == nil || err.Error() != "no rules file: every command is denied" {
 		t.Fatalf("got %v, want a missing-config denial", err)
 	}
@@ -200,7 +208,7 @@ func TestLoadReadsValidFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := p.Check([]string{"git", "status"}); err != nil {
+	if _, err := p.Check([]string{"git", "status"}); err != nil {
 		t.Fatalf("allowed command denied: %v", err)
 	}
 }
@@ -242,28 +250,28 @@ rules:
 `)
 	// --force is a prefix of the value flag --force-with-lease, but it is a
 	// denied flag of its own and must not swallow the next token as a value.
-	err := p.Check(strings.Fields("git push --force origin"))
+	_, err := p.Check(strings.Fields("git push --force origin"))
 	if err == nil || err.Error() != `denied by rule "git push": flag --force is not allowed` {
 		t.Fatalf("got %v, want --force denied", err)
 	}
-	if err := p.Check(strings.Fields("git push --force-with-lease origin main")); err != nil {
+	if _, err := p.Check(strings.Fields("git push --force-with-lease origin main")); err != nil {
 		t.Fatalf("declared value flag denied: %v", err)
 	}
 }
 
 func TestExplicitEmptyAllowListAllowsNothing(t *testing.T) {
 	p := mustParse(t, "rules:\n  - command: ls\n    positional:\n      allow: []\n")
-	if err := p.Check([]string{"ls"}); err != nil {
+	if _, err := p.Check([]string{"ls"}); err != nil {
 		t.Fatalf("bare command denied: %v", err)
 	}
-	if err := p.Check([]string{"ls", "x"}); err == nil {
+	if _, err := p.Check([]string{"ls", "x"}); err == nil {
 		t.Fatal("positional argument allowed by an empty allow list")
 	}
 }
 
 func TestAbsoluteProgramPathIsAllowed(t *testing.T) {
 	p := mustParse(t, "rules:\n  - command: /usr/bin/git status\n    args: any\n")
-	if err := p.Check([]string{"/usr/bin/git", "status"}); err != nil {
+	if _, err := p.Check([]string{"/usr/bin/git", "status"}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -271,7 +279,7 @@ func TestAbsoluteProgramPathIsAllowed(t *testing.T) {
 func TestMissingValueAtEndIsDenied(t *testing.T) {
 	p := mustParse(t, exampleConfig)
 	for _, argv := range []string{"fakehost deploy --project", "fakehost deploy --only"} {
-		if err := p.Check(strings.Fields(argv)); err == nil || !strings.Contains(err.Error(), "needs a value") {
+		if _, err := p.Check(strings.Fields(argv)); err == nil || !strings.Contains(err.Error(), "needs a value") {
 			t.Errorf("%s: got %v, want a missing-value denial", argv, err)
 		}
 	}
@@ -328,7 +336,7 @@ func TestExampleConfig(t *testing.T) {
 		"git pull --ff-only origin main",
 		"git status --porcelain",
 	} {
-		if err := p.Check(strings.Fields(argv)); err != nil {
+		if _, err := p.Check(strings.Fields(argv)); err != nil {
 			t.Errorf("%s: denied: %v", argv, err)
 		}
 	}
@@ -347,7 +355,7 @@ func TestExampleConfig(t *testing.T) {
 		"git fetch ext::sh",
 		"git reset --hard",
 	} {
-		if err := p.Check(strings.Fields(argv)); err == nil {
+		if _, err := p.Check(strings.Fields(argv)); err == nil {
 			t.Errorf("%s: allowed", argv)
 		}
 	}
@@ -357,7 +365,7 @@ func TestExampleConfig(t *testing.T) {
 // or empty when argv must be allowed; a denial has to be a *Denial.
 func expectCheck(t *testing.T, p *Policy, argv []string, deny string) {
 	t.Helper()
-	err := p.Check(argv)
+	_, err := p.Check(argv)
 	switch {
 	case deny == "" && err != nil:
 		t.Errorf("%q: denied: %v", argv, err)
@@ -468,7 +476,7 @@ func TestParseSaysWhichKeysAListTakes(t *testing.T) {
 	cases := map[string]struct{ config, want string }{
 		"null key": {
 			"rules:\n  - command: rm\n    positional:\n      allow_regex:\n",
-			`rule 1: "rm" positional: set allow, deny, allow_regex or deny_regex`,
+			`rule 1: "rm" positional: set allow, deny, allow_regex, deny_regex or path`,
 		},
 		"two keys": {
 			"rules:\n  - command: rm\n    positional:\n      allow: [a]\n      allow_regex: [a]\n",
@@ -566,4 +574,47 @@ func TestExplicitEmptyRegexAllowListAllowsNothing(t *testing.T) {
 	p := mustParse(t, "rules:\n  - command: ls\n    positional:\n      allow_regex: []\n")
 	expectCheck(t, p, []string{"ls"}, "")
 	expectCheck(t, p, []string{"ls", "x"}, `denied by rule "ls": argument "x" is not allowed`)
+}
+
+// A path check stands alone or next to one pattern key, under positional and
+// under a value flag.
+func TestParseAcceptsPathCheck(t *testing.T) {
+	cases := map[string]string{
+		"positional open":      "rules:\n  - command: abx install\n    positional:\n      path: open\n",
+		"positional check":     "rules:\n  - command: abx install\n    positional:\n      path: check\n",
+		"with allow":           "rules:\n  - command: abx install\n    positional:\n      allow: ['*.pkg']\n      path: open\n",
+		"with deny":            "rules:\n  - command: abx install\n    positional:\n      deny: ['*.tmp']\n      path: check\n",
+		"with allow_regex":     "rules:\n  - command: abx install\n    positional:\n      allow_regex: ['\\.pkg$']\n      path: open\n",
+		"with deny_regex":      "rules:\n  - command: abx install\n    positional:\n      deny_regex: ['^-']\n      path: check\n",
+		"flag value open":      "rules:\n  - command: abx install\n    flags:\n      values:\n        --dat: { path: open }\n",
+		"flag value with glob": "rules:\n  - command: abx install\n    flags:\n      values:\n        -o: { allow: ['*.dat'], path: check }\n",
+	}
+	for name, config := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Parse([]byte(config)); err != nil {
+				t.Fatalf("rejected: %v\n%s", err, config)
+			}
+		})
+	}
+}
+
+func TestParseSaysWhichPathModesExist(t *testing.T) {
+	_, err := Parse([]byte("rules:\n  - command: abx install\n    positional:\n      path: resolve\n"))
+	want := `rule 1: "abx install" positional: path must be open or check, not "resolve"`
+	if err == nil || err.Error() != want {
+		t.Fatalf("got %v, want %q", err, want)
+	}
+}
+
+// The patterns of a list see the argument as given and still deny it; a
+// denied command reports no path arguments.
+func TestPathCheckDoesNotWidenTheList(t *testing.T) {
+	p := mustParse(t, "rules:\n  - command: abx install\n    positional:\n      allow: ['*.pkg']\n      path: open\n")
+	paths, err := p.Check([]string{"abx", "install", "notes.txt"})
+	if err == nil || err.Error() != `denied by rule "abx install": argument "notes.txt" is not allowed` {
+		t.Fatalf("got %v, want the list's denial", err)
+	}
+	if paths != nil {
+		t.Fatalf("denied command reported path arguments %+v", paths)
+	}
 }
