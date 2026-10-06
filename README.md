@@ -34,7 +34,8 @@ tar -xzf "$archive" -C ~/.local/bin hostrunner hostrun
 hostrunner version
 ```
 
-From source:
+From source, with mise 2026.5.0 or newer (an older one refuses the
+repository's mise config):
 
 ```sh
 mise install                        # the pinned toolchain (see mise.toml)
@@ -221,11 +222,12 @@ the same risk as `.git/hooks` (see the warning at the top).
 
 The devcontainers come from a Copier template,
 [kravlab/devcontainer-template](https://github.com/kravlab/devcontainer-template).
-It owns `.devcontainer/` except `hostrun.yaml`, so those files are not
-edited here: a change is made in the template and taken with
-`uvx copier update`, run on the host with nothing uncommitted
-(`.copier-answers.yml` records the version in use). That needs
-[uv](https://docs.astral.sh/uv/), which `mise run setup` does not install.
+It owns `.config/mise/conf.d/devcontainer.toml` and everything under
+`.devcontainer/` except `hostrun.yaml`, so those files are not edited
+here: a change is made in the template and taken with
+`mise run template-update`, run on the host with nothing uncommitted
+(`.copier-answers.yml` records the version in use). The task needs only
+mise, which brings uv to run Copier.
 The template's README and `docs/specs/` have the details of what follows.
 
 The repository has two devcontainers; both take the toolchain from
@@ -273,15 +275,16 @@ the container, and a `core.excludesFile` set there points to a host path
 the container lacks, which hides the excludes.
 
 The mise tasks for the containers are the template's too. They are in
-`.devcontainer/mise-tasks.toml`, and `mise.toml` brings them in with
+`.config/mise/conf.d/devcontainer.toml`, a mise config that mise reads by
+itself next to `mise.toml`: no setting in `mise.toml` names it. The same
+file sets a cooldown, `minimum_release_age = "5d"` (mise does not install
+a release until it has been out for five days; the tools in `mise.toml`
+are pinned exactly, and mise installs an exact pin whatever its age), and
+requires mise 2026.5.0 or newer on the host, the oldest known to apply it.
 
-```toml
-[task_config]
-includes = [".devcontainer/mise-tasks.toml"]
-```
-
-They run on the host; inside a container `mise tasks` lists them as well,
-but they cannot work there.
+The tasks run on the host; inside a container `mise tasks` lists them as
+well, but the container tasks cannot work there, for want of a container
+engine.
 
 `mise run dev` brings the everyday container up and opens bash in it;
 `mise run agent` brings the Claude container up and runs `claude` in it

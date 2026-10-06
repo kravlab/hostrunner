@@ -5,20 +5,17 @@
 #   mise run <task>     # build, install, fmt, lint, test, test-scripts, check, pre-commit, e2e, release
 #   mise run dc -- <cmd>, dc-task -- <task>, dev, agent  # in a devcontainer
 #   mise run dev-recreate, agent-recreate  # recreate a devcontainer
-#     (these six are in .devcontainer/mise-tasks.toml: see [task_config])
+#   mise run template-update  # take the devcontainer template's latest version
+#     (these seven, and a cooldown for new releases, are in
+#     .config/mise/conf.d/devcontainer.toml, which mise reads by itself and
+#     which comes from the devcontainer template:
+#     docs/specs/devcontainer-template.md)
 # Docker and/or Podman come from the system; mise does not manage them.
 
 [settings]
 # Tasks install tools explicitly; otherwise `mise run` would install
 # every tool below (gh included) before any task.
 task.run_auto_install = false
-
-# The devcontainer tasks come with .devcontainer/ from the devcontainer
-# template (docs/specs/devcontainer-template.md): this is how mise finds
-# them. They run on the host and need the devcontainer CLI
-# (`mise run setup`); `agent` also needs hostrunner (`mise run install`).
-[task_config]
-includes = [".devcontainer/mise-tasks.toml"]
 
 [tools]
 go = "1.27.1"
@@ -107,6 +104,6 @@ run = "go test -tags e2e -count=1 -v ./e2e/"
 description = "Tag a chosen commit of origin/main and push the tag: mise run release -- [-n N] <version>"
 # raw: the script prompts for the commit and a confirmation on the
 # terminal. Arguments are appended, shell-quoted, as in dc
-# (.devcontainer/mise-tasks.toml).
+# (.config/mise/conf.d/devcontainer.toml).
 raw = true
 run = "scripts/release.sh"

@@ -1,15 +1,29 @@
-# mise tasks for the project's devcontainers. A project gets them with
-#   [task_config]
-#   includes = [".devcontainer/mise-tasks.toml"]
-# in its mise.toml (which replaces mise's default task directories: a
-# project that uses one lists it there too).
+# mise config for the project's devcontainers: a cooldown for new releases
+# and the tasks. mise reads .config/mise/conf.d/*.toml of a project by
+# itself, next to the project's own mise.toml, which wins where both set
+# the same thing.
 #   mise run dc -- <cmd>, dc-task -- <task>, dev, agent  # in a devcontainer
 #   mise run dev-recreate, agent-recreate  # recreate a devcontainer
+#   mise run template-update  # take the template's latest version
 #
 # From the devcontainer template (github.com/kravlab/devcontainer-template),
 # which owns this file: `copier update` updates it and merges local edits.
 # The specs named here are in its docs/specs/.
-#
+
+# The oldest mise known to apply the cooldown below (2026.3.0 takes the
+# setting for an unknown field and installs without one). An older mise
+# refuses the project with this version in its message, instead of going on
+# unprotected.
+min_version = "2026.5.0"
+
+[settings]
+# A release must have been out this long before mise installs it, on the
+# host and in the containers, so that one found to be bad has time to be
+# withdrawn first. It limits requests such as `latest` or `1`; a version
+# pinned exactly is installed whatever its age. A project sets another age
+# in its own mise.toml.
+minimum_release_age = "5d"
+
 # The tasks bring a container up (idempotent; a first run builds the
 # image) and run a command (dc, dc-task), bash (dev) or Claude Code (agent)
 # in it; raw hands it the terminal. They run on the host, in the project's
@@ -21,7 +35,7 @@
 # and without a shell. No usage spec and no eval: with -h/--help among the
 # arguments mise skips usage, and an eval would run them as shell code.
 
-[dc]
+[tasks.dc]
 description = "Run a command in the everyday devcontainer: mise run dc -- <cmd> [args…]"
 raw = true
 # devcontainer up reads stdin to the end; </dev/null leaves it for the
@@ -32,17 +46,17 @@ devcontainer up --workspace-folder . >/dev/null </dev/null &&
   devcontainer exec --workspace-folder .
 """
 
-[dc-task]
+[tasks.dc-task]
 description = "Run a mise task in the everyday devcontainer: mise run dc-task -- <task> [args…]"
 raw = true
 run = "mise run dc -- mise run"
 
-[dev]
+[tasks.dev]
 description = "Start the everyday devcontainer and open bash in it"
 raw = true
 run = "mise run dc -- bash"
 
-[agent]
+[tasks.agent]
 description = "Start the Claude Code devcontainer and run claude in it"
 raw = true
 # </dev/null: devcontainer up reads stdin (see dc); on a terminal it would
@@ -62,10 +76,24 @@ devcontainer up --workspace-folder . --config "$config" </dev/null &&
 # the old container does not. Nothing is started in the new container: dev
 # and agent attach to it. </dev/null as in dc; the JSON result is the
 # output.
-[dev-recreate]
+[tasks.dev-recreate]
 description = "Recreate the everyday devcontainer (rebuilding its image if needed)"
 run = "devcontainer up --workspace-folder . --remove-existing-container </dev/null"
 
-[agent-recreate]
+[tasks.agent-recreate]
 description = "Recreate the Claude Code devcontainer (rebuilding its image if needed)"
 run = "devcontainer up --workspace-folder . --config .devcontainer/claude/devcontainer.json --remove-existing-container </dev/null"
+
+# Takes the template's latest version: the files it owns, this one among
+# them, with Copier. On the host, with nothing uncommitted (Copier refuses
+# a dirty tree; in the Claude Code container .devcontainer/ is read-only).
+# The host needs only mise: `mise exec` brings uv, and uvx runs the Copier
+# version the template is tested with. Copier itself is pinned; its own
+# dependencies are resolved on every run, so --exclude-newer gives them a
+# cooldown too: the same five days as in [settings], written here a second
+# time, which a project's own minimum_release_age does not change. Copier's
+# options are appended, as in dc
+# (`mise run template-update -- --vcs-ref=HEAD`).
+[tasks.template-update]
+description = "Update the devcontainer files from the template: mise run template-update [-- <copier options>]"
+run = 'mise exec uv@0.12.17 -- uvx --exclude-newer "5 days" copier@9.18.2 update'
