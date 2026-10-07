@@ -6,12 +6,16 @@
 //	hostrunner up --dir <runtime-dir> --workspace <host-path> --container-workspace <path>
 //	hostrunner serve --socket <path> --workspace <host-path> --container-workspace <path>
 //	    [--config <path>] [--watch [--startup-timeout 30m] [--grace 15s]]
+//	hostrunner test [--config <path>] [--] <command> [args...]
 //	hostrunner version
 //
 // `up` is meant for devcontainer's initializeCommand: it installs the client
 // into the runtime directory and starts a detached `serve --watch` there,
-// which exits by itself once the devcontainer stops. `version` prints the
-// module version Go stamped into the binary (see buildVersion).
+// which exits by itself once the devcontainer stops. `test` runs the Rules
+// test: whether a rules file (default .devcontainer/hostrun.yaml under the
+// current directory) allows a command; it exits 0 when it does, 126 when it
+// does not, and 1 on any error. `version` prints the module version Go
+// stamped into the binary (see buildVersion).
 package main
 
 import (
@@ -38,7 +42,7 @@ import (
 )
 
 const (
-	usage        = "usage: hostrunner up|serve|version [flags]; see `hostrunner <command> -h`"
+	usage        = "usage: hostrunner up|serve|test|version [flags]; see `hostrunner <command> -h`"
 	upUsage      = "usage: hostrunner up --dir <runtime-dir> --workspace <host-path> --container-workspace <path>"
 	serveUsage   = "usage: hostrunner serve --socket <path> --workspace <host-path> --container-workspace <path> [--config <path>] [--watch]"
 	versionUsage = "usage: hostrunner version"
@@ -54,14 +58,38 @@ const (
 )
 
 func main() {
-	if err := run(os.Args[1:], os.Stdout); err != nil {
+	if err := run(os.Args[1:], os.Stdout, os.Stderr); err != nil {
 		fmt.Fprintf(os.Stderr, "hostrunner: %v\n", err)
-		os.Exit(1)
+		os.Exit(exitCode(err))
 	}
 }
 
-// run dispatches the subcommand in args; stdout receives `version`'s output.
-func run(args []string, stdout io.Writer) error {
+// exitError is an error that makes hostrunner exit with code instead of 1.
+type exitError struct {
+	code int
+	err  error
+}
+
+func (e *exitError) Error() string { return e.err.Error() }
+
+func (e *exitError) Unwrap() error { return e.err }
+
+// exitCode is the code hostrunner exits with after run returned err: 0 for
+// nil, the code of an exitError, and 1 for any other error.
+func exitCode(err error) int {
+	if err == nil {
+		return 0
+	}
+	if e, ok := errors.AsType[*exitError](err); ok {
+		return e.code
+	}
+	return 1
+}
+
+// run dispatches the subcommand in args; stdout receives `version`'s
+// output, stderr flag help, the daemon's log and the Rules test's verdict.
+// The caller prints a returned error; see exitCode for the exit code.
+func run(args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
 		return errors.New(usage)
 	}
@@ -73,13 +101,13 @@ func run(args []string, stdout io.Writer) error {
 		if err != nil {
 			return err
 		}
-		cfg, err := parseUp(args[1:], exe, os.Stderr)
+		cfg, err := parseUp(args[1:], exe, stderr)
 		if err != nil {
 			return err
 		}
 		return launch.Up(ctx, cfg)
 	case "serve":
-		cfg, err := parseServe(args[1:], os.Stderr)
+		cfg, err := parseServe(args[1:], stderr)
 		if err != nil {
 			return err
 		}
@@ -89,9 +117,15 @@ func run(args []string, stdout io.Writer) error {
 				return errors.New("--watch needs docker or podman in PATH")
 			}
 		}
-		return serve(ctx, cfg, slog.New(slog.NewTextHandler(os.Stderr, nil)), runtimes)
+		return serve(ctx, cfg, slog.New(slog.NewTextHandler(stderr, nil)), runtimes)
+	case "test":
+		cfg, err := parseTest(args[1:], stderr)
+		if err != nil {
+			return err
+		}
+		return rulesTest(cfg, stderr)
 	case "version":
-		if err := parseVersion(args[1:], os.Stderr); err != nil {
+		if err := parseVersion(args[1:], stderr); err != nil {
 			return err
 		}
 		_, err := fmt.Fprintln(stdout, buildVersion(debug.ReadBuildInfo()))
@@ -118,9 +152,13 @@ type workspaceFlags struct {
 	containerWorkspace string // the same workspace's path inside the container
 }
 
+// rulesPath is where a workspace keeps its rules file, relative to the
+// workspace.
+var rulesPath = filepath.Join(".devcontainer", "hostrun.yaml")
+
 // rulesFile is the default rules file of a host workspace.
 func (w *workspaceFlags) rulesFile() string {
-	return filepath.Join(w.workspace, ".devcontainer", "hostrun.yaml")
+	return filepath.Join(w.workspace, rulesPath)
 }
 
 // register adds --workspace and --container-workspace to fs.

@@ -36,16 +36,16 @@ func newServer(t *testing.T, opts ...daemon.Option) *daemon.Server {
 // allowAll is a policy that allows every command.
 type allowAll struct{}
 
-func (allowAll) Check([]string) ([]rules.PathArg, error) { return nil, nil }
+func (allowAll) Check([]string) (rules.Allowed, error) { return rules.Allowed{}, nil }
 
 // panicky panics for "boom" and allows everything else.
 type panicky struct{}
 
-func (panicky) Check(argv []string) ([]rules.PathArg, error) {
+func (panicky) Check(argv []string) (rules.Allowed, error) {
 	if argv[0] == "boom" {
 		panic("policy bug")
 	}
-	return nil, nil
+	return rules.Allowed{}, nil
 }
 
 // chanListener returns whatever Accept results the test feeds it, in order,

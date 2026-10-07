@@ -16,6 +16,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime/debug"
 	"slices"
 	"strings"
@@ -52,9 +53,10 @@ type Server struct {
 // Policy decides whether a command may run; rules.Policy implements it. A
 // non-nil error denies the command, and its message is shown to the client,
 // so it must not reveal host paths. For an allowed command it returns the
-// arguments the daemon still has to check as workspace files.
+// allowing rule and the arguments the daemon still has to check as
+// workspace files.
 type Policy interface {
-	Check(argv []string) ([]rules.PathArg, error)
+	Check(argv []string) (rules.Allowed, error)
 }
 
 // Option customizes a Server.
@@ -148,9 +150,9 @@ func isTemporary(err error) bool {
 	return false
 }
 
-// handle serves one connection: an arm request or one command. Cancelling
-// ctx, or the client going away, kills the command without reporting a
-// result.
+// handle serves one connection: an arm request, a dry run or one command.
+// Cancelling ctx, or the client going away, kills the command without
+// reporting a result.
 func (s *Server) handle(ctx context.Context, conn net.Conn) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -159,11 +161,14 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 	defer stop()
 
 	out := &frameWriter{conn: conn}
+	// logArgs mark in the log every refusal of this connection's request,
+	// once its kind is known (a dry run).
+	var logArgs []any
 	// A bug triggered by one request (e.g. in the policy) must not take the
 	// whole daemon down with every other container's session.
 	defer func() {
 		if r := recover(); r != nil {
-			s.reject(out, protocol.ExitHostrunError, "internal error in the hostrunner daemon", fmt.Errorf("panic: %v\n%s", r, debug.Stack()))
+			s.reject(out, protocol.ExitHostrunError, "internal error in the hostrunner daemon", fmt.Errorf("panic: %v\n%s", r, debug.Stack()), logArgs...)
 		}
 	}()
 	_ = conn.SetReadDeadline(time.Now().Add(s.requestTimeout))
@@ -177,12 +182,42 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 		s.arm(out, f)
 		return
 	}
+	if f.Type == protocol.FrameDryRun {
+		logArgs = dryRunLogArgs
+	}
 	req, err := decodeRequest(f)
 	if err != nil {
-		s.reject(out, protocol.ExitHostrunError, err.Error(), err)
+		s.reject(out, protocol.ExitHostrunError, err.Error(), err, logArgs...)
+		return
+	}
+	if f.Type == protocol.FrameDryRun {
+		s.dryRun(out, req)
 		return
 	}
 	s.run(ctx, cancel, conn, out, req)
+}
+
+// dryRunLogArgs mark a dry run's lines in the daemon log.
+var dryRunLogArgs = []any{"dry_run", true}
+
+// dryRun answers whether req would start: it runs the same checks as run,
+// then looks the program up as starting it would, and releases what the
+// checks opened, never starting the command or reading stdin.
+func (s *Server) dryRun(out *frameWriter, req protocol.Request) {
+	p, r := s.prepare(req)
+	if r != nil {
+		s.reject(out, r.code, r.message, r.err, dryRunLogArgs...)
+		return
+	}
+	err := lookupProgram(p.argv[0], p.dir)
+	p.close()
+	if err != nil {
+		code, message := startFailure(req.Argv[0], err)
+		s.reject(out, code, message, err, dryRunLogArgs...)
+		return
+	}
+	s.log.Info("dry run allowed", append([]any{"argv", req.Argv, "rule", p.rule, "dir", p.hostPath}, dryRunLogArgs...)...)
+	_ = out.writeJSON(protocol.FrameAllowed, protocol.Allowed{Rule: p.rule})
 }
 
 // arm handles FrameArm from `hostrunner up`. When the handler asks for a
@@ -208,33 +243,69 @@ func (s *Server) arm(out *frameWriter, f protocol.Frame) {
 	}
 }
 
-// run executes req on the connection if the policy allows it; cancel stops
-// it early. The rules are checked first, so a denied command is reported as
-// such whatever its working directory; the path checks they ask for come
-// after the working directory is open, since paths are resolved from it.
-func (s *Server) run(ctx context.Context, cancel context.CancelFunc, conn net.Conn, out *frameWriter, req protocol.Request) {
-	paths, err := s.policy.Check(req.Argv)
+// prepared is a command that passed every check before its start: what
+// starting it needs. Its owner calls close once it is done with it.
+type prepared struct {
+	rule     string     // the command of the rule that allowed it
+	dir      *os.File   // the working directory, opened
+	hostPath string     // dir's real path on the host
+	argv     []string   // argv to run, with path: open arguments replaced
+	files    []*os.File // path: open files, the command's descriptors 3, 4, …
+}
+
+// close releases the daemon's copies of the directory and of the files
+// the command has not inherited yet.
+func (p *prepared) close() {
+	p.dir.Close()
+	closeAll(p.files)
+}
+
+// refusal is why a command may not start: the exit code and message for
+// the client, which must not reveal host paths, and the error, with host
+// paths, for the daemon log.
+type refusal struct {
+	code    int
+	message string
+	err     error
+}
+
+// prepare runs the checks req has to pass before its command may start.
+// The rules are checked first, so a denied command is reported as such
+// whatever its working directory; the path checks they ask for come after
+// the working directory is open, since paths are resolved from it. On
+// refusal nothing is left open.
+func (s *Server) prepare(req protocol.Request) (*prepared, *refusal) {
+	allowed, err := s.policy.Check(req.Argv)
 	if err != nil {
-		s.reject(out, protocol.ExitRejected, err.Error(), err)
-		return
+		return nil, &refusal{protocol.ExitRejected, err.Error(), err}
 	}
 	dir, hostPath, err := s.mapper.Open(req.Cwd)
 	if err != nil {
-		s.reject(out, protocol.ExitRejected, cwdMessage(req.Cwd, err), err)
-		return
+		return nil, &refusal{protocol.ExitRejected, cwdMessage(req.Cwd, err), err}
 	}
-	defer dir.Close()
-	argv, files, message, err := s.openPaths(req.Argv, paths, hostPath)
-	// The command inherits the files; the daemon's copies go once it has
-	// started (files is cleared then), or with the request on failure.
-	defer func() { closeAll(files) }()
+	argv, files, message, err := s.openPaths(req.Argv, allowed.Paths, hostPath)
 	if err != nil {
-		s.reject(out, protocol.ExitRejected, message, err)
+		dir.Close()
+		closeAll(files)
+		return nil, &refusal{protocol.ExitRejected, message, err}
+	}
+	return &prepared{rule: allowed.Rule, dir: dir, hostPath: hostPath, argv: argv, files: files}, nil
+}
+
+// run executes req on the connection if it passes prepare; cancel stops it
+// early.
+func (s *Server) run(ctx context.Context, cancel context.CancelFunc, conn net.Conn, out *frameWriter, req protocol.Request) {
+	p, r := s.prepare(req)
+	if r != nil {
+		s.reject(out, r.code, r.message, r.err)
 		return
 	}
+	// The command inherits the files; the daemon's copies go once it has
+	// started (p.files is cleared then), or with the request on failure.
+	defer p.close()
 
-	cmd := newCommand(ctx, argv, dir, hostPath, out)
-	cmd.ExtraFiles = files
+	cmd := newCommand(ctx, p.argv, p.dir, p.hostPath, out)
+	cmd.ExtraFiles = p.files
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		s.reject(out, protocol.ExitHostrunError, "cannot start the command", err)
@@ -245,8 +316,8 @@ func (s *Server) run(ctx context.Context, cancel context.CancelFunc, conn net.Co
 		s.reject(out, code, message, err)
 		return
 	}
-	closeAll(files)
-	files = nil
+	closeAll(p.files)
+	p.files = nil
 
 	queue := newStdinQueue(protocol.StdinWindow)
 	var streams sync.WaitGroup
@@ -264,19 +335,20 @@ func (s *Server) run(ctx context.Context, cancel context.CancelFunc, conn net.Co
 	waitErr := cmd.Wait()
 	if ctx.Err() == nil {
 		code := exitCode(cmd.ProcessState)
-		s.log.Info("command finished", "argv", req.Argv, "dir", hostPath, "code", code, "wait_error", waitErr)
+		s.log.Info("command finished", "argv", req.Argv, "dir", p.hostPath, "code", code, "wait_error", waitErr)
 		_ = out.writeJSON(protocol.FrameExit, protocol.Exit{Code: code})
 	} else {
-		s.log.Info("command cancelled", "argv", req.Argv, "dir", hostPath)
+		s.log.Info("command cancelled", "argv", req.Argv, "dir", p.hostPath)
 	}
 	conn.Close()
 	streams.Wait()
 }
 
 // reject reports a command that could not run. The client gets message,
-// which must not reveal host paths; the full err goes to the daemon log.
-func (s *Server) reject(out *frameWriter, code int, message string, err error) {
-	s.log.Warn("request rejected", "code", code, "error", err)
+// which must not reveal host paths; the full err, and logArgs (slog
+// key-value pairs), go to the daemon log.
+func (s *Server) reject(out *frameWriter, code int, message string, err error, logArgs ...any) {
+	s.log.Warn("request rejected", append([]any{"code", code, "error", err}, logArgs...)...)
 	_ = out.writeJSON(protocol.FrameError, protocol.Error{Code: code, Message: message})
 }
 
@@ -351,16 +423,16 @@ func pathMessage(name string, err error) string {
 	return fmt.Sprintf("argument %q is not a workspace file: %s", name, reason)
 }
 
-// readOpening reads the opening frame of a connection (FrameRequest or
-// FrameArm) and checks its protocol version before anything else, so a
-// frame shaped by a newer protocol is reported as a version mismatch rather
-// than a decoding error.
+// readOpening reads the opening frame of a connection (FrameRequest,
+// FrameDryRun or FrameArm) and checks its protocol version before anything
+// else, so a frame shaped by a newer protocol is reported as a version
+// mismatch rather than a decoding error.
 func readOpening(conn net.Conn) (protocol.Frame, error) {
 	f, err := protocol.ReadFrame(conn)
 	if err != nil {
 		return f, fmt.Errorf("read request: %w", err)
 	}
-	if f.Type != protocol.FrameRequest && f.Type != protocol.FrameArm {
+	if f.Type != protocol.FrameRequest && f.Type != protocol.FrameDryRun && f.Type != protocol.FrameArm {
 		return f, fmt.Errorf("expected a request frame, got type %d", f.Type)
 	}
 	var header struct {
@@ -375,7 +447,7 @@ func readOpening(conn net.Conn) (protocol.Frame, error) {
 	return f, nil
 }
 
-// decodeRequest decodes and validates a FrameRequest.
+// decodeRequest decodes and validates a FrameRequest or FrameDryRun.
 func decodeRequest(f protocol.Frame) (protocol.Request, error) {
 	var req protocol.Request
 	if err := protocol.DecodeJSON(f, &req); err != nil {
@@ -385,6 +457,14 @@ func decodeRequest(f protocol.Frame) (protocol.Request, error) {
 		return req, errors.New("empty command")
 	}
 	return req, nil
+}
+
+// fdPath names the open directory dir in the daemon's /proc, so a
+// command started in it, or a path resolved from it, gets that directory
+// even if the container swaps a symlink into its path later. A child keeps
+// the path valid only until exec, as it inherits the descriptor until then.
+func fdPath(dir *os.File) string {
+	return fmt.Sprintf("/proc/self/fd/%d", dir.Fd())
 }
 
 // newCommand prepares argv to run in the open directory dir, whose real
@@ -397,7 +477,7 @@ func decodeRequest(f protocol.Frame) (protocol.Request, error) {
 // cancellation also kills whatever it spawned (e.g. git's ssh).
 func newCommand(ctx context.Context, argv []string, dir *os.File, hostPath string, out *frameWriter) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
-	cmd.Dir = fmt.Sprintf("/proc/self/fd/%d", dir.Fd())
+	cmd.Dir = fdPath(dir)
 	cmd.Env = append(slices.DeleteFunc(os.Environ(), func(kv string) bool {
 		return strings.HasPrefix(kv, "PWD=")
 	}), "PWD="+hostPath)
@@ -407,6 +487,35 @@ func newCommand(ctx context.Context, argv []string, dir *os.File, hostPath strin
 	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
 	cmd.WaitDelay = waitDelay
 	return cmd
+}
+
+// xOK is access(2)'s X_OK, which package syscall does not export.
+const xOK = 0x1
+
+// lookupProgram returns the error starting program in the working
+// directory dir would fail with, as far as it can be told without
+// starting it, so that startFailure classifies both alike. A name is
+// looked up in the daemon's PATH, as newCommand's exec.Cmd does; a path
+// is resolved from dir, as execve does after the child changed into it,
+// and must be an executable file: execve refuses a directory with EACCES.
+func lookupProgram(program string, dir *os.File) error {
+	if !strings.Contains(program, "/") {
+		_, err := exec.LookPath(program)
+		return err
+	}
+	path := program
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(fdPath(dir), path)
+	}
+	if err := syscall.Access(path, xOK); err != nil {
+		return err
+	}
+	if fi, err := os.Stat(path); err != nil {
+		return err
+	} else if fi.IsDir() {
+		return syscall.EACCES
+	}
+	return nil
 }
 
 // startFailure classifies why program could not start and describes it

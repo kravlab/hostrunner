@@ -55,3 +55,14 @@ file. It is `open` (the program gets the file the check
 opened) or `check` (the program gets the argument as
 given).
 _Avoid_: path matcher
+
+**Dry run**:
+A request from the container that goes through every check
+a command would meet before it starts, and reports whether
+it would run instead of running it.
+_Avoid_: check, test run
+
+**Rules test**:
+Testing a command against a rules file alone, on the host,
+without a daemon or a container.
+_Avoid_: check, dry run

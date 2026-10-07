@@ -48,7 +48,7 @@ func TestBuildVersionReportsTheModuleVersion(t *testing.T) {
 // A test binary carries no VCS data, so its version is "dev".
 func TestRunVersionPrintsTheVersion(t *testing.T) {
 	var out strings.Builder
-	if err := run([]string{"version"}, &out); err != nil {
+	if err := run([]string{"version"}, &out, io.Discard); err != nil {
 		t.Fatal(err)
 	}
 	if got := out.String(); got != "dev\n" {
@@ -58,7 +58,7 @@ func TestRunVersionPrintsTheVersion(t *testing.T) {
 
 func TestRunVersionRejectsArguments(t *testing.T) {
 	var out strings.Builder
-	if err := run([]string{"version", "extra"}, &out); err == nil {
+	if err := run([]string{"version", "extra"}, &out, io.Discard); err == nil {
 		t.Fatal("expected an error for an unexpected argument")
 	}
 	if out.Len() != 0 {

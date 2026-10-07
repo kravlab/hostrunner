@@ -25,18 +25,34 @@ const stdinChunk = 32 * 1024
 // command finishes: 128 + SIGINT, as a shell would report it.
 const ExitInterrupted = 130
 
-// Run executes argv on the host with the container working directory cwd
-// and returns the exit code hostrun must terminate with: the command's own
-// code, or one of the protocol.Exit* codes when hostrun or the daemon fails.
-// Failures of hostrun itself are reported on stderr prefixed with "hostrun:".
+// dryRunFlag, as hostrun's first argument, makes Run a dry run.
+const dryRunFlag = "--dry-run"
+
+// Run executes the command in args, hostrun's arguments, on the host with
+// the container working directory cwd and returns the exit code hostrun
+// must terminate with: the command's own code, or one of the protocol.Exit*
+// codes when hostrun or the daemon fails. Failures of hostrun itself are
+// reported on stderr prefixed with "hostrun:".
+//
+// When args starts with dryRunFlag, the rest is the command, and Run makes
+// a dry run of it: the daemon runs every check the command would meet
+// before it starts, but never starts it. Run then reports the allowing
+// rule on stderr and returns 0, or fails as a run of the command would
+// have been refused. Nothing after the first argument is hostrun's own, so
+// a command's --dry-run reaches the command.
 //
 // stdin is forwarded until it returns EOF, within the credit the daemon
-// grants. Run does not wait for that: a command that ignores stdin finishes
-// while a terminal read may still block. Cancelling ctx drops the connection,
-// which makes the daemon kill the command, and Run returns ExitInterrupted.
-func Run(ctx context.Context, d Dialer, argv []string, cwd string, stdin io.Reader, stdout, stderr io.Writer) int {
+// grants; a dry run does not read it. Run does not wait for that: a command
+// that ignores stdin finishes while a terminal read may still block.
+// Cancelling ctx drops the connection, which makes the daemon kill the
+// command, and Run returns ExitInterrupted.
+func Run(ctx context.Context, d Dialer, args []string, cwd string, stdin io.Reader, stdout, stderr io.Writer) int {
+	argv, dryRun := args, len(args) > 0 && args[0] == dryRunFlag
+	if dryRun {
+		argv = args[1:]
+	}
 	if len(argv) == 0 {
-		return fail(stderr, protocol.ExitHostrunError, "usage: hostrun <command> [args...]")
+		return fail(stderr, protocol.ExitHostrunError, "usage: hostrun [%s] <command> [args...]", dryRunFlag)
 	}
 	conn, err := d.Dial(ctx)
 	if err != nil {
@@ -47,13 +63,19 @@ func Run(ctx context.Context, d Dialer, argv []string, cwd string, stdin io.Read
 	defer stop()
 
 	req := protocol.Request{Version: protocol.Version, Argv: argv, Cwd: cwd}
-	if err := protocol.WriteJSON(conn, protocol.FrameRequest, req); err != nil {
+	opening := protocol.FrameRequest
+	if dryRun {
+		opening = protocol.FrameDryRun
+	}
+	if err := protocol.WriteJSON(conn, opening, req); err != nil {
 		return fail(stderr, protocol.ExitHostrunError, "send request: %v", err)
 	}
 	credit := newStdinCredit()
 	defer credit.stop()
-	// After the request this goroutine is the only writer on conn.
-	go forwardStdin(conn, stdin, credit)
+	if !dryRun {
+		// After the request this goroutine is the only writer on conn.
+		go forwardStdin(conn, stdin, credit)
+	}
 
 	for {
 		f, err := protocol.ReadFrame(conn)
@@ -89,6 +111,16 @@ func Run(ctx context.Context, d Dialer, argv []string, cwd string, stdin io.Read
 				return fail(stderr, protocol.ExitHostrunError, "%v", err)
 			}
 			return fail(stderr, e.Code, "%s", e.Message)
+		case protocol.FrameAllowed:
+			if dryRun {
+				var a protocol.Allowed
+				if err := protocol.DecodeJSON(f, &a); err != nil {
+					return fail(stderr, protocol.ExitHostrunError, "%v", err)
+				}
+				fmt.Fprintf(stderr, "hostrun: dry run: allowed by rule %q\n", a.Rule)
+				return 0
+			}
+			fallthrough // only a dry run is answered with it
 		default:
 			return fail(stderr, protocol.ExitHostrunError, "unexpected frame type %d from the daemon", f.Type)
 		}
