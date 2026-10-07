@@ -3,7 +3,9 @@
 //
 // A connection carries a sequence of frames, each encoded as
 // [type:1][length:4, big-endian][payload:length]. A connection either arms
-// the daemon (FrameArm, answered by FrameArmed or FrameError) or runs one
+// the daemon (FrameArm, answered by FrameArmed or FrameError), dry-runs one
+// command (FrameDryRun, answered by FrameAllowed or FrameError, the command
+// never starting), or runs one
 // command: the client opens with one FrameRequest, then streams FrameStdin/FrameStdinClose; the daemon streams
 // FrameStdout/FrameStderr and, when it has a result to report, ends the
 // exchange with one FrameExit or FrameError. If the exchange is cancelled
@@ -14,6 +16,10 @@
 // more as the command consumes them). This keeps the daemon's reader of the
 // connection from ever blocking on a command that does not read stdin, so it
 // always notices a disconnect. Structured payloads are JSON.
+//
+// A dry run has a frame type of its own rather than a field in Request: a
+// daemon that predates it rejects the unknown frame type, where it would
+// ignore an unknown field and run the command.
 package protocol
 
 import (
@@ -52,8 +58,10 @@ const (
 	FrameStdinCredit                      // daemon → client, JSON Credit
 	FrameArm                              // `hostrunner up` → daemon, JSON Arm
 	FrameArmed                            // daemon → `hostrunner up`, JSON Armed
+	FrameDryRun                           // client → daemon, JSON Request
+	FrameAllowed                          // daemon → client, JSON Allowed
 
-	lastFrameType = FrameArmed
+	lastFrameType = FrameAllowed
 )
 
 // Exit codes for failures of hostrun itself rather than of the command,
@@ -99,6 +107,12 @@ type Arm struct {
 type Armed struct {
 	Version int  `json:"version"`
 	Restart bool `json:"restart"`
+}
+
+// Allowed answers a dry run whose command passed every check before its
+// start. Rule is the command of the rule that allows it.
+type Allowed struct {
+	Rule string `json:"rule"`
 }
 
 // Exit reports the exit code of a command that ran.

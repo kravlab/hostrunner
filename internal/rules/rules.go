@@ -140,10 +140,17 @@ func (l *list) matches(s string) bool {
 // Load reads the config at path. A missing file yields a Policy that denies
 // every command; an unreadable or invalid one is an error naming path.
 func Load(path string) (*Policy, error) {
-	data, err := os.ReadFile(path)
+	p, err := Read(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return &Policy{missing: true, digest: missingDigest}, nil
 	}
+	return p, err
+}
+
+// Read is Load for a config that has to exist: a missing file is an error
+// too, satisfying errors.Is(err, fs.ErrNotExist).
+func Read(path string) (*Policy, error) {
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
@@ -410,15 +417,24 @@ type PathArg struct {
 	Mode   PathMode
 }
 
-// Check returns nil if argv is allowed, or a *Denial. For an allowed argv
-// it also returns, in argv order, the arguments that a path check applies
-// to; the caller has to perform those checks before running the command.
-func (p *Policy) Check(argv []string) ([]PathArg, error) {
+// Allowed describes an allowed command.
+type Allowed struct {
+	// Rule is the command of the rule that allowed it (the longest
+	// matching one), as Denial.Rule names a rule.
+	Rule string
+	// Paths are, in argv order, the arguments that a path check applies
+	// to; the caller has to perform those checks before running the
+	// command.
+	Paths []PathArg
+}
+
+// Check returns what allowed argv, or a *Denial when argv is not allowed.
+func (p *Policy) Check(argv []string) (Allowed, error) {
 	if len(argv) == 0 {
-		return nil, &Denial{Reason: "empty command"}
+		return Allowed{}, &Denial{Reason: "empty command"}
 	}
 	if p.missing {
-		return nil, &Denial{Reason: missingReason}
+		return Allowed{}, &Denial{Reason: missingReason}
 	}
 	var best *rule
 	for _, r := range p.rules {
@@ -428,18 +444,18 @@ func (p *Policy) Check(argv []string) ([]PathArg, error) {
 		}
 	}
 	if best == nil {
-		return nil, &Denial{Reason: fmt.Sprintf("no rule allows %q", strings.Join(argv[:min(2, len(argv))], " "))}
+		return Allowed{}, &Denial{Reason: fmt.Sprintf("no rule allows %q", strings.Join(argv[:min(2, len(argv))], " "))}
 	}
 	var paths []PathArg
 	if reason := best.check(argv[len(best.command):], &paths); reason != "" {
-		return nil, &Denial{Rule: best.name, Reason: reason}
+		return Allowed{}, &Denial{Rule: best.name, Reason: reason}
 	}
 	// check finds flag values as it goes but positional arguments at the end.
 	slices.SortFunc(paths, func(a, b PathArg) int { return a.Index - b.Index })
 	for i := range paths {
 		paths[i].Index += len(best.command)
 	}
-	return paths, nil
+	return Allowed{Rule: best.name, Paths: paths}, nil
 }
 
 // check applies the rule to the arguments after its command and returns

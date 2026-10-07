@@ -300,12 +300,12 @@ rules:
 	}
 	for _, tc := range allowed {
 		t.Run(strings.Join(tc.argv, "|"), func(t *testing.T) {
-			paths, err := p.Check(tc.argv)
+			allowed, err := p.Check(tc.argv)
 			if err != nil {
 				t.Fatalf("denied: %v", err)
 			}
-			if !slices.Equal(paths, tc.paths) {
-				t.Fatalf("got paths %+v, want %+v", paths, tc.paths)
+			if !slices.Equal(allowed.Paths, tc.paths) {
+				t.Fatalf("got paths %+v, want %+v", allowed.Paths, tc.paths)
 			}
 		})
 	}

@@ -610,11 +610,11 @@ func TestParseSaysWhichPathModesExist(t *testing.T) {
 // denied command reports no path arguments.
 func TestPathCheckDoesNotWidenTheList(t *testing.T) {
 	p := mustParse(t, "rules:\n  - command: abx install\n    positional:\n      allow: ['*.pkg']\n      path: open\n")
-	paths, err := p.Check([]string{"abx", "install", "notes.txt"})
+	allowed, err := p.Check([]string{"abx", "install", "notes.txt"})
 	if err == nil || err.Error() != `denied by rule "abx install": argument "notes.txt" is not allowed` {
 		t.Fatalf("got %v, want the list's denial", err)
 	}
-	if paths != nil {
-		t.Fatalf("denied command reported path arguments %+v", paths)
+	if allowed.Paths != nil {
+		t.Fatalf("denied command reported path arguments %+v", allowed.Paths)
 	}
 }

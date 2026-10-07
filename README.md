@@ -79,7 +79,19 @@ inside the container:
 ```sh
 hostrun git push
 hostrun git push --force   # hostrun: denied by rule "git push": flag --force is not allowed
+hostrun --dry-run git push # hostrun: dry run: allowed by rule "git push"
 ```
+
+A dry run (`--dry-run` as hostrun's first argument) asks the daemon
+whether the command would run, without running it: the daemon checks the
+rules, the working directory and the path checks, then looks the program
+up as starting it would (127 when the host lacks it, 126 when it cannot
+execute it) and answers. It exits 0
+with the allowing rule, or with the code and message the run would get.
+It does not read stdin, and the daemon log records it with
+`dry_run=true`. After the program, `--dry-run` is the command's own
+(`hostrun git push --dry-run` runs git's dry run). A daemon older than
+dry runs refuses one with 125 rather than running the command.
 
 ## Rules
 
@@ -220,6 +232,23 @@ rules:
     a symlink into the path and point it out of the workspace; `check`
     only stops what is already there when the command starts.
 
+To see whether a rules file allows a command before restarting the
+container, run the Rules test on the host, in the project root:
+
+```sh
+hostrunner test git push -u origin main   # hostrunner: allowed by rule "git push"
+hostrunner test git push --force          # hostrunner: denied by rule "git push": flag --force is not allowed
+hostrunner test --config draft.yaml -- tix pr list
+```
+
+It reads `.devcontainer/hostrun.yaml` under the current directory, or the
+`--config` file, and tests the command against the rules alone: not the
+working directory, path checks or the host's programs. It exits 0 when
+the command is allowed, 126 when it is denied, and 1 when the file is
+missing or invalid (unlike the daemon, which denies everything without a
+file) or no command is given. Its flags end at the first argument that is
+not one of them, or at `--`.
+
 How it works:
 
 - `hostrunner up` runs on the host before every container start. It
@@ -246,6 +275,7 @@ How it works:
 | Code | Meaning |
 |---|---|
 | command's own | the command ran |
+| 0 | `--dry-run`: the command would run |
 | 128+N | the command was killed by signal N |
 | 125 | hostrun failed: daemon unreachable, protocol error, or no command given |
 | 126 | refused: denied by the rules, an argument not a workspace file, working directory outside the workspace, or not executable |

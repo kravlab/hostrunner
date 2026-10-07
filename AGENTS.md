@@ -34,6 +34,13 @@ in the container.
   and when a command needs the host but no rule allows it, report the
   command and the message to the user and wait: only the host can change
   the rules or install tools.
+- To learn whether a command would run without running it, put
+  `--dry-run` first: `hostrun --dry-run git push --force`. The host
+  checks the rules, the directory, file arguments and that the program
+  is installed and executable, then exits 0 with
+  `hostrun: dry run: allowed by rule "…"`, or with the code and message
+  the run would get. Nothing runs and stdin is not read. Anywhere after
+  the program, `--dry-run` is the command's own.
 - No TTY: supply all input up front, through flags or stdin.
 
 ## Go

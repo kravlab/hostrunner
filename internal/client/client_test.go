@@ -37,11 +37,17 @@ type harness struct {
 // everything but the rules.
 type allowAll struct{}
 
-func (allowAll) Check([]string) ([]rules.PathArg, error) { return nil, nil }
+func (allowAll) Check([]string) (rules.Allowed, error) { return rules.Allowed{}, nil }
 
 // startDaemon starts a daemon with the given policy, or one allowing every
 // command.
 func startDaemon(t *testing.T, policies ...daemon.Policy) harness {
+	t.Helper()
+	return startLoggingDaemon(t, slog.New(slog.DiscardHandler), policies...)
+}
+
+// startLoggingDaemon is startDaemon with the daemon logging to log.
+func startLoggingDaemon(t *testing.T, log *slog.Logger, policies ...daemon.Policy) harness {
 	t.Helper()
 	base, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
@@ -66,7 +72,7 @@ func startDaemon(t *testing.T, policies ...daemon.Policy) harness {
 	if len(policies) > 0 {
 		p = policies[0]
 	}
-	srv := daemon.New(mapper, p, slog.New(slog.DiscardHandler))
+	srv := daemon.New(mapper, p, log)
 	go func() { done <- srv.Serve(ctx, l) }()
 	stop := sync.OnceFunc(func() {
 		cancel()
