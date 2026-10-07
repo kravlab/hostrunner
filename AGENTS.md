@@ -19,7 +19,9 @@ When `hostrun` is in `PATH` (a devcontainer wired to hostrunner),
 commands that run on the host, where the host's credentials, tools and
 network are. A command matched by one of its rules runs as
 `hostrun <cmd> [args…]`: on the host, in the directory matching your
-current one, with the host's environment (not the container's); stdin,
+current one or in a host directory its rule names (`dir`; relative file
+arguments still name files next to you), with the host's environment
+(not the container's); stdin,
 stdout, stderr and the exit code pass through. Every other command runs
 in the container.
 
@@ -38,7 +40,8 @@ in the container.
   `--dry-run` first: `hostrun --dry-run git push --force`. The host
   checks the rules, the directory, file arguments and that the program
   is installed and executable, then exits 0 with
-  `hostrun: dry run: allowed by rule "…"`, or with the code and message
+  `hostrun: dry run: allowed by rule "…"` (`, runs in <dir>` when the
+  rule names a directory), or with the code and message
   the run would get. Nothing runs and stdin is not read. Anywhere after
   the program, `--dry-run` is the command's own.
 - No TTY: supply all input up front, through flags or stdin.

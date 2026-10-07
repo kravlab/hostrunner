@@ -35,10 +35,11 @@ func parseTest(args []string, output io.Writer) (testConfig, error) {
 }
 
 // rulesTest runs the Rules test: it tests cfg.argv against the rules file
-// alone, with no daemon or container, and reports the allowing rule on
-// stderr. A denied command is an exitError with protocol.ExitRejected, as
-// hostrun exits when the daemon denies it. Unlike the daemon, it takes a
-// missing file for an error; an invalid one fails as in `hostrunner up`.
+// alone, with no daemon or container, and reports the allowing rule and
+// its fixed directory on stderr. A denied command is an exitError with
+// protocol.ExitRejected, as hostrun exits when the daemon denies it.
+// Unlike the daemon, it takes a missing file for an error; an invalid one
+// fails as in `hostrunner up`.
 func rulesTest(cfg testConfig, stderr io.Writer) error {
 	policy, err := rules.Read(cfg.config)
 	if err != nil {
@@ -48,6 +49,8 @@ func rulesTest(cfg testConfig, stderr io.Writer) error {
 	if err != nil {
 		return &exitError{code: protocol.ExitRejected, err: err}
 	}
-	_, err = fmt.Fprintf(stderr, "hostrunner: allowed by rule %q\n", allowed.Rule)
+	// The report a dry run gets, without checking the fixed directory:
+	// that needs the workspace.
+	_, err = fmt.Fprintf(stderr, "hostrunner: %s\n", protocol.Allowed{Rule: allowed.Rule, Dir: allowed.Dir})
 	return err
 }

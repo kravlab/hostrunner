@@ -1,9 +1,10 @@
 // Package daemon runs host commands on behalf of hostrun clients.
 //
 // Each connection carries exactly one command. The daemon maps the client's
-// container cwd onto the host workspace, starts the command with the host's
-// environment, streams its stdio over the connection and finishes with the
-// exit code. If the client disconnects, the command's process group is killed.
+// current directory onto the host workspace (the mirrored directory),
+// starts the command there, or in the fixed directory its rule names, with
+// the host's environment, streams its stdio over the connection and
+// finishes with the exit code. If the client disconnects, the command's process group is killed.
 package daemon
 
 import (
@@ -217,7 +218,7 @@ func (s *Server) dryRun(out *frameWriter, req protocol.Request) {
 		return
 	}
 	s.log.Info("dry run allowed", append([]any{"argv", req.Argv, "rule", p.rule, "dir", p.hostPath}, dryRunLogArgs...)...)
-	_ = out.writeJSON(protocol.FrameAllowed, protocol.Allowed{Rule: p.rule})
+	_ = out.writeJSON(protocol.FrameAllowed, protocol.Allowed{Rule: p.rule, Dir: p.fixedDir})
 }
 
 // arm handles FrameArm from `hostrunner up`. When the handler asks for a
@@ -247,6 +248,7 @@ func (s *Server) arm(out *frameWriter, f protocol.Frame) {
 // starting it needs. Its owner calls close once it is done with it.
 type prepared struct {
 	rule     string     // the command of the rule that allowed it
+	fixedDir string     // the rule's fixed directory, cleaned; "" if none
 	dir      *os.File   // the working directory, opened
 	hostPath string     // dir's real path on the host
 	argv     []string   // argv to run, with path: open arguments replaced
@@ -271,9 +273,11 @@ type refusal struct {
 
 // prepare runs the checks req has to pass before its command may start.
 // The rules are checked first, so a denied command is reported as such
-// whatever its working directory; the path checks they ask for come after
-// the working directory is open, since paths are resolved from it. On
-// refusal nothing is left open.
+// whatever its directories; the path checks they ask for come after the
+// mirrored directory is open, since paths are resolved from it. The
+// mirrored directory has to be inside the workspace even for a rule with a
+// fixed directory, which is opened last and replaces it as the working
+// directory. On refusal nothing is left open.
 func (s *Server) prepare(req protocol.Request) (*prepared, *refusal) {
 	allowed, err := s.policy.Check(req.Argv)
 	if err != nil {
@@ -289,7 +293,15 @@ func (s *Server) prepare(req protocol.Request) (*prepared, *refusal) {
 		closeAll(files)
 		return nil, &refusal{protocol.ExitRejected, message, err}
 	}
-	return &prepared{rule: allowed.Rule, dir: dir, hostPath: hostPath, argv: argv, files: files}, nil
+	if allowed.Dir != "" {
+		// The mirrored directory was only needed to resolve the paths.
+		dir.Close()
+		if dir, hostPath, err = s.mapper.OpenFixed(allowed.Dir); err != nil {
+			closeAll(files)
+			return nil, &refusal{protocol.ExitRejected, fixedMessage(allowed.Dir, err), err}
+		}
+	}
+	return &prepared{rule: allowed.Rule, fixedDir: allowed.Dir, dir: dir, hostPath: hostPath, argv: argv, files: files}, nil
 }
 
 // run executes req on the connection if it passes prepare; cancel stops it
@@ -358,6 +370,24 @@ func cwdMessage(cwd string, err error) string {
 		return fmt.Sprintf("working directory %s is outside the workspace", cwd)
 	}
 	return fmt.Sprintf("working directory %s is not available on the host", cwd)
+}
+
+// fixedMessage describes why the fixed directory dir, the rules file's path
+// cleaned, is refused. The container reads the rules file, so naming dir
+// reveals nothing; where it leads on the host is left to the daemon log.
+func fixedMessage(dir string, err error) string {
+	var reason string
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		reason = "does not exist"
+	case errors.Is(err, syscall.ENOTDIR):
+		reason = "is not a directory"
+	case errors.Is(err, workspace.ErrInsideWorkspace):
+		reason = "is inside the workspace"
+	default:
+		reason = "cannot be opened on the host"
+	}
+	return fmt.Sprintf("fixed directory %s %s", dir, reason)
 }
 
 // openPaths performs the path checks the policy asked for on argv, whose

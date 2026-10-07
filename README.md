@@ -87,7 +87,9 @@ whether the command would run, without running it: the daemon checks the
 rules, the working directory and the path checks, then looks the program
 up as starting it would (127 when the host lacks it, 126 when it cannot
 execute it) and answers. It exits 0
-with the allowing rule, or with the code and message the run would get.
+with the allowing rule, and the rule's `dir` when it has one
+(`allowed by rule "tix issues", runs in /`), or with the code and
+message the run would get.
 It does not read stdin, and the daemon log records it with
 `dry_run=true`. After the program, `--dry-run` is the command's own
 (`hostrun git push --dry-run` runs git's dry run). A daemon older than
@@ -127,13 +129,17 @@ rules:
       deny: [-asap]
       values:
         -repo: { allow: [my/repo] }
+  - command: tix issues
+    dir: /                     # run in / on the host, not where the container stands
+    args: any
 ```
 
 - A command no rule matches is denied, and so is everything when the file
   is missing. An invalid file (unknown key, two keys on one list such as
   both `allow` and `deny`, a regex that does not compile, `args` together
   with `flags`/`positional`/`flag_style`, an empty section, a rule
-  without any of them, a relative program path, …) makes `hostrunner up`
+  without any of them, a relative program path or `dir`, `dir` with
+  `path: check`, …) makes `hostrunner up`
   fail, and with it `devcontainer up`.
 - Changes apply on the next container start (reopen, restart or rebuild):
   `hostrunner up` notices that the file differs from what the running
@@ -142,6 +148,22 @@ rules:
   change its rules.
 - Matching is literal on argv: `/usr/bin/git push` and `git -C dir push` do
   not match `git push`. The program must be a name or an absolute path.
+- A command runs in the mirrored directory: the host directory that
+  matches the container's current one. A tool that reads configuration
+  from its working directory (`tix` probes it with git and reads
+  `--repo owner/name` as a path when that directory exists there; a mise
+  shim reads the `mise.toml` above it) is then steered by whatever the
+  container puts there. Give its rule `dir:` with an absolute host path to
+  run the command there instead; `PWD` is set to it. It must be an
+  existing directory outside the workspace, symlinks followed: otherwise the
+  command is refused (126). This is checked on every command, not when
+  the rules load. The container must still stand inside the workspace. A
+  longer rule does not inherit `dir`: `tix issues list` above runs in `/`,
+  but a `tix issues list` rule of its own runs in the mirrored directory
+  unless it says `dir` too. `dir: inherit` takes the `dir` of the nearest
+  shorter rule whose command starts the same way (`tix issues` for
+  `tix issues list`), following further `inherit`s; it is an error when
+  there is no such rule or it has no `dir`.
 - Arguments are parsed like getopt, unless the rule says `flag_style: go`
   (below): `--flag=value`, `--flag value`, `-abc` (= `-a -b -c`),
   `-ovalue`, and `--` ending the flags. Only flags
@@ -215,7 +237,7 @@ rules:
   `path: check` to its list, next to the patterns or alone (`positional:
   { path: open }`, `--file: { path: check }`). Every argument the list
   applies to (every positional argument of the rule, or every value of
-  the flag in any spelling) must then be a relative path, from the working
+  the flag in any spelling) must then be a relative path, from the mirrored
   directory, to an existing regular file whose real location on the host,
   symlinks followed, is inside the workspace. Absolute paths, missing
   files, directories, FIFOs and devices are refused, and so is a symlink
@@ -231,6 +253,10 @@ rules:
     itself, after the check. Between the two the container can still swap
     a symlink into the path and point it out of the workspace; `check`
     only stops what is already there when the command starts.
+  - A rule with `dir` can use `path: open` (the file is found from the
+    mirrored directory and handed over open) but not `path: check`: the
+    program would look for the argument in `dir`, not where it was
+    checked, so the rules file is invalid.
 
 To see whether a rules file allows a command before restarting the
 container, run the Rules test on the host, in the project root:
@@ -243,7 +269,9 @@ hostrunner test --config draft.yaml -- tix pr list
 
 It reads `.devcontainer/hostrun.yaml` under the current directory, or the
 `--config` file, and tests the command against the rules alone: not the
-working directory, path checks or the host's programs. It exits 0 when
+working directory, path checks or the host's programs. It reports the
+rule's `dir` (`inherit` resolved) as a dry run does, without checking
+that the directory exists or lies outside the workspace. It exits 0 when
 the command is allowed, 126 when it is denied, and 1 when the file is
 missing or invalid (unlike the daemon, which denies everything without a
 file) or no command is given. Its flags end at the first argument that is
@@ -266,8 +294,9 @@ How it works:
   the nearest `.devcontainer/` above its working directory, or the
   `hostrun.yaml` in it, is writable (the default location only, not a
   `--config` file).
-- The working directory is opened, not re-resolved, when the command
-  starts, so a symlink swapped in by the container cannot redirect it.
+- The working directory (the mirrored directory, or the rule's `dir`) is
+  opened, not re-resolved, when the command starts, so a symlink swapped
+  in by the container cannot redirect it.
   Symlinks inside the workspace must be relative.
 
 ## Exit codes
@@ -278,7 +307,7 @@ How it works:
 | 0 | `--dry-run`: the command would run |
 | 128+N | the command was killed by signal N |
 | 125 | hostrun failed: daemon unreachable, protocol error, or no command given |
-| 126 | refused: denied by the rules, an argument not a workspace file, working directory outside the workspace, or not executable |
+| 126 | refused: denied by the rules, an argument not a workspace file, working directory outside the workspace, a rule's `dir` missing, not a directory or inside the workspace, or not executable |
 | 127 | command not found on the host |
 | 130 | interrupted (Ctrl+C); the host command is killed |
 

@@ -31,6 +31,8 @@ command without restarting the container.
   execve refuses it).
 - Allowed: `hostrun: dry run: allowed by rule "<command>"` on stderr,
   exit 0. `<command>` is the rule's command, the longest matching one.
+  A rule with a fixed directory adds `, runs in <dir>`
+  ([rules-fixed-directory.md](rules-fixed-directory.md)).
 - Refused: the message and exit code a run of the same command would get
   (126 refused, 127 not on the host, 125 hostrun failed), without host
   paths.
@@ -42,7 +44,8 @@ command without restarting the container.
 ## Protocol
 
 - New frame types: `FrameDryRun` (client → daemon, JSON `Request`) and
-  `FrameAllowed` (daemon → client, JSON `{"rule": "<command>"}`). A
+  `FrameAllowed` (daemon → client, JSON `{"rule": "<command>"}`, plus
+  `"dir": "<dir>"` for a rule with a fixed directory). A
   refusal is `FrameError`, as for a run. `Version` stays 1.
 - A frame type rather than a field in `Request`: a daemon older than dry
   runs rejects the unknown frame type (exit 125), where it would ignore an
@@ -58,7 +61,8 @@ command without restarting the container.
   `--`; the rest is the command.
 - Tests the command against the rules alone: not the working directory,
   path checks or the host's programs.
-- Allowed: `hostrunner: allowed by rule "<command>"` on stderr, exit 0.
+- Allowed: `hostrunner: allowed by rule "<command>"` on stderr, exit 0,
+  with `, runs in <dir>` for a rule with a fixed directory (not checked).
 - Denied: the daemon's reason (`hostrunner: denied by rule …`, `hostrunner:
   no rule allows …`), exit 126.
 - Exit 1, with the error: no command (usage), a missing file (unlike the

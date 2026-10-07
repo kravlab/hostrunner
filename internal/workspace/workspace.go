@@ -1,5 +1,6 @@
 // Package workspace maps a working directory inside the container to the
-// matching directory on the host, confining it to the workspace.
+// matching directory on the host, confining it to the workspace, and keeps
+// a rule's fixed directory out of it.
 package workspace
 
 import (
@@ -70,10 +71,50 @@ func (m *Mapper) Open(containerCwd string) (*os.File, string, error) {
 		// os.Root reports escapes (via ".." or symlinks) without an errno.
 		return nil, "", fmt.Errorf("%w: %s: %v", ErrOutsideWorkspace, containerCwd, err)
 	}
+	hostPath, err := realPath(dir, containerCwd)
+	if err != nil {
+		return nil, "", err
+	}
+	return dir, hostPath, nil
+}
+
+// realPath returns the real host path of the directory dir, opened for
+// name, as the kernel resolved it on opening. On failure it closes dir.
+func realPath(dir *os.File, name string) (string, error) {
 	hostPath, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", dir.Fd()))
 	if err != nil {
 		dir.Close()
-		return nil, "", fmt.Errorf("open %s on the host: %w", containerCwd, err)
+		return "", fmt.Errorf("open %s on the host: %w", name, err)
+	}
+	return hostPath, nil
+}
+
+// ErrInsideWorkspace means a fixed directory's real path lies inside the
+// workspace, which the container writes.
+var ErrInsideWorkspace = errors.New("inside the workspace")
+
+// OpenFixed opens the fixed directory path, an absolute host path a rule
+// names, and returns it with its real host path. The caller must close it
+// and run the command in the open directory, as for Open.
+//
+// The directory is refused with ErrInsideWorkspace when its real path, as
+// opened (symlinks followed), is the workspace or lies below it: the
+// container could plant there the configuration a fixed directory keeps a
+// command away from. A missing path keeps fs.ErrNotExist and anything but
+// a directory fails with ENOTDIR.
+func (m *Mapper) OpenFixed(path string) (*os.File, string, error) {
+	// O_DIRECTORY: opening a FIFO in its place would block forever.
+	dir, err := os.OpenFile(path, os.O_RDONLY|syscall.O_DIRECTORY, 0)
+	if err != nil {
+		return nil, "", err
+	}
+	hostPath, err := realPath(dir, path)
+	if err != nil {
+		return nil, "", err
+	}
+	if _, inside := within(m.hostRoot, hostPath); inside {
+		dir.Close()
+		return nil, "", fmt.Errorf("%s leads to %s: %w", path, hostPath, ErrInsideWorkspace)
 	}
 	return dir, hostPath, nil
 }

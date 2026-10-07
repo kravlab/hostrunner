@@ -110,9 +110,20 @@ type Armed struct {
 }
 
 // Allowed answers a dry run whose command passed every check before its
-// start. Rule is the command of the rule that allows it.
+// start. Rule is the command of the rule that allows it; Dir is the rule's
+// fixed directory, the command's working directory, and is omitted when
+// the command would run in the mirrored directory.
 type Allowed struct {
 	Rule string `json:"rule"`
+	Dir  string `json:"dir,omitempty"`
+}
+
+// String describes a, as the dry run and the Rules test report it.
+func (a Allowed) String() string {
+	if a.Dir == "" {
+		return fmt.Sprintf("allowed by rule %q", a.Rule)
+	}
+	return fmt.Sprintf("allowed by rule %q, runs in %s", a.Rule, a.Dir)
 }
 
 // Exit reports the exit code of a command that ran.

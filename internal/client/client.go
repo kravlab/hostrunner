@@ -117,7 +117,7 @@ func Run(ctx context.Context, d Dialer, args []string, cwd string, stdin io.Read
 				if err := protocol.DecodeJSON(f, &a); err != nil {
 					return fail(stderr, protocol.ExitHostrunError, "%v", err)
 				}
-				fmt.Fprintf(stderr, "hostrun: dry run: allowed by rule %q\n", a.Rule)
+				fmt.Fprintf(stderr, "hostrun: dry run: %s\n", a)
 				return 0
 			}
 			fallthrough // only a dry run is answered with it

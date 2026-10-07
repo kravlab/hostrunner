@@ -26,8 +26,19 @@
 // given. This package cannot perform the check, which needs the workspace:
 // Check reports the arguments concerned, and the caller checks them.
 //
-// Rules restrict argv only. A tool that reads configuration or hooks from
-// the workspace can still be steered by whoever can write the workspace.
+// A rule may name a fixed directory (`dir: /`), an absolute host path its
+// command runs in instead of the mirrored directory, so a tool that reads
+// configuration from its working directory is not steered by the
+// container. A longer rule does not inherit it unless it says
+// `dir: inherit`, which Parse resolves (see resolveDirs). Check reports
+// the directory; like a path check, whether it is a directory outside the
+// workspace is the caller's to check. Path checks still resolve from the
+// mirrored directory, so a rule with `dir` may not use `path: check`: the
+// program would resolve the argument from `dir`.
+//
+// Rules restrict argv and, with `dir`, the working directory only. A tool
+// that reads configuration or hooks from the workspace can still be
+// steered by whoever can write the workspace.
 package rules
 
 import (
@@ -87,6 +98,8 @@ type rule struct {
 	command    []string
 	name       string // command joined with single spaces, for messages
 	args       string // "any", "none", or "" when flags/positional filter
+	dir        string // the fixed directory; "" runs in the mirrored directory
+	inherit    bool   // `dir: inherit`, until Parse resolves it into dir
 	style      flagStyle
 	flags      *flagFilter
 	positional *list // nil: positional arguments are unrestricted
@@ -172,6 +185,7 @@ type (
 		Command    string    `yaml:"command"`
 		Args       string    `yaml:"args"`
 		FlagStyle  string    `yaml:"flag_style"`
+		Dir        yaml.Node `yaml:"dir"` // a Node: a null dir is an error, not no dir
 		Flags      *rawFlags `yaml:"flags"`
 		Positional *rawList  `yaml:"positional"`
 	}
@@ -215,7 +229,43 @@ func Parse(data []byte) (*Policy, error) {
 		seen[r.name] = true
 		p.rules = append(p.rules, r)
 	}
+	if err := resolveDirs(p.rules); err != nil {
+		return nil, err
+	}
 	return p, nil
+}
+
+// resolveDirs gives each `dir: inherit` rule the fixed directory of the
+// nearest shorter rule whose command is a prefix of its own. Shorter rules
+// are resolved first, so a chain of inherits ends at a written path. It is
+// an error when there is no such rule, or it has no fixed directory: an
+// inherit never silently means the mirrored directory.
+func resolveDirs(rs []*rule) error {
+	byLength := slices.Clone(rs)
+	slices.SortStableFunc(byLength, func(a, b *rule) int { return len(a.command) - len(b.command) })
+	for _, r := range byLength {
+		if !r.inherit {
+			continue
+		}
+		var parent *rule
+		for _, c := range rs {
+			if len(c.command) < len(r.command) && slices.Equal(c.command, r.command[:len(c.command)]) &&
+				(parent == nil || len(c.command) > len(parent.command)) {
+				parent = c
+			}
+		}
+		switch {
+		case parent == nil:
+			return fmt.Errorf("%q: dir: inherit needs a shorter rule whose command is a prefix of this one", r.name)
+		case parent.dir == "":
+			return fmt.Errorf("%q: dir: inherit, but the nearest shorter rule %q has no dir", r.name, parent.name)
+		}
+		r.dir = parent.dir
+		if r.hasPathCheck() {
+			return errDirWithPathCheck(r.name)
+		}
+	}
+	return nil
 }
 
 // newRule validates one raw rule.
@@ -229,6 +279,18 @@ func newRule(rr rawRule) (*rule, error) {
 		// A relative path resolves in the working directory, which the
 		// container controls: it could plant any program there.
 		return nil, fmt.Errorf("%q: the program must be a name or an absolute path", r.name)
+	}
+	if rr.Dir.Kind != 0 {
+		// A relative directory would depend on where the daemon runs.
+		isStr := rr.Dir.Kind == yaml.ScalarNode && rr.Dir.ShortTag() == "!!str"
+		switch {
+		case isStr && rr.Dir.Value == "inherit":
+			r.inherit = true // resolved by resolveDirs
+		case isStr && filepath.IsAbs(rr.Dir.Value):
+			r.dir = filepath.Clean(rr.Dir.Value)
+		default:
+			return nil, fmt.Errorf("%q: dir must be an absolute path or inherit", r.name)
+		}
 	}
 	if rr.FlagStyle != "" {
 		var ok bool
@@ -266,7 +328,32 @@ func newRule(rr rawRule) (*rule, error) {
 			return nil, fmt.Errorf("%q flags: %w", r.name, err)
 		}
 	}
+	if r.dir != "" && r.hasPathCheck() {
+		return nil, errDirWithPathCheck(r.name)
+	}
 	return r, nil
+}
+
+// hasPathCheck reports whether a list of the rule has `path: check`.
+func (r *rule) hasPathCheck() bool {
+	if r.positional != nil && r.positional.path == PathModeCheck {
+		return true
+	}
+	if r.flags != nil {
+		for _, l := range r.flags.values {
+			if l != nil && l.path == PathModeCheck {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// errDirWithPathCheck is the error for a rule with both a fixed directory
+// and `path: check`: the program would resolve the argument from the fixed
+// directory, not from the mirrored directory it was checked in.
+func errDirWithPathCheck(rule string) error {
+	return fmt.Errorf("%q: dir cannot be combined with path: check (use path: open)", rule)
 }
 
 // newFlagFilter validates a rule's flags section for the rule's flag style.
@@ -426,6 +513,10 @@ type Allowed struct {
 	// to; the caller has to perform those checks before running the
 	// command.
 	Paths []PathArg
+	// Dir is the allowing rule's fixed directory, an absolute host path
+	// the command runs in, or "" to run it in the mirrored directory. The
+	// caller has to check that it is a directory outside the workspace.
+	Dir string
 }
 
 // Check returns what allowed argv, or a *Denial when argv is not allowed.
@@ -455,7 +546,7 @@ func (p *Policy) Check(argv []string) (Allowed, error) {
 	for i := range paths {
 		paths[i].Index += len(best.command)
 	}
-	return Allowed{Rule: best.name, Paths: paths}, nil
+	return Allowed{Rule: best.name, Paths: paths, Dir: best.dir}, nil
 }
 
 // check applies the rule to the arguments after its command and returns
