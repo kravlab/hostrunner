@@ -145,3 +145,25 @@ func TestRulesTestTakesEverythingAfterTheFlagsAsTheCommand(t *testing.T) {
 		t.Fatalf("exit code %d, stderr %q; want 126, %q", code, stderr, want)
 	}
 }
+
+// The Rules test reports the fixed directory, inherit resolved, but tests
+// the rules file alone: the directory need not exist.
+func TestRulesTestReportsTheFixedDirectory(t *testing.T) {
+	config := writeRules(t, `rules:
+  - command: tix
+    dir: /hostrunner-test/no-such-dir
+    args: none
+  - command: tix api
+    dir: inherit
+    args: any
+`)
+	for argv, want := range map[string]string{
+		"tix":       "hostrunner: allowed by rule \"tix\", runs in /hostrunner-test/no-such-dir\n",
+		"tix api x": "hostrunner: allowed by rule \"tix api\", runs in /hostrunner-test/no-such-dir\n",
+	} {
+		code, _, stderr := runTest(t, append([]string{"--config", config}, strings.Fields(argv)...)...)
+		if code != 0 || stderr != want {
+			t.Errorf("%s: exit code %d, stderr %q; want 0, %q", argv, code, stderr, want)
+		}
+	}
+}

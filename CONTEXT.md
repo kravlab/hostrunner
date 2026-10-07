@@ -44,9 +44,22 @@ sequence of characters, `/` included.
 A pattern that is a regular expression, matched anywhere
 in the value unless it anchors itself.
 
+**Mirrored directory**:
+The host directory that matches the container's current
+directory inside the workspace.
+
+**Fixed directory**:
+A host directory outside the workspace that a rule names
+for its command to run in.
+
+**Working directory**:
+The directory a command runs in: the rule's fixed directory
+if it names one, the mirrored directory otherwise.
+_Avoid_: cwd
+
 **Workspace file**:
 An existing regular file inside the workspace, named by a
-path relative to the working directory.
+path relative to the mirrored directory.
 
 **Path check**:
 The requirement a rule puts on positional arguments or on
