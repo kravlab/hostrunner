@@ -11,7 +11,7 @@
 //
 // `up` is meant for devcontainer's initializeCommand: it installs the client
 // into the runtime directory and starts a detached `serve --watch` there,
-// which exits by itself once the devcontainer stops. `test` runs the Rules
+// which exits by itself once its armed container stops. `test` runs the Rules
 // test: whether a rules file (default .devcontainer/hostrun.yaml under the
 // current directory) allows a command; it exits 0 when it does, 126 when it
 // does not, and 1 on any error. `version` prints the module version Go
@@ -212,7 +212,7 @@ type serveConfig struct {
 	socket string // Unix socket to listen on
 	workspaceFlags
 	config         string        // rules file; default <workspace>/.devcontainer/hostrun.yaml
-	watch          bool          // exit once the devcontainer stops
+	watch          bool          // exit once the armed container stops
 	startupTimeout time.Duration // with watch: wait this long for the container
 	grace          time.Duration // with watch: tolerate its absence this long
 	pollInterval   time.Duration // with watch: how often runtimes are asked (not a flag)
@@ -227,7 +227,7 @@ func parseServe(args []string, output io.Writer) (serveConfig, error) {
 	fs.StringVar(&cfg.socket, "socket", "", "Unix socket path to listen on")
 	cfg.workspaceFlags.register(fs)
 	fs.StringVar(&cfg.config, "config", "", "rules file (default <workspace>/.devcontainer/hostrun.yaml)")
-	fs.BoolVar(&cfg.watch, "watch", false, "exit once the workspace's devcontainer stops")
+	fs.BoolVar(&cfg.watch, "watch", false, "exit once the armed container stops")
 	fs.DurationVar(&cfg.startupTimeout, "startup-timeout", defaultStartupTimeout, "with --watch: how long to wait for the container to start")
 	fs.DurationVar(&cfg.grace, "grace", defaultGrace, "with --watch: how long the container may be gone before exiting")
 	if err := parseFlags(fs, args, serveUsage); err != nil {
@@ -300,7 +300,7 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 			return true
 		}
 		if watcher != nil {
-			watcher.Rearm()
+			watcher.Arm()
 		}
 		return false
 	}

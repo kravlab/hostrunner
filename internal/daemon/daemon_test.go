@@ -184,7 +184,7 @@ func TestServeStopsRunningCommandsOnPermanentAcceptError(t *testing.T) {
 	}
 }
 
-func TestServeRearmsOnArmRequest(t *testing.T) {
+func TestServeCallsArmHandlerOnArmRequest(t *testing.T) {
 	armed := make(chan struct{}, 1)
 	srv := newServer(t, daemon.WithArmHandler(func(a protocol.Arm) bool {
 		if a.ConfigDigest == "abc" {

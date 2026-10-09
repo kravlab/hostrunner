@@ -63,7 +63,9 @@ Synchronous, fast, idempotent (it runs on every `devcontainer up`):
 
 - Runtimes: every one of `docker` and `podman` found in `PATH`; no config.
 - Every 2 s it asks each runtime (10 s timeout per query) for running
-  containers labelled `devcontainer.local_folder=<workspace>`. Present if
+  containers labelled `devcontainer.local_folder=<workspace>`. (Since
+  [watch-armed-container.md](watch-armed-container.md): for the
+  workspace's containers in every state, with their start times.) Present if
   any runtime reports one; absent if some runtime answered and none does;
   unknown if none answered. Unknown does not count toward the grace period;
   a failing runtime is logged when it starts and stops failing.
@@ -76,7 +78,9 @@ Synchronous, fast, idempotent (it runs on every `devcontainer up`):
   arm the watcher does not attach to what it sees: a container that
   disappears in that window is being rebuilt, and the daemon waits for the
   new one. (Correction to the research, which assumed the grace period
-  covers the rebuild gap; the build happens inside that gap.)
+  covers the rebuild gap; the build happens inside that gap.) Replaced by
+  [watch-armed-container.md](watch-armed-container.md): a container
+  started after the arm is attached to at once.
 - Exiting cancels `Serve`: running commands are killed and the socket file
   is removed.
 
@@ -88,9 +92,10 @@ Without `--watch`, `serve` behaves as today (runs until signalled).
   arm connection carries only that exchange.
 - `internal/daemon` — `WithArmHandler` option; version checked for both
   opening frames.
-- `internal/watch` — `Watcher` (`Run`, `Rearm`) over a `Runtime` interface
-  (`Running(ctx, workspace) (bool, error)`), plus the CLI-backed runtime
-  (`<rt> ps -q --filter label=… --filter status=running`).
+- `internal/watch` — `Watcher` (`Run`, `Arm`) over a `Runtime` interface
+  (`Containers(ctx, workspace) ([]Container, error)`), plus the CLI-backed
+  runtime (`<rt> ps -aq --filter label=…`, then `<rt> inspect`); see
+  [watch-armed-container.md](watch-armed-container.md).
 - `internal/launch` — `up`'s steps: runtime dir, lock, arm, client install
   with the static-binary check, detached spawn, readiness via arm.
 - `cmd/hostrunner` — wires `up` and `serve --watch`.
@@ -130,7 +135,7 @@ Without `--watch`, `serve` behaves as today (runs until signalled).
 
 Rules (the rules config is only mounted read-only), several containers of
 one workspace, replacing a running daemon after an upgrade or a changed
-`workspaceFolder` (it is re-armed as is), containers started outside devcontainer tooling, Docker with
+`workspaceFolder` (it is armed again as is), containers started outside devcontainer tooling, Docker with
 SELinux enabled in dockerd (documented workaround:
 `"runArgs": ["--security-opt", "label=disable"]`).
 
