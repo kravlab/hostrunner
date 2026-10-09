@@ -79,3 +79,35 @@ _Avoid_: check, test run
 Testing a command against a rules file alone, on the host,
 without a daemon or a container.
 _Avoid_: check, dry run
+
+### Lifecycle
+
+**Daemon**:
+The host process that runs one devcontainer's commands and
+lives as long as its armed container.
+
+**Arm**:
+The signal `hostrunner up` gives the daemon each time the
+devcontainer tooling brings a container of its workspace up.
+_Avoid_: rearm
+
+**Armed container**:
+The container the last arm was for: one started after the
+arm or, when none starts, a container started before it
+that is still running a grace after it.
+_Avoid_: current container, the devcontainer
+
+**Waiting**:
+The daemon's state between an arm and finding its armed
+container.
+
+**Attached**:
+The daemon's state while it knows its armed container.
+
+**Grace**:
+How long the armed container must be seen absent before
+the daemon exits.
+
+**Startup timeout**:
+How long a waiting daemon waits for its armed container
+before it exits.

@@ -70,7 +70,7 @@ func WithRequestTimeout(d time.Duration) Option {
 }
 
 // WithArmHandler sets what the Server does when `hostrunner up` arms it on
-// a devcontainer start (e.g. rearm the container watcher). If f returns
+// a devcontainer start (e.g. arm the container watcher). If f returns
 // true, the Server answers that it is restarting and then stops Serve, so
 // `up` can start a daemon with fresh rules. f is called from connection
 // goroutines, so it must be safe for concurrent use.

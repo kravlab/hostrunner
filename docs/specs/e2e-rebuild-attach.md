@@ -1,5 +1,10 @@
 # Spec: e2e waits for the daemon to attach after a rebuild
 
+Superseded by [watch-armed-container.md](watch-armed-container.md): the
+daemon now sees a container that stops before any poll, so the e2e test
+stops the rebuilt container without waiting, and `waitAttached`,
+`attachedSinceRearm` and `attachTimeout` are gone.
+
 ## Problem
 
 `TestDevcontainerIntegration/docker/daemon_exits_after_the_container_stops`

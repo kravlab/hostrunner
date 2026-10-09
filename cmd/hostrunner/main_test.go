@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,6 +20,7 @@ import (
 	"github.com/kravlab/hostrunner/internal/rules"
 	"github.com/kravlab/hostrunner/internal/transport"
 	"github.com/kravlab/hostrunner/internal/watch"
+	"github.com/kravlab/hostrunner/internal/watch/watchtest"
 )
 
 func TestBuildVersionReportsTheModuleVersion(t *testing.T) {
@@ -166,11 +166,6 @@ func TestParseUpRejectsPositionalArguments(t *testing.T) {
 	}
 }
 
-// fakeRuntime reports whatever the test stores in present.
-type fakeRuntime struct{ present atomic.Bool }
-
-func (f *fakeRuntime) Running(context.Context, string) (bool, error) { return f.present.Load(), nil }
-
 // watchConfig is a `serve --watch` over a temporary workspace with short
 // timings.
 func watchConfig(t *testing.T) serveConfig {
@@ -192,7 +187,7 @@ func watchConfig(t *testing.T) serveConfig {
 
 // startServe runs serve in the background and returns its result channel
 // once the socket accepts connections.
-func startServe(t *testing.T, cfg serveConfig, runtimes ...*fakeRuntime) <-chan error {
+func startServe(t *testing.T, cfg serveConfig, runtimes ...*watchtest.Runtime) <-chan error {
 	t.Helper()
 	rts := make([]watch.Runtime, len(runtimes))
 	for i, rt := range runtimes {
@@ -231,27 +226,27 @@ func expectServeExit(t *testing.T, done <-chan error, socket string) {
 
 func TestServeWatchExitsWhenContainerStops(t *testing.T) {
 	cfg := watchConfig(t)
-	rt := &fakeRuntime{}
-	rt.present.Store(true)
+	rt := &watchtest.Runtime{}
 	done := startServe(t, cfg, rt)
+	rt.Start("c")
 	time.Sleep(50 * time.Millisecond)
-	rt.present.Store(false)
+	rt.Stop("c")
 	expectServeExit(t, done, cfg.socket)
 }
 
 func TestServeWatchExitsWhenContainerNeverStarts(t *testing.T) {
 	cfg := watchConfig(t)
-	expectServeExit(t, startServe(t, cfg, &fakeRuntime{}), cfg.socket)
+	expectServeExit(t, startServe(t, cfg, &watchtest.Runtime{}), cfg.socket)
 }
 
 func TestServeWatchWaitsAgainWhenArmed(t *testing.T) {
 	cfg := watchConfig(t)
-	rt := &fakeRuntime{}
-	rt.present.Store(true)
+	rt := &watchtest.Runtime{}
+	rt.Start("c")
 	done := startServe(t, cfg, rt)
 	time.Sleep(50 * time.Millisecond)
 
-	rt.present.Store(false) // rebuild: old container removed, image building
+	rt.Stop("c") // rebuild: old container removed, image building
 	if restart := armServe(t, cfg, rulesDigest(t, cfg)); restart {
 		t.Fatal("serve asked for a restart although the rules did not change")
 	}
@@ -261,14 +256,14 @@ func TestServeWatchWaitsAgainWhenArmed(t *testing.T) {
 		t.Fatalf("serve exited (%v) within the grace period after being armed", err)
 	case <-time.After(3 * cfg.grace):
 	}
-	rt.present.Store(true) // the rebuilt container starts
+	rt.Start("c") // the rebuilt container starts
 	time.Sleep(cfg.startupTimeout)
 	select {
 	case err := <-done:
 		t.Fatalf("serve exited (%v) while the rebuilt container runs", err)
 	default:
 	}
-	rt.present.Store(false)
+	rt.Stop("c")
 	expectServeExit(t, done, cfg.socket)
 }
 
@@ -362,8 +357,8 @@ func armServe(t *testing.T, cfg serveConfig, digest string) bool {
 
 func TestServeStepsAsideWhenRulesChanged(t *testing.T) {
 	cfg := watchConfig(t)
-	rt := &fakeRuntime{}
-	rt.present.Store(true)
+	rt := &watchtest.Runtime{}
+	rt.Start("c")
 	done := startServe(t, cfg, rt)
 	if restart := armServe(t, cfg, "some other digest"); !restart {
 		t.Fatal("serve kept running with stale rules")

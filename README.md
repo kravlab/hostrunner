@@ -280,15 +280,20 @@ not one of them, or at `--`.
 How it works:
 
 - `hostrunner up` runs on the host before every container start. It
-  creates the per-container runtime directory and either re-arms the
-  daemon already serving it or copies `hostrun` into it and starts a
-  detached daemon.
+  creates the per-container runtime directory and either arms the daemon
+  already serving it or copies `hostrun` into it and starts a detached
+  daemon.
 - The directory is mounted read-only at `/run/hostrunner`; the client
   talks to the daemon over the Unix socket in it.
-- The daemon polls `docker`/`podman` for the container and exits about
-  15 s after it stops. Re-arming makes it wait (up to 30 min) for the new
-  container of a rebuild, however long the image build takes. Its log is
-  `daemon.log` in the runtime directory.
+- The daemon follows its armed container, the one the latest `up` started
+  (or found running): it polls `docker`/`podman` for the workspace's
+  containers, stopped ones included, and exits about 15 s after that
+  container stops, however briefly it ran.
+  After an arm it waits (up to 30 min) for the new container of a
+  rebuild, however long the image build takes. A container run with
+  `--rm` (through `runArgs`) leaves no trace when it stops, so if it stops
+  before a poll (every 2 s) sees it, the daemon waits out those 30 min or
+  the next `up`. Its log is `daemon.log` in the runtime directory.
 - `.devcontainer/` is read-only inside the container, so the container
   cannot rewrite the rules that govern it. `hostrun` warns on stderr when
   the nearest `.devcontainer/` above its working directory, or the
@@ -313,7 +318,7 @@ How it works:
 
 ## Limitations
 
-- A running daemon is re-armed, not replaced: after upgrading hostrunner
+- A running daemon is armed again, not replaced: after upgrading hostrunner
   or changing `workspaceFolder`, stop the container (the daemon exits
   about 15 s later) before starting it again.
 - The container user must be root or have your host UID (devcontainers

@@ -5,7 +5,7 @@
   "name": "hostrunner example",
   "image": "docker.io/library/alpine:3",
 
-  // Starts the host daemon for this container, or re-arms the running one
+  // Starts the host daemon for this container, or arms the running one
   // (e.g. across a rebuild), and installs the hostrun client into the
   // runtime directory mounted below. The array form runs without a shell,
   // so paths with spaces stay intact.
