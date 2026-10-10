@@ -16,3 +16,13 @@ pre-commit:
     - name: go vet
       glob: "*.go"
       run: go vet -tags e2e ./...
+
+commit-msg:
+  jobs:
+    # A Claude Code session link must not reach the history.
+    - name: no session link
+      run: |
+        if grep -qE 'claude\.ai/code/session_[A-Za-z0-9]' {1}; then
+          echo "commit message contains a Claude Code session link (claude.ai/code/session_…)" >&2
+          exit 1
+        fi
