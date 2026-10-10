@@ -17,7 +17,7 @@ import (
 	"os/exec"
 	"slices"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"time"
 )
 
@@ -68,53 +68,109 @@ type Watcher struct {
 	runtimes  []Runtime
 	cfg       Config
 	log       *slog.Logger
-	armSignal chan struct{}             // tells Run about an arm
-	armedAt   atomic.Pointer[time.Time] // time of the last arm
-	failing   map[Runtime]bool          // runtimes whose last query failed; Run's goroutine only
+	armSignal chan struct{}    // tells Run about an arm
+	failing   map[Runtime]bool // runtimes whose last query failed; Run's goroutine only
+
+	// mu orders arms against Run's decision to end: an arm either comes
+	// before it and is followed, or after it and is refused.
+	mu      sync.Mutex
+	armedAt time.Time // time of the last arm
+	ended   error     // why the watch ended; nil while it runs
 }
 
 // New returns a Watcher over runtimes, armed now.
 func New(runtimes []Runtime, cfg Config, log *slog.Logger) *Watcher {
-	w := &Watcher{
+	return &Watcher{
 		runtimes:  runtimes,
 		cfg:       cfg,
 		log:       log,
 		armSignal: make(chan struct{}, 1),
 		failing:   make(map[Runtime]bool),
+		armedAt:   time.Now(),
 	}
-	now := time.Now()
-	w.armedAt.Store(&now)
-	return w
 }
 
 // Arm makes a running Watcher wait for a container started from now on,
-// with a fresh startup timeout. It never blocks; the arm's time is taken
-// here, before the caller lets the container start.
-func (w *Watcher) Arm() {
-	now := time.Now()
-	w.armedAt.Store(&now)
+// with a fresh startup timeout. Once the watch has ended, or its context is
+// cancelled, Arm refuses and returns why it ended: the watcher will not
+// follow the arm, and the daemon must step aside. Arm never waits for
+// runtime queries; the arm's time is taken here, before the caller lets the
+// container start.
+func (w *Watcher) Arm() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.ended != nil {
+		return fmt.Errorf("the watch has ended: %w", w.ended)
+	}
+	w.armedAt = time.Now()
 	select {
 	case w.armSignal <- struct{}{}:
 	default: // an arm is already pending; it reads the latest time
 	}
+	return nil
 }
+
+// lastArm returns the time of the last arm.
+func (w *Watcher) lastArm() time.Time {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.armedAt
+}
+
+// takeArmOrEnd takes an arm that came while Run was deciding to end, and
+// returns its time; without one, or once the watch has ended, it ends the
+// watch for reason.
+func (w *Watcher) takeArmOrEnd(reason error) (armedAt time.Time, ended bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.ended == nil {
+		select {
+		case <-w.armSignal:
+			return w.armedAt, false
+		default:
+		}
+	}
+	w.endLocked(reason)
+	return time.Time{}, true
+}
+
+// markEnded ends the watch for reason, refusing every later arm.
+func (w *Watcher) markEnded(reason error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.endLocked(reason)
+}
+
+func (w *Watcher) endLocked(reason error) {
+	if w.ended == nil {
+		w.ended = reason
+	}
+}
+
+// errArmedContainerStopped is why a watch ends normally.
+var errArmedContainerStopped = errors.New("the armed container stopped")
 
 // Run blocks until the armed container is gone and returns nil, or gives
 // up: ErrNeverStarted if no armed container was found within StartupTimeout
 // of the last arm, ErrRuntimeUnavailable if no runtime answered for
-// StartupTimeout while attached, or ctx's error if cancelled.
+// StartupTimeout while attached, or ctx's error if cancelled. An arm that
+// comes while Run decides to give up wins: Run waits for its container
+// instead.
 //
 // Only observed absence counts toward Grace: while no runtime can answer,
 // the container's state is unknown and the daemon stays.
 func (w *Watcher) Run(ctx context.Context) error {
 	ticker := time.NewTicker(w.cfg.PollInterval)
 	defer ticker.Stop()
+	// Cancellation ends the watch at once, not when the loop notices it,
+	// so no arm is accepted while the daemon stops.
+	stop := context.AfterFunc(ctx, func() { w.markEnded(context.Cause(ctx)) })
+	defer stop()
 
 	var (
-		arm        = arming{at: *w.armedAt.Load()}
+		arm        = w.waitFor(w.lastArm())
 		lastAnswer time.Time // last time any runtime answered
 	)
-	w.log.Info("armed: waiting for the armed container", "workspace", w.cfg.Workspace)
 	for {
 		now := time.Now()
 		containers, answered := w.query(ctx)
@@ -126,24 +182,43 @@ func (w *Watcher) Run(ctx context.Context) error {
 		} else {
 			arm.absentSince = time.Time{} // unknown does not count
 		}
+		var giveUp error
 		switch {
 		case !arm.attached() && now.Sub(arm.at) >= w.cfg.StartupTimeout:
-			return ErrNeverStarted
+			giveUp = ErrNeverStarted
 		case arm.attached() && !arm.absentSince.IsZero() && now.Sub(arm.absentSince) >= w.cfg.Grace:
-			w.log.Info("armed container stopped", "workspace", w.cfg.Workspace)
-			return nil
+			giveUp = errArmedContainerStopped
 		case arm.attached() && now.Sub(lastAnswer) >= w.cfg.StartupTimeout:
-			return ErrRuntimeUnavailable
+			giveUp = ErrRuntimeUnavailable
+		}
+		if giveUp != nil {
+			armedAt, ended := w.takeArmOrEnd(giveUp)
+			switch {
+			case !ended:
+				arm = w.waitFor(armedAt)
+				continue
+			case errors.Is(giveUp, errArmedContainerStopped):
+				w.log.Info("armed container stopped", "workspace", w.cfg.Workspace)
+				return nil
+			default:
+				return giveUp
+			}
 		}
 		select {
 		case <-ctx.Done():
+			w.markEnded(context.Cause(ctx))
 			return ctx.Err()
 		case <-w.armSignal:
-			arm = arming{at: *w.armedAt.Load()}
-			w.log.Info("armed: waiting for the armed container", "workspace", w.cfg.Workspace)
+			arm = w.waitFor(w.lastArm())
 		case <-ticker.C:
 		}
 	}
+}
+
+// waitFor starts waiting for the container of the arm at armedAt.
+func (w *Watcher) waitFor(armedAt time.Time) arming {
+	w.log.Info("armed: waiting for the armed container", "workspace", w.cfg.Workspace)
+	return arming{at: armedAt}
 }
 
 // arming is what the watcher knows since one arm: waiting until it finds

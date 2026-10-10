@@ -58,7 +58,7 @@ func TestMain(m *testing.M) {
 // runFakeDaemon records its pid in fake.pids and, in "serve" mode, listens
 // on --socket and answers every FrameArm, logging it to fake.armed. Like the
 // real daemon it compares the arm's rules digest with the rules it started
-// with and, on a mismatch, answers with a restart and exits. It insists on
+// with and, on a mismatch, steps aside and exits. It insists on
 // --watch, which `up` must always pass.
 func runFakeDaemon(mode string) {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
@@ -93,10 +93,10 @@ func runFakeDaemon(mode string) {
 		if f, err := protocol.ReadFrame(c); err == nil && f.Type == protocol.FrameArm {
 			var a protocol.Arm
 			_ = protocol.DecodeJSON(f, &a)
-			restart := a.ConfigDigest != policy.Digest()
-			appendLine(filepath.Join(dir, "fake.armed"), map[bool]string{false: "armed", true: "restart"}[restart])
-			_ = protocol.WriteJSON(c, protocol.FrameArmed, protocol.Armed{Version: protocol.Version, Restart: restart})
-			if restart {
+			stepAside := a.ConfigDigest != policy.Digest()
+			appendLine(filepath.Join(dir, "fake.armed"), map[bool]string{false: "armed", true: "step aside"}[stepAside])
+			_ = protocol.WriteJSON(c, protocol.FrameArmed, protocol.Armed{Version: protocol.Version, Restart: stepAside})
+			if stepAside {
 				c.Close()
 				l.Close()
 				os.Exit(0)
@@ -466,7 +466,7 @@ func TestUpRejectsInvalidRules(t *testing.T) {
 	}
 }
 
-func TestUpRestartsDaemonWhenRulesChange(t *testing.T) {
+func TestUpReplacesDaemonThatStepsAside(t *testing.T) {
 	cfg := fakeConfig(t, "serve")
 	if err := os.WriteFile(cfg.Rules, []byte("rules:\n  - command: git status\n    args: any\n"), 0o644); err != nil {
 		t.Fatal(err)

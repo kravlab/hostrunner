@@ -108,6 +108,11 @@ The daemon's state while it knows its armed container.
 How long the armed container must be seen absent before
 the daemon exits.
 
+**Step aside**:
+The daemon's answer to an arm it will not follow: it stops,
+and `hostrunner up` starts a new daemon.
+_Avoid_: restart
+
 **Startup timeout**:
 How long a waiting daemon waits for its armed container
 before it exits.

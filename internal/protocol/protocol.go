@@ -102,8 +102,9 @@ type Arm struct {
 	ConfigDigest string `json:"config_digest"`
 }
 
-// Armed answers Arm. Restart means the daemon is shutting down (its rules
-// are stale) and `up` must start a new one once the socket is free.
+// Armed answers Arm. Restart means the daemon steps aside: it will not
+// follow this arm (its rules are stale, or its watch has ended) and is
+// stopping, so `up` must start a new one once the socket is free.
 type Armed struct {
 	Version int  `json:"version"`
 	Restart bool `json:"restart"`

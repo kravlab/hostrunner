@@ -9,6 +9,7 @@ import (
 	"slices"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/kravlab/hostrunner/internal/watch"
@@ -169,6 +170,174 @@ func TestArmedContainerRestartShorterThanGraceKeepsWatch(t *testing.T) {
 	time.Sleep(testConfig.Grace / 3)
 	rt.Start("c")
 	expectRunning(t, done, testConfig.Grace*2, "across a restart shorter than the grace period")
+}
+
+// raceConfig polls less often than the grace period, so a test can act
+// between the poll that sees the armed container stopped and the one that
+// ends the watch. The race tests run in a synctest bubble, where these
+// durations are exact.
+func raceConfig() watch.Config {
+	cfg := testConfig
+	cfg.PollInterval = 150 * time.Millisecond
+	cfg.Grace = 100 * time.Millisecond
+	cfg.StartupTimeout = 2 * time.Second
+	return cfg
+}
+
+// holdNextQuery holds rt's next query and returns once the watcher is in
+// it, i.e. once a poll has started and before it decides anything.
+func holdNextQuery(t *testing.T, rt *watchtest.Runtime) (release func()) {
+	t.Helper()
+	entered, release := rt.Hold()
+	select {
+	case <-entered:
+	case <-time.After(time.Minute):
+		release()
+		t.Fatal("no query reached the runtime")
+	}
+	return release
+}
+
+// expectArmAccepted arms w and fails if it refuses.
+func expectArmAccepted(t *testing.T, w *watch.Watcher) {
+	t.Helper()
+	if err := w.Arm(); err != nil {
+		t.Fatalf("arm refused: %v", err)
+	}
+}
+
+// expectFollowsNewContainer checks that the watch goes on for the arm just
+// made: it attaches to a container started now and ends a grace after that
+// container stops.
+func expectFollowsNewContainer(t *testing.T, cfg watch.Config, rt *watchtest.Runtime, done <-chan error) {
+	t.Helper()
+	time.Sleep(cfg.PollInterval / 10)
+	rt.Start("new")
+	time.Sleep(cfg.PollInterval)
+	rt.Stop("new")
+	expectResult(t, done, nil)
+}
+
+func TestArmDuringPollThatEndsWatchWins(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cfg := raceConfig()
+		rt := &watchtest.Runtime{}
+		w, done := startWatcherWith(context.Background(), cfg, nil, rt)
+		time.Sleep(cfg.PollInterval / 5) // after the first poll
+		rt.Start("old")
+		rt.Stop("old")               // the poll at 150 ms attaches and sees it stopped
+		time.Sleep(cfg.PollInterval) // the poll at 300 ms ends the watch
+
+		release := holdNextQuery(t, rt)
+		expectArmAccepted(t, w)
+		release()
+		synctest.Wait() // the poll has decided
+		expectRunning(t, done, cfg.PollInterval, "although armed before it decided to end")
+		expectFollowsNewContainer(t, cfg, rt, done)
+	})
+}
+
+func TestArmDuringPollThatHitsStartupTimeoutWins(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cfg := raceConfig()
+		cfg.StartupTimeout = 200 * time.Millisecond // the poll at 300 ms gives up
+		rt := &watchtest.Runtime{}
+		w, done := startWatcherWith(context.Background(), cfg, nil, rt)
+		time.Sleep(cfg.PollInterval + cfg.PollInterval/5)
+
+		release := holdNextQuery(t, rt)
+		expectArmAccepted(t, w)
+		release()
+		synctest.Wait() // the poll has decided
+		expectFollowsNewContainer(t, cfg, rt, done)
+	})
+}
+
+func TestArmDuringPollWithoutRuntimeAnswerWins(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cfg := raceConfig()
+		cfg.StartupTimeout = 200 * time.Millisecond
+		rt := &watchtest.Runtime{}
+		w, done := startWatcherWith(context.Background(), cfg, nil, rt)
+		time.Sleep(cfg.PollInterval / 5)
+		rt.Start("c")                // the poll at 150 ms attaches
+		time.Sleep(cfg.PollInterval) // at 180 ms
+		rt.Fail(true)                // no answer from 300 ms; the poll at 450 ms gives up
+		time.Sleep(cfg.PollInterval)
+
+		release := holdNextQuery(t, rt)
+		expectArmAccepted(t, w)
+		release()
+		synctest.Wait() // the poll has decided
+		rt.Fail(false)
+		expectFollowsNewContainer(t, cfg, rt, done)
+	})
+}
+
+func TestArmWhileDaemonStopsIsRefused(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		rt := &watchtest.Runtime{}
+		w, done := startWatcherWith(ctx, raceConfig(), nil, rt)
+		release := holdNextQuery(t, rt)
+		defer release()
+
+		cancel() // SIGTERM while a poll runs
+		synctest.Wait()
+		if err := w.Arm(); !errors.Is(err, context.Canceled) {
+			t.Fatalf("got %v, want the arm refused as the daemon stops", err)
+		}
+		release()
+		expectResult(t, done, context.Canceled)
+	})
+}
+
+func TestArmAfterWatchEndedIsRefused(t *testing.T) {
+	tests := []struct {
+		name string
+		end  func(rt *watchtest.Runtime, cancel context.CancelFunc)
+		want error // from Run
+	}{
+		{"armed container stopped", func(rt *watchtest.Runtime, _ context.CancelFunc) {
+			rt.Start("c")
+			time.Sleep(20 * time.Millisecond)
+			rt.Stop("c")
+		}, nil},
+		{"startup timeout", func(*watchtest.Runtime, context.CancelFunc) {}, watch.ErrNeverStarted},
+		{"no runtime answered", func(rt *watchtest.Runtime, _ context.CancelFunc) {
+			rt.Start("c")
+			time.Sleep(20 * time.Millisecond)
+			rt.Fail(true)
+		}, watch.ErrRuntimeUnavailable},
+		{"cancelled", func(_ *watchtest.Runtime, cancel context.CancelFunc) { cancel() }, context.Canceled},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			rt := &watchtest.Runtime{}
+			w, done := startWatcher(ctx, nil, rt)
+			tt.end(rt, cancel)
+			expectResult(t, done, tt.want)
+			err := w.Arm()
+			if err == nil {
+				t.Fatal("arm accepted after the watch ended")
+			}
+			if tt.want != nil && !errors.Is(err, tt.want) {
+				t.Fatalf("arm refused with %v, want the reason %v", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestArmWhileWatchingIsAccepted(t *testing.T) {
+	rt := &watchtest.Runtime{}
+	w, done := startWatcher(context.Background(), nil, rt)
+	expectArmAccepted(t, w) // waiting
+	rt.Start("c")
+	time.Sleep(testConfig.Grace / 2)
+	expectArmAccepted(t, w) // attached
+	expectRunning(t, done, 10*time.Millisecond, "after being armed")
 }
 
 func TestWaitGivesUpWhenContainerNeverStarts(t *testing.T) {
