@@ -44,7 +44,7 @@ type Server struct {
 	mapper         *workspace.Mapper
 	log            *slog.Logger
 	requestTimeout time.Duration
-	onArm          func(protocol.Arm) (restart bool) // nil: arming changes nothing
+	onArm          func(protocol.Arm) (stepAside bool) // nil: arming changes nothing
 	policy         Policy
 
 	mu        sync.Mutex
@@ -71,10 +71,10 @@ func WithRequestTimeout(d time.Duration) Option {
 
 // WithArmHandler sets what the Server does when `hostrunner up` arms it on
 // a devcontainer start (e.g. arm the container watcher). If f returns
-// true, the Server answers that it is restarting and then stops Serve, so
-// `up` can start a daemon with fresh rules. f is called from connection
+// true, the Server steps aside: it answers so and then stops Serve, so
+// `up` can start a new daemon. f is called from connection
 // goroutines, so it must be safe for concurrent use.
-func WithArmHandler(f func(protocol.Arm) (restart bool)) Option {
+func WithArmHandler(f func(protocol.Arm) (stepAside bool)) Option {
 	return func(s *Server) { s.onArm = f }
 }
 
@@ -92,11 +92,11 @@ func New(mapper *workspace.Mapper, policy Policy, log *slog.Logger, opts ...Opti
 	return s
 }
 
-// Serve accepts connections on l until ctx is cancelled, an arm handler asks
-// for a restart, or l fails; then it closes l, kills running commands and
+// Serve accepts connections on l until ctx is cancelled, an arm handler
+// steps aside, or l fails; then it closes l, kills running commands and
 // returns once every connection is finished. Temporary accept errors (e.g.
 // out of file descriptors) are retried with backoff. It returns nil when
-// stopped by cancellation or a restart, and the accept error otherwise.
+// stopped by cancellation or a step aside, and the accept error otherwise.
 func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -127,7 +127,7 @@ func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 				case <-ctx.Done():
 				}
 			}
-			stopped := ctx.Err() != nil // cancelled by the caller or a restart
+			stopped := ctx.Err() != nil // cancelled by the caller or a step aside
 			cancel()
 			wg.Wait()
 			if stopped {
@@ -221,8 +221,8 @@ func (s *Server) dryRun(out *frameWriter, req protocol.Request) {
 	_ = out.writeJSON(protocol.FrameAllowed, protocol.Allowed{Rule: p.rule, Dir: p.fixedDir})
 }
 
-// arm handles FrameArm from `hostrunner up`. When the handler asks for a
-// restart, the answer is written before Serve is stopped, since stopping
+// arm handles FrameArm from `hostrunner up`. When the handler steps aside,
+// the answer is written before Serve is stopped, since stopping
 // closes every connection.
 func (s *Server) arm(out *frameWriter, f protocol.Frame) {
 	var a protocol.Arm
@@ -230,10 +230,10 @@ func (s *Server) arm(out *frameWriter, f protocol.Frame) {
 		s.reject(out, protocol.ExitHostrunError, err.Error(), err)
 		return
 	}
-	restart := s.onArm != nil && s.onArm(a)
-	s.log.Info("armed by hostrunner up", "restart", restart)
-	_ = out.writeJSON(protocol.FrameArmed, protocol.Armed{Version: protocol.Version, Restart: restart})
-	if restart {
+	stepAside := s.onArm != nil && s.onArm(a)
+	s.log.Info("armed by hostrunner up", "step_aside", stepAside)
+	_ = out.writeJSON(protocol.FrameArmed, protocol.Armed{Version: protocol.Version, Restart: stepAside})
+	if stepAside {
 		s.mu.Lock()
 		stop := s.stopServe
 		s.stopServe = nil

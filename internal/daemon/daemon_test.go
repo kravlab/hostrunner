@@ -208,7 +208,7 @@ func TestServeCallsArmHandlerOnArmRequest(t *testing.T) {
 	}
 	var reply protocol.Armed
 	if err := protocol.DecodeJSON(f, &reply); err != nil || reply.Restart {
-		t.Fatalf("reply %+v, err %v; want no restart", reply, err)
+		t.Fatalf("reply %+v, err %v; want no step aside", reply, err)
 	}
 	select {
 	case <-armed:
@@ -270,7 +270,7 @@ func TestServeSurvivesAPanickingRequest(t *testing.T) {
 	}
 }
 
-func TestServeStopsAfterAnsweringArmThatAsksForRestart(t *testing.T) {
+func TestServeStopsAfterAnsweringArmWithStepAside(t *testing.T) {
 	srv := newServer(t, daemon.WithArmHandler(func(protocol.Arm) bool { return true }))
 	client, server := net.Pipe()
 	defer client.Close()
@@ -284,7 +284,7 @@ func TestServeStopsAfterAnsweringArmThatAsksForRestart(t *testing.T) {
 	f, err := protocol.ReadFrame(client)
 	var reply protocol.Armed
 	if err != nil || f.Type != protocol.FrameArmed || protocol.DecodeJSON(f, &reply) != nil || !reply.Restart {
-		t.Fatalf("got frame %v %+v, err %v; want Armed with restart", f.Type, reply, err)
+		t.Fatalf("got frame %v %+v, err %v; want Armed with step aside", f.Type, reply, err)
 	}
 	select {
 	case err := <-done:
@@ -292,6 +292,6 @@ func TestServeStopsAfterAnsweringArmThatAsksForRestart(t *testing.T) {
 			t.Fatalf("Serve: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Serve kept running after asking for a restart")
+		t.Fatal("Serve kept running after stepping aside")
 	}
 }

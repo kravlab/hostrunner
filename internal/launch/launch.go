@@ -89,11 +89,11 @@ func Up(ctx context.Context, cfg Config) error {
 	}
 	defer unlock()
 
-	restart, err := arm(ctx, socket, digest)
+	stepAside, err := arm(ctx, socket, digest)
 	switch {
-	case err == nil && !restart:
+	case err == nil && !stepAside:
 		return nil
-	case err == nil: // the daemon runs stale rules and is stepping aside
+	case err == nil: // the daemon is stopping for a new one
 		if err := waitStopped(ctx, socket, cfg.ReadyTimeout); err != nil {
 			return err
 		}
@@ -116,7 +116,7 @@ func waitStopped(ctx context.Context, socket string, timeout time.Duration) erro
 		}
 		c.Close()
 		if time.Now().After(deadline) {
-			return fmt.Errorf("the daemon on %s did not stop within %v to apply changed rules", socket, timeout)
+			return fmt.Errorf("the daemon on %s did not stop within %v after stepping aside", socket, timeout)
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
@@ -150,11 +150,12 @@ func lockDir(dir string) (func(), error) {
 }
 
 // arm asks the daemon on socket to wait for its devcontainer again, telling
-// it the digest of the current rules. restart reports that the daemon runs
-// other rules and is shutting down. err wraps errNotListening when nothing
+// it the digest of the current rules. stepAside reports that the daemon
+// will not follow the arm (it runs other rules, or its watch has ended) and
+// is stopping. err wraps errNotListening when nothing
 // accepts connections, and is another error when something listens but does
 // not arm.
-func arm(ctx context.Context, socket, digest string) (restart bool, err error) {
+func arm(ctx context.Context, socket, digest string) (stepAside bool, err error) {
 	ctx, cancel := context.WithTimeout(ctx, armTimeout)
 	defer cancel()
 	c, err := transport.Unix{Path: socket}.Dial(ctx)
@@ -278,12 +279,12 @@ func startDaemon(ctx context.Context, cfg Config, socket, digest string) error {
 			_ = cmd.Process.Kill()
 			return ctx.Err()
 		case <-ticker.C:
-			restart, err := arm(ctx, socket, digest)
-			if err == nil && !restart {
+			stepAside, err := arm(ctx, socket, digest)
+			if err == nil && !stepAside {
 				return nil
 			}
-			if err == nil { // the rules changed again while it started
-				err = errors.New("the new daemon loaded other rules than up validated; retry")
+			if err == nil { // e.g. the rules changed again while it started
+				err = errors.New("the new daemon stepped aside; retry")
 			}
 			if !errors.Is(err, errNotListening) {
 				_ = cmd.Process.Kill()

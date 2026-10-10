@@ -256,7 +256,7 @@ func parseVersion(args []string, output io.Writer) error {
 //
 // The rules file is read once, here: an invalid file stops the daemon from
 // starting (fail closed), a missing one makes it deny every command. Later
-// edits, e.g. by a `git pull` on the host, take effect only on restart.
+// edits, e.g. by a `git pull` on the host, take effect only in a new daemon.
 func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []watch.Runtime) error {
 	policy, err := rules.Load(cfg.config)
 	if err != nil {
@@ -290,19 +290,29 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 			}
 		}()
 	}
-	// `hostrunner up` arms the daemon on every container start with the
-	// digest of the rules it validated: other rules mean this daemon is
-	// stale and steps aside for a fresh one; the same rules mean a (re)start
-	// of the container, which the watcher must wait for.
-	onArm := func(a protocol.Arm) (restart bool) {
-		if a.ConfigDigest != policy.Digest() {
-			log.Info("rules file changed; stopping for a fresh daemon", "config", cfg.config)
+	onArm := armHandler(policy.Digest(), cfg.config, watcher, log)
+	return daemon.New(mapper, policy, log, daemon.WithArmHandler(onArm)).Serve(ctx, l)
+}
+
+// armHandler answers the arms of `hostrunner up`, which arms the daemon on
+// every container start with the digest of the rules it validated. digest
+// is the digest of the rules this daemon loaded from config. The daemon
+// steps aside for a new one when the digests differ, or when watcher has
+// ended and will not follow the arm; otherwise watcher, if any, waits for
+// the container of this arm.
+func armHandler(digest, config string, watcher *watch.Watcher, log *slog.Logger) func(protocol.Arm) (stepAside bool) {
+	return func(a protocol.Arm) bool {
+		if a.ConfigDigest != digest {
+			log.Info("stepping aside: the rules file changed", "config", config)
 			return true
 		}
-		if watcher != nil {
-			watcher.Arm()
+		if watcher == nil {
+			return false
+		}
+		if err := watcher.Arm(); err != nil {
+			log.Info("stepping aside", "reason", err)
+			return true
 		}
 		return false
 	}
-	return daemon.New(mapper, policy, log, daemon.WithArmHandler(onArm)).Serve(ctx, l)
 }

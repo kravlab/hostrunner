@@ -12,6 +12,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/kravlab/hostrunner/internal/client"
@@ -247,8 +248,8 @@ func TestServeWatchWaitsAgainWhenArmed(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	rt.Stop("c") // rebuild: old container removed, image building
-	if restart := armServe(t, cfg, rulesDigest(t, cfg)); restart {
-		t.Fatal("serve asked for a restart although the rules did not change")
+	if stepAside := armServe(t, cfg, rulesDigest(t, cfg)); stepAside {
+		t.Fatal("serve stepped aside although the rules did not change")
 	}
 
 	select {
@@ -336,7 +337,7 @@ func rulesDigest(t *testing.T, cfg serveConfig) string {
 }
 
 // armServe arms the daemon as `hostrunner up` would and returns whether it
-// asked for a restart.
+// stepped aside.
 func armServe(t *testing.T, cfg serveConfig, digest string) bool {
 	t.Helper()
 	c, err := transport.Unix{Path: cfg.socket}.Dial(context.Background())
@@ -355,12 +356,47 @@ func armServe(t *testing.T, cfg serveConfig, digest string) bool {
 	return reply.Restart
 }
 
+func TestArmHandlerStepsAsideOnceTheWatchEnded(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		discard := slog.New(slog.DiscardHandler)
+		w := watch.New([]watch.Runtime{&watchtest.Runtime{}}, watch.Config{
+			PollInterval: time.Second, QueryTimeout: time.Second, StartupTimeout: time.Hour, Grace: time.Second,
+		}, discard)
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() { done <- w.Run(ctx) }()
+		synctest.Wait() // the watch runs, waiting for its next poll
+
+		onArm := armHandler("digest", "rules.yaml", w, discard)
+		if onArm(protocol.Arm{ConfigDigest: "digest"}) {
+			t.Fatal("stepped aside while the watch runs")
+		}
+		cancel()
+		if err := <-done; !errors.Is(err, context.Canceled) {
+			t.Fatalf("watch ended with %v, want context.Canceled", err)
+		}
+		if !onArm(protocol.Arm{ConfigDigest: "digest"}) {
+			t.Fatal("did not step aside after the watch ended")
+		}
+	})
+}
+
+func TestArmHandlerStepsAsideWhenRulesChanged(t *testing.T) {
+	onArm := armHandler("digest", "rules.yaml", nil, slog.New(slog.DiscardHandler))
+	if !onArm(protocol.Arm{ConfigDigest: "other"}) {
+		t.Fatal("kept running with other rules")
+	}
+	if onArm(protocol.Arm{ConfigDigest: "digest"}) {
+		t.Fatal("stepped aside with the same rules and no watch")
+	}
+}
+
 func TestServeStepsAsideWhenRulesChanged(t *testing.T) {
 	cfg := watchConfig(t)
 	rt := &watchtest.Runtime{}
 	rt.Start("c")
 	done := startServe(t, cfg, rt)
-	if restart := armServe(t, cfg, "some other digest"); !restart {
+	if stepAside := armServe(t, cfg, "some other digest"); !stepAside {
 		t.Fatal("serve kept running with stale rules")
 	}
 	expectServeExit(t, done, cfg.socket)
