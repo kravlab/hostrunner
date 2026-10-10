@@ -12,6 +12,14 @@ Default canonical labels: `needs-triage`, `needs-info`, `ready-for-agent`, `read
 
 Single-context: one root `CONTEXT.md` plus `docs/adr/`. See `docs/agents/domain.md`.
 
+## Session links
+
+Everything you publish stays free of Claude Code session links
+(`claude.ai/code/session_…`): commit messages, PR and issue bodies and
+titles, comments, review replies, files. GitHub tooling may append a
+footer carrying one after you post: re-read every PR, issue or comment
+you create or edit, and remove the link before going on.
+
 ## Host commands (hostrun)
 
 When `hostrun` is in `PATH` (a devcontainer wired to hostrunner),
