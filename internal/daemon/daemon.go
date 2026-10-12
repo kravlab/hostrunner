@@ -205,7 +205,7 @@ var dryRunLogArgs = []any{"dry_run", true}
 // then looks the program up as starting it would, and releases what the
 // checks opened, never starting the command or reading stdin.
 func (s *Server) dryRun(out *frameWriter, req protocol.Request) {
-	p, r := s.prepare(req)
+	p, r := s.prepare(req, true)
 	if r != nil {
 		s.reject(out, r.code, r.message, r.err, dryRunLogArgs...)
 		return
@@ -217,8 +217,8 @@ func (s *Server) dryRun(out *frameWriter, req protocol.Request) {
 		s.reject(out, code, message, err, dryRunLogArgs...)
 		return
 	}
-	s.log.Info("dry run allowed", append([]any{"argv", req.Argv, "rule", p.rule, "dir", p.hostPath}, dryRunLogArgs...)...)
-	_ = out.writeJSON(protocol.FrameAllowed, protocol.Allowed{Rule: p.rule, Dir: p.fixedDir})
+	s.log.Info("dry run allowed", append(append(p.logArgs(req), "rule", p.rule), dryRunLogArgs...)...)
+	_ = out.writeJSON(protocol.FrameAllowed, protocol.Allowed{Rule: p.rule, Dir: p.fixedDir, Secrets: p.secrets})
 }
 
 // arm handles FrameArm from `hostrunner up`. When the handler steps aside,
@@ -251,8 +251,11 @@ type prepared struct {
 	fixedDir string     // the rule's fixed directory, cleaned; "" if none
 	dir      *os.File   // the working directory, opened
 	hostPath string     // dir's real path on the host
-	argv     []string   // argv to run, with path: open arguments replaced
-	files    []*os.File // path: open files, the command's descriptors 3, 4, …
+	argv     []string   // argv to run: path: open arguments replaced, injection placed
+	files    []*os.File // path: open, then injected files: the command's descriptors 3, 4, …
+	env      []string   // injected NAME=value variables over the daemon's
+	secrets  []string   // names of the secrets injected, for the log
+	masked   []string   // their values, masked in the command's output
 }
 
 // close releases the daemon's copies of the directory and of the files
@@ -260,6 +263,17 @@ type prepared struct {
 func (p *prepared) close() {
 	p.dir.Close()
 	closeAll(p.files)
+}
+
+// logArgs describe the command p prepared for req in the daemon log: the
+// argv the container sent, never the argv run, which holds the secrets'
+// values, and the names of the secrets injected.
+func (p *prepared) logArgs(req protocol.Request) []any {
+	args := []any{"argv", req.Argv, "dir", p.hostPath}
+	if len(p.secrets) > 0 {
+		args = append(args, "secrets", p.secrets)
+	}
+	return args
 }
 
 // refusal is why a command may not start: the exit code and message for
@@ -277,37 +291,62 @@ type refusal struct {
 // mirrored directory is open, since paths are resolved from it. The
 // mirrored directory has to be inside the workspace even for a rule with a
 // fixed directory, which is opened last and replaces it as the working
-// directory. On refusal nothing is left open.
-func (s *Server) prepare(req protocol.Request) (*prepared, *refusal) {
+// directory. The secrets are obtained once every check has passed, and the
+// rule's injection is placed in the argv to run; for a dry run they are
+// only checked (see checkSources), and the argv is the container's. On
+// refusal nothing is left open.
+func (s *Server) prepare(req protocol.Request, dryRun bool) (*prepared, *refusal) {
 	allowed, err := s.policy.Check(req.Argv)
 	if err != nil {
 		return nil, &refusal{protocol.ExitRejected, err.Error(), err}
 	}
-	dir, hostPath, err := s.mapper.Open(req.Cwd)
-	if err != nil {
+	p := &prepared{rule: allowed.Rule, fixedDir: allowed.Dir, secrets: allowed.SecretNames()}
+	if p.dir, p.hostPath, err = s.mapper.Open(req.Cwd); err != nil {
 		return nil, &refusal{protocol.ExitRejected, cwdMessage(req.Cwd, err), err}
 	}
-	argv, files, message, err := s.openPaths(req.Argv, allowed.Paths, hostPath)
-	if err != nil {
-		dir.Close()
-		closeAll(files)
-		return nil, &refusal{protocol.ExitRejected, message, err}
+	// From here on, a refusal releases what p holds so far.
+	refuse := func(code int, message string, err error) (*prepared, *refusal) {
+		p.close()
+		return nil, &refusal{code, message, err}
+	}
+	var message string
+	if p.argv, p.files, message, err = s.openPaths(req.Argv, allowed.Paths, p.hostPath); err != nil {
+		return refuse(protocol.ExitRejected, message, err)
 	}
 	if allowed.Dir != "" {
 		// The mirrored directory was only needed to resolve the paths.
-		dir.Close()
-		if dir, hostPath, err = s.mapper.OpenFixed(allowed.Dir); err != nil {
-			closeAll(files)
-			return nil, &refusal{protocol.ExitRejected, fixedMessage(allowed.Dir, err), err}
+		p.dir.Close()
+		if p.dir, p.hostPath, err = s.mapper.OpenFixed(allowed.Dir); err != nil {
+			return refuse(protocol.ExitRejected, fixedMessage(allowed.Dir, err), err)
 		}
 	}
-	return &prepared{rule: allowed.Rule, fixedDir: allowed.Dir, dir: dir, hostPath: hostPath, argv: argv, files: files}, nil
+	if dryRun {
+		// Nothing is obtained, run or created: the sources are only
+		// checked, and the argv is not assembled, which needs the values.
+		if r := checkSources(allowed.Secrets, p.dir); r != nil {
+			return refuse(r.code, r.message, r.err)
+		}
+		return p, nil
+	}
+	values, r := obtainSecrets(allowed.Secrets, p.dir, p.hostPath)
+	if r != nil {
+		return refuse(r.code, r.message, r.err)
+	}
+	if p.files, err = injectFiles(allowed.Inject.Files, values, p.files); err != nil {
+		return refuse(protocol.ExitHostrunError, "cannot create the files the rule hands the command", err)
+	}
+	if p.argv, err = allowed.Assemble(p.argv, values); err != nil {
+		return refuse(protocol.ExitHostrunError, err.Error(), err)
+	}
+	p.env = allowed.Environment(values)
+	p.masked = secretValues(allowed.Secrets, values)
+	return p, nil
 }
 
 // run executes req on the connection if it passes prepare; cancel stops it
 // early.
 func (s *Server) run(ctx context.Context, cancel context.CancelFunc, conn net.Conn, out *frameWriter, req protocol.Request) {
-	p, r := s.prepare(req)
+	p, r := s.prepare(req, false)
 	if r != nil {
 		s.reject(out, r.code, r.message, r.err)
 		return
@@ -316,7 +355,9 @@ func (s *Server) run(ctx context.Context, cancel context.CancelFunc, conn net.Co
 	// started (p.files is cleared then), or with the request on failure.
 	defer p.close()
 
-	cmd := newCommand(ctx, p.argv, p.dir, p.hostPath, out)
+	cmd := newCommand(ctx, p.argv, p.dir, p.hostPath, p.env, out)
+	stdout, stderr := newMaskWriter(cmd.Stdout, p.masked), newMaskWriter(cmd.Stderr, p.masked)
+	cmd.Stdout, cmd.Stderr = stdout, stderr
 	cmd.ExtraFiles = p.files
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -345,12 +386,15 @@ func (s *Server) run(ctx context.Context, cancel context.CancelFunc, conn net.Co
 	_ = out.writeJSON(protocol.FrameStdinCredit, protocol.Credit{Bytes: protocol.StdinWindow})
 
 	waitErr := cmd.Wait()
+	// The output is complete: what a mask held back can go now.
+	_ = stdout.Flush()
+	_ = stderr.Flush()
 	if ctx.Err() == nil {
 		code := exitCode(cmd.ProcessState)
-		s.log.Info("command finished", "argv", req.Argv, "dir", p.hostPath, "code", code, "wait_error", waitErr)
+		s.log.Info("command finished", append(p.logArgs(req), "code", code, "wait_error", waitErr)...)
 		_ = out.writeJSON(protocol.FrameExit, protocol.Exit{Code: code})
 	} else {
-		s.log.Info("command cancelled", "argv", req.Argv, "dir", p.hostPath)
+		s.log.Info("command cancelled", p.logArgs(req)...)
 	}
 	conn.Close()
 	streams.Wait()
@@ -502,21 +546,42 @@ func fdPath(dir *os.File) string {
 // /proc/self/fd (it inherits the descriptor until exec), so a symlink the
 // container swaps into the path after the check cannot redirect it; PWD is
 // set to hostPath because the /proc path is meaningless once the child runs.
-// The environment is otherwise the daemon's (host) environment; nothing
-// comes from the container. The command gets its own process group so
+// The environment is otherwise the daemon's (host) environment with env,
+// the rule's injected variables, over it; nothing comes from the
+// container. The command gets its own process group so
 // cancellation also kills whatever it spawned (e.g. git's ssh).
-func newCommand(ctx context.Context, argv []string, dir *os.File, hostPath string, out *frameWriter) *exec.Cmd {
+func newCommand(ctx context.Context, argv []string, dir *os.File, hostPath string, env []string, out *frameWriter) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Dir = fdPath(dir)
-	cmd.Env = append(slices.DeleteFunc(os.Environ(), func(kv string) bool {
-		return strings.HasPrefix(kv, "PWD=")
-	}), "PWD="+hostPath)
+	cmd.Env = commandEnv(hostPath, env...)
 	cmd.Stdout = streamWriter{out: out, frame: protocol.FrameStdout}
 	cmd.Stderr = streamWriter{out: out, frame: protocol.FrameStderr}
+	ownGroup(cmd)
+	return cmd
+}
+
+// ownGroup starts cmd in a process group of its own, so that cancelling it
+// kills whatever it spawned too (e.g. git's ssh), and waits at most
+// waitDelay for its output after it exits.
+func ownGroup(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
 	cmd.WaitDelay = waitDelay
-	return cmd
+}
+
+// commandEnv is the environment a command, or a secret's command source,
+// runs with in the directory whose real path is hostPath: the daemon's,
+// with PWD set to hostPath, then the NAME=value entries of extra (a rule's
+// injected variables) over it.
+func commandEnv(hostPath string, extra ...string) []string {
+	set := append([]string{"PWD=" + hostPath}, extra...)
+	env := slices.DeleteFunc(os.Environ(), func(kv string) bool {
+		return slices.ContainsFunc(set, func(e string) bool {
+			name, _, _ := strings.Cut(e, "=")
+			return strings.HasPrefix(kv, name+"=")
+		})
+	})
+	return append(env, set...)
 }
 
 // xOK is access(2)'s X_OK, which package syscall does not export.

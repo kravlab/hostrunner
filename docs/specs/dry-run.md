@@ -32,7 +32,9 @@ command without restarting the container.
 - Allowed: `hostrun: dry run: allowed by rule "<command>"` on stderr,
   exit 0. `<command>` is the rule's command, the longest matching one.
   A rule with a fixed directory adds `, runs in <dir>`
-  ([rules-fixed-directory.md](rules-fixed-directory.md)).
+  ([rules-fixed-directory.md](rules-fixed-directory.md)), and a rule with
+  secrets `, injects secrets: <names>`, after checking their sources
+  without obtaining them ([rules-secrets.md](rules-secrets.md)).
 - Refused: the message and exit code a run of the same command would get
   (126 refused, 127 not on the host, 125 hostrun failed), without host
   paths.

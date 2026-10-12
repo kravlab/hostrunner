@@ -190,6 +190,12 @@ name container paths anyway, so only relative symlinks are followed.
   `--upload-pack`, `--receive-pack`, `--exec`) and deny URL, scp-style and
   path remotes; a test keeps it valid and checks those denials.
 
+## Extensions
+
+- Secrets and injection (`secrets`, `inject`, `secrets_with_any_args`):
+  [rules-secrets.md](rules-secrets.md). The lists described here check
+  the container's argv only; what a rule injects is placed after them.
+
 ## Out of scope
 
 Raw-command input, mount-check profiles, hot reload of the config.

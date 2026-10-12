@@ -167,3 +167,21 @@ func TestRulesTestReportsTheFixedDirectory(t *testing.T) {
 		}
 	}
 }
+
+// The Rules test names a rule's secrets and touches none of them.
+func TestRulesTestListsTheSecrets(t *testing.T) {
+	rules := `rules:
+  - command: curl
+    secrets:
+      token: {command: [no-such-authtool-xyz]}
+      key: {file: /no/such/file}
+    inject:
+      command_args: ["-H", "Authorization: Bearer ${token}", "${key}"]
+    args: any
+    secrets_with_any_args: true
+`
+	code, _, stderr := runTest(t, "--config", writeRules(t, rules), "curl", "https://example.com")
+	if want := "hostrunner: allowed by rule \"curl\", injects secrets: key, token\n"; code != 0 || stderr != want {
+		t.Fatalf("exit code %d, stderr %q; want 0, %q", code, stderr, want)
+	}
+}

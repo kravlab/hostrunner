@@ -36,6 +36,12 @@
 // mirrored directory, so a rule with `dir` may not use `path: check`: the
 // program would resolve the argument from `dir`.
 //
+// A rule may name secrets (`secrets:`) and add to its command what the
+// container never sends (`inject:`), referring to them as `${name}`. Check
+// reports both, and Assemble places the rendered injection; obtaining the
+// values is the caller's. A rule with secrets takes allow lists only (see
+// checkStrictLists).
+//
 // Rules restrict argv and, with `dir`, the working directory only. A tool
 // that reads configuration or hooks from the workspace can still be
 // steered by whoever can write the workspace.
@@ -103,6 +109,8 @@ type rule struct {
 	style      flagStyle
 	flags      *flagFilter
 	positional *list // nil: positional arguments are unrestricted
+	secrets    []Secret
+	inject     Injection
 }
 
 // flagFilter restricts a rule's flags. Its names and the keys of values are
@@ -182,12 +190,16 @@ type (
 		Rules []rawRule `yaml:"rules"`
 	}
 	rawRule struct {
-		Command    string    `yaml:"command"`
-		Args       string    `yaml:"args"`
-		FlagStyle  string    `yaml:"flag_style"`
-		Dir        yaml.Node `yaml:"dir"` // a Node: a null dir is an error, not no dir
-		Flags      *rawFlags `yaml:"flags"`
-		Positional *rawList  `yaml:"positional"`
+		Command    string               `yaml:"command"`
+		Args       string               `yaml:"args"`
+		FlagStyle  string               `yaml:"flag_style"`
+		Dir        yaml.Node            `yaml:"dir"` // a Node: a null dir is an error, not no dir
+		Flags      *rawFlags            `yaml:"flags"`
+		Positional *rawList             `yaml:"positional"`
+		Secrets    map[string]rawSecret `yaml:"secrets"`
+		Inject     *rawInject           `yaml:"inject"`
+		// SecretsWithAnyArgs allows args: any in a rule with secrets.
+		SecretsWithAnyArgs bool `yaml:"secrets_with_any_args"`
 	}
 	rawList struct {
 		Allow      []string `yaml:"allow"`
@@ -292,6 +304,13 @@ func newRule(rr rawRule) (*rule, error) {
 			return nil, fmt.Errorf("%q: dir must be an absolute path or inherit", r.name)
 		}
 	}
+	var err error
+	if r.secrets, err = newSecrets(rr.Secrets); err != nil {
+		return nil, fmt.Errorf("%q: %w", r.name, err)
+	}
+	if r.inject, err = newInjection(rr.Inject, r.secrets); err != nil {
+		return nil, fmt.Errorf("%q: %w", r.name, err)
+	}
 	if rr.FlagStyle != "" {
 		var ok bool
 		if r.style, ok = flagStyles[rr.FlagStyle]; !ok {
@@ -305,6 +324,9 @@ func newRule(rr rawRule) (*rule, error) {
 			return nil, fmt.Errorf("%q: args cannot be combined with flags, positional or flag_style", r.name)
 		}
 		r.args = rr.Args
+		if err := r.checkStrictLists(rr.SecretsWithAnyArgs); err != nil {
+			return nil, err
+		}
 		return r, nil
 	case "":
 		if rr.Flags == nil && rr.Positional == nil {
@@ -313,7 +335,6 @@ func newRule(rr rawRule) (*rule, error) {
 	default:
 		return nil, fmt.Errorf("%q: args must be any or none, not %q", r.name, rr.Args)
 	}
-	var err error
 	if rr.Positional != nil {
 		if r.positional, err = newList(rawList(*rr.Positional)); err != nil {
 			return nil, fmt.Errorf("%q positional: %w", r.name, err)
@@ -330,6 +351,9 @@ func newRule(rr rawRule) (*rule, error) {
 	}
 	if r.dir != "" && r.hasPathCheck() {
 		return nil, errDirWithPathCheck(r.name)
+	}
+	if err := r.checkStrictLists(rr.SecretsWithAnyArgs); err != nil {
+		return nil, err
 	}
 	return r, nil
 }
@@ -517,6 +541,13 @@ type Allowed struct {
 	// the command runs in, or "" to run it in the mirrored directory. The
 	// caller has to check that it is a directory outside the workspace.
 	Dir string
+	// Secrets are the allowing rule's secrets, sorted by name; the caller
+	// obtains their values on the host for every request.
+	Secrets []Secret
+	// Inject is what the rule adds to the command; Assemble places it.
+	Inject Injection
+	// commandLen is the number of argv tokens the rule's command spans.
+	commandLen int
 }
 
 // Check returns what allowed argv, or a *Denial when argv is not allowed.
@@ -546,7 +577,7 @@ func (p *Policy) Check(argv []string) (Allowed, error) {
 	for i := range paths {
 		paths[i].Index += len(best.command)
 	}
-	return Allowed{Rule: best.name, Paths: paths, Dir: best.dir}, nil
+	return Allowed{Rule: best.name, Paths: paths, Dir: best.dir, Secrets: best.secrets, Inject: best.inject, commandLen: len(best.command)}, nil
 }
 
 // check applies the rule to the arguments after its command and returns

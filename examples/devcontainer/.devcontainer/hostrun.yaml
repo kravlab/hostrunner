@@ -34,3 +34,17 @@ rules:
     positional:
       # force refspecs (+ref), deletions (:ref), and remotes other than by name
       deny: ["+*", ":*", "*://*", "*@*:*", "/*", ".*", "~*", "ext::*", "file:*"]
+
+  # A token only the host holds, added on the host to one API call: the
+  # container never sees it. A rule with secrets takes allow lists only.
+  # - command: curl
+  #   secrets:
+  #     token: { command: [authtool, print-token], timeout: 10s }
+  #   inject:
+  #     command_args: ["-H", "Authorization: Bearer ${token}"]
+  #   flags:
+  #     allow: [-s, --fail]
+  #     values:
+  #       -X: { allow: [GET, PUT] }
+  #   positional:
+  #     allow_regex: ['^https://api\.example\.com/v1/items/42$']
