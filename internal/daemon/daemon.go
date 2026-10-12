@@ -252,7 +252,7 @@ type prepared struct {
 	dir      *os.File   // the working directory, opened
 	hostPath string     // dir's real path on the host
 	argv     []string   // argv to run: path: open arguments replaced, injection placed
-	files    []*os.File // path: open files, the command's descriptors 3, 4, …
+	files    []*os.File // path: open, then injected files: the command's descriptors 3, 4, …
 	env      []string   // injected NAME=value variables over the daemon's
 	secrets  []string   // names of the secrets injected, for the log
 }
@@ -321,6 +321,11 @@ func (s *Server) prepare(req protocol.Request) (*prepared, *refusal) {
 		dir.Close()
 		closeAll(files)
 		return nil, r
+	}
+	if files, err = injectFiles(allowed.Inject.Files, values, files); err != nil {
+		dir.Close()
+		closeAll(files)
+		return nil, &refusal{protocol.ExitHostrunError, "cannot create the files the rule hands the command", err}
 	}
 	if argv, err = allowed.Assemble(argv, values); err != nil {
 		dir.Close()

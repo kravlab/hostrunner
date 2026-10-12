@@ -21,16 +21,13 @@ import (
 const minSecretLength = 8
 
 // obtainSecrets obtains the value of every secret, fresh for this request,
-// with trailing CR and LF trimmed. A command source runs, and a relative
-// file source is read, in the working directory dir, whose real path is
-// hostPath. A secret that yields no
-// usable value refuses the request with ExitHostrunError and a message
-// naming the secret only; the reason, never the value, goes to the error
-// for the log.
+// with trailing CR and LF trimmed, into the map the injection's templates
+// are rendered from (injectFiles adds to it). A command source runs, and a
+// relative file source is read, in the working directory dir, whose real
+// path is hostPath. A secret that yields no usable value refuses the
+// request with ExitHostrunError and a message naming the secret only; the
+// reason, never the value, goes to the error for the log.
 func obtainSecrets(secrets []rules.Secret, dir *os.File, hostPath string) (map[string]string, *refusal) {
-	if len(secrets) == 0 {
-		return nil, nil
-	}
 	values := make(map[string]string, len(secrets))
 	for _, sec := range secrets {
 		value, err := obtain(sec, dir, hostPath)
@@ -97,6 +94,25 @@ func runSource(sec rules.Secret, dir *os.File, hostPath string) (string, error) 
 		return "", fmt.Errorf("command %q: %w; stderr: %q", sec.Command, err, stderr.String())
 	}
 	return stdout.String(), nil
+}
+
+// injectFiles creates the injected files, their content rendered from
+// values, and appends them to files, the descriptors the command already
+// inherits (from path: open), so they get the next numbers. It adds each
+// file's descriptor path to values under rules.FileRef, for the argv and
+// environment templates. On error the returned files still hold every
+// file created, for the caller to close.
+func injectFiles(injected []rules.File, values map[string]string, files []*os.File) ([]*os.File, error) {
+	for _, inj := range injected {
+		f, err := injectedFile(inj.Name, inj.Content.Render(values))
+		if err != nil {
+			return files, fmt.Errorf("injected file %q: %w", inj.Name, err)
+		}
+		// ExtraFiles[i] becomes descriptor 3+i in the command.
+		values[rules.FileRef(inj.Name)] = fmt.Sprintf("/proc/self/fd/%d", 3+len(files))
+		files = append(files, f)
+	}
+	return files, nil
 }
 
 // secretNames returns the names of secrets, for the log.

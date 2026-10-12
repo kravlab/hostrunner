@@ -8,6 +8,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"go.yaml.in/yaml/v3"
 )
 
 // A rule's injection is what it adds to its command after the checks
@@ -61,6 +63,16 @@ type Injection struct {
 	// Env are environment variables for the command, sorted by name; they
 	// override the daemon's.
 	Env []EnvVar
+	// Files are handed to the command as inherited descriptors, in the
+	// order the rules file declares them, after the path: open files.
+	Files []File
+}
+
+// File is a file an injection hands to its command: read-only content the
+// program finds through the descriptor path `${file.name}` renders to.
+type File struct {
+	Name    string
+	Content Template // refers to secrets only
 }
 
 // EnvVar is an environment variable an injection sets.
@@ -75,25 +87,31 @@ func (in Injection) addsNoArgs() bool {
 }
 
 // Template is a string of an injection: literal text with references to
-// secrets (`${name}`); `$$` is a literal `$`.
+// secrets (`${name}`) and injected files (`${file.name}`); `$$` is a
+// literal `$`.
 type Template struct {
 	parts []templatePart
 }
 
-// templatePart is literal text, or a reference to a secret when secret is
-// set.
+// templatePart is literal text, or a reference when ref is set: a secret's
+// name, or FileRef of an injected file's.
 type templatePart struct {
-	text   string
-	secret string
+	text string
+	ref  string
 }
 
-// Render returns t with each reference replaced by the value values holds
-// for it. Parse made sure every reference names a secret of the rule.
+// FileRef is the key under which Render looks up the descriptor path of
+// the injected file name.
+func FileRef(name string) string { return "file." + name }
+
+// Render returns t with each reference replaced by what values holds for
+// it: a secret's value under its name, an injected file's descriptor path
+// under FileRef. Parse made sure every reference names one of the rule's.
 func (t Template) Render(values map[string]string) string {
 	var b strings.Builder
 	for _, p := range t.parts {
-		if p.secret != "" {
-			b.WriteString(values[p.secret])
+		if p.ref != "" {
+			b.WriteString(values[p.ref])
 		} else {
 			b.WriteString(p.text)
 		}
@@ -131,12 +149,12 @@ func parseTemplate(s string) (Template, error) {
 			if end < 0 {
 				return Template{}, fmt.Errorf("%q: unterminated ${", s)
 			}
-			name := s[i+2 : i+end]
-			if !secretName.MatchString(name) {
-				return Template{}, fmt.Errorf("%q: ${%s} is not a secret name", s, name)
+			ref := s[i+2 : i+end]
+			if !secretName.MatchString(strings.TrimPrefix(ref, "file.")) {
+				return Template{}, fmt.Errorf("%q: ${%s} is not a secret or file name", s, ref)
 			}
 			flush()
-			t.parts = append(t.parts, templatePart{secret: name})
+			t.parts = append(t.parts, templatePart{ref: ref})
 			i += end
 		default:
 			// A lone $ is more likely a typo than literal text.
@@ -147,15 +165,15 @@ func parseTemplate(s string) (Template, error) {
 	return t, nil
 }
 
-// references returns the secrets t refers to.
+// references returns what t refers to, as Render looks it up.
 func (t Template) references() []string {
-	var names []string
+	var refs []string
 	for _, p := range t.parts {
-		if p.secret != "" {
-			names = append(names, p.secret)
+		if p.ref != "" {
+			refs = append(refs, p.ref)
 		}
 	}
-	return names
+	return refs
 }
 
 // Raw YAML shapes of secrets and injections; newSecrets and newInjection
@@ -172,6 +190,7 @@ type (
 		CommandArgs  []string          `yaml:"command_args"`
 		TrailingArgs []string          `yaml:"trailing_args"`
 		Env          map[string]string `yaml:"env"`
+		Files        yaml.Node         `yaml:"files"` // a Node: files keep their order
 	}
 )
 
@@ -236,13 +255,22 @@ func newSecret(name string, rs rawSecret) (Secret, error) {
 }
 
 // newInjection validates a rule's injection against its secrets: every
-// reference must name one of them, and every one of them must be used, as
-// an unused secret is most likely a typo and its source would be obtained
-// for nothing.
+// reference must name one of them or of its files, and every one of them
+// must be used, as an unused one is most likely a typo and a secret's
+// source would be obtained for nothing.
 func newInjection(raw *rawInject, secrets []Secret) (Injection, error) {
 	var in Injection
 	used := make(map[string]bool)
 	if raw != nil {
+		var err error
+		// The files come first: the other templates refer to them.
+		if in.Files, err = newFiles(raw.Files, secrets, used); err != nil {
+			return Injection{}, err
+		}
+		files := make([]string, len(in.Files))
+		for i, f := range in.Files {
+			files[i] = f.Name
+		}
 		for _, field := range []struct {
 			key  string
 			raw  []string
@@ -256,7 +284,7 @@ func newInjection(raw *rawInject, secrets []Secret) (Injection, error) {
 				if field.key == "trailing_args" && strings.HasPrefix(s, "-") {
 					return Injection{}, fmt.Errorf("inject.trailing_args: %q starts with -: trailing arguments are positional, add flags to program_args or command_args", s)
 				}
-				t, err := newTemplate(s, secrets, used)
+				t, err := newTemplate(s, secrets, files, used)
 				if err != nil {
 					return Injection{}, fmt.Errorf("inject.%s: %w", field.key, err)
 				}
@@ -271,11 +299,16 @@ func newInjection(raw *rawInject, secrets []Secret) (Injection, error) {
 				// The daemon sets it to the working directory.
 				return Injection{}, errors.New("inject.env: PWD is set by hostrunner")
 			}
-			t, err := newTemplate(raw.Env[name], secrets, used)
+			t, err := newTemplate(raw.Env[name], secrets, files, used)
 			if err != nil {
 				return Injection{}, fmt.Errorf("inject.env: %s: %w", name, err)
 			}
 			in.Env = append(in.Env, EnvVar{Name: name, Value: t})
+		}
+		for _, f := range in.Files {
+			if !used[FileRef(f.Name)] {
+				return Injection{}, fmt.Errorf("inject.files: %q is not used by an argument or a variable", f.Name)
+			}
 		}
 	}
 	for _, sec := range secrets {
@@ -286,18 +319,53 @@ func newInjection(raw *rawInject, secrets []Secret) (Injection, error) {
 	return in, nil
 }
 
-// newTemplate parses s and checks that it refers to secrets only, marking
-// those in used.
-func newTemplate(s string, secrets []Secret, used map[string]bool) (Template, error) {
+// newFiles validates the files of an injection, a mapping from name to
+// content kept in the order the rules file writes it. A file's content
+// refers to secrets only: a descriptor path means nothing inside a file.
+func newFiles(node yaml.Node, secrets []Secret, used map[string]bool) ([]File, error) {
+	if node.Kind == 0 {
+		return nil, nil
+	}
+	if node.Kind != yaml.MappingNode {
+		return nil, errors.New("inject.files must map names to contents")
+	}
+	var files []File
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		key, value := node.Content[i], node.Content[i+1]
+		name := key.Value
+		switch {
+		case !secretName.MatchString(name):
+			return nil, fmt.Errorf("inject.files: %q: a name is lower-case letters, digits and _, starting with a letter", name)
+		case slices.ContainsFunc(files, func(f File) bool { return f.Name == name }):
+			return nil, fmt.Errorf("inject.files: %q is named twice", name)
+		case value.Kind != yaml.ScalarNode || value.ShortTag() != "!!str":
+			return nil, fmt.Errorf("inject.files: %q: the content must be a string", name)
+		}
+		t, err := newTemplate(value.Value, secrets, nil, used)
+		if err != nil {
+			return nil, fmt.Errorf("inject.files: %s: %w", name, err)
+		}
+		files = append(files, File{Name: name, Content: t})
+	}
+	return files, nil
+}
+
+// newTemplate parses s and checks that it refers to secrets, or to the
+// injected files named in files, only, marking those in used.
+func newTemplate(s string, secrets []Secret, files []string, used map[string]bool) (Template, error) {
 	t, err := parseTemplate(s)
 	if err != nil {
 		return Template{}, err
 	}
-	for _, name := range t.references() {
-		if !slices.ContainsFunc(secrets, func(sec Secret) bool { return sec.Name == name }) {
-			return Template{}, fmt.Errorf("%q refers to unknown secret %q", s, name)
+	for _, ref := range t.references() {
+		if name, ok := strings.CutPrefix(ref, "file."); ok {
+			if !slices.Contains(files, name) {
+				return Template{}, fmt.Errorf("%q refers to unknown file %q", s, name)
+			}
+		} else if !slices.ContainsFunc(secrets, func(sec Secret) bool { return sec.Name == ref }) {
+			return Template{}, fmt.Errorf("%q refers to unknown secret %q", s, ref)
 		}
-		used[name] = true
+		used[ref] = true
 	}
 	return t, nil
 }

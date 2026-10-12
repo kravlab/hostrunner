@@ -309,6 +309,15 @@ goes; the container cannot move it.
 - `inject.env` sets environment variables for the command, as
   `{API_TOKEN: "${token}"}`, over the daemon's variable of the same name.
   `PWD` is the working directory and cannot be set.
+- `inject.files` hands the command files whose content is a template, for
+  a program that reads its secret from a config file:
+  `{cfg: 'header = "Authorization: Bearer ${token}"'}`. The program gets
+  each as an inherited descriptor, after the `path: open` files in the
+  order the rules file writes them, and `${file.cfg}` in an argument or a
+  variable is its path (`curl -K ${file.cfg}` runs as
+  `curl -K /proc/self/fd/4`). The file is read-only, can be read again and
+  sought in, and lives in memory only (a sealed memfd), never on a disk.
+  Its content may refer to secrets, not to files.
 - Their strings are templates: `${token}` is the secret's value, `$$` a
   literal `$`; any other `$`, an unknown name or a secret no template uses
   makes the rules file invalid. A `path: open` argument is still replaced
@@ -327,7 +336,7 @@ goes; the container cannot move it.
 - An `inject` without `secrets` adds fixed arguments and needs no strict
   lists.
 - The daemon log records the container's argv and the names of the
-  secrets, never the argv or environment with the values in them.
+  secrets, never the argv, environment or files with the values in them.
 
 To see whether a rules file allows a command before restarting the
 container, run the Rules test on the host, in the project root:

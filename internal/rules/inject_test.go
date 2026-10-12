@@ -88,7 +88,7 @@ func TestParseRefusesABadTemplate(t *testing.T) {
 	for name, tc := range map[string]struct{ arg, want string }{
 		"lone dollar":    {"cost: 5$", "lone $"},
 		"unterminated":   {"Bearer ${token", "unterminated"},
-		"bad name":       {"Bearer ${Token}", "not a secret name"},
+		"bad name":       {"Bearer ${Token}", "is not a secret or file name"},
 		"unknown secret": {"Bearer ${other}", `unknown secret "other"`},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -243,5 +243,38 @@ func TestEnvironmentRendersTheInjectedVariablesByName(t *testing.T) {
 	got := allowed.Environment(map[string]string{"token": "tok-0123456789"})
 	if want := "API_TOKEN=Bearer tok-0123456789|NO_COLOR=1"; strings.Join(got, "|") != want {
 		t.Fatalf("got %q, want %s", got, want)
+	}
+}
+
+func TestParseRefusesABadInjectedFile(t *testing.T) {
+	for name, tc := range map[string]struct{ inject, want string }{
+		"unknown file":      {`command_args: ["${file.cfg}"]`, `unknown file "cfg"`},
+		"unused file":       {`files: {cfg: x}`, `"cfg" is not used`},
+		"path inside file":  {"command_args: [\"${file.cfg}\"]\n      files: {cfg: \"${file.cfg}\"}", `unknown file "cfg"`},
+		"bad name":          {"command_args: [\"${file.Cfg}\"]\n      files: {Cfg: x}", `"Cfg": a name is lower-case`},
+		"not a string":      {"command_args: [\"${file.cfg}\"]\n      files: {cfg: [x]}", "the content must be a string"},
+		"not a mapping":     {"files: [x]", "inject.files must map names to contents"},
+		"secret in content": {"command_args: [\"${file.cfg}\"]\n      files: {cfg: \"${token}\"}", `unknown secret "token"`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			expectParseError(t, "rules:\n  - command: curl\n    inject:\n      "+tc.inject+"\n    args: any\n", tc.want)
+		})
+	}
+}
+
+// Files keep the order the rules file declares them in, which is the order
+// of their descriptors.
+func TestCheckReportsTheInjectedFilesInDeclarationOrder(t *testing.T) {
+	p := mustParse(t, "rules:\n  - command: curl\n    inject:\n      command_args: [\"${file.zeta}\", \"${file.alpha}\"]\n      files: {zeta: z, alpha: a}\n    args: any\n")
+	allowed, err := p.Check([]string{"curl"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, f := range allowed.Inject.Files {
+		names = append(names, f.Name)
+	}
+	if got := strings.Join(names, " "); got != "zeta alpha" {
+		t.Fatalf("got %s, want zeta alpha", got)
 	}
 }
