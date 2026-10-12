@@ -41,6 +41,8 @@ func expectParseError(t *testing.T, config, want string) {
 	}
 }
 
+// A rule with secrets is valid with allow lists everywhere, with no
+// arguments at all, or with args: any chosen deliberately.
 func TestParseAcceptsASecretRuleWithAllowLists(t *testing.T) {
 	mustParse(t, secretRule(strictLists))
 	mustParse(t, secretRule("    args: none\n"))
@@ -118,6 +120,8 @@ func TestParseRefusesAnUnusedSecret(t *testing.T) {
 	expectParseError(t, config, `secret "spare" is not used`)
 }
 
+// A secret needs a name templates can refer to and a source to obtain its
+// value from.
 func TestParseRefusesABadSecret(t *testing.T) {
 	expectParseError(t, "rules:\n  - command: curl\n    secrets:\n      Token: {env: TOKEN}\n    args: none\n", `secret "Token"`)
 	expectParseError(t, "rules:\n  - command: curl\n    secrets:\n      token: {}\n    args: none\n", `secret "token": set its source`)
@@ -151,6 +155,8 @@ func TestAssemblePlacesCommandArgsAfterTheRuleCommand(t *testing.T) {
 	}
 }
 
+// A command source names a program, is the only source of its secret, and
+// runs for a positive time; a timeout means nothing for the other sources.
 func TestParseRefusesABadCommandSource(t *testing.T) {
 	for name, tc := range map[string]struct{ source, want string }{
 		"empty command":     {"{command: []}", "command must name a program"},
@@ -234,6 +240,7 @@ func TestParseRefusesABadInjectedVariable(t *testing.T) {
 	}
 }
 
+// The injected variables come rendered as NAME=value, sorted by name.
 func TestEnvironmentRendersTheInjectedVariablesByName(t *testing.T) {
 	p := mustParse(t, "rules:\n  - command: curl\n    secrets:\n      token: {env: TOKEN}\n    inject:\n      env: {NO_COLOR: \"1\", API_TOKEN: \"Bearer ${token}\"}\n"+strictLists)
 	allowed, err := p.Check([]string{"curl"})
@@ -246,6 +253,9 @@ func TestEnvironmentRendersTheInjectedVariablesByName(t *testing.T) {
 	}
 }
 
+// A file needs a name, string content and a template that uses its path;
+// its content refers to secrets only, as a descriptor path means nothing
+// inside a file.
 func TestParseRefusesABadInjectedFile(t *testing.T) {
 	for name, tc := range map[string]struct{ inject, want string }{
 		"unknown file":      {`command_args: ["${file.cfg}"]`, `unknown file "cfg"`},

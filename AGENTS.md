@@ -49,8 +49,7 @@ in the container.
   checks the rules, the directory, file arguments and that the program
   is installed and executable, then exits 0 with
   `hostrun: dry run: allowed by rule "…"` (`, runs in <dir>` when the
-  rule names a directory, `, injects secrets: <names>` when it adds
-  secrets the host holds), or with the code and message
+  rule names a directory), or with the code and message
   the run would get. Nothing runs and stdin is not read. Anywhere after
   the program, `--dry-run` is the command's own.
 - No TTY: supply all input up front, through flags or stdin.

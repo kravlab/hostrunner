@@ -3,12 +3,12 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"unicode/utf8"
 
 	"github.com/kravlab/hostrunner/internal/protocol"
@@ -32,18 +32,24 @@ func obtainSecrets(secrets []rules.Secret, dir *os.File, hostPath string) (map[s
 	for _, sec := range secrets {
 		value, err := obtain(sec, dir, hostPath)
 		if err != nil {
-			return nil, &refusal{protocol.ExitHostrunError, fmt.Sprintf("secret %q is not available", sec.Name), fmt.Errorf("secret %q: %w", sec.Name, err)}
+			return nil, unavailable(sec, err)
 		}
 		value = strings.TrimRight(value, "\r\n")
 		switch n := utf8.RuneCountInString(value); {
 		case n == 0:
-			return nil, &refusal{protocol.ExitHostrunError, fmt.Sprintf("secret %q is not available", sec.Name), fmt.Errorf("secret %q: the value is empty", sec.Name)}
+			return nil, unavailable(sec, errors.New("the value is empty"))
 		case n < minSecretLength:
 			return nil, &refusal{protocol.ExitHostrunError, fmt.Sprintf("secret %q is too short to mask", sec.Name), fmt.Errorf("secret %q: the value has %d characters, fewer than %d", sec.Name, n, minSecretLength)}
 		}
 		values[sec.Name] = value
 	}
 	return values, nil
+}
+
+// unavailable is the refusal for a secret without a usable value: the
+// message names the secret only, and err, the reason, goes to the log.
+func unavailable(sec rules.Secret, err error) *refusal {
+	return &refusal{protocol.ExitHostrunError, fmt.Sprintf("secret %q is not available", sec.Name), fmt.Errorf("secret %q: %w", sec.Name, err)}
 }
 
 // checkSources checks, for a dry run, what obtainSecrets would need without
@@ -68,7 +74,7 @@ func checkSources(secrets []rules.Secret, dir *os.File) *refusal {
 			}
 		}
 		if err != nil {
-			return &refusal{protocol.ExitHostrunError, fmt.Sprintf("secret %q is not available", sec.Name), fmt.Errorf("secret %q: %w", sec.Name, err)}
+			return unavailable(sec, err)
 		}
 	}
 	return nil
@@ -116,9 +122,7 @@ func runSource(sec rules.Secret, dir *os.File, hostPath string) (string, error) 
 	cmd.Env = commandEnv(hostPath)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
-	cmd.WaitDelay = waitDelay
+	ownGroup(cmd)
 	err := cmd.Run()
 	switch {
 	case ctx.Err() != nil:

@@ -55,3 +55,13 @@ func TestRunHandsAFileWithoutSecretsThroughTheEnvironment(t *testing.T) {
 		t.Fatalf("got %+v, want the file's content", got)
 	}
 }
+
+// The file behaves as a regular one: it has its size, and a program can
+// seek in it rather than read it from the start.
+func TestRunHandsAnInjectedFileThatHasASizeAndSeeks(t *testing.T) {
+	config := "rules:\n  - command: sh\n    inject:\n      command_args: [-c, 'stat -L -c %s \"$$0\"; dd if=\"$$0\" bs=1 skip=6 2>/dev/null', \"${file.cfg}\"]\n      files: {cfg: \"fixed content\\n\"}\n    args: none\n"
+	h := startDaemon(t, policy(t, config))
+	if got := h.run(t, containerRoot, "", "sh"); got != (result{stdout: "14\ncontent\n"}) {
+		t.Fatalf("got %+v, want the size and the content after the first 6 bytes", got)
+	}
+}

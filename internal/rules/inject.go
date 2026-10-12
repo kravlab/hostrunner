@@ -122,8 +122,12 @@ func (t Template) Render(values map[string]string) string {
 // envName is the grammar of an injected environment variable's name.
 var envName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
-// secretName is the grammar of a secret's name.
-var secretName = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
+// refName is the grammar of the names a template refers to: a secret's,
+// and an injected file's after `file.`; refNameRule says it in words.
+var refName = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
+
+// refNameRule describes refName for error messages.
+const refNameRule = "a name is lower-case letters, digits and _, starting with a letter"
 
 // parseTemplate parses s, a template as the rules file writes it.
 func parseTemplate(s string) (Template, error) {
@@ -150,7 +154,7 @@ func parseTemplate(s string) (Template, error) {
 				return Template{}, fmt.Errorf("%q: unterminated ${", s)
 			}
 			ref := s[i+2 : i+end]
-			if !secretName.MatchString(strings.TrimPrefix(ref, "file.")) {
+			if !refName.MatchString(strings.TrimPrefix(ref, "file.")) {
 				return Template{}, fmt.Errorf("%q: ${%s} is not a secret or file name", s, ref)
 			}
 			flush()
@@ -199,8 +203,8 @@ type (
 func newSecrets(raw map[string]rawSecret) ([]Secret, error) {
 	var secrets []Secret
 	for _, name := range slices.Sorted(maps.Keys(raw)) {
-		if !secretName.MatchString(name) {
-			return nil, fmt.Errorf("secret %q: a name is lower-case letters, digits and _, starting with a letter", name)
+		if !refName.MatchString(name) {
+			return nil, fmt.Errorf("secret %q: %s", name, refNameRule)
 		}
 		sec, err := newSecret(name, raw[name])
 		if err != nil {
@@ -334,8 +338,8 @@ func newFiles(node yaml.Node, secrets []Secret, used map[string]bool) ([]File, e
 		key, value := node.Content[i], node.Content[i+1]
 		name := key.Value
 		switch {
-		case !secretName.MatchString(name):
-			return nil, fmt.Errorf("inject.files: %q: a name is lower-case letters, digits and _, starting with a letter", name)
+		case !refName.MatchString(name):
+			return nil, fmt.Errorf("inject.files: %q: %s", name, refNameRule)
 		case slices.ContainsFunc(files, func(f File) bool { return f.Name == name }):
 			return nil, fmt.Errorf("inject.files: %q is named twice", name)
 		case value.Kind != yaml.ScalarNode || value.ShortTag() != "!!str":
@@ -405,16 +409,16 @@ func (r *rule) checkStrictLists(withAnyArgs bool) error {
 	return nil
 }
 
-// ErrTrailingFlag is Assemble's error for a rendered trailing argument
+// errTrailingFlag is Assemble's error for a rendered trailing argument
 // that would read as a flag. Its text holds no value.
-var ErrTrailingFlag = errors.New("an argument the rule adds after the container's starts with -")
+var errTrailingFlag = errors.New("an argument the rule adds after the container's starts with -")
 
 // Assemble returns the argv to run for argv, the container's argv after
 // the caller's own replacements (path: open), with the allowing rule's
 // injection rendered from values, the secret values by name: program,
 // ProgramArgs, rest of the rule's command, CommandArgs, the container's
 // arguments, TrailingArgs. A rendered trailing argument starting with -
-// is ErrTrailingFlag.
+// is errTrailingFlag.
 func (a Allowed) Assemble(argv []string, values map[string]string) ([]string, error) {
 	if a.Inject.addsNoArgs() {
 		return argv, nil
@@ -428,7 +432,7 @@ func (a Allowed) Assemble(argv []string, values map[string]string) ([]string, er
 	}
 	trailing := render(a.Inject.TrailingArgs)
 	if slices.ContainsFunc(trailing, func(arg string) bool { return strings.HasPrefix(arg, "-") }) {
-		return nil, ErrTrailingFlag
+		return nil, errTrailingFlag
 	}
 	out := append([]string{argv[0]}, render(a.Inject.ProgramArgs)...)
 	out = append(out, argv[1:a.commandLen]...)

@@ -300,58 +300,47 @@ func (s *Server) prepare(req protocol.Request, dryRun bool) (*prepared, *refusal
 	if err != nil {
 		return nil, &refusal{protocol.ExitRejected, err.Error(), err}
 	}
-	dir, hostPath, err := s.mapper.Open(req.Cwd)
-	if err != nil {
+	p := &prepared{rule: allowed.Rule, fixedDir: allowed.Dir, secrets: allowed.SecretNames()}
+	if p.dir, p.hostPath, err = s.mapper.Open(req.Cwd); err != nil {
 		return nil, &refusal{protocol.ExitRejected, cwdMessage(req.Cwd, err), err}
 	}
-	argv, files, message, err := s.openPaths(req.Argv, allowed.Paths, hostPath)
-	if err != nil {
-		dir.Close()
-		closeAll(files)
-		return nil, &refusal{protocol.ExitRejected, message, err}
+	// From here on, a refusal releases what p holds so far.
+	refuse := func(code int, message string, err error) (*prepared, *refusal) {
+		p.close()
+		return nil, &refusal{code, message, err}
+	}
+	var message string
+	if p.argv, p.files, message, err = s.openPaths(req.Argv, allowed.Paths, p.hostPath); err != nil {
+		return refuse(protocol.ExitRejected, message, err)
 	}
 	if allowed.Dir != "" {
 		// The mirrored directory was only needed to resolve the paths.
-		dir.Close()
-		if dir, hostPath, err = s.mapper.OpenFixed(allowed.Dir); err != nil {
-			closeAll(files)
-			return nil, &refusal{protocol.ExitRejected, fixedMessage(allowed.Dir, err), err}
+		p.dir.Close()
+		if p.dir, p.hostPath, err = s.mapper.OpenFixed(allowed.Dir); err != nil {
+			return refuse(protocol.ExitRejected, fixedMessage(allowed.Dir, err), err)
 		}
 	}
 	if dryRun {
 		// Nothing is obtained, run or created: the sources are only
 		// checked, and the argv is not assembled, which needs the values.
-		if r := checkSources(allowed.Secrets, dir); r != nil {
-			dir.Close()
-			closeAll(files)
-			return nil, r
+		if r := checkSources(allowed.Secrets, p.dir); r != nil {
+			return refuse(r.code, r.message, r.err)
 		}
-		return &prepared{
-			rule: allowed.Rule, fixedDir: allowed.Dir, dir: dir, hostPath: hostPath,
-			argv: argv, files: files, secrets: allowed.SecretNames(),
-		}, nil
+		return p, nil
 	}
-	values, r := obtainSecrets(allowed.Secrets, dir, hostPath)
+	values, r := obtainSecrets(allowed.Secrets, p.dir, p.hostPath)
 	if r != nil {
-		dir.Close()
-		closeAll(files)
-		return nil, r
+		return refuse(r.code, r.message, r.err)
 	}
-	if files, err = injectFiles(allowed.Inject.Files, values, files); err != nil {
-		dir.Close()
-		closeAll(files)
-		return nil, &refusal{protocol.ExitHostrunError, "cannot create the files the rule hands the command", err}
+	if p.files, err = injectFiles(allowed.Inject.Files, values, p.files); err != nil {
+		return refuse(protocol.ExitHostrunError, "cannot create the files the rule hands the command", err)
 	}
-	if argv, err = allowed.Assemble(argv, values); err != nil {
-		dir.Close()
-		closeAll(files)
-		return nil, &refusal{protocol.ExitHostrunError, err.Error(), err}
+	if p.argv, err = allowed.Assemble(p.argv, values); err != nil {
+		return refuse(protocol.ExitHostrunError, err.Error(), err)
 	}
-	return &prepared{
-		rule: allowed.Rule, fixedDir: allowed.Dir, dir: dir, hostPath: hostPath,
-		argv: argv, files: files, env: allowed.Environment(values),
-		secrets: allowed.SecretNames(), masked: secretValues(allowed.Secrets, values),
-	}, nil
+	p.env = allowed.Environment(values)
+	p.masked = secretValues(allowed.Secrets, values)
+	return p, nil
 }
 
 // run executes req on the connection if it passes prepare; cancel stops it
@@ -367,8 +356,8 @@ func (s *Server) run(ctx context.Context, cancel context.CancelFunc, conn net.Co
 	defer p.close()
 
 	cmd := newCommand(ctx, p.argv, p.dir, p.hostPath, p.env, out)
-	cmd.Stdout = newMaskWriter(cmd.Stdout, p.masked)
-	cmd.Stderr = newMaskWriter(cmd.Stderr, p.masked)
+	stdout, stderr := newMaskWriter(cmd.Stdout, p.masked), newMaskWriter(cmd.Stderr, p.masked)
+	cmd.Stdout, cmd.Stderr = stdout, stderr
 	cmd.ExtraFiles = p.files
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -398,11 +387,8 @@ func (s *Server) run(ctx context.Context, cancel context.CancelFunc, conn net.Co
 
 	waitErr := cmd.Wait()
 	// The output is complete: what a mask held back can go now.
-	for _, w := range []io.Writer{cmd.Stdout, cmd.Stderr} {
-		if m, ok := w.(*maskWriter); ok {
-			_ = m.Flush()
-		}
-	}
+	_ = stdout.Flush()
+	_ = stderr.Flush()
 	if ctx.Err() == nil {
 		code := exitCode(cmd.ProcessState)
 		s.log.Info("command finished", append(p.logArgs(req), "code", code, "wait_error", waitErr)...)
@@ -570,10 +556,17 @@ func newCommand(ctx context.Context, argv []string, dir *os.File, hostPath strin
 	cmd.Env = commandEnv(hostPath, env...)
 	cmd.Stdout = streamWriter{out: out, frame: protocol.FrameStdout}
 	cmd.Stderr = streamWriter{out: out, frame: protocol.FrameStderr}
+	ownGroup(cmd)
+	return cmd
+}
+
+// ownGroup starts cmd in a process group of its own, so that cancelling it
+// kills whatever it spawned too (e.g. git's ssh), and waits at most
+// waitDelay for its output after it exits.
+func ownGroup(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
 	cmd.WaitDelay = waitDelay
-	return cmd
 }
 
 // commandEnv is the environment a command, or a secret's command source,

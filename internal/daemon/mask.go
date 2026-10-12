@@ -24,12 +24,9 @@ type maskWriter struct {
 	err     error    // the first error of w; later writes fail with it
 }
 
-// newMaskWriter returns w masking the values of secrets, or w itself when
-// there are none, so that output without secrets passes through as is.
-func newMaskWriter(w io.Writer, values []string) io.Writer {
-	if len(values) == 0 {
-		return w
-	}
+// newMaskWriter returns a writer to w masking values. Without values it
+// passes output through as is, holding nothing back.
+func newMaskWriter(w io.Writer, values []string) *maskWriter {
 	m := &maskWriter{w: w}
 	for _, v := range values {
 		m.secrets = append(m.secrets, []byte(v))
@@ -43,6 +40,12 @@ func newMaskWriter(w io.Writer, values []string) io.Writer {
 func (m *maskWriter) Write(p []byte) (int, error) {
 	if m.err != nil {
 		return 0, m.err
+	}
+	if len(m.secrets) == 0 {
+		if _, m.err = m.w.Write(p); m.err != nil {
+			return 0, m.err
+		}
+		return len(p), nil
 	}
 	m.pending = append(m.pending, p...)
 	out, rest := m.scan(m.pending, false)
@@ -69,16 +72,19 @@ func (m *maskWriter) Flush() error {
 
 // scan returns buf with the values replaced, up to the first byte where a
 // value could still begin with bytes not seen yet, and the rest of buf
-// from there. With final set, nothing more is coming, so nothing is held.
+// from there. That check comes before a match: a value that begins a
+// longer one must wait for the bytes that decide which of them it is, or
+// the longer one's tail would leak. With final set, nothing more is
+// coming, so nothing is held.
 func (m *maskWriter) scan(buf []byte, final bool) (out, rest []byte) {
 	for i := 0; i < len(buf); {
+		if !final && m.mayStartAt(buf[i:]) {
+			return out, buf[i:]
+		}
 		if s := m.matchAt(buf[i:]); s != nil {
 			out = append(out, maskText...)
 			i += len(s)
 			continue
-		}
-		if !final && m.mayStartAt(buf[i:]) {
-			return out, buf[i:]
 		}
 		out = append(out, buf[i])
 		i++
