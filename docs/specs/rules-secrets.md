@@ -59,6 +59,7 @@ Each names the rule.
   or `allow_regex`. `deny` and `deny_regex` are therefore refused.
   `args: none` is fine.
 - `secrets_with_any_args` without `secrets`, or without `args: any`.
+- A `trailing_args` string starting with `-`.
 - A rule with `inject` but no `secrets` takes any lists.
 
 ## Behavior
@@ -78,7 +79,9 @@ the path checks of [rules-fixed-directory.md](rules-fixed-directory.md):
    `path: open` replacements), `trailing_args`.
 
 The rule's lists check the container's argv only; the added tokens are
-not checked.
+not checked. A rendered trailing argument starting with `-` refuses the
+request with 125 (`an argument the rule adds after the container's starts
+with -`), naming no value.
 
 A secret with no value, an empty one, or one shorter than 8 characters
 refuses the request with 125: `secret "<name>" is not available`, or

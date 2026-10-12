@@ -297,10 +297,19 @@ goes; the container cannot move it.
   trimmed. A source that yields nothing, or a value shorter than 8
   characters, stops the request with 125 and `secret "token" is not
   available` or `… is too short to mask`; the reason is in the daemon log.
-- `inject.command_args` are added right after the rule's command, before
-  the container's arguments. Their strings are templates: `${token}` is
-  the secret's value, `$$` a literal `$`; any other `$`, an unknown name or
-  a secret no template uses makes the rules file invalid.
+- `inject` adds arguments at three places: `program_args` right after the
+  program (global flags, as in `git -c …`), `command_args` right after the
+  rule's command (`gh api -H …`), and `trailing_args` after the
+  container's arguments. For `git push` that is `git <program_args> push
+  <command_args> <container's arguments> <trailing_args>`. A trailing
+  argument is positional only: one starting with `-` makes the rules file
+  invalid, and a value that makes one start with `-` stops the request
+  with 125, so a `--` from the container cannot turn it into something the
+  program echoes.
+- Their strings are templates: `${token}` is the secret's value, `$$` a
+  literal `$`; any other `$`, an unknown name or a secret no template uses
+  makes the rules file invalid. A `path: open` argument is still replaced
+  where it moved to.
 - The rule's lists check the container's arguments only, as without an
   injection; the added ones are not checked, so the rule need not allow the
   container the flags it adds itself.

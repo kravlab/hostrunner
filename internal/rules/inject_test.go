@@ -141,7 +141,11 @@ func TestAssemblePlacesCommandArgsAfterTheRuleCommand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := strings.Join(allowed.Assemble(argv, map[string]string{"token": "tok-0123456789"}), "|")
+	assembled, err := allowed.Assemble(argv, map[string]string{"token": "tok-0123456789"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(assembled, "|")
 	if want := "git|push|--push-option=auth ${token}=tok-0123456789|origin"; got != want {
 		t.Fatalf("got %s, want %s", got, want)
 	}
@@ -180,5 +184,37 @@ func TestCheckReportsACommandSourceWithItsTimeout(t *testing.T) {
 		if got.Kind != SourceCommand || strings.Join(got.Command, " ") != "authtool print-token" || got.Timeout != want {
 			t.Fatalf("%s: got %+v, want authtool print-token with timeout %s", source, got, want)
 		}
+	}
+}
+
+// A trailing argument is positional: a flag there would turn into one
+// after a -- from the container. Flags go to the other two positions.
+func TestParseRefusesATrailingArgumentThatIsAFlag(t *testing.T) {
+	config := "rules:\n  - command: curl\n    inject:\n      trailing_args: [--verbose]\n    args: none\n"
+	expectParseError(t, config, "inject.trailing_args")
+}
+
+// The template rules hold at every position.
+func TestParseChecksTheTemplatesOfEveryPosition(t *testing.T) {
+	for _, key := range []string{"program_args", "trailing_args"} {
+		config := "rules:\n  - command: curl\n    secrets:\n      token: {env: TOKEN}\n    inject:\n      command_args: [\"${token}\"]\n      " + key + ": [\"${other}\"]\n" + strictLists
+		expectParseError(t, config, "inject."+key)
+	}
+}
+
+// A one-word command puts program_args before command_args.
+func TestAssemblePlacesProgramArgsBeforeCommandArgsForAOneWordCommand(t *testing.T) {
+	p := mustParse(t, "rules:\n  - command: curl\n    inject:\n      program_args: [-s]\n      command_args: [-S]\n      trailing_args: [x]\n    args: any\n")
+	argv := []string{"curl", "url"}
+	allowed, err := p.Check(argv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := allowed.Assemble(argv, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "curl -s -S url x"; strings.Join(got, " ") != want {
+		t.Fatalf("got %q, want %q", got, want)
 	}
 }

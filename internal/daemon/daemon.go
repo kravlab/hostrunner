@@ -321,9 +321,14 @@ func (s *Server) prepare(req protocol.Request) (*prepared, *refusal) {
 		closeAll(files)
 		return nil, r
 	}
+	if argv, err = allowed.Assemble(argv, values); err != nil {
+		dir.Close()
+		closeAll(files)
+		return nil, &refusal{protocol.ExitHostrunError, err.Error(), err}
+	}
 	return &prepared{
 		rule: allowed.Rule, fixedDir: allowed.Dir, dir: dir, hostPath: hostPath,
-		argv: allowed.Assemble(argv, values), files: files, secrets: secretNames(allowed.Secrets),
+		argv: argv, files: files, secrets: secretNames(allowed.Secrets),
 	}, nil
 }
 

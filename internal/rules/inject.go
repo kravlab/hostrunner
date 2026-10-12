@@ -48,13 +48,22 @@ type Secret struct {
 // Injection is what a rule adds to its command. Each field holds
 // templates the caller renders with the request's secret values.
 type Injection struct {
+	// ProgramArgs go right after the program, before the rest of the
+	// rule's command (global flags such as git -c).
+	ProgramArgs []Template
 	// CommandArgs go right after the rule's command, before the
 	// container's arguments.
 	CommandArgs []Template
+	// TrailingArgs go after the container's arguments. They are positional
+	// only, so a -- from the container cannot turn one into an argument
+	// the program echoes.
+	TrailingArgs []Template
 }
 
 // empty reports whether the injection adds nothing.
-func (in Injection) empty() bool { return len(in.CommandArgs) == 0 }
+func (in Injection) empty() bool {
+	return len(in.ProgramArgs) == 0 && len(in.CommandArgs) == 0 && len(in.TrailingArgs) == 0
+}
 
 // Template is a string of an injection: literal text with references to
 // secrets (`${name}`); `$$` is a literal `$`.
@@ -147,7 +156,9 @@ type (
 		File    string   `yaml:"file"`
 	}
 	rawInject struct {
-		CommandArgs []string `yaml:"command_args"`
+		ProgramArgs  []string `yaml:"program_args"`
+		CommandArgs  []string `yaml:"command_args"`
+		TrailingArgs []string `yaml:"trailing_args"`
 	}
 )
 
@@ -219,18 +230,25 @@ func newInjection(raw *rawInject, secrets []Secret) (Injection, error) {
 	var in Injection
 	used := make(map[string]bool)
 	if raw != nil {
-		for _, s := range raw.CommandArgs {
-			t, err := parseTemplate(s)
-			if err != nil {
-				return Injection{}, fmt.Errorf("inject.command_args: %w", err)
-			}
-			for _, name := range t.references() {
-				if !slices.ContainsFunc(secrets, func(sec Secret) bool { return sec.Name == name }) {
-					return Injection{}, fmt.Errorf("inject.command_args: %q refers to unknown secret %q", s, name)
+		for _, field := range []struct {
+			key  string
+			raw  []string
+			into *[]Template
+		}{
+			{"program_args", raw.ProgramArgs, &in.ProgramArgs},
+			{"command_args", raw.CommandArgs, &in.CommandArgs},
+			{"trailing_args", raw.TrailingArgs, &in.TrailingArgs},
+		} {
+			for _, s := range field.raw {
+				if field.key == "trailing_args" && strings.HasPrefix(s, "-") {
+					return Injection{}, fmt.Errorf("inject.trailing_args: %q starts with -: trailing arguments are positional, add flags to program_args or command_args", s)
 				}
-				used[name] = true
+				t, err := newTemplate(s, secrets, used)
+				if err != nil {
+					return Injection{}, fmt.Errorf("inject.%s: %w", field.key, err)
+				}
+				*field.into = append(*field.into, t)
 			}
-			in.CommandArgs = append(in.CommandArgs, t)
 		}
 	}
 	for _, sec := range secrets {
@@ -239,6 +257,22 @@ func newInjection(raw *rawInject, secrets []Secret) (Injection, error) {
 		}
 	}
 	return in, nil
+}
+
+// newTemplate parses s and checks that it refers to secrets only, marking
+// those in used.
+func newTemplate(s string, secrets []Secret, used map[string]bool) (Template, error) {
+	t, err := parseTemplate(s)
+	if err != nil {
+		return Template{}, err
+	}
+	for _, name := range t.references() {
+		if !slices.ContainsFunc(secrets, func(sec Secret) bool { return sec.Name == name }) {
+			return Template{}, fmt.Errorf("%q refers to unknown secret %q", s, name)
+		}
+		used[name] = true
+	}
+	return t, nil
 }
 
 // checkStrictLists refuses a rule with secrets whose lists leave part of
@@ -276,16 +310,34 @@ func (r *rule) checkStrictLists(withAnyArgs bool) error {
 	return nil
 }
 
+// ErrTrailingFlag is Assemble's error for a rendered trailing argument
+// that would read as a flag. Its text holds no value.
+var ErrTrailingFlag = errors.New("an argument the rule adds after the container's starts with -")
+
 // Assemble returns the argv to run for argv, the container's argv after
 // the caller's own replacements (path: open), with the allowing rule's
-// injection rendered from values, the secret values by name.
-func (a Allowed) Assemble(argv []string, values map[string]string) []string {
+// injection rendered from values, the secret values by name: program,
+// ProgramArgs, rest of the rule's command, CommandArgs, the container's
+// arguments, TrailingArgs. A rendered trailing argument starting with -
+// is ErrTrailingFlag.
+func (a Allowed) Assemble(argv []string, values map[string]string) ([]string, error) {
 	if a.Inject.empty() {
-		return argv
+		return argv, nil
 	}
-	out := slices.Clone(argv[:a.commandLen])
-	for _, t := range a.Inject.CommandArgs {
-		out = append(out, t.Render(values))
+	render := func(ts []Template) []string {
+		out := make([]string, len(ts))
+		for i, t := range ts {
+			out[i] = t.Render(values)
+		}
+		return out
 	}
-	return append(out, argv[a.commandLen:]...)
+	trailing := render(a.Inject.TrailingArgs)
+	if slices.ContainsFunc(trailing, func(arg string) bool { return strings.HasPrefix(arg, "-") }) {
+		return nil, ErrTrailingFlag
+	}
+	out := append([]string{argv[0]}, render(a.Inject.ProgramArgs)...)
+	out = append(out, argv[1:a.commandLen]...)
+	out = append(out, render(a.Inject.CommandArgs)...)
+	out = append(out, argv[a.commandLen:]...)
+	return append(out, trailing...), nil
 }
