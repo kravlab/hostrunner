@@ -255,6 +255,7 @@ type prepared struct {
 	files    []*os.File // path: open, then injected files: the command's descriptors 3, 4, …
 	env      []string   // injected NAME=value variables over the daemon's
 	secrets  []string   // names of the secrets injected, for the log
+	masked   []string   // their values, masked in the command's output
 }
 
 // close releases the daemon's copies of the directory and of the files
@@ -334,7 +335,8 @@ func (s *Server) prepare(req protocol.Request) (*prepared, *refusal) {
 	}
 	return &prepared{
 		rule: allowed.Rule, fixedDir: allowed.Dir, dir: dir, hostPath: hostPath,
-		argv: argv, files: files, env: allowed.Environment(values), secrets: secretNames(allowed.Secrets),
+		argv: argv, files: files, env: allowed.Environment(values),
+		secrets: secretNames(allowed.Secrets), masked: secretValues(allowed.Secrets, values),
 	}, nil
 }
 
@@ -351,6 +353,8 @@ func (s *Server) run(ctx context.Context, cancel context.CancelFunc, conn net.Co
 	defer p.close()
 
 	cmd := newCommand(ctx, p.argv, p.dir, p.hostPath, p.env, out)
+	cmd.Stdout = newMaskWriter(cmd.Stdout, p.masked)
+	cmd.Stderr = newMaskWriter(cmd.Stderr, p.masked)
 	cmd.ExtraFiles = p.files
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -379,6 +383,12 @@ func (s *Server) run(ctx context.Context, cancel context.CancelFunc, conn net.Co
 	_ = out.writeJSON(protocol.FrameStdinCredit, protocol.Credit{Bytes: protocol.StdinWindow})
 
 	waitErr := cmd.Wait()
+	// The output is complete: what a mask held back can go now.
+	for _, w := range []io.Writer{cmd.Stdout, cmd.Stderr} {
+		if m, ok := w.(*maskWriter); ok {
+			_ = m.Flush()
+		}
+	}
 	if ctx.Err() == nil {
 		code := exitCode(cmd.ProcessState)
 		s.log.Info("command finished", append(p.logArgs(req), "code", code, "wait_error", waitErr)...)

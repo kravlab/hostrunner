@@ -334,6 +334,12 @@ goes; the container cannot move it.
   `deny_regex` and a missing list make the rules file invalid. `args: none`
   is fine; `args: any` needs `secrets_with_any_args: true` next to it, as a
   deliberate choice.
+- The daemon replaces a secret's exact value with `***` wherever the
+  command writes it to stdout or stderr, a server echoing the request
+  included, even split across writes. It does not catch an encoded value
+  (base64, URL or JSON escaping, a hash): masking is a safeguard, not a
+  boundary. What keeps a secret from leaking is the strict allow lists
+  above and the API you allow.
 - An `inject` without `secrets` adds fixed arguments and needs no strict
   lists.
 - The daemon log records the container's argv and the names of the

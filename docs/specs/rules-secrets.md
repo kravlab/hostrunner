@@ -104,6 +104,13 @@ available. The reason goes to
 the daemon log, with a failed command source's stderr; a successful
 source's stderr is discarded, and no message or log line holds a value.
 
+Every exact occurrence of a secret's value in the command's stdout and
+stderr reaches the client as `***`, the longest value first where values
+overlap. Bytes that may begin a value are held back until the next write
+shows whether they do, and written, masked, when the command ends; output
+of a command without secrets passes through as is. Encoded values are not
+masked.
+
 The daemon log records the container's argv and the names of the
 injected secrets (`secrets=[token]`), never the argv, environment or files run.
 
@@ -111,7 +118,7 @@ injected secrets (`secrets=[token]`), never the argv, environment or files run.
 
 - `internal/client`, the client against an in-process daemon: what the
   program received (written to a file, not to the output the daemon
-  masks), a fresh and trimmed value per request, the refusals and their
+  masks), masking on stdout and stderr and across writes, a fresh and trimmed value per request, the refusals and their
   messages, the log, an injection without secrets with `path: open`.
 - `internal/rules`, parse and assemble: every validation error above, the
   accepted strict shapes, the placement of the rendered injection.

@@ -115,6 +115,15 @@ func injectFiles(injected []rules.File, values map[string]string, files []*os.Fi
 	return files, nil
 }
 
+// secretValues returns the values of secrets in values, to mask.
+func secretValues(secrets []rules.Secret, values map[string]string) []string {
+	masked := make([]string, len(secrets))
+	for i, sec := range secrets {
+		masked[i] = values[sec.Name]
+	}
+	return masked
+}
+
 // secretNames returns the names of secrets, for the log.
 func secretNames(secrets []rules.Secret) []string {
 	names := make([]string, len(secrets))
