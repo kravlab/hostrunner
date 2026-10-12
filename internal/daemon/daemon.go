@@ -251,8 +251,9 @@ type prepared struct {
 	fixedDir string     // the rule's fixed directory, cleaned; "" if none
 	dir      *os.File   // the working directory, opened
 	hostPath string     // dir's real path on the host
-	argv     []string   // argv to run, with path: open arguments replaced
+	argv     []string   // argv to run: path: open arguments replaced, injection placed
 	files    []*os.File // path: open files, the command's descriptors 3, 4, …
+	secrets  []string   // names of the secrets injected, for the log
 }
 
 // close releases the daemon's copies of the directory and of the files
@@ -260,6 +261,17 @@ type prepared struct {
 func (p *prepared) close() {
 	p.dir.Close()
 	closeAll(p.files)
+}
+
+// logArgs describe the command p prepared for req in the daemon log: the
+// argv the container sent, never the argv run, which holds the secrets'
+// values, and the names of the secrets injected.
+func (p *prepared) logArgs(req protocol.Request) []any {
+	args := []any{"argv", req.Argv, "dir", p.hostPath}
+	if len(p.secrets) > 0 {
+		args = append(args, "secrets", p.secrets)
+	}
+	return args
 }
 
 // refusal is why a command may not start: the exit code and message for
@@ -277,7 +289,9 @@ type refusal struct {
 // mirrored directory is open, since paths are resolved from it. The
 // mirrored directory has to be inside the workspace even for a rule with a
 // fixed directory, which is opened last and replaces it as the working
-// directory. On refusal nothing is left open.
+// directory. The secrets are obtained once every check has passed, and the
+// rule's injection is placed in the argv to run. On refusal nothing is
+// left open.
 func (s *Server) prepare(req protocol.Request) (*prepared, *refusal) {
 	allowed, err := s.policy.Check(req.Argv)
 	if err != nil {
@@ -301,7 +315,16 @@ func (s *Server) prepare(req protocol.Request) (*prepared, *refusal) {
 			return nil, &refusal{protocol.ExitRejected, fixedMessage(allowed.Dir, err), err}
 		}
 	}
-	return &prepared{rule: allowed.Rule, fixedDir: allowed.Dir, dir: dir, hostPath: hostPath, argv: argv, files: files}, nil
+	values, r := obtainSecrets(allowed.Secrets)
+	if r != nil {
+		dir.Close()
+		closeAll(files)
+		return nil, r
+	}
+	return &prepared{
+		rule: allowed.Rule, fixedDir: allowed.Dir, dir: dir, hostPath: hostPath,
+		argv: allowed.Assemble(argv, values), files: files, secrets: secretNames(allowed.Secrets),
+	}, nil
 }
 
 // run executes req on the connection if it passes prepare; cancel stops it
@@ -347,10 +370,10 @@ func (s *Server) run(ctx context.Context, cancel context.CancelFunc, conn net.Co
 	waitErr := cmd.Wait()
 	if ctx.Err() == nil {
 		code := exitCode(cmd.ProcessState)
-		s.log.Info("command finished", "argv", req.Argv, "dir", p.hostPath, "code", code, "wait_error", waitErr)
+		s.log.Info("command finished", append(p.logArgs(req), "code", code, "wait_error", waitErr)...)
 		_ = out.writeJSON(protocol.FrameExit, protocol.Exit{Code: code})
 	} else {
-		s.log.Info("command cancelled", "argv", req.Argv, "dir", p.hostPath)
+		s.log.Info("command cancelled", p.logArgs(req)...)
 	}
 	conn.Close()
 	streams.Wait()

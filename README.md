@@ -258,6 +258,54 @@ rules:
     program would look for the argument in `dir`, not where it was
     checked, so the rules file is invalid.
 
+### Secrets and injection
+
+A rule can add to its command, on the host, what the container never
+sees: a token only the host can obtain. The rule alone decides where it
+goes; the container cannot move it.
+
+```yaml
+  - command: curl
+    secrets:
+      token: { env: API_TOKEN }  # the daemon's environment variable
+    inject:
+      command_args: ["-H", "Authorization: Bearer ${token}"]
+    flags:
+      allow: [-s]
+      values:
+        -X: { allow: [GET, PUT] }
+    positional:
+      allow_regex: ['^https://api\.example\.com/v1/items/42$']
+```
+
+- `secrets` names the values a rule obtains, each from one source:
+  `env` reads a variable of the daemon's environment (the one
+  `hostrunner up` was started in). A name is lower-case letters, digits
+  and `_`, starting with a letter.
+- The value is obtained fresh for every request; trailing CR and LF are
+  trimmed. A source that yields nothing, or a value shorter than 8
+  characters, stops the request with 125 and `secret "token" is not
+  available` or `… is too short to mask`; the reason is in the daemon log.
+- `inject.command_args` are added right after the rule's command, before
+  the container's arguments. Their strings are templates: `${token}` is
+  the secret's value, `$$` a literal `$`; any other `$`, an unknown name or
+  a secret no template uses makes the rules file invalid.
+- The rule's lists check the container's arguments only, as without an
+  injection; the added ones are not checked, so the rule need not allow the
+  container the flags it adds itself.
+- A program can give its secret away itself (`-v`, `--trace-ascii -`, `-o`,
+  a proxy, a config of its own), more ways than a deny list can name. A
+  rule with `secrets` therefore takes allow lists only: `flags.allow`
+  (`[]` for no flags), an `allow` or `allow_regex` list for every flag
+  under `values`, and `positional` with `allow` or `allow_regex`; `deny`,
+  `deny_regex` and a missing list make the rules file invalid. `args: none`
+  is fine; `args: any` needs `secrets_with_any_args: true` next to it, as a
+  deliberate choice.
+- An `inject` without `secrets` adds fixed arguments and needs no strict
+  lists.
+- The daemon log records the container's argv and the names of the
+  secrets, never the argv with the values in it.
+
 To see whether a rules file allows a command before restarting the
 container, run the Rules test on the host, in the project root:
 
