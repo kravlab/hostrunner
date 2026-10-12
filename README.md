@@ -289,6 +289,10 @@ goes; the container cannot move it.
     successful one's is discarded.
   - `env: API_TOKEN` reads a variable of the daemon's environment (the
     one `hostrunner up` was started in).
+  - `file: /home/u/.config/app/token` reads a host file; a relative path
+    is read from the same working directory as a command source. The file
+    may lie anywhere, the workspace included: what the devcontainer mounts,
+    and so what the container can read or replace, is yours to decide.
 - The value is obtained fresh for every request; trailing CR and LF are
   trimmed. A source that yields nothing, or a value shorter than 8
   characters, stops the request with 125 and `secret "token" is not

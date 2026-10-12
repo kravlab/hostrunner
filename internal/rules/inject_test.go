@@ -151,6 +151,8 @@ func TestParseRefusesABadCommandSource(t *testing.T) {
 	for name, tc := range map[string]struct{ source, want string }{
 		"empty command":     {"{command: []}", "command must name a program"},
 		"two sources":       {"{command: [authtool], env: TOKEN}", "use only one of env, command"},
+		"file and env":      {"{env: TOKEN, file: /etc/token}", "use only one of env, file"},
+		"timeout with file": {"{file: /etc/token, timeout: 5s}", "timeout applies to a command source only"},
 		"zero timeout":      {"{command: [authtool], timeout: 0s}", "timeout must be a positive duration"},
 		"negative timeout":  {"{command: [authtool], timeout: -1s}", "timeout must be a positive duration"},
 		"malformed timeout": {"{command: [authtool], timeout: soon}", "timeout must be a positive duration"},

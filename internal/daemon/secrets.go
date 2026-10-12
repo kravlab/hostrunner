@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"unicode/utf8"
@@ -20,8 +21,9 @@ import (
 const minSecretLength = 8
 
 // obtainSecrets obtains the value of every secret, fresh for this request,
-// with trailing CR and LF trimmed. A command source runs in the working
-// directory dir, whose real path is hostPath. A secret that yields no
+// with trailing CR and LF trimmed. A command source runs, and a relative
+// file source is read, in the working directory dir, whose real path is
+// hostPath. A secret that yields no
 // usable value refuses the request with ExitHostrunError and a message
 // naming the secret only; the reason, never the value, goes to the error
 // for the log.
@@ -52,6 +54,15 @@ func obtain(sec rules.Secret, dir *os.File, hostPath string) (string, error) {
 	switch sec.Kind {
 	case rules.SourceCommand:
 		return runSource(sec, dir, hostPath)
+	case rules.SourceFile:
+		// The rules author decides where the file lies, the workspace
+		// included, so symlinks are followed.
+		path := sec.File
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(fdPath(dir), path)
+		}
+		data, err := os.ReadFile(path)
+		return string(data), err
 	default:
 		value, ok := os.LookupEnv(sec.Env)
 		if !ok {

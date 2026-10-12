@@ -71,7 +71,8 @@ the path checks of [rules-fixed-directory.md](rules-fixed-directory.md):
    directory with the daemon's environment (`PWD` set as for the command),
    an empty stdin and its own process group, which is killed at the
    timeout; its stdout is the value. `env` reads the daemon's
-   environment. Trailing CR and LF are trimmed.
+   environment. `file` reads a host file, a relative path from the working
+   directory, symlinks followed. Trailing CR and LF are trimmed.
 6. The injection is rendered and placed: program, `program_args`, rest of
    the rule's command, `command_args`, the container's arguments (with the
    `path: open` replacements), `trailing_args`.
@@ -82,7 +83,8 @@ not checked.
 A secret with no value, an empty one, or one shorter than 8 characters
 refuses the request with 125: `secret "<name>" is not available`, or
 `secret "<name>" is too short to mask`. A command source that fails to
-start, exits non-zero or times out is not available. The reason goes to
+start, exits non-zero or times out, and a file that cannot be read, are not
+available. The reason goes to
 the daemon log, with a failed command source's stderr; a successful
 source's stderr is discarded, and no message or log line holds a value.
 

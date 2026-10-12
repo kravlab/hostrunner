@@ -25,6 +25,9 @@ const (
 	// SourceCommand: the stdout of a host command, run in the command's
 	// working directory.
 	SourceCommand
+	// SourceFile: the content of a host file, absolute or relative to the
+	// command's working directory.
+	SourceFile
 )
 
 // defaultTimeout is how long a command source may run unless its secret
@@ -39,6 +42,7 @@ type Secret struct {
 	Env     string        // SourceEnv: the variable's name
 	Command []string      // SourceCommand: the argv to run
 	Timeout time.Duration // SourceCommand: how long it may run
+	File    string        // SourceFile: the path as written
 }
 
 // Injection is what a rule adds to its command. Each field holds
@@ -140,6 +144,7 @@ type (
 		Env     string   `yaml:"env"`
 		Command []string `yaml:"command"`
 		Timeout string   `yaml:"timeout"`
+		File    string   `yaml:"file"`
 	}
 	rawInject struct {
 		CommandArgs []string `yaml:"command_args"`
@@ -179,9 +184,13 @@ func newSecret(name string, rs rawSecret) (Secret, error) {
 			return Secret{}, errors.New("command must name a program")
 		}
 	}
+	if rs.File != "" {
+		sources = append(sources, "file")
+		sec.Kind, sec.File = SourceFile, rs.File
+	}
 	switch len(sources) {
 	case 0:
-		return Secret{}, errors.New("set its source (command or env)")
+		return Secret{}, errors.New("set its source (command, env or file)")
 	case 1:
 	default:
 		return Secret{}, fmt.Errorf("use only one of %s", strings.Join(sources, ", "))
