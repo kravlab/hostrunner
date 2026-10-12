@@ -46,19 +46,52 @@ func obtainSecrets(secrets []rules.Secret, dir *os.File, hostPath string) (map[s
 	return values, nil
 }
 
+// checkSources checks, for a dry run, what obtainSecrets would need without
+// obtaining anything: a command source's program is found and executable
+// in the working directory dir, as starting it would look it up, but it is
+// not run; an env source's variable is set; a file source opens for
+// reading. A failed check refuses as obtaining the value would.
+func checkSources(secrets []rules.Secret, dir *os.File) *refusal {
+	for _, sec := range secrets {
+		var err error
+		switch sec.Kind {
+		case rules.SourceCommand:
+			err = lookupProgram(sec.Command[0], dir)
+		case rules.SourceFile:
+			var f *os.File
+			if f, err = os.Open(sourcePath(sec, dir)); err == nil {
+				f.Close()
+			}
+		default:
+			if _, ok := os.LookupEnv(sec.Env); !ok {
+				err = fmt.Errorf("environment variable %s is not set", sec.Env)
+			}
+		}
+		if err != nil {
+			return &refusal{protocol.ExitHostrunError, fmt.Sprintf("secret %q is not available", sec.Name), fmt.Errorf("secret %q: %w", sec.Name, err)}
+		}
+	}
+	return nil
+}
+
+// sourcePath is the path a file source is read from: as written when
+// absolute, from the working directory dir otherwise. The rules author
+// decides where the file lies, the workspace included, so symlinks are
+// followed.
+func sourcePath(sec rules.Secret, dir *os.File) string {
+	if filepath.IsAbs(sec.File) {
+		return sec.File
+	}
+	return filepath.Join(fdPath(dir), sec.File)
+}
+
 // obtain reads the raw value of sec from its source.
 func obtain(sec rules.Secret, dir *os.File, hostPath string) (string, error) {
 	switch sec.Kind {
 	case rules.SourceCommand:
 		return runSource(sec, dir, hostPath)
 	case rules.SourceFile:
-		// The rules author decides where the file lies, the workspace
-		// included, so symlinks are followed.
-		path := sec.File
-		if !filepath.IsAbs(path) {
-			path = filepath.Join(fdPath(dir), path)
-		}
-		data, err := os.ReadFile(path)
+		data, err := os.ReadFile(sourcePath(sec, dir))
 		return string(data), err
 	default:
 		value, ok := os.LookupEnv(sec.Env)
@@ -122,13 +155,4 @@ func secretValues(secrets []rules.Secret, values map[string]string) []string {
 		masked[i] = values[sec.Name]
 	}
 	return masked
-}
-
-// secretNames returns the names of secrets, for the log.
-func secretNames(secrets []rules.Secret) []string {
-	names := make([]string, len(secrets))
-	for i, sec := range secrets {
-		names[i] = sec.Name
-	}
-	return names
 }

@@ -87,9 +87,12 @@ whether the command would run, without running it: the daemon checks the
 rules, the working directory and the path checks, then looks the program
 up as starting it would (127 when the host lacks it, 126 when it cannot
 execute it) and answers. It exits 0
-with the allowing rule, and the rule's `dir` when it has one
-(`allowed by rule "tix issues", runs in /`), or with the code and
-message the run would get.
+with the allowing rule, the rule's `dir` when it has one
+(`allowed by rule "tix issues", runs in /`) and the names of the secrets
+it would inject (`, injects secrets: token`), or with the code and
+message the run would get. It checks a secret's source without obtaining
+the value: a `command` source's program is looked up but not run, an
+`env` variable must be set, a `file` must open.
 It does not read stdin, and the daemon log records it with
 `dry_run=true`. After the program, `--dry-run` is the command's own
 (`hostrun git push --dry-run` runs git's dry run). A daemon older than
@@ -357,8 +360,9 @@ hostrunner test --config draft.yaml -- tix pr list
 It reads `.devcontainer/hostrun.yaml` under the current directory, or the
 `--config` file, and tests the command against the rules alone: not the
 working directory, path checks or the host's programs. It reports the
-rule's `dir` (`inherit` resolved) as a dry run does, without checking
-that the directory exists or lies outside the workspace. It exits 0 when
+rule's `dir` (`inherit` resolved) and its secrets' names as a dry run
+does, without checking that the directory exists or lies outside the
+workspace, or touching any secret's source. It exits 0 when
 the command is allowed, 126 when it is denied, and 1 when the file is
 missing or invalid (unlike the daemon, which denies everything without a
 file) or no command is given. Its flags end at the first argument that is

@@ -111,6 +111,21 @@ shows whether they do, and written, masked, when the command ends; output
 of a command without secrets passes through as is. Encoded values are not
 masked.
 
+## Dry run and Rules test
+
+- A dry run checks every source without obtaining a value: a `command`
+  source's program is looked up in the working directory as starting it
+  would, never run; an `env` variable must be set; a `file` must open for
+  reading. A failed check refuses as the run would (125, `secret "<name>"
+  is not available`). Nothing is rendered or created.
+- The answer (`FrameAllowed`) carries the secrets' names in an optional
+  `secrets` field, omitted when there are none; `Version` stays 1.
+  `hostrun --dry-run` prints `…, injects secrets: <names>` after the rule
+  and the fixed directory.
+- `hostrunner test` prints the names likewise and touches no source.
+
+## Log
+
 The daemon log records the container's argv and the names of the
 injected secrets (`secrets=[token]`), never the argv, environment or files run.
 
@@ -118,10 +133,15 @@ injected secrets (`secrets=[token]`), never the argv, environment or files run.
 
 - `internal/client`, the client against an in-process daemon: what the
   program received (written to a file, not to the output the daemon
-  masks), masking on stdout and stderr and across writes, a fresh and trimmed value per request, the refusals and their
-  messages, the log, an injection without secrets with `path: open`.
-- `internal/rules`, parse and assemble: every validation error above, the
-  accepted strict shapes, the placement of the rendered injection.
+  masks) at every argv position, in the environment and in injected
+  files; each source kind, a fresh and trimmed value per request, a
+  command source's directory, stdin, single run and timeout; the
+  refusals and their messages; masking on stdout and stderr and across
+  writes; the log; dry run reports and refusals, with nothing run.
+- `internal/rules`, parse, check and assemble: every validation error
+  above, the accepted strict shapes, the placement of the rendered
+  injection, the rendered environment, the order of injected files.
+- `cmd/hostrunner`, the Rules test: the secrets' names, no source touched.
 
 ## Out of scope
 

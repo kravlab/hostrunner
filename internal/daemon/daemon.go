@@ -205,7 +205,7 @@ var dryRunLogArgs = []any{"dry_run", true}
 // then looks the program up as starting it would, and releases what the
 // checks opened, never starting the command or reading stdin.
 func (s *Server) dryRun(out *frameWriter, req protocol.Request) {
-	p, r := s.prepare(req)
+	p, r := s.prepare(req, true)
 	if r != nil {
 		s.reject(out, r.code, r.message, r.err, dryRunLogArgs...)
 		return
@@ -217,8 +217,8 @@ func (s *Server) dryRun(out *frameWriter, req protocol.Request) {
 		s.reject(out, code, message, err, dryRunLogArgs...)
 		return
 	}
-	s.log.Info("dry run allowed", append([]any{"argv", req.Argv, "rule", p.rule, "dir", p.hostPath}, dryRunLogArgs...)...)
-	_ = out.writeJSON(protocol.FrameAllowed, protocol.Allowed{Rule: p.rule, Dir: p.fixedDir})
+	s.log.Info("dry run allowed", append(append(p.logArgs(req), "rule", p.rule), dryRunLogArgs...)...)
+	_ = out.writeJSON(protocol.FrameAllowed, protocol.Allowed{Rule: p.rule, Dir: p.fixedDir, Secrets: p.secrets})
 }
 
 // arm handles FrameArm from `hostrunner up`. When the handler steps aside,
@@ -292,9 +292,10 @@ type refusal struct {
 // mirrored directory has to be inside the workspace even for a rule with a
 // fixed directory, which is opened last and replaces it as the working
 // directory. The secrets are obtained once every check has passed, and the
-// rule's injection is placed in the argv to run. On refusal nothing is
-// left open.
-func (s *Server) prepare(req protocol.Request) (*prepared, *refusal) {
+// rule's injection is placed in the argv to run; for a dry run they are
+// only checked (see checkSources), and the argv is the container's. On
+// refusal nothing is left open.
+func (s *Server) prepare(req protocol.Request, dryRun bool) (*prepared, *refusal) {
 	allowed, err := s.policy.Check(req.Argv)
 	if err != nil {
 		return nil, &refusal{protocol.ExitRejected, err.Error(), err}
@@ -317,6 +318,19 @@ func (s *Server) prepare(req protocol.Request) (*prepared, *refusal) {
 			return nil, &refusal{protocol.ExitRejected, fixedMessage(allowed.Dir, err), err}
 		}
 	}
+	if dryRun {
+		// Nothing is obtained, run or created: the sources are only
+		// checked, and the argv is not assembled, which needs the values.
+		if r := checkSources(allowed.Secrets, dir); r != nil {
+			dir.Close()
+			closeAll(files)
+			return nil, r
+		}
+		return &prepared{
+			rule: allowed.Rule, fixedDir: allowed.Dir, dir: dir, hostPath: hostPath,
+			argv: argv, files: files, secrets: allowed.SecretNames(),
+		}, nil
+	}
 	values, r := obtainSecrets(allowed.Secrets, dir, hostPath)
 	if r != nil {
 		dir.Close()
@@ -336,14 +350,14 @@ func (s *Server) prepare(req protocol.Request) (*prepared, *refusal) {
 	return &prepared{
 		rule: allowed.Rule, fixedDir: allowed.Dir, dir: dir, hostPath: hostPath,
 		argv: argv, files: files, env: allowed.Environment(values),
-		secrets: secretNames(allowed.Secrets), masked: secretValues(allowed.Secrets, values),
+		secrets: allowed.SecretNames(), masked: secretValues(allowed.Secrets, values),
 	}, nil
 }
 
 // run executes req on the connection if it passes prepare; cancel stops it
 // early.
 func (s *Server) run(ctx context.Context, cancel context.CancelFunc, conn net.Conn, out *frameWriter, req protocol.Request) {
-	p, r := s.prepare(req)
+	p, r := s.prepare(req, false)
 	if r != nil {
 		s.reject(out, r.code, r.message, r.err)
 		return

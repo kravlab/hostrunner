@@ -447,3 +447,13 @@ func (a Allowed) Environment(values map[string]string) []string {
 	}
 	return env
 }
+
+// SecretNames returns the names of the allowing rule's secrets, in the
+// order Secrets has them, or nil when it has none.
+func (a Allowed) SecretNames() []string {
+	var names []string
+	for _, sec := range a.Secrets {
+		names = append(names, sec.Name)
+	}
+	return names
+}

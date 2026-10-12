@@ -28,6 +28,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 )
 
 // Version is the protocol version the client sends in Request. The daemon
@@ -113,18 +114,25 @@ type Armed struct {
 // Allowed answers a dry run whose command passed every check before its
 // start. Rule is the command of the rule that allows it; Dir is the rule's
 // fixed directory, the command's working directory, and is omitted when
-// the command would run in the mirrored directory.
+// the command would run in the mirrored directory. Secrets are the names
+// of the secrets the rule would inject, omitted when there are none; a
+// client that predates them ignores the field.
 type Allowed struct {
-	Rule string `json:"rule"`
-	Dir  string `json:"dir,omitempty"`
+	Rule    string   `json:"rule"`
+	Dir     string   `json:"dir,omitempty"`
+	Secrets []string `json:"secrets,omitempty"`
 }
 
 // String describes a, as the dry run and the Rules test report it.
 func (a Allowed) String() string {
-	if a.Dir == "" {
-		return fmt.Sprintf("allowed by rule %q", a.Rule)
+	s := fmt.Sprintf("allowed by rule %q", a.Rule)
+	if a.Dir != "" {
+		s += ", runs in " + a.Dir
 	}
-	return fmt.Sprintf("allowed by rule %q, runs in %s", a.Rule, a.Dir)
+	if len(a.Secrets) > 0 {
+		s += ", injects secrets: " + strings.Join(a.Secrets, ", ")
+	}
+	return s
 }
 
 // Exit reports the exit code of a command that ran.
