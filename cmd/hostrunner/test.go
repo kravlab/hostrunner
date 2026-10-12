@@ -49,8 +49,8 @@ func rulesTest(cfg testConfig, stderr io.Writer) error {
 	if err != nil {
 		return &exitError{code: protocol.ExitRejected, err: err}
 	}
-	// The report a dry run gets, without checking the fixed directory:
-	// that needs the workspace.
-	_, err = fmt.Fprintf(stderr, "hostrunner: %s\n", protocol.Allowed{Rule: allowed.Rule, Dir: allowed.Dir})
+	// The report a dry run gets, without checking the fixed directory or
+	// the secrets' sources: those need the workspace and the host.
+	_, err = fmt.Fprintf(stderr, "hostrunner: %s\n", protocol.Allowed{Rule: allowed.Rule, Dir: allowed.Dir, Secrets: allowed.SecretNames()})
 	return err
 }

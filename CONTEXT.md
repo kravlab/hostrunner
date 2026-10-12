@@ -80,6 +80,21 @@ Testing a command against a rules file alone, on the host,
 without a daemon or a container.
 _Avoid_: check, dry run
 
+**Secret**:
+A value a rule obtains on the host for each request and adds
+to its command; the container never sees it.
+_Avoid_: credential, token
+
+**Secret source**:
+Where a secret's value comes from: the output of a host
+command, a host environment variable, or a host file.
+_Avoid_: provider
+
+**Injection**:
+What a rule adds to its command after the checks: arguments,
+environment variables or files, with or without secrets.
+_Avoid_: rewrite, wrapper
+
 ### Lifecycle
 
 **Daemon**:

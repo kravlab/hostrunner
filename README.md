@@ -87,9 +87,12 @@ whether the command would run, without running it: the daemon checks the
 rules, the working directory and the path checks, then looks the program
 up as starting it would (127 when the host lacks it, 126 when it cannot
 execute it) and answers. It exits 0
-with the allowing rule, and the rule's `dir` when it has one
-(`allowed by rule "tix issues", runs in /`), or with the code and
-message the run would get.
+with the allowing rule, the rule's `dir` when it has one
+(`allowed by rule "tix issues", runs in /`) and the names of the secrets
+it would inject (`, injects secrets: token`), or with the code and
+message the run would get. It checks a secret's source without obtaining
+the value: a `command` source's program is looked up but not run, an
+`env` variable must be set, a `file` must open.
 It does not read stdin, and the daemon log records it with
 `dry_run=true`. After the program, `--dry-run` is the command's own
 (`hostrun git push --dry-run` runs git's dry run). A daemon older than
@@ -258,6 +261,93 @@ rules:
     program would look for the argument in `dir`, not where it was
     checked, so the rules file is invalid.
 
+### Secrets and injection
+
+A rule can add to its command, on the host, what the container never
+sees: a token only the host can obtain. The rule alone decides where it
+goes; the container cannot move it.
+
+```yaml
+  - command: curl
+    secrets:
+      token: { env: API_TOKEN }  # the daemon's environment variable
+    inject:
+      command_args: ["-H", "Authorization: Bearer ${token}"]
+    flags:
+      allow: [-s]
+      values:
+        -X: { allow: [GET, PUT] }
+    positional:
+      allow_regex: ['^https://api\.example\.com/v1/items/42$']
+```
+
+- `secrets` names the values a rule obtains, each from one source. A
+  name is lower-case letters, digits and `_`, starting with a letter.
+  - `command: [authtool, print-token]` takes the stdout of a host
+    command. It runs where the rule's command would (the rule's `dir`, or
+    the mirrored directory, which the container can write to), with the
+    daemon's environment and an empty stdin, for at most `timeout` (a Go
+    duration, `30s` by default), after which it and whatever it started
+    are killed. A failed source's stderr goes to the daemon log; a
+    successful one's is discarded.
+  - `env: API_TOKEN` reads a variable of the daemon's environment (the
+    one `hostrunner up` was started in).
+  - `file: /home/u/.config/app/token` reads a host file; a relative path
+    is read from the same working directory as a command source. The file
+    may lie anywhere, the workspace included: what the devcontainer mounts,
+    and so what the container can read or replace, is yours to decide.
+- The value is obtained fresh for every request; trailing CR and LF are
+  trimmed. A source that yields nothing, or a value shorter than 8
+  characters, stops the request with 125 and `secret "token" is not
+  available` or `… is too short to mask`; the reason is in the daemon log.
+- `inject` adds arguments at three places: `program_args` right after the
+  program (global flags, as in `git -c …`), `command_args` right after the
+  rule's command (`gh api -H …`), and `trailing_args` after the
+  container's arguments. For `git push` that is `git <program_args> push
+  <command_args> <container's arguments> <trailing_args>`. A trailing
+  argument is positional only: one starting with `-` makes the rules file
+  invalid, and a value that makes one start with `-` stops the request
+  with 125, so a `--` from the container cannot turn it into something the
+  program echoes.
+- `inject.env` sets environment variables for the command, as
+  `{API_TOKEN: "${token}"}`, over the daemon's variable of the same name.
+  `PWD` is the working directory and cannot be set.
+- `inject.files` hands the command files whose content is a template, for
+  a program that reads its secret from a config file:
+  `{cfg: 'header = "Authorization: Bearer ${token}"'}`. The program gets
+  each as an inherited descriptor, after the `path: open` files in the
+  order the rules file writes them, and `${file.cfg}` in an argument or a
+  variable is its path (`curl -K ${file.cfg}` runs as
+  `curl -K /proc/self/fd/4`). The file is read-only, can be read again and
+  sought in, and lives in memory only (a sealed memfd), never on a disk.
+  Its content may refer to secrets, not to files.
+- Their strings are templates: `${token}` is the secret's value,
+  `${file.cfg}` an injected file's path, `$$` a literal `$`; any other `$`,
+  an unknown name, or a secret or file no template uses makes the rules
+  file invalid. A `path: open` argument is still replaced
+  where it moved to.
+- The rule's lists check the container's arguments only, as without an
+  injection; the added ones are not checked, so the rule need not allow the
+  container the flags it adds itself.
+- A program can give its secret away itself (`-v`, `--trace-ascii -`, `-o`,
+  a proxy, a config of its own), more ways than a deny list can name. A
+  rule with `secrets` therefore takes allow lists only: `flags.allow`
+  (`[]` for no flags), an `allow` or `allow_regex` list for every flag
+  under `values`, and `positional` with `allow` or `allow_regex`; `deny`,
+  `deny_regex` and a missing list make the rules file invalid. `args: none`
+  is fine; `args: any` needs `secrets_with_any_args: true` next to it, as a
+  deliberate choice.
+- The daemon replaces a secret's exact value with `***` wherever the
+  command writes it to stdout or stderr, a server echoing the request
+  included, even split across writes. It does not catch an encoded value
+  (base64, URL or JSON escaping, a hash): masking is a safeguard, not a
+  boundary. What keeps a secret from leaking is the strict allow lists
+  above and the API you allow.
+- An `inject` without `secrets` adds fixed arguments and needs no strict
+  lists.
+- The daemon log records the container's argv and the names of the
+  secrets, never the argv, environment or files with the values in them.
+
 To see whether a rules file allows a command before restarting the
 container, run the Rules test on the host, in the project root:
 
@@ -270,8 +360,9 @@ hostrunner test --config draft.yaml -- tix pr list
 It reads `.devcontainer/hostrun.yaml` under the current directory, or the
 `--config` file, and tests the command against the rules alone: not the
 working directory, path checks or the host's programs. It reports the
-rule's `dir` (`inherit` resolved) as a dry run does, without checking
-that the directory exists or lies outside the workspace. It exits 0 when
+rule's `dir` (`inherit` resolved) and its secrets' names as a dry run
+does, without checking that the directory exists or lies outside the
+workspace, or touching any secret's source. It exits 0 when
 the command is allowed, 126 when it is denied, and 1 when the file is
 missing or invalid (unlike the daemon, which denies everything without a
 file) or no command is given. Its flags end at the first argument that is
