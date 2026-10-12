@@ -253,6 +253,7 @@ type prepared struct {
 	hostPath string     // dir's real path on the host
 	argv     []string   // argv to run: path: open arguments replaced, injection placed
 	files    []*os.File // path: open files, the command's descriptors 3, 4, …
+	env      []string   // injected NAME=value variables over the daemon's
 	secrets  []string   // names of the secrets injected, for the log
 }
 
@@ -328,7 +329,7 @@ func (s *Server) prepare(req protocol.Request) (*prepared, *refusal) {
 	}
 	return &prepared{
 		rule: allowed.Rule, fixedDir: allowed.Dir, dir: dir, hostPath: hostPath,
-		argv: argv, files: files, secrets: secretNames(allowed.Secrets),
+		argv: argv, files: files, env: allowed.Environment(values), secrets: secretNames(allowed.Secrets),
 	}, nil
 }
 
@@ -344,7 +345,7 @@ func (s *Server) run(ctx context.Context, cancel context.CancelFunc, conn net.Co
 	// started (p.files is cleared then), or with the request on failure.
 	defer p.close()
 
-	cmd := newCommand(ctx, p.argv, p.dir, p.hostPath, out)
+	cmd := newCommand(ctx, p.argv, p.dir, p.hostPath, p.env, out)
 	cmd.ExtraFiles = p.files
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -530,13 +531,14 @@ func fdPath(dir *os.File) string {
 // /proc/self/fd (it inherits the descriptor until exec), so a symlink the
 // container swaps into the path after the check cannot redirect it; PWD is
 // set to hostPath because the /proc path is meaningless once the child runs.
-// The environment is otherwise the daemon's (host) environment; nothing
-// comes from the container. The command gets its own process group so
+// The environment is otherwise the daemon's (host) environment with env,
+// the rule's injected variables, over it; nothing comes from the
+// container. The command gets its own process group so
 // cancellation also kills whatever it spawned (e.g. git's ssh).
-func newCommand(ctx context.Context, argv []string, dir *os.File, hostPath string, out *frameWriter) *exec.Cmd {
+func newCommand(ctx context.Context, argv []string, dir *os.File, hostPath string, env []string, out *frameWriter) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Dir = fdPath(dir)
-	cmd.Env = commandEnv(hostPath)
+	cmd.Env = commandEnv(hostPath, env...)
 	cmd.Stdout = streamWriter{out: out, frame: protocol.FrameStdout}
 	cmd.Stderr = streamWriter{out: out, frame: protocol.FrameStderr}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -547,11 +549,17 @@ func newCommand(ctx context.Context, argv []string, dir *os.File, hostPath strin
 
 // commandEnv is the environment a command, or a secret's command source,
 // runs with in the directory whose real path is hostPath: the daemon's,
-// with PWD set to hostPath.
-func commandEnv(hostPath string) []string {
-	return append(slices.DeleteFunc(os.Environ(), func(kv string) bool {
-		return strings.HasPrefix(kv, "PWD=")
-	}), "PWD="+hostPath)
+// with PWD set to hostPath, then the NAME=value entries of extra (a rule's
+// injected variables) over it.
+func commandEnv(hostPath string, extra ...string) []string {
+	set := append([]string{"PWD=" + hostPath}, extra...)
+	env := slices.DeleteFunc(os.Environ(), func(kv string) bool {
+		return slices.ContainsFunc(set, func(e string) bool {
+			name, _, _ := strings.Cut(e, "=")
+			return strings.HasPrefix(kv, name+"=")
+		})
+	})
+	return append(env, set...)
 }
 
 // xOK is access(2)'s X_OK, which package syscall does not export.

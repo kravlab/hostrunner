@@ -306,6 +306,9 @@ goes; the container cannot move it.
   invalid, and a value that makes one start with `-` stops the request
   with 125, so a `--` from the container cannot turn it into something the
   program echoes.
+- `inject.env` sets environment variables for the command, as
+  `{API_TOKEN: "${token}"}`, over the daemon's variable of the same name.
+  `PWD` is the working directory and cannot be set.
 - Their strings are templates: `${token}` is the secret's value, `$$` a
   literal `$`; any other `$`, an unknown name or a secret no template uses
   makes the rules file invalid. A `path: open` argument is still replaced
@@ -324,7 +327,7 @@ goes; the container cannot move it.
 - An `inject` without `secrets` adds fixed arguments and needs no strict
   lists.
 - The daemon log records the container's argv and the names of the
-  secrets, never the argv with the values in it.
+  secrets, never the argv or environment with the values in them.
 
 To see whether a rules file allows a command before restarting the
 container, run the Rules test on the host, in the project root:

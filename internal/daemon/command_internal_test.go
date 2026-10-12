@@ -53,7 +53,7 @@ func TestCommandRunsInOpenedDirectoryAfterSwap(t *testing.T) {
 		}
 		close(frames)
 	}()
-	cmd := newCommand(context.Background(), []string{"pwd", "-P"}, dir, hostPath, &frameWriter{conn: server})
+	cmd := newCommand(context.Background(), []string{"pwd", "-P"}, dir, hostPath, nil, &frameWriter{conn: server})
 	if err := cmd.Run(); err != nil {
 		t.Fatal(err)
 	}

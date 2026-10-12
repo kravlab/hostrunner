@@ -218,3 +218,30 @@ func TestAssemblePlacesProgramArgsBeforeCommandArgsForAOneWordCommand(t *testing
 		t.Fatalf("got %q, want %q", got, want)
 	}
 }
+
+// The daemon sets PWD to the working directory, and a name the shell could
+// not read is most likely a typo.
+func TestParseRefusesABadInjectedVariable(t *testing.T) {
+	for name, tc := range map[string]struct{ env, want string }{
+		"pwd":            {"{PWD: /tmp}", "PWD is set by hostrunner"},
+		"dash":           {"{API-TOKEN: x}", `"API-TOKEN" is not a variable name`},
+		"leading digit":  {"{1TOKEN: x}", `"1TOKEN" is not a variable name`},
+		"unknown secret": {`{API_TOKEN: "${other}"}`, `unknown secret "other"`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			expectParseError(t, "rules:\n  - command: curl\n    inject:\n      env: "+tc.env+"\n    args: any\n", tc.want)
+		})
+	}
+}
+
+func TestEnvironmentRendersTheInjectedVariablesByName(t *testing.T) {
+	p := mustParse(t, "rules:\n  - command: curl\n    secrets:\n      token: {env: TOKEN}\n    inject:\n      env: {NO_COLOR: \"1\", API_TOKEN: \"Bearer ${token}\"}\n"+strictLists)
+	allowed, err := p.Check([]string{"curl"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := allowed.Environment(map[string]string{"token": "tok-0123456789"})
+	if want := "API_TOKEN=Bearer tok-0123456789|NO_COLOR=1"; strings.Join(got, "|") != want {
+		t.Fatalf("got %q, want %s", got, want)
+	}
+}

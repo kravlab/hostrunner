@@ -60,6 +60,7 @@ Each names the rule.
   `args: none` is fine.
 - `secrets_with_any_args` without `secrets`, or without `args: any`.
 - A `trailing_args` string starting with `-`.
+- An `env` name outside `[A-Za-z_][A-Za-z0-9_]*`, or `PWD`.
 - A rule with `inject` but no `secrets` takes any lists.
 
 ## Behavior
@@ -78,6 +79,9 @@ the path checks of [rules-fixed-directory.md](rules-fixed-directory.md):
    the rule's command, `command_args`, the container's arguments (with the
    `path: open` replacements), `trailing_args`.
 
+The command's environment is the daemon's, `PWD` set to the working
+directory, then `inject.env` over it.
+
 The rule's lists check the container's argv only; the added tokens are
 not checked. A rendered trailing argument starting with `-` refuses the
 request with 125 (`an argument the rule adds after the container's starts
@@ -92,7 +96,7 @@ the daemon log, with a failed command source's stderr; a successful
 source's stderr is discarded, and no message or log line holds a value.
 
 The daemon log records the container's argv and the names of the
-injected secrets (`secrets=[token]`), never the argv run.
+injected secrets (`secrets=[token]`), never the argv or environment run.
 
 ## Tests
 

@@ -58,10 +58,19 @@ type Injection struct {
 	// only, so a -- from the container cannot turn one into an argument
 	// the program echoes.
 	TrailingArgs []Template
+	// Env are environment variables for the command, sorted by name; they
+	// override the daemon's.
+	Env []EnvVar
 }
 
-// empty reports whether the injection adds nothing.
-func (in Injection) empty() bool {
+// EnvVar is an environment variable an injection sets.
+type EnvVar struct {
+	Name  string
+	Value Template
+}
+
+// addsNoArgs reports whether the injection adds no argument.
+func (in Injection) addsNoArgs() bool {
 	return len(in.ProgramArgs) == 0 && len(in.CommandArgs) == 0 && len(in.TrailingArgs) == 0
 }
 
@@ -91,6 +100,9 @@ func (t Template) Render(values map[string]string) string {
 	}
 	return b.String()
 }
+
+// envName is the grammar of an injected environment variable's name.
+var envName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 // secretName is the grammar of a secret's name.
 var secretName = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
@@ -156,9 +168,10 @@ type (
 		File    string   `yaml:"file"`
 	}
 	rawInject struct {
-		ProgramArgs  []string `yaml:"program_args"`
-		CommandArgs  []string `yaml:"command_args"`
-		TrailingArgs []string `yaml:"trailing_args"`
+		ProgramArgs  []string          `yaml:"program_args"`
+		CommandArgs  []string          `yaml:"command_args"`
+		TrailingArgs []string          `yaml:"trailing_args"`
+		Env          map[string]string `yaml:"env"`
 	}
 )
 
@@ -250,6 +263,20 @@ func newInjection(raw *rawInject, secrets []Secret) (Injection, error) {
 				*field.into = append(*field.into, t)
 			}
 		}
+		for _, name := range slices.Sorted(maps.Keys(raw.Env)) {
+			switch {
+			case !envName.MatchString(name):
+				return Injection{}, fmt.Errorf("inject.env: %q is not a variable name", name)
+			case name == "PWD":
+				// The daemon sets it to the working directory.
+				return Injection{}, errors.New("inject.env: PWD is set by hostrunner")
+			}
+			t, err := newTemplate(raw.Env[name], secrets, used)
+			if err != nil {
+				return Injection{}, fmt.Errorf("inject.env: %s: %w", name, err)
+			}
+			in.Env = append(in.Env, EnvVar{Name: name, Value: t})
+		}
 	}
 	for _, sec := range secrets {
 		if !used[sec.Name] {
@@ -321,7 +348,7 @@ var ErrTrailingFlag = errors.New("an argument the rule adds after the container'
 // arguments, TrailingArgs. A rendered trailing argument starting with -
 // is ErrTrailingFlag.
 func (a Allowed) Assemble(argv []string, values map[string]string) ([]string, error) {
-	if a.Inject.empty() {
+	if a.Inject.addsNoArgs() {
 		return argv, nil
 	}
 	render := func(ts []Template) []string {
@@ -340,4 +367,15 @@ func (a Allowed) Assemble(argv []string, values map[string]string) ([]string, er
 	out = append(out, render(a.Inject.CommandArgs)...)
 	out = append(out, argv[a.commandLen:]...)
 	return append(out, trailing...), nil
+}
+
+// Environment returns the allowing rule's injected environment variables,
+// rendered from values, as NAME=value entries for the command; the caller
+// lets them override its own.
+func (a Allowed) Environment(values map[string]string) []string {
+	var env []string
+	for _, v := range a.Inject.Env {
+		env = append(env, v.Name+"="+v.Value.Render(values))
+	}
+	return env
 }
