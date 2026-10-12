@@ -1,11 +1,13 @@
 package rules
 
 import (
+	"errors"
 	"fmt"
 	"maps"
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 )
 
 // A rule's injection is what it adds to its command after the checks
@@ -20,14 +22,23 @@ type SourceKind int
 const (
 	// SourceEnv: a variable of the daemon's environment.
 	SourceEnv SourceKind = iota + 1
+	// SourceCommand: the stdout of a host command, run in the command's
+	// working directory.
+	SourceCommand
 )
+
+// defaultTimeout is how long a command source may run unless its secret
+// says otherwise.
+const defaultTimeout = 30 * time.Second
 
 // Secret is a named secret of a rule and its source. The caller obtains
 // its value for every request; this package never does.
 type Secret struct {
-	Name string
-	Kind SourceKind
-	Env  string // SourceEnv: the variable's name
+	Name    string
+	Kind    SourceKind
+	Env     string        // SourceEnv: the variable's name
+	Command []string      // SourceCommand: the argv to run
+	Timeout time.Duration // SourceCommand: how long it may run
 }
 
 // Injection is what a rule adds to its command. Each field holds
@@ -126,7 +137,9 @@ func (t Template) references() []string {
 // validate them.
 type (
 	rawSecret struct {
-		Env string `yaml:"env"`
+		Env     string   `yaml:"env"`
+		Command []string `yaml:"command"`
+		Timeout string   `yaml:"timeout"`
 	}
 	rawInject struct {
 		CommandArgs []string `yaml:"command_args"`
@@ -141,13 +154,52 @@ func newSecrets(raw map[string]rawSecret) ([]Secret, error) {
 		if !secretName.MatchString(name) {
 			return nil, fmt.Errorf("secret %q: a name is lower-case letters, digits and _, starting with a letter", name)
 		}
-		rs := raw[name]
-		if rs.Env == "" {
-			return nil, fmt.Errorf("secret %q: set its source (env)", name)
+		sec, err := newSecret(name, raw[name])
+		if err != nil {
+			return nil, fmt.Errorf("secret %q: %w", name, err)
 		}
-		secrets = append(secrets, Secret{Name: name, Kind: SourceEnv, Env: rs.Env})
+		secrets = append(secrets, sec)
 	}
 	return secrets, nil
+}
+
+// newSecret validates one secret: exactly one source, and a timeout only
+// for a command source.
+func newSecret(name string, rs rawSecret) (Secret, error) {
+	sec := Secret{Name: name}
+	var sources []string
+	if rs.Env != "" {
+		sources = append(sources, "env")
+		sec.Kind, sec.Env = SourceEnv, rs.Env
+	}
+	if rs.Command != nil {
+		sources = append(sources, "command")
+		sec.Kind, sec.Command = SourceCommand, rs.Command
+		if len(rs.Command) == 0 || rs.Command[0] == "" {
+			return Secret{}, errors.New("command must name a program")
+		}
+	}
+	switch len(sources) {
+	case 0:
+		return Secret{}, errors.New("set its source (command or env)")
+	case 1:
+	default:
+		return Secret{}, fmt.Errorf("use only one of %s", strings.Join(sources, ", "))
+	}
+	if rs.Timeout != "" && sec.Kind != SourceCommand {
+		return Secret{}, errors.New("timeout applies to a command source only")
+	}
+	if sec.Kind == SourceCommand {
+		sec.Timeout = defaultTimeout
+		if rs.Timeout != "" {
+			d, err := time.ParseDuration(rs.Timeout)
+			if err != nil || d <= 0 {
+				return Secret{}, fmt.Errorf("timeout must be a positive duration such as 30s, not %q", rs.Timeout)
+			}
+			sec.Timeout = d
+		}
+	}
+	return sec, nil
 }
 
 // newInjection validates a rule's injection against its secrets: every

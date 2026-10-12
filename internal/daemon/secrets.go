@@ -1,9 +1,13 @@
 package daemon
 
 import (
+	"bytes"
+	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
+	"syscall"
 	"unicode/utf8"
 
 	"github.com/kravlab/hostrunner/internal/protocol"
@@ -16,16 +20,18 @@ import (
 const minSecretLength = 8
 
 // obtainSecrets obtains the value of every secret, fresh for this request,
-// with trailing CR and LF trimmed. A secret that yields no usable value
-// refuses the request with ExitHostrunError and a message naming the
-// secret only; the reason, never the value, goes to the error for the log.
-func obtainSecrets(secrets []rules.Secret) (map[string]string, *refusal) {
+// with trailing CR and LF trimmed. A command source runs in the working
+// directory dir, whose real path is hostPath. A secret that yields no
+// usable value refuses the request with ExitHostrunError and a message
+// naming the secret only; the reason, never the value, goes to the error
+// for the log.
+func obtainSecrets(secrets []rules.Secret, dir *os.File, hostPath string) (map[string]string, *refusal) {
 	if len(secrets) == 0 {
 		return nil, nil
 	}
 	values := make(map[string]string, len(secrets))
 	for _, sec := range secrets {
-		value, err := obtain(sec)
+		value, err := obtain(sec, dir, hostPath)
 		if err != nil {
 			return nil, &refusal{protocol.ExitHostrunError, fmt.Sprintf("secret %q is not available", sec.Name), fmt.Errorf("secret %q: %w", sec.Name, err)}
 		}
@@ -42,12 +48,44 @@ func obtainSecrets(secrets []rules.Secret) (map[string]string, *refusal) {
 }
 
 // obtain reads the raw value of sec from its source.
-func obtain(sec rules.Secret) (string, error) {
-	value, ok := os.LookupEnv(sec.Env)
-	if !ok {
-		return "", fmt.Errorf("environment variable %s is not set", sec.Env)
+func obtain(sec rules.Secret, dir *os.File, hostPath string) (string, error) {
+	switch sec.Kind {
+	case rules.SourceCommand:
+		return runSource(sec, dir, hostPath)
+	default:
+		value, ok := os.LookupEnv(sec.Env)
+		if !ok {
+			return "", fmt.Errorf("environment variable %s is not set", sec.Env)
+		}
+		return value, nil
 	}
-	return value, nil
+}
+
+// runSource runs the command source of sec as the command itself would
+// run (working directory, environment, own process group), with an empty
+// stdin, which no source waiting for a password can get past, and its
+// timeout, after which the whole group is killed. It returns the stdout.
+// The stderr of a failed source is part of the error, for the log; a
+// successful source's is discarded, as it may carry the value.
+func runSource(sec rules.Secret, dir *os.File, hostPath string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), sec.Timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, sec.Command[0], sec.Command[1:]...)
+	cmd.Dir = fdPath(dir)
+	cmd.Env = commandEnv(hostPath)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+	cmd.WaitDelay = waitDelay
+	err := cmd.Run()
+	switch {
+	case ctx.Err() != nil:
+		return "", fmt.Errorf("command %q timed out after %s; stderr: %q", sec.Command, sec.Timeout, stderr.String())
+	case err != nil:
+		return "", fmt.Errorf("command %q: %w; stderr: %q", sec.Command, err, stderr.String())
+	}
+	return stdout.String(), nil
 }
 
 // secretNames returns the names of secrets, for the log.

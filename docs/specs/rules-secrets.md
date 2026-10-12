@@ -49,7 +49,8 @@ rules:
 Each names the rule.
 
 - A secret name outside the grammar; a secret with no source, or more than
-  one.
+  one; an empty `command`; a `timeout` that is not a positive Go duration,
+  or one on a source other than `command`.
 - In a template: a lone `$`, an unterminated `${`, a name outside the
   grammar, an unknown secret or file. A secret or file no template uses.
 - A rule with `secrets` whose lists are not strict: `args: any` without
@@ -65,8 +66,12 @@ Each names the rule.
 The daemon's pre-start step gains, after the rules, the directories and
 the path checks of [rules-fixed-directory.md](rules-fixed-directory.md):
 
-5. Every secret of the allowing rule is obtained, fresh for this request:
-   `env` reads the daemon's environment. Trailing CR and LF are trimmed.
+5. Every secret of the allowing rule is obtained, fresh for this request,
+   once even when several templates use it. `command` runs in the working
+   directory with the daemon's environment (`PWD` set as for the command),
+   an empty stdin and its own process group, which is killed at the
+   timeout; its stdout is the value. `env` reads the daemon's
+   environment. Trailing CR and LF are trimmed.
 6. The injection is rendered and placed: program, `program_args`, rest of
    the rule's command, `command_args`, the container's arguments (with the
    `path: open` replacements), `trailing_args`.
@@ -76,8 +81,10 @@ not checked.
 
 A secret with no value, an empty one, or one shorter than 8 characters
 refuses the request with 125: `secret "<name>" is not available`, or
-`secret "<name>" is too short to mask`. The reason goes to the daemon log;
-no message or log line holds a value.
+`secret "<name>" is too short to mask`. A command source that fails to
+start, exits non-zero or times out is not available. The reason goes to
+the daemon log, with a failed command source's stderr; a successful
+source's stderr is discarded, and no message or log line holds a value.
 
 The daemon log records the container's argv and the names of the
 injected secrets (`secrets=[token]`), never the argv run.

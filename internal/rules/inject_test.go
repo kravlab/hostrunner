@@ -3,6 +3,7 @@ package rules
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // secretRule is a rule for curl with a secret token from $TOKEN injected
@@ -143,5 +144,39 @@ func TestAssemblePlacesCommandArgsAfterTheRuleCommand(t *testing.T) {
 	got := strings.Join(allowed.Assemble(argv, map[string]string{"token": "tok-0123456789"}), "|")
 	if want := "git|push|--push-option=auth ${token}=tok-0123456789|origin"; got != want {
 		t.Fatalf("got %s, want %s", got, want)
+	}
+}
+
+func TestParseRefusesABadCommandSource(t *testing.T) {
+	for name, tc := range map[string]struct{ source, want string }{
+		"empty command":     {"{command: []}", "command must name a program"},
+		"two sources":       {"{command: [authtool], env: TOKEN}", "use only one of env, command"},
+		"zero timeout":      {"{command: [authtool], timeout: 0s}", "timeout must be a positive duration"},
+		"negative timeout":  {"{command: [authtool], timeout: -1s}", "timeout must be a positive duration"},
+		"malformed timeout": {"{command: [authtool], timeout: soon}", "timeout must be a positive duration"},
+		"timeout with env":  {"{env: TOKEN, timeout: 5s}", "timeout applies to a command source only"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			config := "rules:\n  - command: curl\n    secrets:\n      token: " + tc.source + "\n    inject:\n      command_args: [\"${token}\"]\n" + strictLists
+			expectParseError(t, config, tc.want)
+		})
+	}
+}
+
+// A command source runs for 30 s unless its secret says otherwise.
+func TestCheckReportsACommandSourceWithItsTimeout(t *testing.T) {
+	for source, want := range map[string]time.Duration{
+		"{command: [authtool, print-token]}":              30 * time.Second,
+		"{command: [authtool, print-token], timeout: 2m}": 2 * time.Minute,
+	} {
+		p := mustParse(t, "rules:\n  - command: curl\n    secrets:\n      token: "+source+"\n    inject:\n      command_args: [\"${token}\"]\n"+strictLists)
+		allowed, err := p.Check([]string{"curl", "https://api.example.com/v1/items/42"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := allowed.Secrets[0]
+		if got.Kind != SourceCommand || strings.Join(got.Command, " ") != "authtool print-token" || got.Timeout != want {
+			t.Fatalf("%s: got %+v, want authtool print-token with timeout %s", source, got, want)
+		}
 	}
 }

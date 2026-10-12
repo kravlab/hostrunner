@@ -278,10 +278,17 @@ goes; the container cannot move it.
       allow_regex: ['^https://api\.example\.com/v1/items/42$']
 ```
 
-- `secrets` names the values a rule obtains, each from one source:
-  `env` reads a variable of the daemon's environment (the one
-  `hostrunner up` was started in). A name is lower-case letters, digits
-  and `_`, starting with a letter.
+- `secrets` names the values a rule obtains, each from one source. A
+  name is lower-case letters, digits and `_`, starting with a letter.
+  - `command: [authtool, print-token]` takes the stdout of a host
+    command. It runs where the rule's command would (the rule's `dir`, or
+    the mirrored directory, which the container can write to), with the
+    daemon's environment and an empty stdin, for at most `timeout` (a Go
+    duration, `30s` by default), after which it and whatever it started
+    are killed. A failed source's stderr goes to the daemon log; a
+    successful one's is discarded.
+  - `env: API_TOKEN` reads a variable of the daemon's environment (the
+    one `hostrunner up` was started in).
 - The value is obtained fresh for every request; trailing CR and LF are
   trimmed. A source that yields nothing, or a value shorter than 8
   characters, stops the request with 125 and `secret "token" is not

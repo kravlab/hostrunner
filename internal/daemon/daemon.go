@@ -315,7 +315,7 @@ func (s *Server) prepare(req protocol.Request) (*prepared, *refusal) {
 			return nil, &refusal{protocol.ExitRejected, fixedMessage(allowed.Dir, err), err}
 		}
 	}
-	values, r := obtainSecrets(allowed.Secrets)
+	values, r := obtainSecrets(allowed.Secrets, dir, hostPath)
 	if r != nil {
 		dir.Close()
 		closeAll(files)
@@ -531,15 +531,22 @@ func fdPath(dir *os.File) string {
 func newCommand(ctx context.Context, argv []string, dir *os.File, hostPath string, out *frameWriter) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Dir = fdPath(dir)
-	cmd.Env = append(slices.DeleteFunc(os.Environ(), func(kv string) bool {
-		return strings.HasPrefix(kv, "PWD=")
-	}), "PWD="+hostPath)
+	cmd.Env = commandEnv(hostPath)
 	cmd.Stdout = streamWriter{out: out, frame: protocol.FrameStdout}
 	cmd.Stderr = streamWriter{out: out, frame: protocol.FrameStderr}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
 	cmd.WaitDelay = waitDelay
 	return cmd
+}
+
+// commandEnv is the environment a command, or a secret's command source,
+// runs with in the directory whose real path is hostPath: the daemon's,
+// with PWD set to hostPath.
+func commandEnv(hostPath string) []string {
+	return append(slices.DeleteFunc(os.Environ(), func(kv string) bool {
+		return strings.HasPrefix(kv, "PWD=")
+	}), "PWD="+hostPath)
 }
 
 // xOK is access(2)'s X_OK, which package syscall does not export.
