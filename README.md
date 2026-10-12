@@ -318,9 +318,10 @@ goes; the container cannot move it.
   `curl -K /proc/self/fd/4`). The file is read-only, can be read again and
   sought in, and lives in memory only (a sealed memfd), never on a disk.
   Its content may refer to secrets, not to files.
-- Their strings are templates: `${token}` is the secret's value, `$$` a
-  literal `$`; any other `$`, an unknown name or a secret no template uses
-  makes the rules file invalid. A `path: open` argument is still replaced
+- Their strings are templates: `${token}` is the secret's value,
+  `${file.cfg}` an injected file's path, `$$` a literal `$`; any other `$`,
+  an unknown name, or a secret or file no template uses makes the rules
+  file invalid. A `path: open` argument is still replaced
   where it moved to.
 - The rule's lists check the container's arguments only, as without an
   injection; the added ones are not checked, so the rule need not allow the
