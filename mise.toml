@@ -56,12 +56,45 @@ env = { CGO_ENABLED = "0" }
 run = "go build -trimpath -o bin/ ./cmd/..."
 
 [tasks.install]
-description = "Install both binaries into $PREFIX/bin (default ~/.local/bin)"
+description = "Install both binaries into the versioned layout under $PREFIX (default ~/.local)"
 depends = ["build"]
+# The layout `hostrunner update` needs (docs/specs/update.md): a directory
+# per version, a current link switched with one rename, and absolute bin/
+# symlinks through it. It runs under the lock `update` takes (a flock on
+# the root). The current link first points to one synced copy while a
+# second one replaces <version>, so it always names an existing complete
+# pair, a reinstalled version included. Temporary entries start with
+# .tmp., in the root and in bin/; a run that fails or is killed leaves
+# them, and the next one removes them under the lock, except one the
+# current link names (left by a killed install). Only directories named
+# dev or a semver version (is_version, as golang.org/x/mod/semver reads
+# one) are version directories; other entries of the root are kept. The
+# built version is installed whatever it is: unlike update, this can
+# downgrade. Commands chain with && whatever shell options mise runs the
+# script with.
 run = """
-prefix="${PREFIX:-$HOME/.local}"
-install -d "$prefix/bin"
-install -m 0755 bin/hostrunner bin/hostrun "$prefix/bin/"
+prefix="${PREFIX:-$HOME/.local}" &&
+case "$prefix" in /*) ;; *) prefix="$PWD/$prefix" ;; esac &&
+root="$prefix/lib/hostrunner" &&
+version="$(bin/hostrunner version)" &&
+install -d "$root" "$prefix/bin" &&
+exec 9<"$root" &&
+{ flock -n 9 || { rc=$? && if [ "$rc" = 1 ]; then echo "another update or install is running in $root" >&2; else echo "cannot lock $root (flock exit $rc)" >&2; fi && false; }; } &&
+{ old="$(readlink "$root/current")" || old=; } &&
+for entry in "$root"/.tmp.*; do { [ ! -e "$entry" ] && [ ! -L "$entry" ]; } || [ "${entry##*/}" = "$old" ] || rm -rf "$entry" || exit; done &&
+rm -f "$prefix/bin"/.tmp.hostrunner-* "$prefix/bin"/.tmp.hostrun-* &&
+n='(0|[1-9][0-9]*)' && p='(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)' && b='[0-9A-Za-z-]+' &&
+is_version() { printf '%s\\n' "$1" | grep -Eqx "v$n(\\.$n(\\.$n(-$p(\\.$p)*)?(\\+$b(\\.$b)*)?)?)?"; } &&
+copy() { dir="$(mktemp -d "$root/.tmp.$version-XXXXXXXX")" && chmod 0755 "$dir" && install -m 0755 bin/hostrunner bin/hostrun "$dir/" && sync "$dir/hostrunner" "$dir/hostrun" "$dir" "$root"; } &&
+relink() { link="$(mktemp -u "$(dirname "$2")/.tmp.$(basename "$2")-XXXXXXXX")" && ln -s "$1" "$link" && mv -T "$link" "$2"; } &&
+switch() { relink "$1" "$root/current" && sync "$root"; } &&
+copy && first="$dir" && switch "${first##*/}" &&
+copy && rm -rf "$root/$version" && mv -T "$dir" "$root/$version" && sync "$root" &&
+switch "$version" &&
+for entry in "$root"/* "$root"/.tmp.*; do name="${entry##*/}" && case "$name" in "$version") continue ;; .tmp.*) ;; *) { [ -d "$entry" ] && [ ! -L "$entry" ] && { [ "$name" = dev ] || is_version "$name"; }; } || continue ;; esac && rm -rf "$entry" || exit; done &&
+relink "$root/current/hostrunner" "$prefix/bin/hostrunner" &&
+relink "$root/current/hostrun" "$prefix/bin/hostrun" &&
+sync "$prefix/bin"
 """
 
 [tasks.test]

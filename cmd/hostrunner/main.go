@@ -7,6 +7,7 @@
 //	hostrunner serve --socket <path> --workspace <host-path> --container-workspace <path>
 //	    [--config <path>] [--watch [--startup-timeout 30m] [--grace 15s]]
 //	hostrunner test [--config <path>] [--] <command> [args...]
+//	hostrunner update [--check]
 //	hostrunner version
 //
 // `up` is meant for devcontainer's initializeCommand: it installs the client
@@ -14,8 +15,10 @@
 // which exits by itself once its armed container stops. `test` runs the Rules
 // test: whether a rules file (default .devcontainer/hostrun.yaml under the
 // current directory) allows a command; it exits 0 when it does, 126 when it
-// does not, and 1 on any error. `version` prints the module version Go
-// stamped into the binary (see buildVersion).
+// does not, and 1 on any error. `update` switches the versioned install
+// of hostrunner and hostrun to the latest release (see internal/update).
+// `version` prints the module version Go stamped into the binary (see
+// buildVersion).
 package main
 
 import (
@@ -28,6 +31,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"runtime/debug"
 	"syscall"
 	"time"
@@ -37,14 +41,16 @@ import (
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
 	"github.com/kravlab/hostrunner/internal/transport"
+	"github.com/kravlab/hostrunner/internal/update"
 	"github.com/kravlab/hostrunner/internal/watch"
 	"github.com/kravlab/hostrunner/internal/workspace"
 )
 
 const (
-	usage        = "usage: hostrunner up|serve|test|version [flags]; see `hostrunner <command> -h`"
+	usage        = "usage: hostrunner up|serve|test|update|version [flags]; see `hostrunner <command> -h`"
 	upUsage      = "usage: hostrunner up --dir <runtime-dir> --workspace <host-path> --container-workspace <path>"
 	serveUsage   = "usage: hostrunner serve --socket <path> --workspace <host-path> --container-workspace <path> [--config <path>] [--watch]"
+	updateUsage  = "usage: hostrunner update [--check]"
 	versionUsage = "usage: hostrunner version"
 )
 
@@ -55,6 +61,7 @@ const (
 	defaultStartupTimeout = 30 * time.Minute // covers image builds, also after a rebuild's arm
 	defaultGrace          = 15 * time.Second // how long a stopped container is tolerated
 	readyTimeout          = 10 * time.Second // how long `up` waits for the daemon
+	updateTimeout         = 5 * time.Minute  // `update`'s version lookup and downloads
 )
 
 func main() {
@@ -86,8 +93,9 @@ func exitCode(err error) int {
 	return 1
 }
 
-// run dispatches the subcommand in args; stdout receives `version`'s
-// output, stderr flag help, the daemon's log and the Rules test's verdict.
+// run dispatches the subcommand in args; stdout receives `version`'s and
+// `update`'s output, stderr flag help, the daemon's log and the Rules
+// test's verdict.
 // The caller prints a returned error; see exitCode for the exit code.
 func run(args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
@@ -124,6 +132,12 @@ func run(args []string, stdout, stderr io.Writer) error {
 			return err
 		}
 		return rulesTest(cfg, stderr)
+	case "update":
+		check, err := parseUpdate(args[1:], stderr)
+		if err != nil {
+			return err
+		}
+		return runUpdate(ctx, check, buildVersion(debug.ReadBuildInfo()), stdout)
 	case "version":
 		if err := parseVersion(args[1:], stderr); err != nil {
 			return err
@@ -248,6 +262,61 @@ func parseVersion(args []string, output io.Writer) error {
 	fs := flag.NewFlagSet("version", flag.ContinueOnError)
 	fs.SetOutput(output)
 	return parseFlags(fs, args, versionUsage)
+}
+
+// parseUpdate parses the flags of `hostrunner update` and returns whether
+// --check was given; output receives the flag help for -h.
+func parseUpdate(args []string, output io.Writer) (check bool, err error) {
+	fs := flag.NewFlagSet("update", flag.ContinueOnError)
+	fs.SetOutput(output)
+	fs.BoolVar(&check, "check", false, "only report whether a newer release exists")
+	err = parseFlags(fs, args, updateUsage)
+	return check, err
+}
+
+// runUpdate switches the install of the running hostrunner, whose version
+// is current, and its hostrun to the latest release (only reports with check)
+// and prints the outcome to stdout. Errors are prefixed "update: ". The
+// network calls are bounded by updateTimeout.
+func runUpdate(ctx context.Context, check bool, current string, stdout io.Writer) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("update: %w", err)
+	}
+	// update.Run needs the version directory, not the bin/ symlink. On
+	// Linux os.Executable already resolves symlinks (/proc/self/exe);
+	// resolving again keeps that true where it does not.
+	if exe, err = filepath.EvalSymlinks(exe); err != nil {
+		return fmt.Errorf("update: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(ctx, updateTimeout)
+	defer cancel()
+	res, err := update.Run(ctx, update.Config{
+		APIURL:      update.APIURL,
+		DownloadURL: update.DownloadURL,
+		Current:     current,
+		Dir:         filepath.Dir(exe),
+		GOOS:        runtime.GOOS,
+		GOARCH:      runtime.GOARCH,
+		CheckOnly:   check,
+	})
+	if err != nil {
+		return fmt.Errorf("update: %w", err)
+	}
+	_, err = fmt.Fprintln(stdout, updateMessage(res))
+	return err
+}
+
+// updateMessage is the line `hostrunner update` prints for res.
+func updateMessage(res update.Result) string {
+	switch res.Outcome {
+	case update.Available:
+		return fmt.Sprintf("hostrunner: %s available (current %s)", res.Latest, res.Current)
+	case update.Updated:
+		return fmt.Sprintf("hostrunner: updated %s -> %s", res.Current, res.Latest)
+	default:
+		return fmt.Sprintf("hostrunner: already up to date (%s)", res.Current)
+	}
 }
 
 // serve runs the daemon until ctx is cancelled or, with watch, until the

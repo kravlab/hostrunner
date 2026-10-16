@@ -102,9 +102,10 @@ Without `--watch`, `serve` behaves as today (runs until signalled).
 
 ## Build and install
 
-`Makefile`: `build` and `install` compile both binaries with
-`CGO_ENABLED=0 -trimpath`; `install` copies them to `$(PREFIX)/bin`
-(default `~/.local`). Also `test` and `e2e` targets.
+`mise.toml`: `build` and `install` compile both binaries with
+`CGO_ENABLED=0 -trimpath`; `install` puts them into the versioned
+layout under `$PREFIX` (default `~/.local`) and links them into
+`$PREFIX/bin` ([update.md](update.md)). Also `test` and `e2e` tasks.
 
 ## Example and verification
 
