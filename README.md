@@ -29,24 +29,69 @@ archive=hostrunner_${v}_linux_${arch}.tar.gz
 gh release download "v$v" --repo kravlab/hostrunner -p "$archive" -p checksums.txt
 sha256sum -c --ignore-missing checksums.txt
 gh attestation verify "$archive" --repo kravlab/hostrunner  # optional: built by this repo's CI
-mkdir -p ~/.local/bin               # any directory in PATH
-tar -xzf "$archive" -C ~/.local/bin hostrunner hostrun
+root=~/.local/lib/hostrunner bin=~/.local/bin   # bin: any directory in PATH
+mkdir -p "$root/v$v" "$bin"
+tar -xzf "$archive" -C "$root/v$v" hostrunner hostrun
+ln -sfn "v$v" "$root/current"
+ln -sfn "$root/current/hostrunner" "$bin/hostrunner"
+ln -sfn "$root/current/hostrun" "$bin/hostrun"
 hostrunner version
 ```
+
+Each version gets its own directory and the `current` link points to
+the one in use: `hostrunner update` needs this layout to replace both
+binaries at once. These steps are for a first install, or to reinstall
+one `hostrunner update` refuses; later versions come with
+`hostrunner update`, which v0.4.0 and older releases do not have.
 
 From source, with mise 2026.5.0 or newer (an older one refuses the
 repository's mise config):
 
 ```sh
+git fetch --tags                    # the version comes from the tags
 mise install                        # the pinned toolchain (see mise.toml)
-mise run install                    # builds with CGO_ENABLED=0 into ~/.local/bin
+mise run install                    # builds with CGO_ENABLED=0 into the layout under ~/.local
 PREFIX=/usr/local mise run install
 ```
+
+The build's version comes from the clone's git tags: without them it is
+`v0.0.0-…`, which `hostrunner update` replaces with the latest release
+even when the build is newer. Updated to v0.4.0 or an older release, a
+source build loses `update` until a release that has it is installed.
+`mise run install` installs the version it builds, an older one than
+installed too.
 
 `hostrunner` must be in the `PATH` of the process that starts your
 devcontainer (VS Code, the devcontainer CLI). The `hostrun` client is
 installed next to it; it must stay statically linked, which
 `mise run install` guarantees.
+
+### Update
+
+```sh
+hostrunner update --check   # hostrunner: v0.5.0 available (current v0.4.0)
+hostrunner update           # hostrunner: updated v0.4.0 -> v0.5.0
+```
+
+`update` downloads the latest release for the host's architecture, checks
+it against the release's `checksums.txt`, extracts it into a new version
+directory, switches the `current` link to it with one rename and removes
+the other version directories. Both binaries change together: on an
+error or a crash the `current` link points to the old pair or the new
+one, never a mix.
+When a newer release exists, an install outside the layout above is
+refused (`--check` too): reinstall it as described. It never downgrades,
+refuses a build from source without a version (`dev`), runs only while
+no other update or `mise run install` is running and gives up after 5
+minutes. Build provenance is
+not checked: use the manual steps above for `gh attestation verify`.
+
+A running daemon keeps the old version until it exits after its
+container stops; a container restart or rebuild before that reuses it
+with the old `hostrun`, unless the rules changed: then the new version
+takes over. The first `hostrunner up` after it has exited runs the new
+version. A `hostrunner up` already in progress during the update may
+fail; run it again.
 
 ## Use in a devcontainer
 
