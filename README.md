@@ -20,7 +20,21 @@ stops. Linux hosts; Docker and Podman.
 
 ## Install
 
-From a [release](https://github.com/kravlab/hostrunner/releases)
+The latest release, into `~/.local` (`hostrunner` and `hostrun` in
+`~/.local/bin`, which must be in `PATH`):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/kravlab/hostrunner/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/kravlab/hostrunner/main/scripts/install.sh | bash -s -- -v v0.5.0
+curl -fsSL https://raw.githubusercontent.com/kravlab/hostrunner/main/scripts/install.sh | PREFIX=/usr/local bash
+```
+
+The script checks the archive against the release's `checksums.txt`
+and installs the layout described below; it installs the version asked
+for whatever is installed, an older one too.
+
+By hand, with a build provenance check,
+from a [release](https://github.com/kravlab/hostrunner/releases)
 (`gh release download` or the Releases page):
 
 ```sh

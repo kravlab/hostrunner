@@ -226,12 +226,13 @@ scope ([devcontainer-integration.md](devcontainer-integration.md)).
 - `cmd/hostrunner`: `parseUpdate`, the `update` case in `run`,
   `runUpdate` (resolves the executable, bounds the update with the
   5-minute deadline) and `updateMessage` (the stdout line).
-- `mise.toml` `install`: builds into `bin/`, then installs the layout
-  under `$PREFIX` (default `~/.local`; a relative one is made absolute),
-  its commands chained with `&&` whatever shell options mise runs it
-  with, under the lock of step 2 (`flock -n` on the root; held: refused
-  as in step 2; `flock` failing otherwise, e.g. not installed: `cannot
-  lock <root> (flock exit <code>)`). It installs the built version
+- `mise.toml` `install`: builds into `bin/`, then runs
+  `scripts/install.sh --from bin` ([install-script.md](install-script.md)),
+  which installs the layout under `$PREFIX` (default `~/.local`; a
+  relative one is made absolute), under the lock of step 2 (`flock -n`
+  on the root; held: refused as in step 2; `flock` not installed:
+  `flock is required but not installed`; `flock` failing otherwise:
+  `cannot lock <root> (flock exit <code>)`). It installs the built version
   whatever it is, an older one than installed too: unlike `update`, it
   can downgrade. First it removes the temporary entries (`.tmp.*`) of
   the root, except one the current link points to (left by a killed
