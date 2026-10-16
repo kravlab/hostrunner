@@ -131,3 +131,17 @@ _Avoid_: restart
 **Startup timeout**:
 How long a waiting daemon waits for its armed container
 before it exits.
+
+**Layout root**:
+The directory an install keeps its versions in,
+`<prefix>/lib/hostrunner`.
+
+**Version directory**:
+A directory in the layout root named after the version of
+the `hostrunner` and `hostrun` it holds.
+
+**Current link**:
+The symlink `current` in the layout root to the version
+directory in use; `hostrunner update` switches it with one
+rename.
+_Avoid_: current (in code and specs that is the running version)

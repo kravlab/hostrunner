@@ -35,8 +35,9 @@ the binaries report a pseudo-version.
   - No build info, or the version `(devel)` or empty (no VCS data):
     `dev`.
 - Flags are parsed like the other subcommands' (`parseFlags`): `-h`
-  prints the usage, and extra arguments are an error.
-- The top-level usage lists the subcommand: `up|serve|version`.
+  prints the flag help of Go's flag package and exits 1, and extra
+  arguments are an error.
+- The top-level usage lists the subcommand: `up|serve|test|update|version`.
 - `hostrun` gets no version command: its arguments are the host command
   to run.
 
@@ -103,7 +104,8 @@ Configured through `gh api` after the merge.
 
 - README "Install": download the archive for the host's architecture from
   the Releases page, check it (`sha256sum -c` against `checksums.txt`
-  or `gh attestation verify`), unpack both binaries into a directory in
+  or `gh attestation verify`), unpack both binaries into the versioned
+  layout ([update.md](update.md)) and link them into a directory in
   `PATH`; building from source with `mise run install` stays.
 - README: how to cut a release (the two git commands above).
 - `cmd/hostrunner` package doc: the `version` subcommand.

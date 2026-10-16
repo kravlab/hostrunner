@@ -20,6 +20,7 @@ import (
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
 	"github.com/kravlab/hostrunner/internal/transport"
+	"github.com/kravlab/hostrunner/internal/update"
 	"github.com/kravlab/hostrunner/internal/watch"
 	"github.com/kravlab/hostrunner/internal/watch/watchtest"
 )
@@ -400,4 +401,95 @@ func TestServeStepsAsideWhenRulesChanged(t *testing.T) {
 		t.Fatal("serve kept running with stale rules")
 	}
 	expectServeExit(t, done, cfg.socket)
+}
+
+// TestParseUpdateFlags checks that --check is the only flag of update.
+func TestParseUpdateFlags(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{"no flags", nil, false},
+		{"check", []string{"--check"}, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseUpdate(tt.args, io.Discard)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tt.want {
+				t.Fatalf("check: got %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestParseUpdateRejectsArguments checks that update takes no version
+// or other argument.
+func TestParseUpdateRejectsArguments(t *testing.T) {
+	if _, err := parseUpdate([]string{"v0.5.0"}, io.Discard); err == nil || !strings.Contains(err.Error(), updateUsage) {
+		t.Fatalf("got %v, want an error with the usage", err)
+	}
+}
+
+// TestParseUpdateHelpIsTheFlagHelp checks that -h is handled like the
+// other subcommands' -h.
+func TestParseUpdateHelpIsTheFlagHelp(t *testing.T) {
+	if _, err := parseUpdate([]string{"-h"}, io.Discard); !errors.Is(err, flag.ErrHelp) {
+		t.Fatalf("got %v, want flag.ErrHelp", err)
+	}
+}
+
+// TestRunUpdateRefusesADevBuild checks that runUpdate passes a dev build's
+// refusal on with the "update: " prefix. The version is passed in, so the
+// test does not depend on the test binary's build info; that the refusal
+// comes before any request is tested in internal/update.
+func TestRunUpdateRefusesADevBuild(t *testing.T) {
+	var out strings.Builder
+	err := runUpdate(context.Background(), false, "dev", &out)
+	if !errors.Is(err, update.ErrDevBuild) || !strings.HasPrefix(err.Error(), "update: ") {
+		t.Fatalf("got %v, want update.ErrDevBuild prefixed with \"update: \"", err)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("printed %q despite the error", out.String())
+	}
+}
+
+// TestRunDispatchesUpdate checks that run hands `update` to parseUpdate:
+// its errors, not the top-level usage, come back. No case reaches the
+// network.
+func TestRunDispatchesUpdate(t *testing.T) {
+	if err := run([]string{"update", "v0.5.0"}, io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), updateUsage) {
+		t.Fatalf("extra argument: got %v, want an error with %q", err, updateUsage)
+	}
+	if err := run([]string{"update", "-h"}, io.Discard, io.Discard); !errors.Is(err, flag.ErrHelp) {
+		t.Fatalf("-h: got %v, want flag.ErrHelp", err)
+	}
+}
+
+// TestUsageListsUpdate checks that the top-level usage names update.
+func TestUsageListsUpdate(t *testing.T) {
+	if err := run(nil, io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "up|serve|test|update|version") {
+		t.Fatalf("got %v, want the usage listing update", err)
+	}
+}
+
+// TestUpdateMessage checks the line update prints for each outcome.
+func TestUpdateMessage(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		res  update.Result
+		want string
+	}{
+		{"up to date", update.Result{Current: "v0.5.0", Latest: "v0.5.0", Outcome: update.UpToDate}, "hostrunner: already up to date (v0.5.0)"},
+		{"available", update.Result{Current: "v0.4.0", Latest: "v0.5.0", Outcome: update.Available}, "hostrunner: v0.5.0 available (current v0.4.0)"},
+		{"updated", update.Result{Current: "v0.4.0", Latest: "v0.5.0", Outcome: update.Updated}, "hostrunner: updated v0.4.0 -> v0.5.0"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := updateMessage(tt.res); got != tt.want {
+				t.Fatalf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
 }
