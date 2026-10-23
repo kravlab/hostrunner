@@ -28,6 +28,10 @@ const ExitInterrupted = 130
 // dryRunFlag, as hostrun's first argument, makes Run a dry run.
 const dryRunFlag = "--dry-run"
 
+// askFlag, as hostrun's first argument, makes Run ask for an approval when
+// the rules refuse the command.
+const askFlag = "--ask"
+
 // Run executes the command in args, hostrun's arguments, on the host with
 // the container working directory cwd and returns the exit code hostrun
 // must terminate with: the command's own code, or one of the protocol.Exit*
@@ -41,18 +45,30 @@ const dryRunFlag = "--dry-run"
 // have been refused. Nothing after the first argument is hostrun's own, so
 // a command's --dry-run reaches the command.
 //
+// When args starts with askFlag, a command the rules refuse but a human may
+// approve waits for an approval session's answer: Run reports on stderr
+// that it waits, then that it was approved and how far, and runs it as
+// usual; a refusal exits as any other. Cancelling ctx withdraws the
+// request.
+//
 // stdin is forwarded until it returns EOF, within the credit the daemon
-// grants; a dry run does not read it. Run does not wait for that: a command
-// that ignores stdin finishes while a terminal read may still block.
-// Cancelling ctx drops the connection, which makes the daemon kill the
-// command, and Run returns ExitInterrupted.
+// grants; a dry run does not read it, and an approval request reads it only
+// once approved. Run does not wait for that: a command that ignores stdin
+// finishes while a terminal read may still block. Cancelling ctx drops the
+// connection, which makes the daemon kill the command, and Run returns
+// ExitInterrupted.
 func Run(ctx context.Context, d Dialer, args []string, cwd string, stdin io.Reader, stdout, stderr io.Writer) int {
-	argv, dryRun := args, len(args) > 0 && args[0] == dryRunFlag
-	if dryRun {
-		argv = args[1:]
+	argv, dryRun, ask := args, false, false
+	if len(args) > 0 {
+		switch args[0] {
+		case dryRunFlag:
+			argv, dryRun = args[1:], true
+		case askFlag:
+			argv, ask = args[1:], true
+		}
 	}
 	if len(argv) == 0 {
-		return fail(stderr, protocol.ExitHostrunError, "usage: hostrun [%s] <command> [args...]", dryRunFlag)
+		return fail(stderr, protocol.ExitHostrunError, "usage: hostrun [%s|%s] <command> [args...]", dryRunFlag, askFlag)
 	}
 	conn, err := d.Dial(ctx)
 	if err != nil {
@@ -63,18 +79,25 @@ func Run(ctx context.Context, d Dialer, args []string, cwd string, stdin io.Read
 	defer stop()
 
 	req := protocol.Request{Version: protocol.Version, Argv: argv, Cwd: cwd}
-	opening := protocol.FrameRequest
-	if dryRun {
-		opening = protocol.FrameDryRun
+	switch {
+	case dryRun:
+		err = protocol.WriteJSON(conn, protocol.FrameDryRun, req)
+	case ask:
+		err = protocol.WriteJSON(conn, protocol.FrameAsk, protocol.Ask{Request: req})
+	default:
+		err = protocol.WriteJSON(conn, protocol.FrameRequest, req)
 	}
-	if err := protocol.WriteJSON(conn, opening, req); err != nil {
+	if err != nil {
 		return fail(stderr, protocol.ExitHostrunError, "send request: %v", err)
 	}
 	credit := newStdinCredit()
 	defer credit.stop()
-	if !dryRun {
-		// After the request this goroutine is the only writer on conn.
-		go forwardStdin(conn, stdin, credit)
+	// After the request this goroutine is the only writer on conn. An
+	// approval request sends nothing until it is approved, so a client
+	// that goes away is all the daemon reads meanwhile.
+	startStdin := func() { go forwardStdin(conn, stdin, credit) }
+	if !dryRun && !ask {
+		startStdin()
 	}
 
 	for {
@@ -111,18 +134,37 @@ func Run(ctx context.Context, d Dialer, args []string, cwd string, stdin io.Read
 				return fail(stderr, protocol.ExitHostrunError, "%v", err)
 			}
 			return fail(stderr, e.Code, "%s", e.Message)
-		case protocol.FrameAllowed:
-			if dryRun {
-				var a protocol.Allowed
-				if err := protocol.DecodeJSON(f, &a); err != nil {
-					return fail(stderr, protocol.ExitHostrunError, "%v", err)
-				}
-				fmt.Fprintf(stderr, "hostrun: dry run: %s\n", a)
-				return 0
+		case protocol.FrameAllowed: // only a dry run is answered with it
+			if !dryRun {
+				return unexpectedFrame(stderr, f)
 			}
-			fallthrough // only a dry run is answered with it
+			var a protocol.Allowed
+			if err := protocol.DecodeJSON(f, &a); err != nil {
+				return fail(stderr, protocol.ExitHostrunError, "%v", err)
+			}
+			fmt.Fprintf(stderr, "hostrun: dry run: %s\n", a)
+			return 0
+		case protocol.FrameWaiting: // only an approval request gets it
+			if !ask {
+				return unexpectedFrame(stderr, f)
+			}
+			var w protocol.Waiting
+			if err := protocol.DecodeJSON(f, &w); err != nil {
+				return fail(stderr, protocol.ExitHostrunError, "%v", err)
+			}
+			fmt.Fprintf(stderr, "hostrun: %s\n", w)
+		case protocol.FrameApproved: // likewise; the run stream follows
+			if !ask {
+				return unexpectedFrame(stderr, f)
+			}
+			var a protocol.Approved
+			if err := protocol.DecodeJSON(f, &a); err != nil {
+				return fail(stderr, protocol.ExitHostrunError, "%v", err)
+			}
+			fmt.Fprintf(stderr, "hostrun: %s\n", a)
+			startStdin()
 		default:
-			return fail(stderr, protocol.ExitHostrunError, "unexpected frame type %d from the daemon", f.Type)
+			return unexpectedFrame(stderr, f)
 		}
 	}
 }
@@ -203,4 +245,9 @@ func (c *stdinCredit) stop() {
 func fail(stderr io.Writer, code int, format string, args ...any) int {
 	fmt.Fprintf(stderr, "hostrun: "+format+"\n", args...)
 	return code
+}
+
+// unexpectedFrame fails on a frame the daemon must not send at this point.
+func unexpectedFrame(stderr io.Writer, f protocol.Frame) int {
+	return fail(stderr, protocol.ExitHostrunError, "unexpected frame type %d from the daemon", f.Type)
 }

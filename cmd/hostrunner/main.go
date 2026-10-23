@@ -7,6 +7,7 @@
 //	hostrunner serve --socket <path> --workspace <host-path> --container-workspace <path>
 //	    [--config <path>] [--watch [--startup-timeout 30m] [--grace 15s]]
 //	hostrunner test [--config <path>] [--] <command> [args...]
+//	hostrunner approve --dir <runtime-dir>
 //	hostrunner update [--check]
 //	hostrunner version
 //
@@ -18,7 +19,9 @@
 // does not, and 1 on any error. `update` switches the versioned install
 // of hostrunner and hostrun to the latest release (see internal/update).
 // `version` prints the module version Go stamped into the binary (see
-// buildVersion).
+// buildVersion). `approve` runs an approval session in a host terminal: it
+// serves the daemon of the runtime directory, showing each approval request
+// and sending the human's answer (see internal/approval).
 package main
 
 import (
@@ -33,9 +36,11 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/kravlab/hostrunner/internal/approval"
 	"github.com/kravlab/hostrunner/internal/daemon"
 	"github.com/kravlab/hostrunner/internal/launch"
 	"github.com/kravlab/hostrunner/internal/protocol"
@@ -47,9 +52,10 @@ import (
 )
 
 const (
-	usage        = "usage: hostrunner up|serve|test|update|version [flags]; see `hostrunner <command> -h`"
+	usage        = "usage: hostrunner up|serve|test|approve|update|version [flags]; see `hostrunner <command> -h`"
 	upUsage      = "usage: hostrunner up --dir <runtime-dir> --workspace <host-path> --container-workspace <path>"
 	serveUsage   = "usage: hostrunner serve --socket <path> --workspace <host-path> --container-workspace <path> [--config <path>] [--watch]"
+	approveUsage = "usage: hostrunner approve --dir <runtime-dir>"
 	updateUsage  = "usage: hostrunner update [--check]"
 	versionUsage = "usage: hostrunner version"
 )
@@ -94,7 +100,8 @@ func exitCode(err error) int {
 }
 
 // run dispatches the subcommand in args; stdout receives `version`'s and
-// `update`'s output, stderr flag help, the daemon's log and the Rules
+// `update`'s output and the approval session, which reads the human's
+// answers from stdin; stderr flag help, the daemon's log and the Rules
 // test's verdict.
 // The caller prints a returned error; see exitCode for the exit code.
 func run(args []string, stdout, stderr io.Writer) error {
@@ -132,6 +139,12 @@ func run(args []string, stdout, stderr io.Writer) error {
 			return err
 		}
 		return rulesTest(cfg, stderr)
+	case "approve":
+		cfg, err := parseApprove(args[1:], stderr)
+		if err != nil {
+			return err
+		}
+		return approval.Run(ctx, cfg, os.Stdin, stdout)
 	case "update":
 		check, err := parseUpdate(args[1:], stderr)
 		if err != nil {
@@ -256,6 +269,23 @@ func parseServe(args []string, output io.Writer) (serveConfig, error) {
 	return cfg, nil
 }
 
+// parseApprove parses the flags of `hostrunner approve`: --dir, the runtime
+// directory of the daemon to serve, is required, and its approval socket
+// is beside it.
+func parseApprove(args []string, output io.Writer) (approval.Config, error) {
+	var dir string
+	fs := flag.NewFlagSet("approve", flag.ContinueOnError)
+	fs.SetOutput(output)
+	fs.StringVar(&dir, "dir", "", "runtime directory of the daemon to serve")
+	if err := parseFlags(fs, args, approveUsage); err != nil {
+		return approval.Config{}, err
+	}
+	if dir == "" {
+		return approval.Config{}, errors.New(approveUsage)
+	}
+	return approval.Config{Socket: launch.ApprovalSocket(dir)}, nil
+}
+
 // parseVersion parses the arguments of `hostrunner version`, which takes
 // none; output receives the usage for -h.
 func parseVersion(args []string, output io.Writer) error {
@@ -335,11 +365,23 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 	if err != nil {
 		return err
 	}
+	// The approval socket lies beside the runtime directory, the socket's
+	// directory, which the container mounts: the container must not reach
+	// the channel a human approves on.
+	approvalSocket := launch.ApprovalSocket(filepath.Dir(cfg.socket))
+	if err := checkApprovalSocket(cfg.workspace, approvalSocket); err != nil {
+		return err
+	}
 	l, err := transport.Unix{Path: cfg.socket}.Listen()
 	if err != nil {
 		return err
 	}
-	log.Info("listening", "socket", cfg.socket, "workspace", cfg.workspace, "container_workspace", cfg.containerWorkspace, "config", cfg.config, "rules_digest", policy.Digest(), "watch", cfg.watch)
+	al, err := transport.Unix{Path: approvalSocket}.Listen()
+	if err != nil {
+		l.Close()
+		return err
+	}
+	log.Info("listening", "socket", cfg.socket, "approval_socket", approvalSocket, "workspace", cfg.workspace, "container_workspace", cfg.containerWorkspace, "config", cfg.config, "rules_digest", policy.Digest(), "watch", cfg.watch)
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -360,7 +402,27 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 		}()
 	}
 	onArm := armHandler(policy.Digest(), cfg.config, watcher, log)
-	return daemon.New(mapper, policy, log, daemon.WithArmHandler(onArm)).Serve(ctx, l)
+	return daemon.New(mapper, policy, log, daemon.WithArmHandler(onArm), daemon.WithApprovals(al, cfg.config)).Serve(ctx, l)
+}
+
+// checkApprovalSocket refuses an approval socket inside the workspace,
+// which the container mounts and so could reach to answer its own
+// requests. Other mounts the daemon cannot see: the runtime directory
+// `hostrunner up` uses lies under $XDG_RUNTIME_DIR, which no container
+// mounts whole.
+func checkApprovalSocket(workspace, socket string) error {
+	ws, err := filepath.EvalSymlinks(workspace)
+	if err != nil {
+		return err
+	}
+	dir, err := filepath.EvalSymlinks(filepath.Dir(socket))
+	if err != nil {
+		return err
+	}
+	if rel, err := filepath.Rel(ws, dir); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("approval socket %s lies inside the workspace %s, which the container mounts", socket, workspace)
+	}
+	return nil
 }
 
 // armHandler answers the arms of `hostrunner up`, which arms the daemon on

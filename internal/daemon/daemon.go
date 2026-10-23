@@ -5,6 +5,13 @@
 // starts the command there, or in the fixed directory its rule names, with
 // the host's environment, streams its stdio over the connection and
 // finishes with the exit code. If the client disconnects, the command's process group is killed.
+//
+// With an approval socket (WithApprovals), a command the rules refuse can
+// be approved by a human: the client asks with FrameAsk, and the request
+// waits for the answer of the approval session that serves the daemon (see
+// approvals.go). The approval socket lies outside what the container
+// mounts, and takes no frames from the container's socket, nor that socket
+// any of its frames.
 package daemon
 
 import (
@@ -46,6 +53,7 @@ type Server struct {
 	requestTimeout time.Duration
 	onArm          func(protocol.Arm) (stepAside bool) // nil: arming changes nothing
 	policy         Policy
+	approvals      *approvals // nil: no approval socket, so nothing is approved
 
 	mu        sync.Mutex
 	stopServe context.CancelFunc // stops the running Serve; nil when not serving
@@ -97,6 +105,8 @@ func New(mapper *workspace.Mapper, policy Policy, log *slog.Logger, opts ...Opti
 // returns once every connection is finished. Temporary accept errors (e.g.
 // out of file descriptors) are retried with backoff. It returns nil when
 // stopped by cancellation or a step aside, and the accept error otherwise.
+// With WithApprovals it accepts approval sessions on the approval socket
+// meanwhile, and closes that socket when it stops too.
 func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -108,13 +118,24 @@ func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 		s.stopServe = nil
 		s.mu.Unlock()
 	}()
-	stop := context.AfterFunc(ctx, func() { l.Close() })
+	// The approval socket closes first: `hostrunner up` starts the next
+	// daemon once the socket is closed, and that daemon takes the approval
+	// socket too.
+	stop := context.AfterFunc(ctx, func() {
+		if s.approvals != nil {
+			s.approvals.listener.Close()
+		}
+		l.Close()
+	})
 	defer stop()
 
 	var (
 		wg      sync.WaitGroup
 		backoff time.Duration
 	)
+	if s.approvals != nil {
+		wg.Go(func() { s.serveApprovals(ctx, &wg) })
+	}
 	for {
 		conn, err := l.Accept()
 		if err != nil {
@@ -183,6 +204,10 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 		s.arm(out, f)
 		return
 	}
+	if f.Type == protocol.FrameAsk {
+		s.ask(ctx, cancel, conn, out, f)
+		return
+	}
 	if f.Type == protocol.FrameDryRun {
 		logArgs = dryRunLogArgs
 	}
@@ -206,17 +231,14 @@ var dryRunLogArgs = []any{"dry_run", true}
 // checks opened, never starting the command or reading stdin.
 func (s *Server) dryRun(out *frameWriter, req protocol.Request) {
 	p, r := s.prepare(req, true)
+	if r == nil {
+		r = lookupStart(p, req)
+	}
 	if r != nil {
 		s.reject(out, r.code, r.message, r.err, dryRunLogArgs...)
 		return
 	}
-	err := lookupProgram(p.argv[0], p.dir)
 	p.close()
-	if err != nil {
-		code, message := startFailure(req.Argv[0], err)
-		s.reject(out, code, message, err, dryRunLogArgs...)
-		return
-	}
 	s.log.Info("dry run allowed", append(append(p.logArgs(req), "rule", p.rule), dryRunLogArgs...)...)
 	_ = out.writeJSON(protocol.FrameAllowed, protocol.Allowed{Rule: p.rule, Dir: p.fixedDir, Secrets: p.secrets})
 }
@@ -300,6 +322,14 @@ func (s *Server) prepare(req protocol.Request, dryRun bool) (*prepared, *refusal
 	if err != nil {
 		return nil, &refusal{protocol.ExitRejected, err.Error(), err}
 	}
+	return s.prepareAllowed(req, allowed, dryRun)
+}
+
+// prepareAllowed runs the checks after the rules for req, a command the
+// rules allowed, or a human approved, as allowed describes: its working
+// directory, path checks, fixed directory and secrets (see prepare).
+func (s *Server) prepareAllowed(req protocol.Request, allowed rules.Allowed, dryRun bool) (*prepared, *refusal) {
+	var err error
 	p := &prepared{rule: allowed.Rule, fixedDir: allowed.Dir, secrets: allowed.SecretNames()}
 	if p.dir, p.hostPath, err = s.mapper.Open(req.Cwd); err != nil {
 		return nil, &refusal{protocol.ExitRejected, cwdMessage(req.Cwd, err), err}
@@ -351,6 +381,18 @@ func (s *Server) run(ctx context.Context, cancel context.CancelFunc, conn net.Co
 		s.reject(out, r.code, r.message, r.err)
 		return
 	}
+	s.start(ctx, cancel, conn, out, req, p, func() (protocol.Frame, error) { return protocol.ReadFrame(conn) })
+}
+
+// frameSource returns the client's next frame, or an error once the
+// connection ends.
+type frameSource func() (protocol.Frame, error)
+
+// start runs p, the prepared command of req, on the connection: it streams
+// stdio, reading the client's frames from next, and reports the exit code;
+// cancel stops it early. logArgs (slog key-value pairs) go to its log
+// lines.
+func (s *Server) start(ctx context.Context, cancel context.CancelFunc, conn net.Conn, out *frameWriter, req protocol.Request, p *prepared, next frameSource, logArgs ...any) {
 	// The command inherits the files; the daemon's copies go once it has
 	// started (p.files is cleared then), or with the request on failure.
 	defer p.close()
@@ -375,7 +417,7 @@ func (s *Server) run(ctx context.Context, cancel context.CancelFunc, conn net.Co
 	queue := newStdinQueue(protocol.StdinWindow)
 	var streams sync.WaitGroup
 	streams.Go(func() {
-		if err := readClient(conn, queue); err != nil {
+		if err := readClient(next, queue); err != nil {
 			s.reject(out, protocol.ExitHostrunError, err.Error(), err)
 		}
 		// The client is gone or broke the protocol: nobody is left to
@@ -391,10 +433,10 @@ func (s *Server) run(ctx context.Context, cancel context.CancelFunc, conn net.Co
 	_ = stderr.Flush()
 	if ctx.Err() == nil {
 		code := exitCode(cmd.ProcessState)
-		s.log.Info("command finished", append(p.logArgs(req), "code", code, "wait_error", waitErr)...)
+		s.log.Info("command finished", append(append(p.logArgs(req), logArgs...), "code", code, "wait_error", waitErr)...)
 		_ = out.writeJSON(protocol.FrameExit, protocol.Exit{Code: code})
 	} else {
-		s.log.Info("command cancelled", p.logArgs(req)...)
+		s.log.Info("command cancelled", append(p.logArgs(req), logArgs...)...)
 	}
 	conn.Close()
 	streams.Wait()
@@ -497,16 +539,19 @@ func pathMessage(name string, err error) string {
 	return fmt.Sprintf("argument %q is not a workspace file: %s", name, reason)
 }
 
-// readOpening reads the opening frame of a connection (FrameRequest,
-// FrameDryRun or FrameArm) and checks its protocol version before anything
-// else, so a frame shaped by a newer protocol is reported as a version
-// mismatch rather than a decoding error.
+// readOpening reads the opening frame of a connection to the container's
+// socket (FrameRequest, FrameDryRun, FrameAsk or FrameArm) and checks its
+// protocol version before anything else, so a frame shaped by a newer
+// protocol is reported as a version mismatch rather than a decoding error.
+// Every other frame, the approval socket's included, is refused.
 func readOpening(conn net.Conn) (protocol.Frame, error) {
 	f, err := protocol.ReadFrame(conn)
 	if err != nil {
 		return f, fmt.Errorf("read request: %w", err)
 	}
-	if f.Type != protocol.FrameRequest && f.Type != protocol.FrameDryRun && f.Type != protocol.FrameArm {
+	switch f.Type {
+	case protocol.FrameRequest, protocol.FrameDryRun, protocol.FrameAsk, protocol.FrameArm:
+	default:
 		return f, fmt.Errorf("expected a request frame, got type %d", f.Type)
 	}
 	var header struct {
@@ -587,6 +632,19 @@ func commandEnv(hostPath string, extra ...string) []string {
 // xOK is access(2)'s X_OK, which package syscall does not export.
 const xOK = 0x1
 
+// lookupStart looks the program of p, prepared for req, up as starting it
+// would (see lookupProgram). On failure it releases p and returns the
+// refusal starting it would get.
+func lookupStart(p *prepared, req protocol.Request) *refusal {
+	err := lookupProgram(p.argv[0], p.dir)
+	if err == nil {
+		return nil
+	}
+	p.close()
+	code, message := startFailure(req.Argv[0], err)
+	return &refusal{code, message, err}
+}
+
 // lookupProgram returns the error starting program in the working
 // directory dir would fail with, as far as it can be told without
 // starting it, so that startFailure classifies both alike. A name is
@@ -642,10 +700,10 @@ func exitCode(state *os.ProcessState) int {
 // stdin for feedStdin. It never blocks on the command, so a disconnect is
 // always noticed. It returns nil when the connection ends and an error when
 // the client breaks the protocol. The queue is closed either way.
-func readClient(conn net.Conn, queue *stdinQueue) error {
+func readClient(next frameSource, queue *stdinQueue) error {
 	defer queue.close()
 	for {
-		f, err := protocol.ReadFrame(conn)
+		f, err := next()
 		if err != nil {
 			return nil
 		}
@@ -753,16 +811,19 @@ func (q *stdinQueue) close() {
 }
 
 // frameWriter serializes frame writes from the stdout and stderr copiers and
-// the final status frame onto one connection.
+// the final status frame onto one connection. With a timeout, a write the
+// peer does not take within it fails instead of blocking the writer.
 type frameWriter struct {
-	mu   sync.Mutex
-	conn net.Conn
+	mu      sync.Mutex
+	conn    net.Conn
+	timeout time.Duration // 0: writes may block as long as the peer lets them
 }
 
 // write sends one frame.
 func (w *frameWriter) write(f protocol.Frame) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.setDeadline()
 	return protocol.WriteFrame(w.conn, f)
 }
 
@@ -770,7 +831,15 @@ func (w *frameWriter) write(f protocol.Frame) error {
 func (w *frameWriter) writeJSON(t protocol.FrameType, v any) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.setDeadline()
 	return protocol.WriteJSON(w.conn, t, v)
+}
+
+// setDeadline bounds the next write by w's timeout, if it has one.
+func (w *frameWriter) setDeadline() {
+	if w.timeout > 0 {
+		_ = w.conn.SetWriteDeadline(time.Now().Add(w.timeout))
+	}
 }
 
 // streamWriter turns a command's output stream into frames of one type,

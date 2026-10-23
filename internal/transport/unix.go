@@ -9,6 +9,8 @@ import (
 	"os"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // ErrAlreadyListening means another process is serving the socket path.
@@ -72,4 +74,29 @@ func removeStaleSocket(path string) error {
 		return fmt.Errorf("probe existing socket %s: %w", path, err)
 	}
 	return os.Remove(path)
+}
+
+// PeerCred returns the uid and pid of the process on the other end of conn,
+// a Unix socket connection, as the kernel recorded them when it connected
+// (SO_PEERCRED). The daemon checks the uid on its approval socket.
+func PeerCred(conn net.Conn) (uid, pid int, err error) {
+	uc, ok := conn.(*net.UnixConn)
+	if !ok {
+		return 0, 0, fmt.Errorf("peer credentials of a %T", conn)
+	}
+	raw, err := uc.SyscallConn()
+	if err != nil {
+		return 0, 0, err
+	}
+	var cred *unix.Ucred
+	var credErr error
+	if err := raw.Control(func(fd uintptr) {
+		cred, credErr = unix.GetsockoptUcred(int(fd), unix.SOL_SOCKET, unix.SO_PEERCRED)
+	}); err != nil {
+		return 0, 0, err
+	}
+	if credErr != nil {
+		return 0, 0, credErr
+	}
+	return int(cred.Uid), int(cred.Pid), nil
 }

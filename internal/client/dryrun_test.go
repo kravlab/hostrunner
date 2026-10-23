@@ -104,10 +104,11 @@ func TestDryRunChecksWorkspaceFiles(t *testing.T) {
 
 func TestDryRunRequiresACommand(t *testing.T) {
 	h := startDaemon(t)
-	got := h.run(t, containerRoot, "", "--dry-run")
-	want := result{code: protocol.ExitHostrunError, stderr: "hostrun: usage: hostrun [--dry-run] <command> [args...]\n"}
-	if got != want {
-		t.Fatalf("got %+v, want %+v", got, want)
+	want := result{code: protocol.ExitHostrunError, stderr: "hostrun: usage: hostrun [--dry-run|--ask] <command> [args...]\n"}
+	for _, flag := range []string{"--dry-run", "--ask"} {
+		if got := h.run(t, containerRoot, "", flag); got != want {
+			t.Errorf("%s: got %+v, want %+v", flag, got, want)
+		}
 	}
 }
 

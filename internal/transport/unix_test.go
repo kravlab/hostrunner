@@ -125,3 +125,40 @@ func TestUnixListenRefusesSocketOfRunningDaemon(t *testing.T) {
 	c.Close()
 	<-accepted
 }
+
+// The kernel reports who connected; with both ends in this test that is
+// this process.
+func TestPeerCredReportsTheConnectingProcess(t *testing.T) {
+	u := Unix{Path: filepath.Join(t.TempDir(), "h.sock")}
+	l, err := u.Listen()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		c, err := l.Accept()
+		if err != nil {
+			close(accepted)
+			return
+		}
+		accepted <- c
+	}()
+	c, err := u.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	server, ok := <-accepted
+	if !ok {
+		t.Fatal("accept failed")
+	}
+	defer server.Close()
+	uid, pid, err := PeerCred(server)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uid != os.Getuid() || pid != os.Getpid() {
+		t.Fatalf("PeerCred = uid %d pid %d, want uid %d pid %d", uid, pid, os.Getuid(), os.Getpid())
+	}
+}

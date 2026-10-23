@@ -38,6 +38,10 @@ func NewMapper(hostRoot, containerRoot string) (*Mapper, error) {
 	return &Mapper{hostRoot: resolved, containerRoot: filepath.Clean(containerRoot)}, nil
 }
 
+// Roots returns the workspace's real path on the host and its path in the
+// container.
+func (m *Mapper) Roots() (host, container string) { return m.hostRoot, m.containerRoot }
+
 // Open opens the host directory for containerCwd and returns it with its
 // real host path. The caller must close it.
 //

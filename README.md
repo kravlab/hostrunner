@@ -157,6 +157,58 @@ It does not read stdin, and the daemon log records it with
 (`hostrun git push --dry-run` runs git's dry run). A daemon older than
 dry runs refuses one with 125 rather than running the command.
 
+### Approvals on the host
+
+A command no rule allows can be approved by a human on the host, one
+request at a time. In a host terminal (not one inside the container),
+start an approval session for the devcontainer's runtime directory, the
+`--dir` its `initializeCommand` gives `hostrunner up`:
+
+```sh
+hostrunner approve --dir "$XDG_RUNTIME_DIR/hostrunner/<devcontainerId>"
+```
+
+It serves that devcontainer's daemon: it prints each approval request as
+it arrives, with the container directory, the argv and why the rules
+refused it, rings the terminal bell, and takes the answer, a letter and
+Enter: `r` refuses it (then an optional note for the agent), `o` approves
+this request only. Input typed before the prompt is discarded, and what
+came from the container is shown quoted, so it cannot steer the terminal.
+
+In the container, ask with `--ask` as hostrun's first argument:
+
+```sh
+hostrun --ask git rebase -i main
+# hostrun: waiting for approval on the host: no rule allows "git rebase"
+# hostrun: approved on the host: this request only
+```
+
+- A command the rules allow runs at once, without asking.
+- Approvals are on only while a session serves the daemon: without one,
+  `--ask` is refused at once with 126 and `not approved: no approval
+  session serves this devcontainer`.
+- A refusal exits 126 with `refused on the host` and the human's note
+  (`hostrun: refused on the host: use git rebase main`); a request nobody
+  answers is refused after 10 minutes (`not approved: nobody answered on
+  the host`). Ctrl+C withdraws the request.
+- A command the daemon would refuse anyway (the working directory, the
+  program) is refused at once, before anyone is asked. So is one too
+  large to show (`not approved: the request is too large to show`).
+- Approvals cover commands no rule matches, which run in the mirrored
+  directory with nothing injected. A refusal by a matching rule is
+  reported as without `--ask`.
+
+The session reaches the daemon over its approval socket,
+`<runtime directory>.approval.sock`, beside the runtime directory: the
+container mounts the runtime directory alone, so it cannot answer its own
+requests, and only the daemon's user may connect; `hostrunner serve`
+refuses to start when the approval socket would lie inside the
+workspace, and a session that stops reading (suspended) is dropped
+rather than holding up its daemon. A daemon older than
+`--ask` refuses it with 125 rather than running the command. The daemon
+log, `daemon.log` in the runtime directory, records the requests and
+answers; the container can read it.
+
 ## Rules
 
 ```yaml
@@ -471,7 +523,7 @@ How it works:
 | 0 | `--dry-run`: the command would run |
 | 128+N | the command was killed by signal N |
 | 125 | hostrun failed: daemon unreachable, protocol error, or no command given |
-| 126 | refused: denied by the rules, an argument not a workspace file, working directory outside the workspace, a rule's `dir` missing, not a directory or inside the workspace, or not executable |
+| 126 | refused: denied by the rules, an argument not a workspace file, working directory outside the workspace, a rule's `dir` missing, not a directory or inside the workspace, or not executable; with `--ask`, not approved on the host (refused, unanswered, no approval session) |
 | 127 | command not found on the host |
 | 130 | interrupted (Ctrl+C); the host command is killed |
 

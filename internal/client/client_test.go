@@ -17,6 +17,7 @@ import (
 
 	"github.com/kravlab/hostrunner/internal/client"
 	"github.com/kravlab/hostrunner/internal/daemon"
+	"github.com/kravlab/hostrunner/internal/launch"
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
 	"github.com/kravlab/hostrunner/internal/transport"
@@ -26,11 +27,14 @@ import (
 const containerRoot = "/workspaces/app"
 
 // harness is a daemon serving a temporary host workspace over a temporary
-// socket, torn down when the test ends.
+// socket, and approval sessions over its approval socket beside the
+// socket's directory, torn down when the test ends.
 type harness struct {
-	transport transport.Unix
-	hostRoot  string
-	stop      func() // shuts the daemon down; safe to call more than once
+	transport      transport.Unix
+	hostRoot       string
+	runtimeDir     string // the directory holding the socket
+	approvalSocket string
+	stop           func() // shuts the daemon down; safe to call more than once
 }
 
 // allowAll is a policy that allows every command, for tests about
@@ -66,13 +70,18 @@ func startLoggingDaemon(t *testing.T, log *slog.Logger, policies ...daemon.Polic
 	if err != nil {
 		t.Fatal(err)
 	}
+	approvalSocket := launch.ApprovalSocket(base)
+	al, err := transport.Unix{Path: approvalSocket}.Listen()
+	if err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	var p daemon.Policy = allowAll{}
 	if len(policies) > 0 {
 		p = policies[0]
 	}
-	srv := daemon.New(mapper, p, log)
+	srv := daemon.New(mapper, p, log, daemon.WithApprovals(al, filepath.Join(hostRoot, ".devcontainer", "hostrun.yaml")))
 	go func() { done <- srv.Serve(ctx, l) }()
 	stop := sync.OnceFunc(func() {
 		cancel()
@@ -81,7 +90,7 @@ func startLoggingDaemon(t *testing.T, log *slog.Logger, policies ...daemon.Polic
 		}
 	})
 	t.Cleanup(stop)
-	return harness{transport: tr, hostRoot: hostRoot, stop: stop}
+	return harness{transport: tr, hostRoot: hostRoot, runtimeDir: base, approvalSocket: approvalSocket, stop: stop}
 }
 
 // result is what the user of hostrun observes.

@@ -20,6 +20,18 @@
 // A dry run has a frame type of its own rather than a field in Request: a
 // daemon that predates it rejects the unknown frame type, where it would
 // ignore an unknown field and run the command.
+//
+// A connection opened with FrameAsk runs a command as FrameRequest does
+// when the rules allow it. When they refuse it but a human may approve it,
+// the daemon first sends FrameWaiting and then, on an approval,
+// FrameApproved and the ordinary run stream, or FrameError on a refusal;
+// the client sends no stdin until the command has started.
+//
+// The approval socket speaks its own frames (FrameHello onwards), with its
+// own version (ApprovalVersion): a session opens with FrameHello, the
+// daemon answers FrameDaemonInfo; FrameServe makes the session the one
+// that serves the daemon, which then sends it each FrameApprovalRequest
+// and takes its FrameAnswer, confirmed by FrameAnswered.
 package protocol
 
 import (
@@ -61,8 +73,22 @@ const (
 	FrameArmed                            // daemon → `hostrunner up`, JSON Armed
 	FrameDryRun                           // client → daemon, JSON Request
 	FrameAllowed                          // daemon → client, JSON Allowed
+	FrameAsk                              // client → daemon, JSON Ask
+	FrameWaiting                          // daemon → client, JSON Waiting
+	FrameApproved                         // daemon → client, JSON Approved
 
-	lastFrameType = FrameAllowed
+	// Frames of the approval socket, between an approval session and the
+	// daemon; the container's socket refuses them, and the approval socket
+	// refuses every other frame.
+	FrameHello           // session → daemon, JSON Hello
+	FrameDaemonInfo      // daemon → session, JSON DaemonInfo
+	FrameServe           // session → daemon, no payload: serve the daemon
+	FrameServing         // daemon → session, no payload: the session serves it
+	FrameApprovalRequest // daemon → session, JSON ApprovalRequest
+	FrameAnswer          // session → daemon, JSON Answer
+	FrameAnswered        // daemon → session, JSON Answered
+
+	lastFrameType = FrameAnswered
 )
 
 // Exit codes for failures of hostrun itself rather than of the command,
@@ -133,6 +159,106 @@ func (a Allowed) String() string {
 		s += ", injects secrets: " + strings.Join(a.Secrets, ", ")
 	}
 	return s
+}
+
+// Ask asks the daemon to run a command as Request does and, if the rules
+// refuse it, to ask an approval session for an approval. TimeoutMs bounds
+// how long it waits for an answer, in milliseconds; 0 is the daemon's
+// default. It has a frame type of its own for the reason a dry run has: a
+// daemon that predates it rejects the frame type instead of running the
+// command.
+type Ask struct {
+	Request
+	TimeoutMs int64 `json:"timeout_ms,omitempty"`
+}
+
+// Waiting tells the client that its command waits for a human's answer.
+// Reasons are every reason the rules refused it; Guarded is set when
+// approving it needs a second confirmation.
+type Waiting struct {
+	Reasons []string `json:"reasons"`
+	Guarded bool     `json:"guarded,omitempty"`
+}
+
+// String is the line the client prints while its command waits.
+func (w Waiting) String() string {
+	s := "waiting for approval on the host"
+	if w.Guarded {
+		s += " (guarded)"
+	}
+	return s + ": " + strings.Join(w.Reasons, "; ")
+}
+
+// Scope is how far an approval reaches.
+type Scope string
+
+// Scopes of an approval.
+const (
+	ScopeOnce Scope = "once" // this request only
+)
+
+// Approved tells the client that a human approved its command, which the
+// ordinary run stream (FrameStdinCredit, output, FrameExit) then follows.
+type Approved struct {
+	Scope Scope `json:"scope"`
+}
+
+// String is the line the client prints before the approved command runs.
+func (a Approved) String() string {
+	reach := string(a.Scope)
+	if a.Scope == ScopeOnce {
+		reach = "this request only"
+	}
+	return "approved on the host: " + reach
+}
+
+// ApprovalVersion is the version of the approval socket's protocol, which
+// the session and the daemon exchange in Hello and DaemonInfo. A session
+// serves only a daemon of its own version.
+const ApprovalVersion = 1
+
+// Hello opens a session's connection to an approval socket.
+type Hello struct {
+	Version int `json:"version"`
+}
+
+// DaemonInfo answers Hello: the daemon's approval protocol version, its
+// workspace on the host and in the container, the rules file it loaded,
+// and whether a session serves it.
+type DaemonInfo struct {
+	Version            int    `json:"version"`
+	Workspace          string `json:"workspace"`
+	ContainerWorkspace string `json:"container_workspace"`
+	RulesFile          string `json:"rules_file"`
+	Served             bool   `json:"served,omitempty"`
+}
+
+// ApprovalRequest is a command waiting for the serving session's answer.
+// ID names it in the Answer; Cwd is the container directory; Reasons and
+// Guarded are as in Waiting; TimeoutMs is the time left to answer it, in
+// milliseconds.
+type ApprovalRequest struct {
+	ID        uint64   `json:"id"`
+	Argv      []string `json:"argv"`
+	Cwd       string   `json:"cwd"`
+	Reasons   []string `json:"reasons"`
+	Guarded   bool     `json:"guarded,omitempty"`
+	TimeoutMs int64    `json:"timeout_ms"`
+}
+
+// Answer is the human's answer to the approval request ID: an approval of
+// Scope, or a refusal when Scope is empty, with Note for the agent.
+type Answer struct {
+	ID    uint64 `json:"id"`
+	Scope Scope  `json:"scope,omitempty"`
+	Note  string `json:"note,omitempty"`
+}
+
+// Answered tells the session whether the daemon took its Answer to ID;
+// Error says why not (the request was answered, withdrawn or expired).
+type Answered struct {
+	ID    uint64 `json:"id"`
+	Error string `json:"error,omitempty"`
 }
 
 // Exit reports the exit code of a command that ran.
