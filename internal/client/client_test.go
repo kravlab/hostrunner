@@ -526,6 +526,24 @@ func TestRunRejectsCommandDeniedByRules(t *testing.T) {
 	}
 }
 
+// A plain refusal and its dry run name only the first reason, though the
+// rules find every one (the Rules test lists them all).
+func TestRunAndDryRunReportTheFirstReasonOnly(t *testing.T) {
+	h := startDaemon(t, policy(t, `rules:
+  - command: sh
+    flags:
+      allow: [-c]
+    positional:
+      deny: ["+*"]
+`))
+	want := result{code: protocol.ExitRejected, stderr: "hostrun: denied by rule \"sh\": flag -x is not allowed\n"}
+	for _, argv := range [][]string{{"sh", "-x", "+script"}, {"--dry-run", "sh", "-x", "+script"}} {
+		if got := h.run(t, containerRoot, "", argv...); got != want {
+			t.Errorf("%q: got %+v, want %+v", argv, got, want)
+		}
+	}
+}
+
 func TestRunChecksRulesBeforeTheWorkingDirectory(t *testing.T) {
 	h := startDaemon(t, policy(t, echoOnly))
 	got := h.run(t, "/etc", "", "rm", "x")

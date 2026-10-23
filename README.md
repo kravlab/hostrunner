@@ -412,7 +412,7 @@ container, run the Rules test on the host, in the project root:
 
 ```sh
 hostrunner test git push -u origin main   # hostrunner: allowed by rule "git push"
-hostrunner test git push --force          # hostrunner: denied by rule "git push": flag --force is not allowed
+hostrunner test git push --force          # hostrunner: denied by rule "git push": flag --force is not allowed (approvable)
 hostrunner test --config draft.yaml -- tix pr list
 ```
 
@@ -426,6 +426,15 @@ the command is allowed, 126 when it is denied, and 1 when the file is
 missing or invalid (unlike the daemon, which denies everything without a
 file) or no command is given. Its flags end at the first argument that is
 not one of them, or at `--`.
+
+Unlike a refusal from the daemon, which names the first reason, a denied
+command's line lists every reason, joined by `; `, and ends with the class
+an approval would get: `(approvable)`, or `(guarded: approvable after a
+second confirmation)` for a deny pattern, an argv the rules cannot read
+(a flag missing its value, an abbreviated flag without `=`, an ambiguous
+abbreviation, a value for a flag that takes none, tokens Go flag parsers
+read differently) or a rule with secrets. A failed path check
+makes a refusal guarded too, but the Rules test does no path checks.
 
 How it works:
 

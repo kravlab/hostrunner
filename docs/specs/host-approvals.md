@@ -43,7 +43,9 @@ from `protocol.Version` of the container's socket.
   - a failed path check;
   - an argv the rules cannot read: a flag missing its value, an
     abbreviated flag without `=`, an ambiguous abbreviation, a value given
-    to a flag that takes none;
+    to a flag that takes none, and, under `flag_style: go`, tokens the Go
+    flag parsers read differently (more than two dashes, a value flag in
+    a cluster, a value they disagree on, a path check on such a token);
   - a rule with secrets, which approving would inject.
 - **Not approvable**, refused at once with today's code and message and no
   hint: the container directory outside the workspace or unavailable on

@@ -37,7 +37,9 @@ func parseTest(args []string, output io.Writer) (testConfig, error) {
 // rulesTest runs the Rules test: it tests cfg.argv against the rules file
 // alone, with no daemon or container, and reports the allowing rule and
 // its fixed directory on stderr. A denied command is an exitError with
-// protocol.ExitRejected, as hostrun exits when the daemon denies it.
+// protocol.ExitRejected, as hostrun exits when the daemon denies it; its
+// message lists every reason, not only the first a refusal reports, and
+// the class an approval session would put it in (see denialClass).
 // Unlike the daemon, it takes a missing file for an error; an invalid one
 // fails as in `hostrunner up`.
 func rulesTest(cfg testConfig, stderr io.Writer) error {
@@ -46,6 +48,10 @@ func rulesTest(cfg testConfig, stderr io.Writer) error {
 		return fmt.Errorf("rules file: %w", err)
 	}
 	allowed, err := policy.Check(cfg.argv)
+	var d *rules.Denial
+	if errors.As(err, &d) && d.Approvable() {
+		err = fmt.Errorf("%s (%s)", d.Explain(), denialClass(d))
+	}
 	if err != nil {
 		return &exitError{code: protocol.ExitRejected, err: err}
 	}
@@ -53,4 +59,15 @@ func rulesTest(cfg testConfig, stderr io.Writer) error {
 	// the secrets' sources: those need the workspace and the host.
 	_, err = fmt.Fprintf(stderr, "hostrunner: %s\n", protocol.Allowed{Rule: allowed.Rule, Dir: allowed.Dir, Secrets: allowed.SecretNames()})
 	return err
+}
+
+// denialClass names the class of an approvable refusal, as judged from the
+// rules file alone: guarded when approving it needs a second confirmation.
+// The path checks, which need the workspace, can make a refusal guarded
+// too; the Rules test does not perform them.
+func denialClass(d *rules.Denial) string {
+	if d.Guarded() {
+		return "guarded: approvable after a second confirmation"
+	}
+	return "approvable"
 }
