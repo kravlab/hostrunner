@@ -336,11 +336,11 @@ func ContentDigest(data []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// FileDigest returns the digest Load gives the rules file at path (see
-// Policy.Digest), and the file's content: no content, with the digest of
-// no file, when it is missing.
-func FileDigest(path string) (string, []byte, error) {
-	data, err := os.ReadFile(path)
+// FileDigest returns the digest of the rules file name in fsys, the one
+// Load gives the file it loads (see Policy.Digest), and the file's
+// content: no content, with the digest of no file, when it is missing.
+func FileDigest(fsys fs.FS, name string) (string, []byte, error) {
+	data, err := fs.ReadFile(fsys, name)
 	if errors.Is(err, fs.ErrNotExist) {
 		return missingDigest, nil, nil
 	}

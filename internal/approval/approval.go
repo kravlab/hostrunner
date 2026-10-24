@@ -199,6 +199,7 @@ func (t *term) serveDaemon(ctx context.Context, socket string, takeOver, canList
 	s.prompt(idlePrompt)
 	frames := readDaemon(conn, done)
 	end, err := s.loop(ctx, frames)
+	s.dropAddition()
 	hangUp(conn, frames)
 	return end, err
 }
@@ -613,7 +614,7 @@ func (s *session) withdrawn(w protocol.Withdrawn) {
 		fmt.Fprintf(s.out, "\nrequest %d %s\n", w.ID, w.Reason)
 		s.note, s.confirm = false, ""
 		if !s.rereading {
-			s.adding = nil
+			s.dropAddition()
 		}
 		s.next()
 	}

@@ -523,3 +523,165 @@ func TestAddRuleWritesThroughASymbolicLink(t *testing.T) {
 		t.Fatalf("the target lacks the rule:\n%s", file)
 	}
 }
+
+// A rules file swapped for a symbolic link after the proposal, to a file
+// outside its directory with the same content, is not written through:
+// the file the link points to stays as it was.
+func TestAddRuleWritesNothingThroughAFileSwappedForALink(t *testing.T) {
+	const content = "rules:\n  - command: echo\n    args: any\n"
+	h := startRulesDaemon(t, slog.New(slog.DiscardHandler), content, false)
+	outside := filepath.Join(t.TempDir(), "other.yaml")
+	if err := os.WriteFile(outside, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := h.startSession(t)
+	ch := h.ask(t, "touch", "-a", "marker")
+	s.waitFor(t, answerPromptText)
+	s.answer(t, "a")
+	s.waitFor(t, addPromptText)
+	if err := os.Remove(h.rulesFile); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, h.rulesFile); err != nil {
+		t.Fatal(err)
+	}
+	s.answer(t, "w")
+	s.waitFor(t, "nothing written: the rules file was swapped for a link out of its directory\n")
+	s.waitFor(t, answerPromptText)
+	s.answer(t, "o")
+	awaitResult(t, ch)
+	if file := readFile(t, outside); file != content {
+		t.Fatalf("the file the link points to is\n%s\nwant it untouched", file)
+	}
+}
+
+// A rules file's directory swapped for a symbolic link after the
+// proposal, to a directory holding a file of the same content, is not
+// written through: the rule goes to the directory the proposal read.
+func TestAddRuleWritesNothingThroughADirectorySwappedForALink(t *testing.T) {
+	const content = "rules:\n  - command: echo\n    args: any\n"
+	h := startRulesDaemon(t, slog.New(slog.DiscardHandler), content, false)
+	other := t.TempDir()
+	if err := os.WriteFile(filepath.Join(other, filepath.Base(h.rulesFile)), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := h.startSession(t)
+	ch := h.ask(t, "touch", "-a", "marker")
+	s.waitFor(t, answerPromptText)
+	s.answer(t, "a")
+	s.waitFor(t, addPromptText)
+	dir := filepath.Dir(h.rulesFile)
+	if err := os.Rename(dir, dir+".real"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(other, dir); err != nil {
+		t.Fatal(err)
+	}
+	s.answer(t, "w")
+	s.waitFor(t, "rule added, but the daemon kept its old rules: the rules file changed since the session wrote it · request 1 runs once\n")
+	if got := awaitResult(t, ch); !strings.HasSuffix(got.stderr, "hostrun: approved on the host: this request only\n") || got.code != 0 {
+		t.Fatalf("got %+v, want it approved once", got)
+	}
+	if file := readFile(t, filepath.Join(other, filepath.Base(h.rulesFile))); file != content {
+		t.Fatalf("the file in the directory linked to is\n%s\nwant it untouched", file)
+	}
+	if file := readFile(t, filepath.Join(dir+".real", filepath.Base(h.rulesFile))); !strings.Contains(file, "- command: touch") {
+		t.Fatalf("the directory the proposal read lacks the rule:\n%s", file)
+	}
+}
+
+// A rules file swapped after the proposal for a link to another file in
+// its directory is replaced by a regular file with the mode of the file
+// linked to; that file stays as it was.
+func TestAddRuleKeepsTheModeThroughALinkSwappedInItsDirectory(t *testing.T) {
+	const content = "rules:\n  - command: echo\n    args: any\n"
+	var sibling string
+	h := startRulesDaemonWith(t, slog.New(slog.DiscardHandler), false, func(rulesFile string) {
+		if err := os.WriteFile(rulesFile, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		sibling = filepath.Join(filepath.Dir(rulesFile), "copy.yaml")
+		if err := os.WriteFile(sibling, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	})
+	s := h.startSession(t)
+	ch := h.ask(t, "touch", "-a", "marker")
+	s.waitFor(t, answerPromptText)
+	s.answer(t, "a")
+	s.waitFor(t, addPromptText)
+	if err := os.Remove(h.rulesFile); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("copy.yaml", h.rulesFile); err != nil {
+		t.Fatal(err)
+	}
+	s.answer(t, "w")
+	s.waitFor(t, "rule added; the daemon reloaded the rules · request 1 runs under it\n")
+	awaitResult(t, ch)
+	fi, err := os.Lstat(h.rulesFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fi.Mode().IsRegular() || fi.Mode().Perm() != 0o600 {
+		t.Errorf("the rules file has mode %v, want a regular file with mode 0600", fi.Mode())
+	}
+	if file := readFile(t, sibling); file != content {
+		t.Errorf("the file linked to is\n%s\nwant it untouched", file)
+	}
+}
+
+// A rules file reached through a symbolic link shows, with the proposal,
+// the file it writes; one reached directly does not.
+func TestAddRuleShowsTheFileItWritesThroughALink(t *testing.T) {
+	h := startRulesDaemonWith(t, slog.New(slog.DiscardHandler), false, func(rulesFile string) {
+		target := filepath.Join(filepath.Dir(rulesFile), "rules.yaml")
+		if err := os.WriteFile(target, []byte("rules:\n  - command: echo\n    args: any\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("rules.yaml", rulesFile); err != nil {
+			t.Fatal(err)
+		}
+	})
+	s := h.startSession(t)
+	ch := h.ask(t, "touch", "-a", "marker")
+	s.waitFor(t, answerPromptText)
+	s.answer(t, "a")
+	if block := s.waitFor(t, addPromptText); !strings.Contains(block, "writes .devcontainer/rules.yaml\n") {
+		t.Errorf("the block %q does not show the file it writes", block)
+	}
+	s.answer(t, "c")
+	s.waitFor(t, answerPromptText)
+	s.answer(t, "o")
+	awaitResult(t, ch)
+
+	direct := startRulesDaemon(t, slog.New(slog.DiscardHandler), "rules:\n  - command: echo\n    args: any\n", false)
+	ds := direct.startSession(t)
+	dch := direct.ask(t, "touch", "-a", "marker")
+	ds.waitFor(t, answerPromptText)
+	ds.answer(t, "a")
+	if block := ds.waitFor(t, addPromptText); strings.Contains(block, "writes ") {
+		t.Errorf("the block %q shows the file it writes, which the diff names", block)
+	}
+	ds.answer(t, "c")
+	ds.waitFor(t, answerPromptText)
+	ds.answer(t, "o")
+	awaitResult(t, dch)
+}
+
+// Without the rules file's directory no rule is proposed: the session says
+// why and asks for the answer again.
+func TestAddRuleWithoutTheRulesDirectorySaysSo(t *testing.T) {
+	h := startRulesDaemon(t, slog.New(slog.DiscardHandler), "", false)
+	if err := os.Remove(filepath.Dir(h.rulesFile)); err != nil {
+		t.Fatal(err)
+	}
+	s := h.startSession(t)
+	ch := h.ask(t, "touch", "-a", "marker")
+	s.waitFor(t, answerPromptText)
+	s.answer(t, "a")
+	s.waitFor(t, "cannot add a rule: the rules file's directory does not exist\n")
+	s.waitFor(t, answerPromptText)
+	s.answer(t, "o")
+	awaitResult(t, ch)
+}

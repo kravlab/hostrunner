@@ -234,7 +234,8 @@ later check (a fixed directory missing). A rule is added only while the file
 on disk is the one the daemon serves, and written only when it has not
 changed since the proposal: an edit of the file by hand never goes live
 with a rule, but at the next container start. A rule sharing YAML
-anchors or aliases is not widened.
+anchors or aliases is not widened. A missing rules file is created, but
+not its directory.
 
 In the container, ask with `--ask` as hostrun's first argument:
 
@@ -601,6 +602,12 @@ How it works:
   opened, not re-resolved, when the command starts, so a symlink swapped
   in by the container cannot redirect it.
   Symlinks inside the workspace must be relative.
+- A rule added from the approval session is written into the directory
+  the rules file was read from for the proposal, kept open meanwhile: a
+  symlink swapped in for the file or its directory after the proposal
+  cannot redirect the write. Links in the rules file's path at the
+  proposal are followed; when they lead off the configured path, the
+  proposal shows the file it writes (`writes …`).
 
 ## Exit codes
 

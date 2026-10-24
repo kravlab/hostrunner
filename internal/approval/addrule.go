@@ -4,9 +4,12 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
@@ -17,7 +20,8 @@ import (
 // proposal's or the human's edit of it (edited); and base, the digest of
 // the file the proposal was computed against, which the file must still
 // have when it is written. invalid is set while an edit is not a rules
-// file allowing the request, which is never written.
+// file allowing the request, which is never written. file is the rules
+// file as the proposal read it, where it is written.
 type addition struct {
 	id      uint64
 	rule    string
@@ -25,6 +29,65 @@ type addition struct {
 	base    string
 	edited  bool
 	invalid bool
+	file    *rulesFileAt
+}
+
+// dropAddition ends the rule being added, if any, releasing its file's
+// directory.
+func (s *session) dropAddition() {
+	if s.adding != nil {
+		s.adding.file.close()
+		s.adding = nil
+	}
+}
+
+// rulesFileAt is the rules file name in dir, a directory opened once, when
+// a proposal reads the file: the file is checked and written there, so
+// neither the file nor its directory swapped for a symbolic link
+// meanwhile redirects the write. path is where the file lies, symbolic
+// links resolved when dir was opened.
+type rulesFileAt struct {
+	dir  *os.Root
+	name string
+	path string
+}
+
+// openRules opens the directory of the rules file at path, its symbolic
+// links resolved (a missing file's in its directory's path).
+func openRules(path string) (*rulesFileAt, error) {
+	resolved, err := filepath.EvalSymlinks(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		var dir string
+		if dir, err = filepath.EvalSymlinks(filepath.Dir(path)); err == nil {
+			resolved = filepath.Join(dir, filepath.Base(path))
+		}
+	}
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, errors.New("the rules file's directory does not exist")
+	}
+	if err != nil {
+		return nil, err
+	}
+	dir, err := os.OpenRoot(filepath.Dir(resolved))
+	if err != nil {
+		return nil, err
+	}
+	return &rulesFileAt{dir: dir, name: filepath.Base(resolved), path: resolved}, nil
+}
+
+// close releases the file's directory.
+func (f *rulesFileAt) close() { f.dir.Close() }
+
+// digest returns the file's digest and content (see rules.FileDigest). A
+// file swapped for a link out of its directory cannot be read: os.Root
+// reports that escape without an errno.
+func (f *rulesFileAt) digest() (string, []byte, error) {
+	digest, data, err := rules.FileDigest(f.dir.FS(), f.name)
+	var errno syscall.Errno
+	if err != nil && !errors.As(err, &errno) {
+		return "", nil, errors.New("the rules file was swapped for a link out of its directory")
+	}
+	return digest, data, err
 }
 
 // guarded reports whether approving w needs a second confirmation; a
@@ -46,7 +109,14 @@ func (s *session) askAnswer() {
 // waits for the next container start, rather than going live with the
 // rule. When there is no edit, it says why and asks for the answer again.
 func (s *session) proposeRule(r waiting) {
-	digest, data, err := rules.FileDigest(s.rulesFile)
+	var (
+		digest string
+		data   []byte
+	)
+	file, err := openRules(s.rulesFile)
+	if err == nil {
+		digest, data, err = file.digest()
+	}
 	if err == nil && s.rulesDigest != "" && digest != s.rulesDigest {
 		err = errors.New("the rules file changed since the daemon loaded it; the change takes effect at the next container start")
 	}
@@ -55,12 +125,19 @@ func (s *session) proposeRule(r waiting) {
 		p, err = rules.Propose(data, s.rulesName(), r.Argv)
 	}
 	if err != nil {
+		if file != nil {
+			file.close()
+		}
 		fmt.Fprintf(s.out, "cannot add a rule: %s\n", display(err.Error()))
 		s.askAnswer()
 		return
 	}
 	s.printDiff(p.Diff)
-	s.adding = &addition{id: r.ID, rule: p.Rule, data: p.Data, base: digest}
+	if file.path != s.rulesFile {
+		// A link on the way: the diff names the file the daemon reads.
+		fmt.Fprintf(s.out, "writes %s\n", display(s.shownPath(file.path)))
+	}
+	s.adding = &addition{id: r.ID, rule: p.Rule, data: p.Data, base: digest, file: file}
 	s.prompt(addPrompt)
 }
 
@@ -77,7 +154,7 @@ func (s *session) addTyped(r waiting, text string) {
 	case "e":
 		s.editRule(r)
 	case "c":
-		s.adding = nil
+		s.dropAddition()
 		s.askAnswer()
 	default:
 		s.prompt(s.asking)
@@ -87,19 +164,20 @@ func (s *session) addTyped(r waiting, text string) {
 // writeRule writes the rule being added into the rules file and asks the
 // daemon to reread it; the daemon's result answers the request (see
 // reread). A file that changed since the proposal is not overwritten, and
-// a failed write goes back to the answer.
+// a failed write goes back to the answer. The file is checked and written
+// in the directory the proposal read it from (see addition).
 func (s *session) writeRule() {
 	a := s.adding
-	digest, _, err := rules.FileDigest(s.rulesFile)
+	digest, _, err := a.file.digest()
 	if err == nil && digest != a.base {
 		err = errors.New("the rules file changed since the proposal")
 	}
 	if err == nil {
-		err = writeRules(s.rulesFile, a.data)
+		err = a.file.write(a.data)
 	}
 	if err != nil {
 		fmt.Fprintf(s.out, "nothing written: %s\n", display(err.Error()))
-		s.adding = nil
+		s.dropAddition()
 		s.askAnswer()
 		return
 	}
@@ -155,7 +233,8 @@ func (s *session) editRule(r waiting) {
 // answer.
 func (s *session) reread(res protocol.RereadResult) {
 	a := s.adding
-	s.adding, s.rereading = nil, false
+	s.dropAddition()
+	s.rereading = false
 	if a == nil {
 		return
 	}
@@ -196,32 +275,33 @@ func (s *session) printDiff(diff string) {
 	}
 }
 
-// rulesName names the rules file as the diff shows it: relative to the
-// daemon's host workspace when it lies inside it.
-func (s *session) rulesName() string {
-	if rel, err := filepath.Rel(s.workspace, s.rulesFile); err == nil && filepath.IsLocal(rel) {
+// rulesName names the rules file as the diff shows it (see shownPath).
+func (s *session) rulesName() string { return s.shownPath(s.rulesFile) }
+
+// shownPath shows path relative to the daemon's host workspace when it
+// lies inside it.
+func (s *session) shownPath(path string) string {
+	if rel, err := filepath.Rel(s.workspace, path); err == nil && filepath.IsLocal(rel) {
 		return rel
 	}
-	return s.rulesFile
+	return path
 }
 
-// writeRules replaces the rules file at path, or the file a symbolic link
-// there points to, with data at once: written to a temporary file beside
-// it, with its mode, synced and renamed over it, so the daemon never reads
-// half a file.
-func writeRules(path string, data []byte) error {
-	if real, err := filepath.EvalSymlinks(path); err == nil {
-		path = real
-	}
+// write replaces the file with data at once: written to a temporary file
+// beside it, with its mode, synced and renamed over it, so the daemon
+// never reads half a file. A symbolic link there is replaced, not
+// followed out of the directory; the mode is that of the file it points
+// to in the directory.
+func (f *rulesFileAt) write(data []byte) error {
 	mode := fs.FileMode(0o644)
-	if fi, err := os.Stat(path); err == nil {
+	if fi, err := f.dir.Stat(f.name); err == nil {
 		mode = fi.Mode().Perm()
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*")
+	tmp, tmpName, err := f.createTemp()
 	if err != nil {
 		return err
 	}
-	defer os.Remove(tmp.Name())
+	defer f.dir.Remove(tmpName)
 	for _, step := range []func() error{
 		func() error { _, err := tmp.Write(data); return err },
 		func() error { return tmp.Chmod(mode) },
@@ -235,5 +315,18 @@ func writeRules(path string, data []byte) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), path)
+	return f.dir.Rename(tmpName, f.name)
+}
+
+// createTemp creates a new temporary file beside the file, trying another
+// name while one is taken.
+func (f *rulesFileAt) createTemp() (*os.File, string, error) {
+	for range 10 {
+		name := "." + f.name + "." + strconv.FormatUint(rand.Uint64(), 36)
+		tmp, err := f.dir.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if !errors.Is(err, fs.ErrExist) {
+			return tmp, name, err
+		}
+	}
+	return nil, "", errors.New("no free name for a temporary file beside the rules file")
 }

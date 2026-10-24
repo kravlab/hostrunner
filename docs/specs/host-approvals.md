@@ -218,12 +218,16 @@ from `protocol.Version` of the container's socket.
   file edited by hand since is refused, so its change waits for the next
   start rather than going live unreviewed with the rule. A rule holding
   YAML anchors or aliases is not widened, as its lists may be other
-  rules' too. A missing file is created with `rules:` and the rule. Only the touched
+  rules' too. A missing file is created with `rules:` and the rule; without
+  its directory no rule is proposed. Only the touched
   rule's lines change, or the rule is appended. The result, also after the
   editor, must parse as `hostrunner up` parses it and allow the approved
   argv; an invalid result is never written, and the human edits again or
   cancels. The write goes to a temporary file in the same directory,
-  renamed over the original.
+  renamed over the original. That directory is opened when the proposal
+  reads the file, the path's symbolic links resolved then, and the check
+  and the write go through it; when the links lead off the configured
+  path, the proposal shows `writes <file>` under the diff.
 - Then the session tells the daemon to reread the file. The daemon checks
   it and serves new requests with the new rules and their digest, so the
   next arm does not step aside and standing approvals stay; running
@@ -413,6 +417,15 @@ revoked 1
   the connection closes; standing approvals are gone.
 - The rules file changes between the proposal and the write: nothing is
   written, and the session asks for the answer again.
+- The rules file or its directory swapped for a symlink between the
+  proposal and the write: the write goes to the directory the proposal
+  read, kept open meanwhile, never through the link. A directory swapped
+  so: the daemon rereads another file and keeps its old rules (`rule
+  added, but the daemon kept its old rules: … · request 9 runs once`). A
+  file swapped for a link out of that directory: `nothing written: the
+  rules file was swapped for a link out of its directory`. A file swapped
+  for a link to another file in it: that link is replaced by a regular
+  file, with the mode of the file it pointed to.
 - A failed reread after a write: the request runs once, the old rules
   stay, the session says so.
 - A rule edited by hand that the rules allow but a later check refuses
