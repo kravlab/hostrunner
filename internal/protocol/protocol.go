@@ -31,7 +31,8 @@
 // own version (ApprovalVersion): a session opens with FrameHello, the
 // daemon answers FrameDaemonInfo; FrameServe makes the session the one
 // that serves the daemon, which then sends it each FrameApprovalRequest
-// and takes its FrameAnswer, confirmed by FrameAnswered.
+// and takes its FrameAnswer, confirmed by FrameAnswered, or tells it with
+// FrameWithdrawn that a request ended unanswered.
 package protocol
 
 import (
@@ -87,8 +88,9 @@ const (
 	FrameApprovalRequest // daemon → session, JSON ApprovalRequest
 	FrameAnswer          // session → daemon, JSON Answer
 	FrameAnswered        // daemon → session, JSON Answered
+	FrameWithdrawn       // daemon → session, JSON Withdrawn
 
-	lastFrameType = FrameAnswered
+	lastFrameType = FrameWithdrawn
 )
 
 // Exit codes for failures of hostrun itself rather than of the command,
@@ -259,10 +261,29 @@ type Answer struct {
 
 // Answered tells the session whether the daemon took its Answer to ID;
 // Error says why not (the request was answered, withdrawn or expired).
+// Ended is the Withdrawn reason of a request that ended as the answer came,
+// when the daemon has not finished telling the session of it, so the
+// session reports the end whichever frame comes first.
 type Answered struct {
 	ID    uint64 `json:"id"`
 	Error string `json:"error,omitempty"`
+	Ended string `json:"ended,omitempty"`
 }
+
+// Withdrawn tells the session that request ID ended unanswered, for
+// Reason: WithdrawnByClient or WithdrawnExpired. It takes no answer any
+// more.
+type Withdrawn struct {
+	ID     uint64 `json:"id"`
+	Reason string `json:"reason"`
+}
+
+// Reasons a request ends unanswered, as Withdrawn and the daemon log give
+// them.
+const (
+	WithdrawnByClient = "withdrawn" // the client went away
+	WithdrawnExpired  = "expired"   // its limit ran out
+)
 
 // Exit reports the exit code of a command that ran.
 type Exit struct {

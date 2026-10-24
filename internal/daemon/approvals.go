@@ -21,6 +21,9 @@ import (
 // when the client sets no limit.
 const defaultAskTimeout = 10 * time.Minute
 
+// maxAskTimeout is the longest limit a client may set on the wait.
+const maxAskTimeout = time.Hour
+
 // sessionWriteTimeout bounds a write to an approval session. A session
 // that does not take a frame within it (suspended, its terminal stopped)
 // is taken for gone, so it holds up neither requests nor other sessions.
@@ -33,14 +36,17 @@ const (
 	noSessionMessage  = "not approved: no approval session serves this devcontainer"
 	unansweredMessage = "not approved: nobody answered on the host"
 	tooLargeMessage   = "not approved: the request is too large to show"
+	stoppingMessage   = "not approved: the hostrunner daemon is stopping"
 )
 
 // Errors for the log, beside the messages above.
 var (
-	errRefused    = errors.New("refused by the human")
-	errNoSession  = errors.New("no approval session serves the daemon")
-	errUnanswered = errors.New("nobody answered the approval request")
-	errTooLarge   = errors.New("the approval request exceeds a frame")
+	errRefused     = errors.New("refused by the human")
+	errNoSession   = errors.New("no approval session serves the daemon")
+	errUnanswered  = errors.New("nobody answered the approval request")
+	errTooLarge    = errors.New("the approval request exceeds a frame")
+	errSessionLeft = errors.New("the approval session left")
+	errStopping    = errors.New("the daemon stops")
 )
 
 // WithApprovals makes the Server take approval sessions on l, its approval
@@ -49,7 +55,7 @@ var (
 // stops. Without it, nothing is approved.
 func WithApprovals(l net.Listener, rulesFile string) Option {
 	return func(s *Server) {
-		s.approvals = &approvals{listener: l, rulesFile: rulesFile, waiting: map[uint64]*approvalRequest{}}
+		s.approvals = &approvals{listener: l, rulesFile: rulesFile, waiting: map[uint64]*approvalRequest{}, telling: map[uint64]endReason{}}
 	}
 }
 
@@ -63,6 +69,8 @@ type approvals struct {
 	serving *sessionConn // nil while no session serves the daemon
 	lastID  uint64
 	waiting map[uint64]*approvalRequest
+	// telling holds the requests that ended while the session is told so.
+	telling map[uint64]endReason
 }
 
 // sessionConn is a connected approval session: its connection, where its
@@ -74,20 +82,60 @@ type sessionConn struct {
 	pid  int
 }
 
-// approvalRequest is a request waiting for an answer, which arrives once on
-// answers.
+// approvalRequest is a request waiting for its outcome, which arrives once
+// on done: the answer of the session it was sent to, or why it ended
+// unanswered. Whatever ends it first is its outcome; the rest find it no
+// longer waiting.
 type approvalRequest struct {
-	answers chan protocol.Answer
+	session *sessionConn
+	done    chan outcome
+}
+
+// outcome is how an approval request ended: the human's answer, or, when
+// ended is set, why it got none.
+type outcome struct {
+	answer protocol.Answer
+	ended  endReason
+}
+
+// endReason is why an approval request ended unanswered.
+type endReason string
+
+// Reasons an approval request ends unanswered; the daemon log gives them.
+const (
+	endedWithdrawn   endReason = protocol.WithdrawnByClient // the client went away
+	endedExpired     endReason = protocol.WithdrawnExpired  // its limit ran out
+	endedSessionLeft endReason = "session left"             // its session left
+	endedStopping    endReason = "daemon stopping"          // the daemon stops or steps aside
+)
+
+// told reports whether the session is told of the end (FrameWithdrawn): it
+// still shows the request, while a session that left or a stopping daemon
+// takes it along.
+func (r endReason) told() bool { return r == endedWithdrawn || r == endedExpired }
+
+// refusal is what the client of a request that ended for r is told, or nil
+// when it went away.
+func (r endReason) refusal() *refusal {
+	switch r {
+	case endedExpired:
+		return &refusal{protocol.ExitRejected, unansweredMessage, errUnanswered}
+	case endedSessionLeft:
+		return &refusal{protocol.ExitRejected, refusedMessage, errSessionLeft}
+	case endedStopping:
+		return &refusal{protocol.ExitRejected, stoppingMessage, errStopping}
+	}
+	return nil
 }
 
 // enqueue registers msg as a new approval request and sends it to the
-// serving session. It returns the request's id and where its answer
-// arrives, or errNoSession when no session serves the daemon or the
-// session does not take the request (it is then taken for gone and its
-// connection closed), or errTooLarge when the request exceeds a frame.
-// The write happens outside the lock, so a slow session holds up only the
-// request it is sent.
-func (a *approvals) enqueue(msg protocol.ApprovalRequest) (uint64, <-chan protocol.Answer, error) {
+// serving session. It returns the request's id and the request, whose
+// outcome arrives on its done channel, or errNoSession when no session
+// serves the daemon or the session does not take the request (it is then
+// taken for gone and its connection closed), or errTooLarge when the
+// request exceeds a frame. The write happens outside the lock, so a slow
+// session holds up only the request it is sent.
+func (a *approvals) enqueue(msg protocol.ApprovalRequest) (uint64, *approvalRequest, error) {
 	a.mu.Lock()
 	c := a.serving
 	if c == nil {
@@ -96,11 +144,13 @@ func (a *approvals) enqueue(msg protocol.ApprovalRequest) (uint64, <-chan protoc
 	}
 	a.lastID++
 	msg.ID = a.lastID
-	r := &approvalRequest{answers: make(chan protocol.Answer, 1)}
+	r := &approvalRequest{session: c, done: make(chan outcome, 1)}
 	a.waiting[msg.ID] = r
 	a.mu.Unlock()
 	if err := c.out.writeJSON(protocol.FrameApprovalRequest, msg); err != nil {
-		a.withdraw(msg.ID)
+		a.mu.Lock()
+		delete(a.waiting, msg.ID)
+		a.mu.Unlock()
 		if errors.Is(err, protocol.ErrPayloadTooLarge) {
 			return 0, nil, errTooLarge
 		}
@@ -108,34 +158,57 @@ func (a *approvals) enqueue(msg protocol.ApprovalRequest) (uint64, <-chan protoc
 		c.conn.Close()
 		return 0, nil, errNoSession
 	}
-	return msg.ID, r.answers, nil
+	return msg.ID, r, nil
 }
 
-// withdraw drops request id: it takes no answer any more.
-func (a *approvals) withdraw(id uint64) {
+// end ends request id, r, unanswered for reason, unless something else
+// ended it first, and returns its outcome. A session still serving is told
+// when the reason says so. Until it is told, an answer it sends for the
+// request learns the reason from answer, so the session reports the end
+// whichever frame reaches it first.
+func (a *approvals) end(id uint64, r *approvalRequest, reason endReason) outcome {
 	a.mu.Lock()
-	defer a.mu.Unlock()
-	delete(a.waiting, id)
+	_, waiting := a.waiting[id]
+	if waiting {
+		delete(a.waiting, id)
+		r.done <- outcome{ended: reason}
+	}
+	tell := waiting && reason.told() && a.serving == r.session
+	if tell {
+		a.telling[id] = reason
+	}
+	a.mu.Unlock()
+	if tell {
+		if err := r.session.out.writeJSON(protocol.FrameWithdrawn, protocol.Withdrawn{ID: id, Reason: string(reason)}); err != nil {
+			// As in enqueue: a session that does not take it is gone.
+			r.session.conn.Close()
+		}
+		a.mu.Lock()
+		delete(a.telling, id)
+		a.mu.Unlock()
+	}
+	return <-r.done
 }
 
 // answer delivers ans from session c to its request and returns why it was
-// not taken, or "".
-func (a *approvals) answer(c *sessionConn, ans protocol.Answer) string {
+// not taken, or "", and, for a request that ended unanswered while the
+// session is being told so, the reason (see end).
+func (a *approvals) answer(c *sessionConn, ans protocol.Answer) (string, endReason) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.serving != c {
-		return "this session does not serve the daemon"
+		return "this session does not serve the daemon", ""
 	}
 	if ans.Scope != "" && ans.Scope != protocol.ScopeOnce {
-		return fmt.Sprintf("unknown scope %q", ans.Scope)
+		return fmt.Sprintf("unknown scope %q", ans.Scope), ""
 	}
 	r, ok := a.waiting[ans.ID]
 	if !ok {
-		return fmt.Sprintf("request %d is not waiting any more", ans.ID)
+		return fmt.Sprintf("request %d is not waiting any more", ans.ID), a.telling[ans.ID]
 	}
 	delete(a.waiting, ans.ID)
-	r.answers <- ans
-	return ""
+	r.done <- outcome{answer: ans}
+	return "", ""
 }
 
 // serve makes c the session that serves the daemon and returns why not, or
@@ -150,10 +223,19 @@ func (a *approvals) serve(c *sessionConn) string {
 	return ""
 }
 
-// leave drops c, if it served the daemon, and reports whether it did.
-func (a *approvals) leave(c *sessionConn) bool {
+// leave drops c, if it served the daemon, and reports whether it did. Every
+// request still waiting for c's answer ends unanswered for reason
+// (endedSessionLeft, or endedStopping when c leaves because the daemon
+// stops): nobody else would see it.
+func (a *approvals) leave(c *sessionConn, reason endReason) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	for id, r := range a.waiting {
+		if r.session == c {
+			delete(a.waiting, id)
+			r.done <- outcome{ended: reason}
+		}
+	}
 	if a.serving != c {
 		return false
 	}
@@ -230,7 +312,13 @@ func (s *Server) handleSession(ctx context.Context, conn net.Conn) {
 		RulesFile: s.approvals.rulesFile, Served: s.approvals.served(),
 	})
 	defer func() {
-		if s.approvals.leave(c) {
+		// The daemon stopping closes the connection too: its requests end
+		// for that, not for the session leaving.
+		reason := endedSessionLeft
+		if ctx.Err() != nil {
+			reason = endedStopping
+		}
+		if s.approvals.leave(c, reason) {
 			s.log.Info("approval session left", "pid", pid)
 		}
 	}()
@@ -257,7 +345,8 @@ func (s *Server) handleSession(ctx context.Context, conn net.Conn) {
 				s.sessionRefused(out, pid, err)
 				return
 			}
-			_ = out.writeJSON(protocol.FrameAnswered, protocol.Answered{ID: ans.ID, Error: s.approvals.answer(c, ans)})
+			why, ended := s.approvals.answer(c, ans)
+			_ = out.writeJSON(protocol.FrameAnswered, protocol.Answered{ID: ans.ID, Error: why, Ended: string(ended)})
 		default:
 			s.sessionRefused(out, pid, fmt.Errorf("frame type %d does not belong on the approval socket", f.Type))
 			return
@@ -277,7 +366,17 @@ func (s *Server) sessionRefused(out *frameWriter, pid int, err error) {
 // approved, as the rule that refused it runs its allowed commands (in the
 // mirrored directory with nothing injected when no rule matched). A
 // refusal that cannot be approved is the one a plain request gets.
+//
+// A waiting request ends unanswered when its client goes away, its limit
+// runs out, its session leaves or the daemon stops; but for the first,
+// the client is told why. To tell it the daemon stops, ask closes the
+// connection on ctx's end itself, once nothing waits (handle does not).
 func (s *Server) ask(ctx context.Context, cancel context.CancelFunc, conn net.Conn, out *frameWriter, f protocol.Frame) {
+	// The connection closes when the daemon stops, as handle closes it for
+	// other requests, but while a request waits: ask then tells its client
+	// that the daemon stops first.
+	closeOnStop := context.AfterFunc(ctx, func() { conn.Close() })
+	defer func() { closeOnStop() }()
 	var ask protocol.Ask
 	if err := protocol.DecodeJSON(f, &ask); err != nil {
 		s.reject(out, protocol.ExitHostrunError, err.Error(), err)
@@ -286,6 +385,15 @@ func (s *Server) ask(ctx context.Context, cancel context.CancelFunc, conn net.Co
 	req := ask.Request
 	if len(req.Argv) == 0 {
 		err := errors.New("empty command")
+		s.reject(out, protocol.ExitHostrunError, err.Error(), err)
+		return
+	}
+	timeout := defaultAskTimeout
+	if ask.TimeoutMs > 0 {
+		timeout = time.Duration(ask.TimeoutMs) * time.Millisecond
+	}
+	if timeout > maxAskTimeout {
+		err := fmt.Errorf("--ask limit %s exceeds %s", timeout, maxAskTimeout)
 		s.reject(out, protocol.ExitHostrunError, err.Error(), err)
 		return
 	}
@@ -305,17 +413,13 @@ func (s *Server) ask(ctx context.Context, cancel context.CancelFunc, conn net.Co
 		s.start(ctx, cancel, conn, out, req, p, func() (protocol.Frame, error) { return protocol.ReadFrame(conn) })
 		return
 	}
-	timeout := defaultAskTimeout
-	if ask.TimeoutMs > 0 {
-		timeout = time.Duration(ask.TimeoutMs) * time.Millisecond
-	}
 	var (
 		id      uint64
-		answers <-chan protocol.Answer
+		request *approvalRequest
 	)
 	err := errNoSession
 	if s.approvals != nil {
-		id, answers, err = s.approvals.enqueue(protocol.ApprovalRequest{
+		id, request, err = s.approvals.enqueue(protocol.ApprovalRequest{
 			Argv: req.Argv, Cwd: req.Cwd, Reasons: need.text.sessionReasons, Guards: need.text.guards, TimeoutMs: timeout.Milliseconds(),
 		})
 	}
@@ -328,7 +432,7 @@ func (s *Server) ask(ctx context.Context, cancel context.CancelFunc, conn net.Co
 		s.reject(out, protocol.ExitRejected, message, err)
 		return
 	}
-	defer s.approvals.withdraw(id)
+	closeOnStop()
 	guarded := len(need.text.guards) > 0
 	s.log.Info("approval requested", "approval_id", id, "argv", req.Argv, "dir", need.hostDir, "reasons", need.text.agentReasons, "guarded", guarded, "timeout", timeout)
 	_ = out.writeJSON(protocol.FrameWaiting, protocol.Waiting{Reasons: need.text.agentReasons, Guarded: guarded})
@@ -336,20 +440,26 @@ func (s *Server) ask(ctx context.Context, cancel context.CancelFunc, conn net.Co
 	frames := readFrames(ctx, conn)
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
-	var ans protocol.Answer
+	var o outcome
 	select {
-	case ans = <-answers:
+	case o = <-request.done:
 	case <-frames:
 		// The client sends nothing before its command starts: it went away.
-		s.log.Info("approval not answered", "approval_id", id, "reason", "withdrawn")
-		return
+		o = s.approvals.end(id, request, endedWithdrawn)
 	case <-timer.C:
-		s.log.Info("approval not answered", "approval_id", id, "reason", "expired")
-		s.reject(out, protocol.ExitRejected, unansweredMessage, errUnanswered)
-		return
+		o = s.approvals.end(id, request, endedExpired)
 	case <-ctx.Done():
+		o = s.approvals.end(id, request, endedStopping)
+	}
+	if o.ended != "" {
+		s.log.Info("approval not answered", "approval_id", id, "reason", string(o.ended))
+		if r := o.ended.refusal(); r != nil {
+			s.reject(out, r.code, r.message, r.err)
+		}
 		return
 	}
+	closeOnStop = context.AfterFunc(ctx, func() { conn.Close() })
+	ans := o.answer
 	if ans.Scope == "" {
 		s.log.Info("approval answered", "approval_id", id, "scope", "refused", "note", ans.Note)
 		message := refusedMessage

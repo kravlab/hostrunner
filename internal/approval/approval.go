@@ -13,11 +13,13 @@ package approval
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -44,8 +46,10 @@ const (
 
 // Run serves the daemon on cfg.Socket until ctx ends, in ends, or the
 // daemon goes away: it shows each approval request on out, ringing the
-// terminal bell, and sends the answer the human types on in. It returns an
-// error when it cannot serve the daemon.
+// terminal bell, and sends the answer the human types on in. Requests that
+// end unanswered are dropped as the daemon reports them; leaving refuses
+// the ones still waiting (the daemon does, as the connection closes), and
+// Run says how many. It returns an error when it cannot serve the daemon.
 func Run(ctx context.Context, cfg Config, in io.Reader, out io.Writer) error {
 	conn, err := transport.Unix{Path: cfg.Socket}.Dial(ctx)
 	if err != nil {
@@ -138,18 +142,22 @@ type session struct {
 	fresh uint64
 }
 
-// waiting is an approval request and when its time runs out.
+// waiting is an approval request and when its time runs out. ended is why
+// it ended unanswered (a protocol.Withdrawn reason) while its answer was
+// on the way to the daemon, which will not take it.
 type waiting struct {
 	protocol.ApprovalRequest
 	deadline time.Time
+	ended    string
 }
 
 // loop handles the daemon's frames and the human's lines until one of them
-// ends or ctx does.
+// ends or ctx does. Leaving refuses the requests still waiting.
 func (s *session) loop(ctx context.Context, frames <-chan protocol.Frame) error {
 	for {
 		select {
 		case <-ctx.Done():
+			s.leave()
 			return nil
 		case f, ok := <-frames:
 			if !ok {
@@ -161,6 +169,7 @@ func (s *session) loop(ctx context.Context, frames <-chan protocol.Frame) error 
 			}
 		case l, ok := <-s.lines:
 			if !ok {
+				s.leave()
 				return nil
 			}
 			if l.n >= s.fresh {
@@ -179,7 +188,7 @@ func (s *session) daemonFrame(f protocol.Frame) error {
 			return err
 		}
 		fmt.Fprint(s.out, "\a")
-		s.queue = append(s.queue, waiting{r, time.Now().Add(time.Duration(r.TimeoutMs) * time.Millisecond)})
+		s.queue = append(s.queue, waiting{ApprovalRequest: r, deadline: time.Now().Add(time.Duration(r.TimeoutMs) * time.Millisecond)})
 		if len(s.queue) == 1 {
 			s.show()
 		}
@@ -191,13 +200,25 @@ func (s *session) daemonFrame(f protocol.Frame) error {
 		if s.sent == "" || len(s.queue) == 0 || s.queue[0].ID != a.ID {
 			return fmt.Errorf("the daemon confirmed request %d, which was not answered", a.ID)
 		}
-		if a.Error != "" {
+		// The request may have ended as the answer came: the daemon says so
+		// here, or told the session already (withdrawn).
+		ended := cmp.Or(a.Ended, s.queue[0].ended)
+		switch {
+		case a.Error != "" && ended != "":
+			fmt.Fprintf(s.out, "request %d %s\n", a.ID, ended)
+		case a.Error != "":
 			fmt.Fprintf(s.out, "request %d: not taken: %s\n", a.ID, a.Error)
-		} else {
+		default:
 			fmt.Fprintln(s.out, s.sent)
 		}
 		s.sent = ""
 		s.next()
+	case protocol.FrameWithdrawn:
+		var w protocol.Withdrawn
+		if err := protocol.DecodeJSON(f, &w); err != nil {
+			return err
+		}
+		s.withdrawn(w)
 	default:
 		return frameError(f)
 	}
@@ -259,6 +280,43 @@ func (s *session) send(ans protocol.Answer, outcome string) {
 	_ = protocol.WriteJSON(s.conn, protocol.FrameAnswer, ans)
 }
 
+// withdrawn drops the request w names, which ended unanswered. A queued
+// one drops out silently; the current one is announced, and the next is
+// shown, its prompt discarding what was typed for the one that ended. One
+// whose answer is on the way is announced once the daemon refuses it.
+func (s *session) withdrawn(w protocol.Withdrawn) {
+	i := slices.IndexFunc(s.queue, func(r waiting) bool { return r.ID == w.ID })
+	switch {
+	case i < 0: // answered meanwhile, or its end came with the answer
+	case i > 0:
+		s.queue = slices.Delete(s.queue, i, i+1)
+	case s.sent != "":
+		s.queue[0].ended = w.Reason
+	default:
+		fmt.Fprintf(s.out, "\nrequest %d %s\n", w.ID, w.Reason)
+		s.note, s.confirm = false, false
+		s.next()
+	}
+}
+
+// leave says how many requests leaving refuses: the daemon refuses every
+// one still waiting once the session's connection closes. One whose answer
+// is on the way may be taken first, so it does not count. The count is the
+// session's view: a request or an end still on its way from the daemon is
+// not in it.
+func (s *session) leave() {
+	n := len(s.queue)
+	if s.sent != "" {
+		n--
+	}
+	switch {
+	case n == 1:
+		fmt.Fprintln(s.out, "\nrefused 1 waiting request")
+	case n > 1:
+		fmt.Fprintf(s.out, "\nrefused %d waiting requests\n", n)
+	}
+}
+
 // next drops the answered request and shows the one after it, if any.
 func (s *session) next() {
 	s.queue = s.queue[1:]
@@ -289,6 +347,9 @@ func (s *session) show() {
 	}
 	for _, guard := range r.Guards {
 		fmt.Fprintf(s.out, "  ⚠ guarded: %s\n", display(guard))
+	}
+	if more := len(s.queue) - 1; more > 0 {
+		fmt.Fprintf(s.out, "  (%d more waiting)\n", more)
 	}
 	s.prompt(answerPrompt)
 }

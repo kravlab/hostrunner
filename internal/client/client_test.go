@@ -53,6 +53,17 @@ func startDaemon(t *testing.T, policies ...daemon.Policy) harness {
 // startLoggingDaemon is startDaemon with the daemon logging to log.
 func startLoggingDaemon(t *testing.T, log *slog.Logger, policies ...daemon.Policy) harness {
 	t.Helper()
+	var p daemon.Policy = allowAll{}
+	if len(policies) > 0 {
+		p = policies[0]
+	}
+	return startDaemonWith(t, log, p)
+}
+
+// startDaemonWith is startLoggingDaemon with policy p and the Server
+// options opts besides its approval socket.
+func startDaemonWith(t *testing.T, log *slog.Logger, p daemon.Policy, opts ...daemon.Option) harness {
+	t.Helper()
 	base, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -77,11 +88,8 @@ func startLoggingDaemon(t *testing.T, log *slog.Logger, policies ...daemon.Polic
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	var p daemon.Policy = allowAll{}
-	if len(policies) > 0 {
-		p = policies[0]
-	}
-	srv := daemon.New(mapper, p, log, daemon.WithApprovals(al, filepath.Join(hostRoot, ".devcontainer", "hostrun.yaml")))
+	opts = append([]daemon.Option{daemon.WithApprovals(al, filepath.Join(hostRoot, ".devcontainer", "hostrun.yaml"))}, opts...)
+	srv := daemon.New(mapper, p, log, opts...)
 	go func() { done <- srv.Serve(ctx, l) }()
 	stop := sync.OnceFunc(func() {
 		cancel()

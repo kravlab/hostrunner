@@ -205,6 +205,9 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 		return
 	}
 	if f.Type == protocol.FrameAsk {
+		// A request waiting for an answer is told that the daemon stops
+		// before its connection closes: ask closes it itself.
+		stop()
 		s.ask(ctx, cancel, conn, out, f)
 		return
 	}

@@ -174,6 +174,13 @@ refused it, rings the terminal bell, and takes the answer, a letter and
 Enter: `r` refuses it (then an optional note for the agent), `o` approves
 this request only. Input typed before the prompt is discarded, and what
 came from the container is shown quoted, so it cannot steer the terminal.
+Requests are shown one at a time, first in, first out; a new one rings
+the bell without interrupting the prompt and is counted in the next
+block (`(1 more waiting)`). A shown request whose agent goes away or
+whose time runs out is announced (`request 7 withdrawn`, `request 7
+expired`) and the next is shown; a queued one drops out silently.
+Leaving the session (Ctrl+C, end of input) refuses the requests still
+waiting and says how many.
 
 In the container, ask with `--ask` as hostrun's first argument:
 
@@ -198,9 +205,17 @@ hostrun --ask git rebase -i main
   `--ask` is refused at once with 126 and `not approved: no approval
   session serves this devcontainer`.
 - A refusal exits 126 with `refused on the host` and the human's note
-  (`hostrun: refused on the host: use git rebase main`); a request nobody
-  answers is refused after 10 minutes (`not approved: nobody answered on
-  the host`). Ctrl+C withdraws the request.
+  (`hostrun: refused on the host: use git rebase main`).
+- A request waits 10 minutes, or as long as `--ask=<duration>` says (a
+  Go duration: `--ask=3m`, `--ask=90s`); then it is refused with 126
+  `not approved: nobody answered on the host`. A limit that is not a
+  positive duration fails with 125 before connecting; the daemon refuses
+  one over 1 hour with 125. Set it within your tool's timeout.
+- Ctrl+C, or anything else that drops the connection, withdraws the
+  request. A session that leaves refuses every request still waiting
+  (126 `refused on the host`); a daemon that stops or steps aside
+  answers every waiting request with 126 `not approved: the hostrunner
+  daemon is stopping`.
 - A command the daemon would refuse anyway (the working directory, the
   program) is refused at once, before anyone is asked. So is one too
   large to show (`not approved: the request is too large to show`).

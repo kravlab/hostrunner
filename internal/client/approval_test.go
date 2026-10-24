@@ -3,17 +3,20 @@ package client_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/kravlab/hostrunner/internal/approval"
 	"github.com/kravlab/hostrunner/internal/client"
+	"github.com/kravlab/hostrunner/internal/daemon"
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/transport"
 )
@@ -22,20 +25,28 @@ import (
 // test as a human would drive it: it reads what the session prints and
 // types answers.
 type session struct {
-	in   *io.PipeWriter
-	out  *lockedBuffer
-	seen int // how much of out the test has read
-	done chan error
+	in     *io.PipeWriter
+	out    *lockedBuffer
+	seen   int // how much of out the test has read
+	done   chan error
+	cancel context.CancelFunc // stops the session, as Ctrl+C does
 }
 
 // startSession starts an approval session for h's daemon and waits until
 // it serves the daemon. It ends when the test does.
 func (h harness) startSession(t *testing.T) *session {
 	t.Helper()
+	return startSessionOn(t, h.approvalSocket)
+}
+
+// startSessionOn is startSession for the daemon on the approval socket
+// socket.
+func startSessionOn(t *testing.T, socket string) *session {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	pr, pw := io.Pipe()
-	s := &session{in: pw, out: &lockedBuffer{}, done: make(chan error, 1)}
-	go func() { s.done <- approval.Run(ctx, approval.Config{Socket: h.approvalSocket}, pr, s.out) }()
+	s := &session{in: pw, out: &lockedBuffer{}, done: make(chan error, 1), cancel: cancel}
+	go func() { s.done <- approval.Run(ctx, approval.Config{Socket: socket}, pr, s.out) }()
 	t.Cleanup(func() {
 		cancel()
 		pw.Close()
@@ -399,8 +410,8 @@ func TestAStalledSessionIsDropped(t *testing.T) {
 	}
 }
 
-// A request whose agent went away is withdrawn: the human's later answer
-// is not taken, and the session says so instead of claiming it.
+// A request whose agent went away is withdrawn: the session announces it
+// and drops it, and a later answer reaches nothing.
 func TestAskWithdrawnWhenTheClientGoesAway(t *testing.T) {
 	var log lockedBuffer
 	h := startLoggingDaemon(t, slog.New(slog.NewTextHandler(&log, nil)), policy(t, echoOnly))
@@ -416,10 +427,11 @@ func TestAskWithdrawnWhenTheClientGoesAway(t *testing.T) {
 		t.Fatalf("exit code %d, want %d", code, client.ExitInterrupted)
 	}
 	waitForLog(t, &log, `msg="approval not answered" approval_id=1 reason=withdrawn`)
+	s.waitFor(t, "request 1 withdrawn\n")
 	s.answer(t, "o")
-	s.waitFor(t, "request 1: not taken: request 1 is not waiting any more")
-	if strings.Contains(s.out.String(), "approved once") {
-		t.Fatalf("the session claimed an answer the daemon did not take:\n%s", s.out.String())
+	time.Sleep(50 * time.Millisecond)
+	if out := s.out.String()[s.seen:]; out != "" {
+		t.Fatalf("the session answered a withdrawn request: %q", out)
 	}
 	assertNotRun(t, h, "marker")
 }
@@ -847,6 +859,306 @@ func TestRefusalsAskWouldRefuseAnywayDoNotHint(t *testing.T) {
 				if got := h.run(t, tt.cwd, "", append(mode, tt.argv...)...); got != want {
 					t.Errorf("%v: got %+v, want %+v", mode, got, want)
 				}
+			}
+		})
+	}
+}
+
+// askFor runs hostrun --ask=limit argv in the background, as ask does.
+func (h harness) askFor(t *testing.T, limit string, argv ...string) <-chan result {
+	t.Helper()
+	ch := make(chan result, 1)
+	go func() { ch <- h.run(t, containerRoot, "", append([]string{"--ask=" + limit}, argv...)...) }()
+	return ch
+}
+
+// A limit that is not a positive Go duration fails before hostrun
+// connects: no daemon listens on the socket it is given.
+func TestAskLimitMustBeAPositiveDuration(t *testing.T) {
+	nowhere := transport.Unix{Path: filepath.Join(t.TempDir(), "none.sock")}
+	for _, limit := range []string{"abc", "", "0s", "-1m", "10"} {
+		var stderr strings.Builder
+		code := client.Run(context.Background(), nowhere, []string{"--ask=" + limit, "touch", "marker"}, containerRoot, strings.NewReader(""), io.Discard, &stderr)
+		want := "hostrun: --ask limit " + strconv.Quote(limit) + " is not a positive duration\n"
+		if code != protocol.ExitHostrunError || stderr.String() != want {
+			t.Errorf("%q: code %d, stderr %q; want %d and %q", limit, code, stderr.String(), protocol.ExitHostrunError, want)
+		}
+	}
+}
+
+// The daemon refuses a limit over 1 hour without asking anyone; 1 hour
+// itself is taken.
+func TestAskLimitOverAnHourIsRefused(t *testing.T) {
+	h := startDaemon(t, policy(t, echoOnly))
+	s := h.startSession(t)
+	want := result{code: protocol.ExitHostrunError, stderr: "hostrun: --ask limit 1h0m1s exceeds 1h0m0s\n"}
+	if got := h.run(t, containerRoot, "", "--ask=1h0m1s", "touch", "marker"); got != want {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+	if out := s.out.String()[s.seen:]; strings.Contains(out, "request") {
+		t.Fatalf("the session was asked: %q", out)
+	}
+	ch := h.askFor(t, "1h", "touch", "marker")
+	s.waitFor(t, "── request 1 ── 60:00 left")
+	s.waitFor(t, "answer [r]efuse [o]nce ? ")
+	s.answer(t, "o")
+	if got := awaitResult(t, ch); got.code != 0 {
+		t.Fatalf("got %+v, want the approved command's result", got)
+	}
+}
+
+// A request nobody answers within its limit is refused, announced in the
+// session, which drops it, and logged.
+func TestAskExpiresAtItsLimit(t *testing.T) {
+	var log lockedBuffer
+	h := startLoggingDaemon(t, slog.New(slog.NewTextHandler(&log, nil)), policy(t, echoOnly))
+	s := h.startSession(t)
+	ch := h.askFor(t, "300ms", "touch", "marker")
+	s.waitFor(t, "answer [r]efuse [o]nce ? ")
+	got := awaitResult(t, ch)
+	if want := (result{code: protocol.ExitRejected, stderr: waitingNoRule + "hostrun: not approved: nobody answered on the host\n"}); got != want {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+	s.waitFor(t, "request 1 expired\n")
+	waitForLog(t, &log, `msg="approval not answered" approval_id=1 reason=expired`)
+	assertNotRun(t, h, "marker")
+}
+
+// Requests are shown one at a time, first in, first out: a new one rings
+// the bell, prints nothing in the middle of the prompt, and is counted at
+// the next block.
+func TestAskSessionShowsRequestsInTurn(t *testing.T) {
+	h := startDaemon(t, policy(t, echoOnly))
+	s := h.startSession(t)
+	first := h.ask(t, "touch", "first")
+	block := s.waitFor(t, "answer [r]efuse [o]nce ? ")
+	if strings.Contains(block, "more waiting") {
+		t.Errorf("the first block counts others: %q", block)
+	}
+	second := h.ask(t, "touch", "second")
+	s.waitFor(t, "\a")
+	third := h.ask(t, "touch", "third")
+	s.waitFor(t, "\a")
+	time.Sleep(50 * time.Millisecond)
+	if out := s.out.String()[s.seen:]; out != "" {
+		t.Fatalf("the session printed in the middle of the prompt: %q", out)
+	}
+	s.answer(t, "o")
+	if got := awaitResult(t, first); got.code != 0 {
+		t.Fatalf("first: got %+v", got)
+	}
+	block = s.waitFor(t, "answer [r]efuse [o]nce ? ")
+	for _, want := range []string{"── request 2 ──", `"touch" "second"`, "  (1 more waiting)\n"} {
+		if !strings.Contains(block, want) {
+			t.Errorf("the second block %q lacks %q", block, want)
+		}
+	}
+	s.answer(t, "o")
+	awaitResult(t, second)
+	block = s.waitFor(t, "answer [r]efuse [o]nce ? ")
+	if !strings.Contains(block, `"touch" "third"`) || strings.Contains(block, "more waiting") {
+		t.Errorf("the third block %q", block)
+	}
+	s.answer(t, "o")
+	awaitResult(t, third)
+}
+
+// A queued request that expires drops out silently; a current one that is
+// withdrawn is announced, what was typed for it is discarded, and the
+// next is shown.
+func TestAskSessionDropsRequestsThatEnd(t *testing.T) {
+	h := startDaemon(t, policy(t, echoOnly))
+	s := h.startSession(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	current := make(chan int, 1)
+	go func() {
+		current <- client.Run(ctx, h.transport, []string{"--ask", "touch", "current"}, containerRoot, strings.NewReader(""), io.Discard, io.Discard)
+	}()
+	s.waitFor(t, "answer [r]efuse [o]nce ? ")
+	expiring := h.askFor(t, "200ms", "touch", "expiring")
+	s.waitFor(t, "\a")
+	if got := awaitResult(t, expiring); got.code != protocol.ExitRejected {
+		t.Fatalf("expiring: got %+v", got)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if out := s.out.String()[s.seen:]; out != "" {
+		t.Fatalf("a queued request that expired was announced: %q", out)
+	}
+	last := h.ask(t, "touch", "last")
+	s.waitFor(t, "\a")
+	s.answer(t, "r")
+	s.waitFor(t, notePromptText)
+	cancel()
+	<-current
+	s.waitFor(t, "request 1 withdrawn\n")
+	block := s.waitFor(t, "answer [r]efuse [o]nce ? ")
+	if !strings.Contains(block, "── request 3 ──") || strings.Contains(block, "request 2") || strings.Contains(block, "more waiting") {
+		t.Fatalf("after the withdrawn request the session showed %q, want request 3 alone", block)
+	}
+	// The note's prompt went with request 1: "o" answers request 3.
+	s.answer(t, "o")
+	if got := awaitResult(t, last); got.code != 0 {
+		t.Fatalf("last: got %+v, want it approved", got)
+	}
+	assertNotRun(t, h, "current")
+	assertNotRun(t, h, "expiring")
+}
+
+// A session that leaves refuses every request still waiting, says how
+// many, and the daemon logs why.
+func TestASessionLeavingRefusesWaitingRequests(t *testing.T) {
+	var log lockedBuffer
+	h := startLoggingDaemon(t, slog.New(slog.NewTextHandler(&log, nil)), policy(t, echoOnly))
+	s := h.startSession(t)
+	first := h.ask(t, "touch", "first")
+	s.waitFor(t, "answer [r]efuse [o]nce ? ")
+	second := h.ask(t, "touch", "second")
+	s.waitFor(t, "\a")
+	s.in.Close()
+	s.waitFor(t, "refused 2 waiting requests\n")
+	for _, ch := range []<-chan result{first, second} {
+		if got := awaitResult(t, ch); got.code != protocol.ExitRejected || !strings.HasSuffix(got.stderr, "hostrun: refused on the host\n") {
+			t.Errorf("got %+v, want a refusal", got)
+		}
+	}
+	waitForLog(t, &log, `msg="approval not answered" approval_id=1 reason="session left"`)
+	waitForLog(t, &log, `msg="approval not answered" approval_id=2 reason="session left"`)
+}
+
+// A daemon that stops answers every waiting request before it closes.
+func TestAStoppingDaemonAnswersWaitingRequests(t *testing.T) {
+	var log lockedBuffer
+	h := startLoggingDaemon(t, slog.New(slog.NewTextHandler(&log, nil)), policy(t, echoOnly))
+	s := h.startSession(t)
+	ch := h.ask(t, "touch", "marker")
+	s.waitFor(t, "answer [r]efuse [o]nce ? ")
+	h.stop()
+	got := awaitResult(t, ch)
+	if want := (result{code: protocol.ExitRejected, stderr: waitingNoRule + "hostrun: not approved: the hostrunner daemon is stopping\n"}); got != want {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+	waitForLog(t, &log, `msg="approval not answered" approval_id=1 reason="daemon stopping"`)
+}
+
+// Ctrl+C in the session refuses the requests still waiting, as leaving
+// does, and says how many.
+func TestASessionInterruptedRefusesWaitingRequests(t *testing.T) {
+	h := startDaemon(t, policy(t, echoOnly))
+	s := h.startSession(t)
+	ch := h.ask(t, "touch", "marker")
+	s.waitFor(t, "answer [r]efuse [o]nce ? ")
+	s.cancel()
+	s.waitFor(t, "refused 1 waiting request\n")
+	if got := awaitResult(t, ch); got != (result{code: protocol.ExitRejected, stderr: waitingNoRule + "hostrun: refused on the host\n"}) {
+		t.Fatalf("got %+v, want a refusal", got)
+	}
+}
+
+// A daemon that steps aside for a new one answers every waiting request
+// before it closes, as a stopping one does.
+func TestADaemonSteppingAsideAnswersWaitingRequests(t *testing.T) {
+	h := startDaemonWith(t, slog.New(slog.DiscardHandler), policy(t, echoOnly), daemon.WithArmHandler(func(protocol.Arm) bool { return true }))
+	s := h.startSession(t)
+	ch := h.ask(t, "touch", "marker")
+	s.waitFor(t, "answer [r]efuse [o]nce ? ")
+	conn, err := h.transport.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := protocol.WriteJSON(conn, protocol.FrameArm, protocol.Arm{Version: protocol.Version}); err != nil {
+		t.Fatal(err)
+	}
+	if f, err := protocol.ReadFrame(conn); err != nil || f.Type != protocol.FrameArmed {
+		t.Fatalf("frame %v, err %v; want armed", f.Type, err)
+	}
+	if got := awaitResult(t, ch); got != (result{code: protocol.ExitRejected, stderr: waitingNoRule + "hostrun: not approved: the hostrunner daemon is stopping\n"}) {
+		t.Fatalf("got %+v, want the daemon stopping", got)
+	}
+}
+
+// A limit under a millisecond is a limit of a millisecond, not the
+// daemon's default.
+func TestAskLimitUnderAMillisecondExpiresAtOnce(t *testing.T) {
+	h := startDaemon(t, policy(t, echoOnly))
+	h.startSession(t)
+	if got := awaitResult(t, h.askFor(t, "500us", "touch", "marker")); got != (result{code: protocol.ExitRejected, stderr: waitingNoRule + "hostrun: not approved: nobody answered on the host\n"}) {
+		t.Fatalf("got %+v, want it expired", got)
+	}
+}
+
+// fakeDaemon serves one approval session on a socket of its own, sending
+// it request 1, and returns the socket and the connection once the session
+// serves it; the test plays the daemon's part from there.
+func fakeDaemon(t *testing.T) (string, <-chan net.Conn) {
+	t.Helper()
+	socket := filepath.Join(t.TempDir(), "fake.approval.sock")
+	l, err := transport.Unix{Path: socket}.Listen()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	served := make(chan net.Conn, 1)
+	go func() {
+		conn, err := l.Accept()
+		if err != nil {
+			return
+		}
+		t.Cleanup(func() { conn.Close() })
+		for _, step := range []struct {
+			read  protocol.FrameType
+			reply protocol.FrameType
+			v     any
+		}{
+			{protocol.FrameHello, protocol.FrameDaemonInfo, protocol.DaemonInfo{Version: protocol.ApprovalVersion}},
+			{protocol.FrameServe, protocol.FrameServing, nil},
+		} {
+			if f, err := protocol.ReadFrame(conn); err != nil || f.Type != step.read {
+				return
+			}
+			if step.v == nil {
+				_ = protocol.WriteFrame(conn, protocol.Frame{Type: step.reply})
+			} else {
+				_ = protocol.WriteJSON(conn, step.reply, step.v)
+			}
+		}
+		_ = protocol.WriteJSON(conn, protocol.FrameApprovalRequest, protocol.ApprovalRequest{ID: 1, Argv: []string{"touch", "marker"}, Cwd: containerRoot, Reasons: []string{"no rule"}, TimeoutMs: 60000})
+		served <- conn
+	}()
+	return socket, served
+}
+
+// An answer that crosses its request's end is reported as the end, in
+// whichever order the daemon's two frames arrive.
+func TestAskSessionReportsAnAnswerTooLate(t *testing.T) {
+	for _, withdrawnFirst := range []bool{true, false} {
+		t.Run(fmt.Sprintf("withdrawn first %v", withdrawnFirst), func(t *testing.T) {
+			socket, served := fakeDaemon(t)
+			s := startSessionOn(t, socket)
+			conn := <-served
+			s.waitFor(t, "answer [r]efuse [o]nce ? ")
+			s.answer(t, "o")
+			if f, err := protocol.ReadFrame(conn); err != nil || f.Type != protocol.FrameAnswer {
+				t.Fatalf("frame %v, err %v; want the answer", f.Type, err)
+			}
+			withdrawn := func() {
+				_ = protocol.WriteJSON(conn, protocol.FrameWithdrawn, protocol.Withdrawn{ID: 1, Reason: protocol.WithdrawnExpired})
+			}
+			answered := func() {
+				_ = protocol.WriteJSON(conn, protocol.FrameAnswered, protocol.Answered{ID: 1, Error: "request 1 is not waiting any more", Ended: protocol.WithdrawnExpired})
+			}
+			if withdrawnFirst {
+				withdrawn()
+				answered()
+			} else {
+				answered()
+				withdrawn()
+			}
+			s.waitFor(t, "request 1 expired\n")
+			time.Sleep(50 * time.Millisecond)
+			if out := s.out.String(); strings.Contains(out, "not taken") || strings.Contains(out, "approved once") {
+				t.Fatalf("the session reported the answer as such:\n%s", out)
 			}
 		})
 	}

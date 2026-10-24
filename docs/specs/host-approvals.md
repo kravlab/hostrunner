@@ -67,9 +67,10 @@ from `protocol.Version` of the container's socket.
 - `hostrun --ask[=<duration>] <command> [args…]`: `--ask` is hostrun's
   first argument, like `--dry-run`; after the program every argument is
   the command's own. The duration is a Go duration; an unparsable or
-  non-positive one fails with 125 before connecting. Plain `--ask` waits
-  the daemon's default, 10 minutes; the daemon refuses more than 1 hour
-  with 125.
+  non-positive one fails with 125 before connecting (`--ask limit "x"
+  is not a positive duration`). Plain `--ask` waits the daemon's default,
+  10 minutes; the daemon refuses more than 1 hour with 125 (`--ask limit
+  1h0m1s exceeds 1h0m0s`).
 - `--dry-run` and `--ask` together, in either order as the first two
   arguments: 125, `--dry-run and --ask cannot be combined`.
 - A command the rules or a standing approval allow runs at once, printing
@@ -135,7 +136,11 @@ from `protocol.Version` of the container's socket.
 - Each approval request has an id (a counter in the daemon), sent with its
   content. The session answers by id; only the serving session is heard;
   an answer for an unknown, answered, withdrawn or expired request is
-  refused, and the session says so.
+  refused, and the session says so. The daemon tells the serving session
+  of a request withdrawn or expired (`Withdrawn{id, reason}`), so it
+  drops it; an answer that crosses it is refused with that reason
+  (`Answered{id, error, ended}`), so the session reports the end
+  (`request N expired`) whichever frame comes first.
 - Take-overs are handled one at a time; the last wins. Waiting requests,
   with the rest of their limit, and the standing approvals pass to the new
   session.
@@ -146,8 +151,10 @@ from `protocol.Version` of the container's socket.
 - A session serves it: the request waits up to its limit, then is refused
   with "nobody answered" and leaves the session.
 - A session that leaves without a take-over refuses every request still
-  waiting. A daemon that stops or steps aside answers every waiting
-  request with 126 before closing.
+  waiting (126 `refused on the host`, logged `session left`); the session
+  says how many (`refused 2 waiting requests`). A daemon that stops or
+  steps aside answers every waiting request with 126 before closing,
+  also when its session goes with it.
 
 ## Running an approved command
 

@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/kravlab/hostrunner/internal/protocol"
 )
@@ -29,8 +31,12 @@ const ExitInterrupted = 130
 const dryRunFlag = "--dry-run"
 
 // askFlag, as hostrun's first argument, makes Run ask for an approval when
-// the rules refuse the command.
+// the rules refuse the command; askFlag=<duration> also sets how long the
+// request waits for an answer (see isAskFlag).
 const askFlag = "--ask"
+
+// isAskFlag reports whether arg is askFlag, with a limit or without.
+func isAskFlag(arg string) bool { return arg == askFlag || strings.HasPrefix(arg, askFlag+"=") }
 
 // Run executes the command in args, hostrun's arguments, on the host with
 // the container working directory cwd and returns the exit code hostrun
@@ -60,17 +66,25 @@ const askFlag = "--ask"
 // ExitInterrupted.
 func Run(ctx context.Context, d Dialer, args []string, cwd string, stdin io.Reader, stdout, stderr io.Writer) int {
 	argv, dryRun, ask := args, false, false
+	var limit time.Duration // how long an approval request waits; 0: the daemon's default
 	if len(args) > 0 {
-		switch args[0] {
-		case dryRunFlag:
+		switch {
+		case args[0] == dryRunFlag:
 			argv, dryRun = args[1:], true
-		case askFlag:
+		case isAskFlag(args[0]):
 			argv, ask = args[1:], true
+			if value, set := strings.CutPrefix(args[0], askFlag+"="); set {
+				d, err := time.ParseDuration(value)
+				if err != nil || d <= 0 {
+					return fail(stderr, protocol.ExitHostrunError, "%s limit %q is not a positive duration", askFlag, value)
+				}
+				limit = d
+			}
 		}
 	}
 	// The other flag as the next argument is taken for a mistake rather
 	// than for a program of that name.
-	if len(argv) > 0 && (dryRun && argv[0] == askFlag || ask && argv[0] == dryRunFlag) {
+	if len(argv) > 0 && (dryRun && isAskFlag(argv[0]) || ask && argv[0] == dryRunFlag) {
 		return fail(stderr, protocol.ExitHostrunError, "%s and %s cannot be combined", dryRunFlag, askFlag)
 	}
 	if len(argv) == 0 {
@@ -89,7 +103,7 @@ func Run(ctx context.Context, d Dialer, args []string, cwd string, stdin io.Read
 	case dryRun:
 		err = protocol.WriteJSON(conn, protocol.FrameDryRun, req)
 	case ask:
-		err = protocol.WriteJSON(conn, protocol.FrameAsk, protocol.Ask{Request: req})
+		err = protocol.WriteJSON(conn, protocol.FrameAsk, protocol.Ask{Request: req, TimeoutMs: askTimeoutMs(limit)})
 	default:
 		err = protocol.WriteJSON(conn, protocol.FrameRequest, req)
 	}
@@ -173,6 +187,15 @@ func Run(ctx context.Context, d Dialer, args []string, cwd string, stdin io.Read
 			return unexpectedFrame(stderr, f)
 		}
 	}
+}
+
+// askTimeoutMs is limit as Ask.TimeoutMs carries it: 0 for the daemon's
+// default, and never 0 for a limit under a millisecond.
+func askTimeoutMs(limit time.Duration) int64 {
+	if limit <= 0 {
+		return 0
+	}
+	return max(limit.Milliseconds(), 1)
 }
 
 // forwardStdin streams stdin as FrameStdin frames, never exceeding the
