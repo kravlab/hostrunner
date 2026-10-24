@@ -278,6 +278,9 @@ type prepared struct {
 	env      []string   // injected NAME=value variables over the daemon's
 	secrets  []string   // names of the secrets injected, for the log
 	masked   []string   // their values, masked in the command's output
+	// pathFailures are the arguments that failed their path checks and are
+	// passed as given, as asGiven allowed (see prepareAllowed).
+	pathFailures []pathFailure
 }
 
 // close releases the daemon's copies of the directory and of the files
@@ -322,13 +325,15 @@ func (s *Server) prepare(req protocol.Request, dryRun bool) (*prepared, *refusal
 	if err != nil {
 		return nil, &refusal{protocol.ExitRejected, err.Error(), err}
 	}
-	return s.prepareAllowed(req, allowed, dryRun)
+	return s.prepareAllowed(req, allowed, dryRun, nil)
 }
 
 // prepareAllowed runs the checks after the rules for req, a command the
 // rules allowed, or a human approved, as allowed describes: its working
-// directory, path checks, fixed directory and secrets (see prepare).
-func (s *Server) prepareAllowed(req protocol.Request, allowed rules.Allowed, dryRun bool) (*prepared, *refusal) {
+// directory, path checks, fixed directory and secrets (see prepare). A failed
+// path check of an argument whose argv index asGiven holds does not refuse
+// it: the argument is passed as given, and the failure is in pathFailures.
+func (s *Server) prepareAllowed(req protocol.Request, allowed rules.Allowed, dryRun bool, asGiven map[int]bool) (*prepared, *refusal) {
 	var err error
 	p := &prepared{rule: allowed.Rule, fixedDir: allowed.Dir, secrets: allowed.SecretNames()}
 	if p.dir, p.hostPath, err = s.mapper.Open(req.Cwd); err != nil {
@@ -340,7 +345,7 @@ func (s *Server) prepareAllowed(req protocol.Request, allowed rules.Allowed, dry
 		return nil, &refusal{code, message, err}
 	}
 	var message string
-	if p.argv, p.files, message, err = s.openPaths(req.Argv, allowed.Paths, p.hostPath); err != nil {
+	if p.argv, p.files, p.pathFailures, message, err = s.openPaths(req.Argv, allowed.Paths, p.hostPath, asGiven); err != nil {
 		return refuse(protocol.ExitRejected, message, err)
 	}
 	if allowed.Dir != "" {
@@ -481,23 +486,29 @@ func fixedMessage(dir string, err error) string {
 // run and the files to hand to the command as its descriptors 3, 4, …; the
 // caller closes the files, which it gets on failure too. A failed check
 // returns a message for the client, in container terms only, and an error
-// with host paths for the daemon log.
+// with host paths for the daemon log. An argument whose argv index asGiven
+// holds refuses nothing: it is passed as given, and its failure returned.
 //
 // A PathModeCheck argument is opened to check it and closed again; the
 // program gets it as given. A PathModeOpen argument stays open and is
 // replaced with the /proc/self/fd path of the descriptor the program
 // inherits, keeping the part of its token before the path (--file=, -f).
-func (s *Server) openPaths(argv []string, paths []rules.PathArg, dirPath string) ([]string, []*os.File, string, error) {
+func (s *Server) openPaths(argv []string, paths []rules.PathArg, dirPath string, asGiven map[int]bool) ([]string, []*os.File, []pathFailure, string, error) {
 	if len(paths) == 0 {
-		return argv, nil, "", nil
+		return argv, nil, nil, "", nil
 	}
 	runArgv := slices.Clone(argv)
 	var files []*os.File
+	var failed []pathFailure
 	for _, p := range paths {
 		name := argv[p.Index][len(p.Prefix):]
 		f, err := s.mapper.OpenFile(dirPath, name)
+		if err != nil && asGiven[p.Index] {
+			failed = append(failed, pathFailure{p.Index, pathMessage(name, err)})
+			continue
+		}
 		if err != nil {
-			return nil, files, pathMessage(name, err), err
+			return nil, files, nil, pathMessage(name, err), err
 		}
 		if p.Mode != rules.PathModeOpen {
 			f.Close()
@@ -507,7 +518,14 @@ func (s *Server) openPaths(argv []string, paths []rules.PathArg, dirPath string)
 		runArgv[p.Index] = fmt.Sprintf("%s/proc/self/fd/%d", p.Prefix, 3+len(files))
 		files = append(files, f)
 	}
-	return runArgv, files, "", nil
+	return runArgv, files, failed, "", nil
+}
+
+// pathFailure is an argument that failed its path check: its argv index,
+// and why, for the client.
+type pathFailure struct {
+	index   int
+	message string
 }
 
 // closeAll closes the daemon's copies of the files openPaths opened. Close

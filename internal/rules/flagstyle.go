@@ -118,9 +118,11 @@ func (r *rule) goPositionals(args []string, from int, paths *[]PathArg, found *f
 func (r *rule) goPositional(args []string, i int, ambiguous bool, paths *[]PathArg, found *findings) {
 	tok := args[i]
 	readings := textReadings(tok)
+	// A refused argument is path-checked too (see checkPositionals); its
+	// other readings would only repeat the refusal.
 	for _, arg := range readings {
 		if !r.checkPositional(arg, found) {
-			return
+			break
 		}
 	}
 	if r.positional == nil || r.positional.path == PathModeNone {
@@ -232,9 +234,11 @@ func goValue(args []string, i int, l *list, name string, ambiguous bool, paths *
 		}
 		values = textReadings(next)
 	}
+	// A refused value is path-checked too (see checkPositionals); its other
+	// readings would only repeat the refusal.
 	for _, v := range values {
 		if !checkFlagValue(l, name, v, found) {
-			return at != i
+			break
 		}
 	}
 	if l != nil && l.path != PathModeNone {

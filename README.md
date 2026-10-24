@@ -159,7 +159,7 @@ dry runs refuses one with 125 rather than running the command.
 
 ### Approvals on the host
 
-A command no rule allows can be approved by a human on the host, one
+A command the rules refuse can be approved by a human on the host, one
 request at a time. In a host terminal (not one inside the container),
 start an approval session for the devcontainer's runtime directory, the
 `--dir` its `initializeCommand` gives `hostrunner up`:
@@ -183,7 +183,7 @@ hostrun --ask git rebase -i main
 # hostrun: approved on the host: this request only
 ```
 
-- A command the rules allow runs at once, without asking.
+- A command that would run without `--ask` runs at once, without asking.
 - Approvals are on only while a session serves the daemon: without one,
   `--ask` is refused at once with 126 and `not approved: no approval
   session serves this devcontainer`.
@@ -194,9 +194,16 @@ hostrun --ask git rebase -i main
 - A command the daemon would refuse anyway (the working directory, the
   program) is refused at once, before anyone is asked. So is one too
   large to show (`not approved: the request is too large to show`).
-- Approvals cover commands no rule matches, which run in the mirrored
-  directory with nothing injected. A refusal by a matching rule is
-  reported as without `--ask`.
+- An approved command runs as the rule that refused it runs the commands
+  it allows: in its `dir`, with its injection and its secrets masked; one
+  no rule matches runs in the mirrored directory with nothing injected.
+  Arguments that pass their path check are handed over as for an allowed
+  command; one approved after failing it is passed as given.
+- Some refusals are guarded: by a deny list, by a path check, an argv the
+  rules cannot read (an ambiguous flag), or a rule that injects secrets.
+  The request shows each as `⚠ guarded: …`, the agent's wait line says
+  `(guarded)`, and `o` approves it only after the warning is read and
+  `yes` typed; anything else returns to the answer prompt.
 
 The session reaches the daemon over its approval socket,
 `<runtime directory>.approval.sock`, beside the runtime directory: the

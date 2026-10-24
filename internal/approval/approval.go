@@ -39,6 +39,7 @@ type Config struct {
 const (
 	answerPrompt = "answer [r]efuse [o]nce ? "
 	notePrompt   = "note for the agent (Enter for none): "
+	yesPrompt    = `Type "yes" to run it once: `
 )
 
 // Run serves the daemon on cfg.Socket until ctx ends, in ends, or the
@@ -127,6 +128,8 @@ type session struct {
 	queue []waiting
 	// note is set while the human types the note of a refusal.
 	note bool
+	// confirm is set while the human confirms approving a guarded request.
+	confirm bool
 	// sent is the outcome of the answer sent for the first request,
 	// printed once the daemon has taken it; "" while none is sent.
 	sent string
@@ -214,15 +217,39 @@ func (s *session) typed(text string) {
 		s.send(protocol.Answer{ID: r.ID, Note: text}, "refused")
 		return
 	}
+	if s.confirm {
+		s.confirm = false
+		if text == "yes" {
+			s.approveOnce(r.ID)
+		} else {
+			s.prompt(answerPrompt)
+		}
+		return
+	}
 	switch text {
 	case "o":
-		s.send(protocol.Answer{ID: r.ID, Scope: protocol.ScopeOnce}, "approved once")
+		if len(r.Guards) == 0 {
+			s.approveOnce(r.ID)
+			return
+		}
+		// A guarded request runs only once the human has read its guards
+		// again and typed "yes"; anything else asks for the answer again.
+		for _, guard := range r.Guards {
+			fmt.Fprintf(s.out, "⚠ %s\n", display(guard))
+		}
+		s.confirm = true
+		s.prompt(yesPrompt)
 	case "r":
 		s.note = true
 		s.prompt(notePrompt)
 	default:
 		s.prompt(answerPrompt)
 	}
+}
+
+// approveOnce approves request id for this request only.
+func (s *session) approveOnce(id uint64) {
+	s.send(protocol.Answer{ID: id, Scope: protocol.ScopeOnce}, "approved once")
 }
 
 // send sends ans to the daemon; outcome is printed once the daemon has
@@ -259,6 +286,9 @@ func (s *session) show() {
 			label = "    "
 		}
 		fmt.Fprintf(s.out, "  %s  %s\n", label, display(reason))
+	}
+	for _, guard := range r.Guards {
+		fmt.Fprintf(s.out, "  ⚠ guarded: %s\n", display(guard))
 	}
 	s.prompt(answerPrompt)
 }

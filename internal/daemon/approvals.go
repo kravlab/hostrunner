@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"time"
 
@@ -270,11 +271,12 @@ func (s *Server) sessionRefused(out *frameWriter, pid int, err error) {
 	_ = out.writeJSON(protocol.FrameError, protocol.Error{Code: protocol.ExitHostrunError, Message: err.Error()})
 }
 
-// ask handles FrameAsk: a command the rules allow runs as for FrameRequest;
-// one they refuse but a human may approve waits for the serving session's
-// answer and runs if approved. Approvals cover commands no rule matches,
-// which run as with no rule: in the mirrored directory, with nothing
-// injected. Any other refusal is the one a plain request gets.
+// ask handles FrameAsk: a command the rules allow, and whose path checks
+// pass, runs as for FrameRequest. One the rules refuse, or whose path
+// checks fail, waits for the serving session's answer and runs if
+// approved, as the rule that refused it runs its allowed commands (in the
+// mirrored directory with nothing injected when no rule matched). A
+// refusal that cannot be approved is the one a plain request gets.
 func (s *Server) ask(ctx context.Context, cancel context.CancelFunc, conn net.Conn, out *frameWriter, f protocol.Frame) {
 	var ask protocol.Ask
 	if err := protocol.DecodeJSON(f, &ask); err != nil {
@@ -287,16 +289,19 @@ func (s *Server) ask(ctx context.Context, cancel context.CancelFunc, conn net.Co
 		s.reject(out, protocol.ExitHostrunError, err.Error(), err)
 		return
 	}
-	_, err := s.policy.Check(req.Argv)
+	approved, err := s.policy.Check(req.Argv)
 	var d *rules.Denial
-	if err == nil || !errors.As(err, &d) || !d.Approvable() || d.Rule != "" || d.Guarded() {
+	if err != nil && (!errors.As(err, &d) || !d.Approvable()) {
 		s.run(ctx, cancel, conn, out, req)
 		return
 	}
-	approved := rules.Allowed{} // no rule: the mirrored directory, nothing injected
+	if d != nil {
+		approved = d.Approved
+	}
 	// What would refuse the command anyway is reported before a human is
-	// asked; starting it checks all of it again.
-	p, r := s.prepareAllowed(req, approved, true)
+	// asked; starting it checks all of it again. Every path check may fail
+	// here: its failure is asked about.
+	p, r := s.prepareAllowed(req, approved, true, everyPath(approved.Paths))
 	if r == nil {
 		r = lookupStart(p, req)
 	}
@@ -304,20 +309,26 @@ func (s *Server) ask(ctx context.Context, cancel context.CancelFunc, conn net.Co
 		s.reject(out, r.code, r.message, r.err)
 		return
 	}
-	hostDir := p.hostPath
+	hostDir, pathFailures := p.hostPath, p.pathFailures
 	p.close()
+	if d == nil && len(pathFailures) == 0 {
+		s.run(ctx, cancel, conn, out, req)
+		return
+	}
+	text := describeRequest(d, approved, pathFailures)
 	timeout := defaultAskTimeout
 	if ask.TimeoutMs > 0 {
 		timeout = time.Duration(ask.TimeoutMs) * time.Millisecond
 	}
-	reasons := reasonTexts(d)
 	var (
 		id      uint64
 		answers <-chan protocol.Answer
 	)
 	err = errNoSession
 	if s.approvals != nil {
-		id, answers, err = s.approvals.enqueue(protocol.ApprovalRequest{Argv: req.Argv, Cwd: req.Cwd, Reasons: reasons, TimeoutMs: timeout.Milliseconds()})
+		id, answers, err = s.approvals.enqueue(protocol.ApprovalRequest{
+			Argv: req.Argv, Cwd: req.Cwd, Reasons: text.sessionReasons, Guards: text.guards, TimeoutMs: timeout.Milliseconds(),
+		})
 	}
 	if err != nil {
 		reason, message := "no session", noSessionMessage
@@ -329,8 +340,9 @@ func (s *Server) ask(ctx context.Context, cancel context.CancelFunc, conn net.Co
 		return
 	}
 	defer s.approvals.withdraw(id)
-	s.log.Info("approval requested", "approval_id", id, "argv", req.Argv, "dir", hostDir, "reasons", reasons, "guarded", false, "timeout", timeout)
-	_ = out.writeJSON(protocol.FrameWaiting, protocol.Waiting{Reasons: reasons})
+	guarded := len(text.guards) > 0
+	s.log.Info("approval requested", "approval_id", id, "argv", req.Argv, "dir", hostDir, "reasons", text.agentReasons, "guarded", guarded, "timeout", timeout)
+	_ = out.writeJSON(protocol.FrameWaiting, protocol.Waiting{Reasons: text.agentReasons, Guarded: guarded})
 
 	frames := readFrames(ctx, conn)
 	timer := time.NewTimer(timeout)
@@ -360,20 +372,77 @@ func (s *Server) ask(ctx context.Context, cancel context.CancelFunc, conn net.Co
 	}
 	s.log.Info("approval answered", "approval_id", id, "scope", ans.Scope)
 	_ = out.writeJSON(protocol.FrameApproved, protocol.Approved{Scope: ans.Scope})
-	if p, r = s.prepareAllowed(req, approved, false); r != nil {
+	// Only the path failures the human saw are passed as given: one that
+	// fails its check only now (a file swapped for a symlink meanwhile)
+	// refuses the command.
+	if p, r = s.prepareAllowed(req, approved, false, failedPaths(pathFailures)); r != nil {
 		s.reject(out, r.code, r.message, r.err)
 		return
 	}
 	s.start(ctx, cancel, conn, out, req, p, frames.next, "approved", ans.Scope, "approval_id", id)
 }
 
-// reasonTexts returns the texts of every reason of d.
-func reasonTexts(d *rules.Denial) []string {
-	texts := make([]string, len(d.Reasons))
-	for i, r := range d.Reasons {
-		texts[i] = r.Text
+// requestText is how an approval request reads: its reasons for the
+// client and the log, the first naming the rule that refused it, as a
+// refusal does; the same reasons as the session shows them, each also
+// naming a deny list that gave it; and its guarded reasons, one line each.
+type requestText struct {
+	agentReasons   []string
+	sessionReasons []string
+	guards         []string
+}
+
+// describeRequest describes a request the rules refused as d says, or,
+// with d nil, one they allowed, and whose arguments failed their path
+// checks as pathFailures say; approved is what the command would run
+// with.
+func describeRequest(d *rules.Denial, approved rules.Allowed, pathFailures []pathFailure) requestText {
+	var text requestText
+	if d != nil {
+		for i, reason := range d.Reasons {
+			agent := reason.Text
+			if i == 0 {
+				agent = d.Describe(agent)
+			}
+			session := agent
+			if reason.Kind == rules.ReasonDenied {
+				session += " (deny list)"
+			}
+			text.agentReasons = append(text.agentReasons, agent)
+			text.sessionReasons = append(text.sessionReasons, session)
+			if guard := reason.Guard(); guard != "" {
+				text.guards = append(text.guards, guard)
+			}
+		}
 	}
-	return texts
+	for _, failure := range pathFailures {
+		text.agentReasons = append(text.agentReasons, failure.message)
+		text.sessionReasons = append(text.sessionReasons, failure.message)
+		text.guards = append(text.guards, "path check: "+failure.message)
+	}
+	if names := approved.SecretNames(); len(names) > 0 {
+		text.guards = append(text.guards, "injects secrets: "+strings.Join(names, ", "))
+	}
+	return text
+}
+
+// everyPath returns the argv indices of paths, the arguments under a path
+// check.
+func everyPath(paths []rules.PathArg) map[int]bool {
+	indices := make(map[int]bool, len(paths))
+	for _, p := range paths {
+		indices[p.Index] = true
+	}
+	return indices
+}
+
+// failedPaths returns the argv indices of the arguments in failures.
+func failedPaths(failures []pathFailure) map[int]bool {
+	indices := make(map[int]bool, len(failures))
+	for _, f := range failures {
+		indices[f.index] = true
+	}
+	return indices
 }
 
 // clientFrames carries what the client sends, read once, so that waiting

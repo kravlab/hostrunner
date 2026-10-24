@@ -173,8 +173,9 @@ type Ask struct {
 }
 
 // Waiting tells the client that its command waits for a human's answer.
-// Reasons are every reason the rules refused it; Guarded is set when
-// approving it needs a second confirmation.
+// Reasons are every reason it was refused, the first naming the rule that
+// refused it, as a refusal does; Guarded is set when approving it needs a
+// second confirmation.
 type Waiting struct {
 	Reasons []string `json:"reasons"`
 	Guarded bool     `json:"guarded,omitempty"`
@@ -234,15 +235,17 @@ type DaemonInfo struct {
 }
 
 // ApprovalRequest is a command waiting for the serving session's answer.
-// ID names it in the Answer; Cwd is the container directory; Reasons and
-// Guarded are as in Waiting; TimeoutMs is the time left to answer it, in
-// milliseconds.
+// ID names it in the Answer; Cwd is the container directory; Reasons are
+// as in Waiting, each also naming the kind of list that gave it where that
+// matters; Guards are the guarded reasons, one line each ("explicitly
+// denied: …"), empty unless approving it needs a second confirmation;
+// TimeoutMs is the time left to answer it, in milliseconds.
 type ApprovalRequest struct {
 	ID        uint64   `json:"id"`
 	Argv      []string `json:"argv"`
 	Cwd       string   `json:"cwd"`
 	Reasons   []string `json:"reasons"`
-	Guarded   bool     `json:"guarded,omitempty"`
+	Guards    []string `json:"guards,omitempty"`
 	TimeoutMs int64    `json:"timeout_ms"`
 }
 

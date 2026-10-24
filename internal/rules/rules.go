@@ -75,18 +75,20 @@ import (
 // one a refusal reports (Error); Reasons are all of them, Reasons[0] being
 // Reason, so an approval request and the Rules test can show every one.
 // Reasons is empty for an empty command, which nothing can approve.
-// Secrets are the names of the matching rule's secrets, which approving
-// the command would inject.
+// Approved is what the matching rule would run the command with if a
+// human approved it, as Check reports an allowed command: its fixed
+// directory, secrets, injection and the arguments under lists with a path
+// check, refused ones included; the zero Allowed when no rule matches.
 type Denial struct {
-	Rule    string
-	Reason  string
-	Reasons []Reason
-	Secrets []string
+	Rule     string
+	Reason   string
+	Reasons  []Reason
+	Approved Allowed
 }
 
 // Error describes the denial with its first reason, as a refusal reports
 // it.
-func (d *Denial) Error() string { return d.describe(d.Reason) }
+func (d *Denial) Error() string { return d.Describe(d.Reason) }
 
 // Explain describes the denial with every reason, joined by "; ", as
 // Error describes it with the first.
@@ -95,11 +97,12 @@ func (d *Denial) Explain() string {
 	for i, r := range d.Reasons {
 		texts[i] = r.Text
 	}
-	return d.describe(strings.Join(texts, "; "))
+	return d.Describe(strings.Join(texts, "; "))
 }
 
-// describe prefixes reason with the rule that gave it, if any.
-func (d *Denial) describe(reason string) string {
+// Describe prefixes reason, one of the denial's, with the rule that gave
+// it, if any, as a refusal reports it.
+func (d *Denial) Describe(reason string) string {
 	if d.Rule == "" {
 		return reason
 	}
@@ -118,10 +121,10 @@ func (d *Denial) Approvable() bool { return len(d.Reasons) > 0 }
 // cannot read, or the matching rule would inject secrets. A failed path
 // check, the remaining kind of guarded refusal, is the caller's to find.
 func (d *Denial) Guarded() bool {
-	if len(d.Secrets) > 0 {
+	if len(d.Approved.Secrets) > 0 {
 		return true
 	}
-	return slices.ContainsFunc(d.Reasons, func(r Reason) bool { return r.Kind.guarded() })
+	return slices.ContainsFunc(d.Reasons, func(r Reason) bool { return r.Guard() != "" })
 }
 
 // Reason is one reason the rules refuse a command, and its kind.
@@ -151,8 +154,18 @@ const (
 	ReasonUnreadable
 )
 
-// guarded reports whether a reason of kind k makes approving guarded.
-func (k ReasonKind) guarded() bool { return k == ReasonDenied || k == ReasonUnreadable }
+// Guard describes r as the guarded reason it makes approving the command
+// ("explicitly denied: …", "unreadable argv: …"), or returns "" when it
+// does not make approving it guarded.
+func (r Reason) Guard() string {
+	switch r.Kind {
+	case ReasonDenied:
+		return "explicitly denied: " + r.Text
+	case ReasonUnreadable:
+		return "unreadable argv: " + r.Text
+	}
+	return ""
+}
 
 // findings collects the reasons a rule refuses arguments, in the order a
 // refusal has always reported its first one.
@@ -640,7 +653,7 @@ func (p *Policy) Check(argv []string) (Allowed, error) {
 		return Allowed{}, &Denial{Reason: "empty command"}
 	}
 	if p.missing {
-		return Allowed{}, denial("", nil, findings{{ReasonNoFile, missingReason}})
+		return Allowed{}, denial("", Allowed{}, findings{{ReasonNoFile, missingReason}})
 	}
 	var best *rule
 	for _, r := range p.rules {
@@ -650,30 +663,28 @@ func (p *Policy) Check(argv []string) (Allowed, error) {
 		}
 	}
 	if best == nil {
-		return Allowed{}, denial("", nil, findings{{ReasonNoRule, fmt.Sprintf("no rule allows %q", strings.Join(argv[:min(2, len(argv))], " "))}})
+		return Allowed{}, denial("", Allowed{}, findings{{ReasonNoRule, fmt.Sprintf("no rule allows %q", strings.Join(argv[:min(2, len(argv))], " "))}})
 	}
 	var paths []PathArg
 	var found findings
 	best.check(argv[len(best.command):], &paths, &found)
-	if len(found) > 0 {
-		return Allowed{}, denial(best.name, best.secrets, found)
-	}
 	// check finds flag values as it goes but positional arguments at the end.
 	slices.SortFunc(paths, func(a, b PathArg) int { return a.Index - b.Index })
 	for i := range paths {
 		paths[i].Index += len(best.command)
 	}
-	return Allowed{Rule: best.name, Paths: paths, Dir: best.dir, Secrets: best.secrets, Inject: best.inject, commandLen: len(best.command)}, nil
+	allowed := Allowed{Rule: best.name, Paths: paths, Dir: best.dir, Secrets: best.secrets, Inject: best.inject, commandLen: len(best.command)}
+	if len(found) > 0 {
+		return Allowed{}, denial(best.name, allowed, found)
+	}
+	return allowed, nil
 }
 
 // denial builds the Denial for the reasons found, which must not be empty,
-// by the rule named rule (empty when no rule applies) with secrets.
-func denial(rule string, secrets []Secret, found findings) *Denial {
-	d := &Denial{Rule: rule, Reason: found[0].Text, Reasons: found}
-	for _, sec := range secrets {
-		d.Secrets = append(d.Secrets, sec.Name)
-	}
-	return d
+// by the rule named rule (empty when no rule applies), which would run the
+// command as approved describes.
+func denial(rule string, approved Allowed, found findings) *Denial {
+	return &Denial{Rule: rule, Reason: found[0].Text, Reasons: found, Approved: approved}
 }
 
 // check applies the rule to the arguments after its command and adds to
@@ -747,9 +758,8 @@ func (r *rule) check(args []string, paths *[]PathArg, found *findings) {
 					i++
 					value, prefix = args[i], ""
 				}
-				if r.flags.checkValue(flag, value, found) {
-					r.flags.addPath(paths, flag, i, prefix)
-				}
+				r.flags.checkValue(flag, value, found)
+				r.flags.addPath(paths, flag, i, prefix)
 				continue
 			}
 			r.flags.checkName(name, inline, found)
@@ -767,9 +777,8 @@ func (r *rule) check(args []string, paths *[]PathArg, found *findings) {
 						i++
 						value, prefix = args[i], ""
 					}
-					if r.flags.checkValue(flag, value, found) {
-						r.flags.addPath(paths, flag, i, prefix)
-					}
+					r.flags.checkValue(flag, value, found)
+					r.flags.addPath(paths, flag, i, prefix)
 					break
 				}
 				r.flags.checkName(flag, false, found)
@@ -781,12 +790,11 @@ func (r *rule) check(args []string, paths *[]PathArg, found *findings) {
 
 // checkPositionals applies the positional list to args[i] for each i in
 // positional, adding to found the reason for each one refused, and
-// appends the others to paths if the list has a path check.
+// appends each to paths if the list has a path check: a refused one too,
+// since an approval runs it, and a failed check makes it guarded.
 func (r *rule) checkPositionals(args []string, positional []int, paths *[]PathArg, found *findings) {
 	for _, i := range positional {
-		if !r.checkPositional(args[i], found) {
-			continue
-		}
+		r.checkPositional(args[i], found)
 		if r.positional != nil && r.positional.path != PathModeNone {
 			*paths = append(*paths, PathArg{Index: i, Mode: r.positional.path})
 		}
@@ -906,9 +914,9 @@ func (f *flagFilter) checkDenied(flag string) string {
 
 // checkValue filters the value of a flag that takes one; see
 // checkFlagValue.
-func (f *flagFilter) checkValue(flag, value string, found *findings) bool {
+func (f *flagFilter) checkValue(flag, value string, found *findings) {
 	l, _ := f.valuesFor(flag)
-	return checkFlagValue(l, flag, value, found)
+	checkFlagValue(l, flag, value, found)
 }
 
 // checkFlagValue applies l, the value list of flag, to one value; a nil list
@@ -930,7 +938,8 @@ func checkFlagValue(l *list, flag, value string, found *findings) bool {
 }
 
 // addPath appends to paths the value of flag at args[i], after prefix in its
-// token, if the flag's list has a path check.
+// token, if the flag's list has a path check; whether the list refused the
+// value or not, as for positional arguments (see checkPositionals).
 func (f *flagFilter) addPath(paths *[]PathArg, flag string, i int, prefix string) {
 	if l, _ := f.valuesFor(flag); l != nil && l.path != PathModeNone {
 		*paths = append(*paths, PathArg{Index: i, Prefix: prefix, Mode: l.path})

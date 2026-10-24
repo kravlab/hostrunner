@@ -208,13 +208,25 @@ func TestAskRefusesWhatCannotBeApprovedWithoutAsking(t *testing.T) {
 	}
 }
 
-// Until a refusal by a matching rule or a guarded one can be approved, it
-// is refused as without --ask.
-func TestAskRefusesARefusalByAMatchingRuleAsWithoutAsk(t *testing.T) {
+// A refusal by a matching rule's allow list is approvable, and not guarded:
+// the rule's name leads the reasons.
+func TestAskAsksForARefusalByAMatchingRule(t *testing.T) {
 	h := startDaemon(t, policy(t, echoOnly))
-	h.startSession(t)
-	got := h.run(t, containerRoot, "", "--ask", "sh", "-x", "script")
-	if want := (result{code: protocol.ExitRejected, stderr: "hostrun: denied by rule \"sh\": flag -x is not allowed\n"}); got != want {
+	s := h.startSession(t)
+	ch := h.ask(t, "sh", "-x", "script")
+	block := s.waitFor(t, "answer [r]efuse [o]nce ? ")
+	if want := "why   denied by rule \"sh\": flag -x is not allowed\n"; !strings.Contains(block, want) {
+		t.Errorf("the block %q lacks %q", block, want)
+	}
+	if strings.Contains(block, "guarded") {
+		t.Errorf("an allow-list refusal is shown guarded: %q", block)
+	}
+	s.answer(t, "r")
+	s.waitFor(t, notePromptText)
+	s.answer(t, "")
+	got := awaitResult(t, ch)
+	want := result{code: protocol.ExitRejected, stderr: "hostrun: waiting for approval on the host: denied by rule \"sh\": flag -x is not allowed\nhostrun: refused on the host\n"}
+	if got != want {
 		t.Fatalf("got %+v, want %+v", got, want)
 	}
 }
@@ -515,4 +527,233 @@ func TestAskWithoutASessionAndASessionLeavingAreLogged(t *testing.T) {
 	conn := h.serveRaw(t)
 	conn.Close()
 	waitForLog(t, &log, `msg="approval session left" pid=`)
+}
+
+// guardedRules refuse each kind of guarded refusal: a deny list, a path
+// check, an argv the rules cannot read, and a rule with secrets.
+const guardedRules = `
+rules:
+  - command: touch
+    positional:
+      deny: ["+*"]
+  - command: cat
+    positional:
+      path: open
+  - command: env
+    flags:
+      values:
+        --unset: {}
+        --unset-other: {}
+  - command: printf
+    secrets:
+      token: {env: TOKEN}
+    inject:
+      env: {API_TOKEN: "${token}"}
+    flags:
+      allow: []
+    positional:
+      allow: ["ok"]
+`
+
+// A guarded refusal is marked as such, and approving it needs "yes" after a
+// warning naming why; anything else returns to the answer prompt.
+func TestAskGuardedRefusalsNeedYes(t *testing.T) {
+	t.Setenv("TOKEN", testToken)
+	tests := []struct {
+		name  string
+		argv  []string
+		guard string
+	}{
+		{"explicitly denied", []string{"touch", "+marker"}, `explicitly denied: argument "+marker" is denied`},
+		{"path check", []string{"cat", "/etc/passwd"}, `path check: argument "/etc/passwd" is not a workspace file: it is an absolute path`},
+		{"unreadable argv", []string{"env", "--unse", "x"}, `unreadable argv: flag --unse is ambiguous`},
+		{"secrets", []string{"printf", "other"}, `injects secrets: token`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := startDaemon(t, policy(t, guardedRules))
+			s := h.startSession(t)
+			ch := h.ask(t, tt.argv...)
+			block := s.waitFor(t, "answer [r]efuse [o]nce ? ")
+			if want := "⚠ guarded: " + tt.guard + "\n"; !strings.Contains(block, want) {
+				t.Errorf("the block %q lacks %q", block, want)
+			}
+			s.answer(t, "o")
+			warning := s.waitFor(t, `Type "yes" to run it once: `)
+			if !strings.Contains(warning, "⚠ "+tt.guard+"\n") {
+				t.Errorf("the warning %q lacks %q", warning, tt.guard)
+			}
+			s.answer(t, "no")
+			s.waitFor(t, "answer [r]efuse [o]nce ? ")
+			s.answer(t, "r")
+			s.waitFor(t, notePromptText)
+			s.answer(t, "")
+			got := awaitResult(t, ch)
+			if got.code != protocol.ExitRejected || !strings.HasPrefix(got.stderr, "hostrun: waiting for approval on the host (guarded): ") {
+				t.Fatalf("got %+v, want a guarded wait and a refusal", got)
+			}
+		})
+	}
+}
+
+// Typing "yes" approves a guarded refusal; the log records it guarded.
+func TestAskApprovesAGuardedRefusalWithYes(t *testing.T) {
+	var log lockedBuffer
+	h := startLoggingDaemon(t, slog.New(slog.NewTextHandler(&log, nil)), policy(t, guardedRules))
+	s := h.startSession(t)
+	ch := h.ask(t, "touch", "+marker")
+	s.waitFor(t, "answer [r]efuse [o]nce ? ")
+	s.answer(t, "o")
+	s.waitFor(t, `Type "yes" to run it once: `)
+	s.answer(t, "yes")
+	got := awaitResult(t, ch)
+	want := result{stderr: "hostrun: waiting for approval on the host (guarded): denied by rule \"touch\": argument \"+marker\" is denied\nhostrun: approved on the host: this request only\n"}
+	if got != want {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+	if _, err := os.Stat(filepath.Join(h.hostRoot, "+marker")); err != nil {
+		t.Fatalf("the approved command did not run: %v", err)
+	}
+	waitForLog(t, &log, "guarded=true")
+}
+
+// approveYes approves the shown request once, through its warning.
+func (s *session) approveYes(t *testing.T) {
+	t.Helper()
+	s.waitFor(t, "answer [r]efuse [o]nce ? ")
+	s.answer(t, "o")
+	s.waitFor(t, `Type "yes" to run it once: `)
+	s.answer(t, "yes")
+}
+
+// An approved command a rule refused runs as the rule's allowed commands
+// do: in its fixed directory, with its injection, its secrets masked in
+// the output.
+func TestAskRunsAnApprovedCommandAsItsRuleWould(t *testing.T) {
+	t.Setenv("TOKEN", testToken)
+	dir := fixedDir(t)
+	h := startDaemon(t, policy(t, `
+rules:
+  - command: sh
+    dir: `+dir+`
+    secrets:
+      token: {env: TOKEN}
+    inject:
+      env: {API_TOKEN: "${token}"}
+    flags:
+      allow: [-c]
+    positional:
+      allow: ["true"]
+`))
+	s := h.startSession(t)
+	ch := h.ask(t, "sh", "-c", `pwd; echo "$API_TOKEN"`)
+	s.approveYes(t)
+	got := awaitResult(t, ch)
+	if want := dir + "\n***\n"; got.code != 0 || got.stdout != want {
+		t.Fatalf("got %+v, want stdout %q", got, want)
+	}
+}
+
+// Arguments that pass their path check are handed over as the files the
+// check opened; one approved after failing it is passed as given.
+func TestAskHandsPassingPathsOverAndFailingOnesAsGiven(t *testing.T) {
+	h := startDaemon(t, policy(t, `
+rules:
+  - command: echo
+    positional:
+      path: open
+`))
+	if err := os.WriteFile(filepath.Join(h.hostRoot, "inside"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "outside")
+	s := h.startSession(t)
+	ch := h.ask(t, "echo", "inside", outside)
+	s.approveYes(t)
+	got := awaitResult(t, ch)
+	if want := "/proc/self/fd/3 " + outside + "\n"; got.code != 0 || got.stdout != want {
+		t.Fatalf("got %+v, want stdout %q", got, want)
+	}
+}
+
+// An argument its list refuses is path-checked too: one that fails the
+// check makes the request guarded.
+func TestAskPathChecksArgumentsTheListsRefuse(t *testing.T) {
+	tests := []struct {
+		name string
+		argv []string
+	}{
+		{"positional", []string{"cat", "/etc/passwd"}},
+		{"flag value", []string{"cat", "--file", "/etc/passwd"}},
+		{"go positional", []string{"tail", "/etc/passwd"}},
+		{"go flag value", []string{"tail", "-file", "/etc/passwd"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := startDaemon(t, policy(t, `
+rules:
+  - command: cat
+    flags:
+      values:
+        --file: {allow: ["foo"], path: open}
+    positional:
+      allow: ["foo"]
+      path: open
+  - command: tail
+    flag_style: go
+    flags:
+      values:
+        -file: {allow: ["foo"], path: open}
+    positional:
+      allow: ["foo"]
+      path: open
+`))
+			s := h.startSession(t)
+			ch := h.ask(t, tt.argv...)
+			block := s.waitFor(t, "answer [r]efuse [o]nce ? ")
+			if want := `⚠ guarded: path check: argument "/etc/passwd" is not a workspace file: it is an absolute path` + "\n"; !strings.Contains(block, want) {
+				t.Errorf("the block %q lacks %q", block, want)
+			}
+			s.answer(t, "r")
+			s.waitFor(t, notePromptText)
+			s.answer(t, "")
+			awaitResult(t, ch)
+		})
+	}
+}
+
+// An argument that passed its path check when the human was asked, and
+// fails it when the approved command starts, refuses the command: only
+// the failures the human saw are passed as given.
+func TestAskRefusesAPathThatFailsOnlyOnceApproved(t *testing.T) {
+	h := startDaemon(t, policy(t, `
+rules:
+  - command: cat
+    flags:
+      allow: []
+    positional:
+      path: open
+`))
+	inside := filepath.Join(h.hostRoot, "inside")
+	if err := os.WriteFile(inside, []byte("inside\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "outside")
+	if err := os.WriteFile(outside, []byte("outside\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := h.startSession(t)
+	ch := h.ask(t, "cat", "-n", "inside")
+	s.waitFor(t, "answer [r]efuse [o]nce ? ")
+	if err := os.Remove(inside); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, inside); err != nil {
+		t.Fatal(err)
+	}
+	s.answer(t, "o")
+	got := awaitResult(t, ch)
+	if got.code != protocol.ExitRejected || !strings.Contains(got.stderr, `hostrun: argument "inside" is not a workspace file`) || strings.Contains(got.stdout, "outside") {
+		t.Fatalf("got %+v, want the path check to refuse it", got)
+	}
 }

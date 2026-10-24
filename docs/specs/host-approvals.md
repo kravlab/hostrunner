@@ -53,8 +53,9 @@ from `protocol.Version` of the container's socket.
   workspace; a secret unavailable or too short to mask; the program not
   found or not executable.
 - For an approval request, and for the Rules test, the rules check the
-  whole argv and collect every reason, path checks included; one guarded
-  reason makes the request guarded. A plain refusal reports the first
+  whole argv and collect every reason, path checks included (an argument
+  a list refuses is path-checked too); one guarded reason makes the
+  request guarded. A plain refusal reports the first
   reason; its hint's guarded mark is judged over every reason.
 - Before asking, the daemon runs every check that cannot be approved, as a
   dry run does (directories, the secrets' sources without obtaining
@@ -74,8 +75,9 @@ from `protocol.Version` of the container's socket.
 - A command the rules or a standing approval allow runs at once, printing
   nothing of hostrun's own.
 - While the request waits: one stderr line, `hostrun: waiting for approval
-  on the host: <reasons joined by "; ">`, with ` (guarded)` after `host`
-  for a guarded refusal.
+  on the host: <reasons joined by "; ">`, the first naming the rule that
+  refused it as a refusal does (`denied by rule "git push": …`), with
+  ` (guarded)` after `host` for a guarded refusal.
 - Approved: `hostrun: approved on the host: this request only` (`for the
   daemon's lifetime`, `rule added`), then the command's output and exit
   code as for an allowed command.
@@ -220,10 +222,11 @@ waiting for requests · commands: standing, revoke <n>, daemons, quit
   dir   /workspaces/app/svc
   argv  "git" "push" "--force" "origin" "main"
   why   denied by rule "git push": flag --force is not allowed (deny list)
-  ⚠ guarded: explicitly denied
+  ⚠ guarded: explicitly denied: flag --force is not allowed
   (1 more waiting)
 answer [r]efuse [o]nce [l]ifetime [?]more ? o
-⚠ --force is explicitly denied. Type "yes" to run it once: yes
+⚠ explicitly denied: flag --force is not allowed
+Type "yes" to run it once: yes
 approved once
 
 ── request 9 ── 10:00 left ──────────────────────────────
@@ -260,10 +263,11 @@ revoked 1
   the agent), `o` this request only, `l` for the daemon's lifetime, `a`
   add a rule, `?` the whole argv. Input typed before the prompt is
   discarded; an invalid line asks again.
-- Guarded: after `o` or `l`, a warning listing every guarded reason and
-  `yes` to type; anything else returns to the answer prompt. The `why`
-  line names the list kind that refused (`(deny list)`), which the rules'
-  own message does not.
+- Guarded: the block lists every guarded reason, `⚠ guarded: <reason>`
+  each, sent with the request; after `o` or `l`, a warning repeats them,
+  `⚠ <reason>` each, then `yes` to type; anything else returns to the
+  answer prompt. The `why` line names the list kind that refused
+  (`(deny list)`), which the rules' own message does not.
 - What came from the container is shown in Go quotes: control characters
   and terminal escapes appear escaped. Printable Unicode is shown as is,
   and an argument holding non-ASCII gets `⚠ non-ASCII` and its ASCII form.
