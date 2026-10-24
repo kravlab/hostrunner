@@ -534,6 +534,12 @@ func (s *Server) ask(ctx context.Context, cancel context.CancelFunc, conn net.Co
 		s.start(ctx, cancel, conn, out, req, p, func() (protocol.Frame, error) { return protocol.ReadFrame(conn) })
 		return
 	}
+	// From here on the daemon stopping does not close the connection: a
+	// waiting request tells its client first (see the wait below). Had it
+	// closed it already, nothing is asked.
+	if !closeOnStop() {
+		return
+	}
 	var (
 		id      uint64
 		request *approvalRequest
@@ -553,7 +559,6 @@ func (s *Server) ask(ctx context.Context, cancel context.CancelFunc, conn net.Co
 		s.reject(out, protocol.ExitRejected, message, err)
 		return
 	}
-	closeOnStop()
 	guarded := len(need.text.guards) > 0
 	s.log.Info("approval requested", "approval_id", id, "argv", req.Argv, "dir", need.hostDir, "reasons", need.text.agentReasons, "guarded", guarded, "timeout", timeout)
 	_ = out.writeJSON(protocol.FrameWaiting, protocol.Waiting{Reasons: need.text.agentReasons, Guarded: guarded})
