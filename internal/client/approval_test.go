@@ -757,3 +757,97 @@ rules:
 		t.Fatalf("got %+v, want the path check to refuse it", got)
 	}
 }
+
+// While a session serves the daemon, a refusal --ask would ask a human
+// about hints at it, marked guarded when any of its reasons is; a dry run
+// reports what the run gets.
+func TestRefusalsHintAtAskWhileASessionServes(t *testing.T) {
+	t.Setenv("TOKEN", testToken)
+	const ask = " (ask for an approval: hostrun --ask …)\n"
+	const guarded = " (ask for an approval: hostrun --ask …; guarded: needs a second confirmation)\n"
+	tests := []struct {
+		name   string
+		rules  string
+		argv   []string
+		marker string // what the command would create in the workspace; "" if nothing
+		stderr string
+	}{
+		{"no rule", echoOnly, []string{"touch", "marker"}, "marker", `hostrun: no rule allows "touch marker"` + ask},
+		{"guarded by a later reason", `
+rules:
+  - command: touch
+    flags:
+      allow: []
+    positional:
+      deny: ["+*"]
+`, []string{"touch", "-a", "+marker"}, "+marker", `hostrun: denied by rule "touch": flag -a is not allowed` + guarded},
+		{"path check", guardedRules, []string{"cat", "/etc/passwd"}, "", `hostrun: argument "/etc/passwd" is not a workspace file: it is an absolute path` + guarded},
+		{"rule with secrets", guardedRules, []string{"printf", "other"}, "", `hostrun: denied by rule "printf": argument "other" is not allowed` + guarded},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := startDaemon(t, policy(t, tt.rules))
+			h.startSession(t)
+			want := result{code: protocol.ExitRejected, stderr: tt.stderr}
+			for _, mode := range [][]string{nil, {"--dry-run"}} {
+				if got := h.run(t, containerRoot, "", append(mode, tt.argv...)...); got != want {
+					t.Errorf("%v: got %+v, want %+v", mode, got, want)
+				}
+			}
+			if tt.marker != "" {
+				assertNotRun(t, h, tt.marker)
+			}
+		})
+	}
+}
+
+// Without a session nothing can be approved, so nothing hints at --ask.
+func TestRefusalsDoNotHintWithoutASession(t *testing.T) {
+	h := startDaemon(t, policy(t, echoOnly))
+	want := result{code: protocol.ExitRejected, stderr: "hostrun: no rule allows \"touch marker\"\n"}
+	if got := h.run(t, containerRoot, "", "touch", "marker"); got != want {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+}
+
+// A refusal --ask would refuse anyway, before asking anyone, does not hint
+// at it, in a run or a dry run.
+func TestRefusalsAskWouldRefuseAnywayDoNotHint(t *testing.T) {
+	h := startDaemon(t, policy(t, echoOnly+`
+  - command: touch
+    dir: /no-such-dir-hostrunner
+    flags:
+      allow: []
+  - command: printf
+    secrets:
+      token: {env: HOSTRUNNER_TEST_UNSET_TOKEN}
+    inject:
+      env: {API_TOKEN: "${token}"}
+    flags:
+      allow: []
+    positional:
+      allow: ["ok"]
+`))
+	h.startSession(t)
+	tests := []struct {
+		name string
+		cwd  string
+		argv []string
+		want string
+	}{
+		{"program not found", containerRoot, []string{"no-such-program-hostrunner"}, "hostrun: no rule allows \"no-such-program-hostrunner\"\n"},
+		{"directory outside the workspace", "/etc", []string{"sh", "-x"}, "hostrun: denied by rule \"sh\": flag -x is not allowed\n"},
+		{"rule's dir missing", containerRoot, []string{"touch", "-a", "x"}, "hostrun: denied by rule \"touch\": flag -a is not allowed\n"},
+		{"secret unavailable", containerRoot, []string{"printf", "-v"}, "hostrun: denied by rule \"printf\": flag -v is not allowed\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			want := result{code: protocol.ExitRejected, stderr: tt.want}
+			for _, mode := range [][]string{nil, {"--dry-run"}} {
+				if got := h.run(t, tt.cwd, "", append(mode, tt.argv...)...); got != want {
+					t.Errorf("%v: got %+v, want %+v", mode, got, want)
+				}
+			}
+		})
+	}
+}

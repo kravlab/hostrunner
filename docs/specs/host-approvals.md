@@ -90,7 +90,10 @@ from `protocol.Version` of the container's socket.
 - Interrupted: 130 as today; the dropped connection withdraws the request.
 - While a session serves the daemon, a plain refusal that can be approved
   ends with `(ask for an approval: hostrun --ask …)`, or `(ask for an
-  approval: hostrun --ask …; guarded: needs a second confirmation)`.
+  approval: hostrun --ask …; guarded: needs a second confirmation)`; the
+  `…` is literal. It hints only when `--ask` would ask a human: not when
+  a check an approval cannot lift (a directory, a secret's source, the
+  program) would refuse the command anyway.
 - Exact wording may be polished when implemented; the scheme of codes and
   `hostrun:` messages stays.
 

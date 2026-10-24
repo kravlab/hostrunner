@@ -42,14 +42,15 @@ const askFlag = "--ask"
 // a dry run of it: the daemon runs every check the command would meet
 // before it starts, but never starts it. Run then reports the allowing
 // rule on stderr and returns 0, or fails as a run of the command would
-// have been refused. Nothing after the first argument is hostrun's own, so
-// a command's --dry-run reaches the command.
+// have been refused. After the program nothing is hostrun's own, so a
+// command's --dry-run reaches the command.
 //
 // When args starts with askFlag, a command the rules refuse but a human may
 // approve waits for an approval session's answer: Run reports on stderr
 // that it waits, then that it was approved and how far, and runs it as
 // usual; a refusal exits as any other. Cancelling ctx withdraws the
-// request.
+// request. The two flags exclude each other: one followed by the other
+// fails with ExitHostrunError.
 //
 // stdin is forwarded until it returns EOF, within the credit the daemon
 // grants; a dry run does not read it, and an approval request reads it only
@@ -66,6 +67,11 @@ func Run(ctx context.Context, d Dialer, args []string, cwd string, stdin io.Read
 		case askFlag:
 			argv, ask = args[1:], true
 		}
+	}
+	// The other flag as the next argument is taken for a mistake rather
+	// than for a program of that name.
+	if len(argv) > 0 && (dryRun && argv[0] == askFlag || ask && argv[0] == dryRunFlag) {
+		return fail(stderr, protocol.ExitHostrunError, "%s and %s cannot be combined", dryRunFlag, askFlag)
 	}
 	if len(argv) == 0 {
 		return fail(stderr, protocol.ExitHostrunError, "usage: hostrun [%s|%s] <command> [args...]", dryRunFlag, askFlag)

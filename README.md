@@ -184,6 +184,16 @@ hostrun --ask git rebase -i main
 ```
 
 - A command that would run without `--ask` runs at once, without asking.
+- While a session serves the daemon, a run or dry run that the rules or
+  a path check refuse ends with a hint when `--ask` would ask a human
+  about it, marked guarded when any of its reasons is:
+  `hostrun: denied by rule "git push": flag --force is not allowed (ask
+  for an approval: hostrun --ask …; guarded: needs a second
+  confirmation)`. No hint comes when `--ask` would be refused anyway:
+  the working directory, the rule's `dir`, a secret's source or the
+  program.
+- `--dry-run` and `--ask` cannot be combined: either followed by the
+  other fails with 125.
 - Approvals are on only while a session serves the daemon: without one,
   `--ask` is refused at once with 126 and `not approved: no approval
   session serves this devcontainer`.
@@ -529,7 +539,7 @@ How it works:
 | command's own | the command ran |
 | 0 | `--dry-run`: the command would run |
 | 128+N | the command was killed by signal N |
-| 125 | hostrun failed: daemon unreachable, protocol error, or no command given |
+| 125 | hostrun failed: daemon unreachable, protocol error, no command given, or `--dry-run` and `--ask` combined |
 | 126 | refused: denied by the rules, an argument not a workspace file, working directory outside the workspace, a rule's `dir` missing, not a directory or inside the workspace, or not executable; with `--ask`, not approved on the host (refused, unanswered, no approval session) |
 | 127 | command not found on the host |
 | 130 | interrupted (Ctrl+C); the host command is killed |

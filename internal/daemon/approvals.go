@@ -289,33 +289,22 @@ func (s *Server) ask(ctx context.Context, cancel context.CancelFunc, conn net.Co
 		s.reject(out, protocol.ExitHostrunError, err.Error(), err)
 		return
 	}
-	approved, err := s.policy.Check(req.Argv)
-	var d *rules.Denial
-	if err != nil && (!errors.As(err, &d) || !d.Approvable()) {
-		s.run(ctx, cancel, conn, out, req)
-		return
-	}
-	if d != nil {
-		approved = d.Approved
-	}
-	// What would refuse the command anyway is reported before a human is
-	// asked; starting it checks all of it again. Every path check may fail
-	// here: its failure is asked about.
-	p, r := s.prepareAllowed(req, approved, true, everyPath(approved.Paths))
-	if r == nil {
-		r = lookupStart(p, req)
-	}
+	need, r := s.assessApproval(req)
 	if r != nil {
 		s.reject(out, r.code, r.message, r.err)
 		return
 	}
-	hostDir, pathFailures := p.hostPath, p.pathFailures
-	p.close()
-	if d == nil && len(pathFailures) == 0 {
-		s.run(ctx, cancel, conn, out, req)
+	if need == nil {
+		// It runs as a plain request does, but a refusal (a file changed
+		// since the assessment) does not hint at --ask: it was asked with it.
+		p, r := s.prepare(req, false)
+		if r != nil {
+			s.reject(out, r.code, r.message, r.err)
+			return
+		}
+		s.start(ctx, cancel, conn, out, req, p, func() (protocol.Frame, error) { return protocol.ReadFrame(conn) })
 		return
 	}
-	text := describeRequest(d, approved, pathFailures)
 	timeout := defaultAskTimeout
 	if ask.TimeoutMs > 0 {
 		timeout = time.Duration(ask.TimeoutMs) * time.Millisecond
@@ -324,10 +313,10 @@ func (s *Server) ask(ctx context.Context, cancel context.CancelFunc, conn net.Co
 		id      uint64
 		answers <-chan protocol.Answer
 	)
-	err = errNoSession
+	err := errNoSession
 	if s.approvals != nil {
 		id, answers, err = s.approvals.enqueue(protocol.ApprovalRequest{
-			Argv: req.Argv, Cwd: req.Cwd, Reasons: text.sessionReasons, Guards: text.guards, TimeoutMs: timeout.Milliseconds(),
+			Argv: req.Argv, Cwd: req.Cwd, Reasons: need.text.sessionReasons, Guards: need.text.guards, TimeoutMs: timeout.Milliseconds(),
 		})
 	}
 	if err != nil {
@@ -335,14 +324,14 @@ func (s *Server) ask(ctx context.Context, cancel context.CancelFunc, conn net.Co
 		if errors.Is(err, errTooLarge) {
 			reason, message = "too large", tooLargeMessage
 		}
-		s.log.Info("approval not answered", "reason", reason, "argv", req.Argv, "dir", hostDir)
+		s.log.Info("approval not answered", "reason", reason, "argv", req.Argv, "dir", need.hostDir)
 		s.reject(out, protocol.ExitRejected, message, err)
 		return
 	}
 	defer s.approvals.withdraw(id)
-	guarded := len(text.guards) > 0
-	s.log.Info("approval requested", "approval_id", id, "argv", req.Argv, "dir", hostDir, "reasons", text.agentReasons, "guarded", guarded, "timeout", timeout)
-	_ = out.writeJSON(protocol.FrameWaiting, protocol.Waiting{Reasons: text.agentReasons, Guarded: guarded})
+	guarded := len(need.text.guards) > 0
+	s.log.Info("approval requested", "approval_id", id, "argv", req.Argv, "dir", need.hostDir, "reasons", need.text.agentReasons, "guarded", guarded, "timeout", timeout)
+	_ = out.writeJSON(protocol.FrameWaiting, protocol.Waiting{Reasons: need.text.agentReasons, Guarded: guarded})
 
 	frames := readFrames(ctx, conn)
 	timer := time.NewTimer(timeout)
@@ -375,11 +364,80 @@ func (s *Server) ask(ctx context.Context, cancel context.CancelFunc, conn net.Co
 	// Only the path failures the human saw are passed as given: one that
 	// fails its check only now (a file swapped for a symlink meanwhile)
 	// refuses the command.
-	if p, r = s.prepareAllowed(req, approved, false, failedPaths(pathFailures)); r != nil {
+	p, r := s.prepareAllowed(req, need.approved, false, failedPaths(need.pathFailures))
+	if r != nil {
 		s.reject(out, r.code, r.message, r.err)
 		return
 	}
 	s.start(ctx, cancel, conn, out, req, p, frames.next, "approved", ans.Scope, "approval_id", id)
+}
+
+// approvalNeed is what --ask would ask a human about a request: what the
+// command would run with, the path failures that would be passed as
+// given, the host directory it would run from (for the log), and how the
+// request reads.
+type approvalNeed struct {
+	approved     rules.Allowed
+	pathFailures []pathFailure
+	hostDir      string
+	text         requestText
+}
+
+// assessApproval runs the checks --ask runs on req before asking a human:
+// the rules, then, as a dry run, every check an approval cannot lift
+// (directories, secrets' sources, the program), with the path checks
+// collected rather than refusing. It returns nil and nil when req would run
+// without asking, a refusal when it would be refused without asking, or
+// what the human would be asked.
+func (s *Server) assessApproval(req protocol.Request) (*approvalNeed, *refusal) {
+	approved, err := s.policy.Check(req.Argv)
+	var d *rules.Denial
+	if err != nil && (!errors.As(err, &d) || !d.Approvable()) {
+		return nil, &refusal{protocol.ExitRejected, err.Error(), err}
+	}
+	if d != nil {
+		approved = d.Approved
+	}
+	// Starting the command checks all of it again. Every path check may
+	// fail here: its failure is asked about.
+	p, r := s.prepareAllowed(req, approved, true, everyPath(approved.Paths))
+	if r == nil {
+		r = lookupStart(p, req)
+	}
+	if r != nil {
+		return nil, r
+	}
+	p.close()
+	if d == nil && len(p.pathFailures) == 0 {
+		return nil, nil
+	}
+	return &approvalNeed{
+		approved:     approved,
+		pathFailures: p.pathFailures,
+		hostDir:      p.hostPath,
+		text:         describeRequest(d, approved, p.pathFailures),
+	}, nil
+}
+
+// withAskHint returns r, the refusal of a plain request or dry run of req,
+// with a hint at --ask added to its message when a session serves the
+// daemon and --ask would ask a human about req; the hint says whether
+// approving it is guarded, judged over every reason. Otherwise it returns
+// r.
+func (s *Server) withAskHint(req protocol.Request, r *refusal) *refusal {
+	if s.approvals == nil || !s.approvals.served() {
+		return r
+	}
+	// A refusal --ask would get comes without what it would ask.
+	need, _ := s.assessApproval(req)
+	if need == nil {
+		return r
+	}
+	hint := "ask for an approval: hostrun --ask …"
+	if len(need.text.guards) > 0 {
+		hint += "; guarded: needs a second confirmation"
+	}
+	return &refusal{r.code, r.message + " (" + hint + ")", r.err}
 }
 
 // requestText is how an approval request reads: its reasons for the

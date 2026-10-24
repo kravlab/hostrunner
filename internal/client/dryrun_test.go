@@ -273,3 +273,21 @@ func TestMalformedDryRunIsLoggedAsADryRun(t *testing.T) {
 		t.Fatalf("the refusal is not logged as a dry run:\n%s", log.String())
 	}
 }
+
+// --dry-run and --ask exclude each other as hostrun's first two arguments,
+// in either order; after the program both are the command's own.
+func TestDryRunAndAskCannotBeCombined(t *testing.T) {
+	h := startDaemon(t, policy(t, echoOnly))
+	want := result{code: protocol.ExitHostrunError, stderr: "hostrun: --dry-run and --ask cannot be combined\n"}
+	for _, flags := range [][]string{{"--dry-run", "--ask"}, {"--ask", "--dry-run"}} {
+		if got := h.run(t, containerRoot, "", append(flags, "echo", "hi")...); got != want {
+			t.Errorf("%v: got %+v, want %+v", flags, got, want)
+		}
+	}
+	if got := h.run(t, containerRoot, "", "--ask", "echo", "--dry-run", "--ask"); got != (result{stdout: "--dry-run --ask\n"}) {
+		t.Errorf("after the program: got %+v, want echo's output", got)
+	}
+	if got := h.run(t, containerRoot, "", "--dry-run", "echo", "--ask"); got != (result{stderr: "hostrun: dry run: allowed by rule \"echo\"\n"}) {
+		t.Errorf("after the program, in a dry run: got %+v, want the allowing rule", got)
+	}
+}

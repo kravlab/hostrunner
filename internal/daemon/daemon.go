@@ -235,6 +235,7 @@ func (s *Server) dryRun(out *frameWriter, req protocol.Request) {
 		r = lookupStart(p, req)
 	}
 	if r != nil {
+		r = s.withAskHint(req, r)
 		s.reject(out, r.code, r.message, r.err, dryRunLogArgs...)
 		return
 	}
@@ -383,6 +384,7 @@ func (s *Server) prepareAllowed(req protocol.Request, allowed rules.Allowed, dry
 func (s *Server) run(ctx context.Context, cancel context.CancelFunc, conn net.Conn, out *frameWriter, req protocol.Request) {
 	p, r := s.prepare(req, false)
 	if r != nil {
+		r = s.withAskHint(req, r)
 		s.reject(out, r.code, r.message, r.err)
 		return
 	}
