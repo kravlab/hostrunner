@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"slices"
@@ -162,14 +163,22 @@ const (
 
 // serveDaemon serves the daemon on socket, taking it over from the session
 // serving it with takeOver, until the human or the daemon ends it; canList
-// lets the human ask for the list of daemons.
+// lets the human ask for the list of daemons. It returns once the daemon
+// has dropped the session (see hangUp), so a list of daemons asked for
+// right after shows the daemon unserved; an interruption (ctx) hangs up
+// alike.
 func (t *term) serveDaemon(ctx context.Context, socket string, takeOver, canList bool) (end, error) {
 	conn, err := transport.Unix{Path: socket}.Dial(ctx)
 	if err != nil {
 		return endNoDaemon, err
 	}
 	defer conn.Close()
-	stop := context.AfterFunc(ctx, func() { conn.Close() })
+	stop := context.AfterFunc(ctx, func() {
+		// The daemon closing its side ends every read; should it not
+		// within hangUpTimeout, the connection is closed here.
+		halfClose(conn)
+		time.AfterFunc(hangUpTimeout, func() { conn.Close() })
+	})
 	defer stop()
 
 	info, err := hello(conn)
@@ -188,7 +197,45 @@ func (t *term) serveDaemon(ctx context.Context, socket string, takeOver, canList
 	defer close(done)
 	s := &session{term: t, conn: conn, canList: canList, rulesFile: info.RulesFile, rulesDigest: info.RulesDigest, workspace: info.Workspace}
 	s.prompt(idlePrompt)
-	return s.loop(ctx, readDaemon(conn, done))
+	frames := readDaemon(conn, done)
+	end, err := s.loop(ctx, frames)
+	hangUp(conn, frames)
+	return end, err
+}
+
+// hangUpTimeout bounds how long a session that ends waits for the daemon
+// to drop it (see hangUp).
+const hangUpTimeout = time.Second
+
+// hangUp lets the daemon on conn drop the session before it returns: it
+// closes the session's side for writing (see halfClose) and reads what
+// the daemon still sends, frames, until the daemon closes the connection,
+// which it does once it no longer counts the session as serving it, or
+// hangUpTimeout passes.
+func hangUp(conn net.Conn, frames <-chan protocol.Frame) {
+	halfClose(conn)
+	timeout := time.NewTimer(hangUpTimeout)
+	defer timeout.Stop()
+	for {
+		select {
+		case _, more := <-frames:
+			if !more {
+				return
+			}
+		case <-timeout.C:
+			return
+		}
+	}
+}
+
+// halfClose closes the session's side of conn for writing: the daemon
+// reads the end of it and drops the session. A connection to a daemon is
+// a Unix one, which can; any other is left open, and hangUp waits out
+// hangUpTimeout.
+func halfClose(conn net.Conn) {
+	if cw, ok := conn.(interface{ CloseWrite() error }); ok {
+		_ = cw.CloseWrite()
+	}
 }
 
 // hello opens the connection and returns the daemon's answer.
@@ -310,7 +357,8 @@ func (s *session) loop(ctx context.Context, frames <-chan protocol.Frame) (end, 
 			return endQuit, nil
 		case f, ok := <-frames:
 			if !ok && ctx.Err() != nil {
-				// Ctrl+C closed the connection before ctx.Done was seen.
+				// Ctrl+C hung up, and the daemon closed the connection,
+				// before ctx.Done was seen.
 				s.leave()
 				return endQuit, nil
 			}

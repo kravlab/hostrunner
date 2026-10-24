@@ -234,6 +234,21 @@ func TestSessionDaemonsCommandReturnsToTheList(t *testing.T) {
 	waitForLog(t, &log, `msg="approval session left"`)
 }
 
+// A session interrupted (Ctrl+C) lets the daemon drop it before it ends:
+// a session listing the daemons right after sees it unserved.
+func TestInterruptedSessionLeavesTheDaemonUnserved(t *testing.T) {
+	base, root := newBase(t)
+	h := startEchoDaemon(t, slog.New(slog.DiscardHandler), base)
+	s := h.startSession(t)
+	s.waitFor(t, "> ")
+	s.cancel()
+	<-s.ended
+	next := startSessionWith(t, approval.Config{Root: root, Cwd: h.hostRoot})
+	if list := next.waitForListed(t); strings.Contains(list, "served by another session") {
+		t.Fatalf("the interrupted session still serves the daemon: %q", list)
+	}
+}
+
 // A runtime directory without an approval socket has no approvals: the
 // session says so.
 func TestSessionWithoutAnApprovalSocketSaysSo(t *testing.T) {

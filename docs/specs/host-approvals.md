@@ -353,7 +353,9 @@ revoked 1
   `daemons` lists them meanwhile.
 - `daemons` at the idle prompt leaves the daemon served (nothing waits at
   that prompt) and shows the list; choosing it again serves it again. One
-  session serves one daemon.
+  session serves one daemon. A session that ends, by `daemons`, `quit` or
+  Ctrl+C, waits (up to 1 s) for the daemon to drop it, so a list shown
+  right after shows the daemon unserved.
 - Session frames: `Serve{take_over}` (an empty `Serve` serves a daemon
   nobody serves), answered by `FrameServing` and the requests passed on;
   the session replaced gets `FrameTakenOver`.
