@@ -245,10 +245,13 @@ from `protocol.Version` of the container's socket.
   set` and asks again. A valid edit is written at once; an invalid one is
   reported and `[e]dit again [c]ancel` asked. The session reads nothing
   from the terminal while the editor runs.
-- Session frames: `Reread{rule, edited, digest}`, `digest` that of the
-  file written, answered by `RereadResult{digest, error}`; the daemon
-  keeps its rules when the file it rereads has another digest. The answer
-  then has the scope `rule`, or `once` after a failed reread.
+- Session frames: `Reread{rule, edited, digest, id}`, `digest` that of
+  the file written, `id` the request the rule is for, answered by
+  `RereadResult{digest, error, runs_once}`; the daemon keeps its rules
+  when the file it rereads has another digest, and `runs_once` says why
+  its checks still refuse request `id` under the new rules. The answer
+  then has the scope `rule`, or `once` after a failed reread or with
+  `runs_once`.
 
 ## Approval session
 
@@ -412,6 +415,10 @@ revoked 1
   written, and the session asks for the answer again.
 - A failed reread after a write: the request runs once, the old rules
   stay, the session says so.
+- A rule edited by hand that the rules allow but a later check refuses
+  (a fixed directory missing): the request runs once, the session says
+  so and why (`request 9 runs once: fixed directory … does not exist`),
+  and the agent and the log get `once`, not `rule`.
 - An argv holding terminal escapes, look-alike letters, or megabytes of
   arguments: shown escaped, marked and cut; `?` shows all.
 

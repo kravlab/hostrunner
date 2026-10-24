@@ -536,7 +536,30 @@ func (s *Server) reread(c *sessionConn, rr protocol.Reread) protocol.RereadResul
 		return protocol.RereadResult{Error: err.Error()}
 	}
 	s.log.Info("rules reread", "file", s.approvals.rulesFile, "digest", digest)
-	return protocol.RereadResult{Digest: digest}
+	res := protocol.RereadResult{Digest: digest}
+	if msg, ok := s.approvals.waitingMsg(rr.ID); ok {
+		// As the request will be run once answered (see ask): its checks
+		// under the new rules, as a dry run.
+		p, r := s.prepare(protocol.Request{Version: protocol.Version, Argv: msg.Argv, Cwd: msg.Cwd}, true)
+		if r != nil {
+			res.RunsOnce = r.message
+		} else {
+			p.close()
+		}
+	}
+	return res
+}
+
+// waitingMsg returns the request id as sent to the session, while it
+// waits for an answer.
+func (a *approvals) waitingMsg(id uint64) (protocol.ApprovalRequest, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	r, ok := a.waiting[id]
+	if !ok {
+		return protocol.ApprovalRequest{}, false
+	}
+	return r.msg, true
 }
 
 // serveSession makes c the session that serves the daemon, taking it over
@@ -709,33 +732,39 @@ func (s *Server) ask(ctx context.Context, cancel context.CancelFunc, conn net.Co
 		s.reject(out, protocol.ExitRejected, message, errRefused)
 		return
 	}
-	s.log.Info("approval answered", "approval_id", id, "scope", ans.Scope)
-	_ = out.writeJSON(protocol.FrameApproved, protocol.Approved{Scope: ans.Scope})
-	if ans.Scope == protocol.ScopeRule {
+	scope := ans.Scope
+	var p *prepared
+	if scope == protocol.ScopeRule {
 		// The session added a rule and the daemon reread it: the command
-		// runs under it. Should the rules refuse it still (the file changed
-		// again), it runs as approved once.
-		if p, r := s.prepare(req, false); r == nil {
-			s.start(ctx, cancel, conn, out, req, p, frames.next, "approved", ans.Scope, "approval_id", id)
-			return
+		// runs under it. The session answers once when the reread found
+		// the daemon's checks refusing it still (see reread); should they
+		// refuse it now all the same (the host changed meanwhile), it runs
+		// as approved once, and the agent and the log are told so.
+		var r *refusal
+		if p, r = s.prepare(req, false); r != nil {
+			scope = protocol.ScopeOnce
 		}
 	}
+	s.log.Info("approval answered", "approval_id", id, "scope", scope)
+	_ = out.writeJSON(protocol.FrameApproved, protocol.Approved{Scope: scope})
 	// Only the path failures the human saw are passed as given, for the
 	// reason they saw: one that fails its check only now, or otherwise (a
 	// file swapped for a symlink meanwhile), refuses the command.
 	seen := seenPaths(need.pathFailures)
-	p, r := s.prepareAllowed(req, need.approved, false, seen)
-	if r != nil {
-		s.reject(out, r.code, r.message, r.err)
-		return
+	if p == nil {
+		var r *refusal
+		if p, r = s.prepareAllowed(req, need.approved, false, seen); r != nil {
+			s.reject(out, r.code, r.message, r.err)
+			return
+		}
 	}
-	if ans.Scope == protocol.ScopeLifetime {
+	if scope == protocol.ScopeLifetime {
 		// Granted once the approved command has passed its checks, so a
 		// request refused at its start leaves nothing standing.
 		n := s.approvals.grant(req, len(need.text.guards) > 0, seen)
 		s.log.Info("standing approval granted", "standing", n, "argv", req.Argv, "dir", need.hostDir, "approval_id", id)
 	}
-	s.start(ctx, cancel, conn, out, req, p, frames.next, "approved", ans.Scope, "approval_id", id)
+	s.start(ctx, cancel, conn, out, req, p, frames.next, "approved", scope, "approval_id", id)
 }
 
 // approvalNeed is what --ask would ask a human about a request: what the

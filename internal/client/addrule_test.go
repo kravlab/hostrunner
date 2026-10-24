@@ -337,6 +337,35 @@ func TestAddRuleWithAFailedRereadRunsOnce(t *testing.T) {
 	}
 }
 
+// A rule added that the daemon's checks after the rules still refuse (here
+// a fixed directory that does not exist) lets the request run once: the
+// agent is told, and the log records, an approval of this request only.
+func TestAddRuleThatStillRefusesRunsOnce(t *testing.T) {
+	const edited = "rules:\n  - command: echo\n    args: any\n  - command: touch\n    args: any\n    dir: /nonexistent-hostrunner-dir\n"
+	scriptEditor(t, edited)
+	var log lockedBuffer
+	h := startRulesDaemon(t, slog.New(slog.NewTextHandler(&log, nil)), "rules:\n  - command: echo\n    args: any\n", false)
+	s := h.startSession(t)
+	ch := h.ask(t, "touch", "marker")
+	s.waitFor(t, answerPromptText)
+	s.answer(t, "a")
+	s.waitFor(t, addPromptText)
+	s.answer(t, "e")
+	s.waitFor(t, "rule added; the daemon reloaded the rules · request 1 runs once: fixed directory /nonexistent-hostrunner-dir does not exist\n")
+	got := awaitResult(t, ch)
+	if !strings.HasSuffix(got.stderr, "hostrun: approved on the host: this request only\n") || got.code != 0 {
+		t.Fatalf("got %+v, want it approved once", got)
+	}
+	waitForLog(t, &log, `msg="approval answered" approval_id=1 scope=once`)
+	waitForLog(t, &log, "approved=once")
+	if strings.Contains(log.String(), "=rule") {
+		t.Errorf("the log records the rule scope: %s", log.String())
+	}
+	if _, err := os.Stat(filepath.Join(h.hostRoot, "marker")); err != nil {
+		t.Errorf("the request did not run in the mirrored directory: %v", err)
+	}
+}
+
 // scriptEditor makes $VISUAL an editor that, opened the n-th time, leaves
 // the file it is given with edits[n-1].
 func scriptEditor(t *testing.T, edits ...string) {

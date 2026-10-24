@@ -104,7 +104,7 @@ func (s *session) writeRule() {
 		return
 	}
 	s.rereading = true
-	_ = protocol.WriteJSON(s.conn, protocol.FrameReread, protocol.Reread{Rule: a.rule, Edited: a.edited, Digest: rules.ContentDigest(a.data)})
+	_ = protocol.WriteJSON(s.conn, protocol.FrameReread, protocol.Reread{Rule: a.rule, Edited: a.edited, Digest: rules.ContentDigest(a.data), ID: a.id})
 }
 
 // editRule opens the rules file to write in $VISUAL or $EDITOR and writes
@@ -149,9 +149,10 @@ func (s *session) editRule(r waiting) {
 }
 
 // reread reports the daemon's reread of the rules file a rule was written
-// to, and answers the request it was added for: under the new rule, or,
-// when the daemon kept its old rules, once. A request that ended meanwhile
-// gets no answer.
+// to, and answers the request it was added for: under the new rule, or
+// once, when the daemon kept its old rules or its checks still refuse the
+// request under the new ones. A request that ended meanwhile gets no
+// answer.
 func (s *session) reread(res protocol.RereadResult) {
 	a := s.adding
 	s.adding, s.rereading = nil, false
@@ -169,7 +170,12 @@ func (s *session) reread(res protocol.RereadResult) {
 	} else {
 		s.rulesDigest = res.Digest
 		fmt.Fprint(s.out, "rule added; the daemon reloaded the rules")
-		if waiting {
+		switch {
+		case !waiting:
+		case res.RunsOnce != "":
+			scope = protocol.ScopeOnce
+			fmt.Fprintf(s.out, " · request %d runs once: %s", a.id, display(res.RunsOnce))
+		default:
 			fmt.Fprintf(s.out, " · request %d runs under it", a.id)
 		}
 	}

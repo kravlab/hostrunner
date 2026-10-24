@@ -335,18 +335,23 @@ type Revoked struct {
 // has written Rule, the command of a rule it added or widened (Edited: by
 // the human, in an editor), leaving the file with Digest. The daemon keeps
 // its rules when the file it rereads has another digest: an edit nobody
-// reviewed waits for the next start.
+// reviewed waits for the next start. ID is the request the rule was added
+// for.
 type Reread struct {
 	Rule   string `json:"rule"`
 	Edited bool   `json:"edited,omitempty"`
 	Digest string `json:"digest"`
+	ID     uint64 `json:"id,omitempty"`
 }
 
 // RereadResult answers Reread: Digest identifies the rules the daemon now
-// serves, or Error says why it kept its old ones.
+// serves, or Error says why it kept its old ones. RunsOnce says why the
+// daemon's checks still refuse request ID under the new rules (a rule
+// edited by hand that a later check refuses), so it runs approved once.
 type RereadResult struct {
-	Digest string `json:"digest,omitempty"`
-	Error  string `json:"error,omitempty"`
+	Digest   string `json:"digest,omitempty"`
+	Error    string `json:"error,omitempty"`
+	RunsOnce string `json:"runs_once,omitempty"`
 }
 
 // Withdrawn tells the session that request ID ended unanswered, for
