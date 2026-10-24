@@ -368,7 +368,7 @@ func TestArmHandlerStepsAsideOnceTheWatchEnded(t *testing.T) {
 		go func() { done <- w.Run(ctx) }()
 		synctest.Wait() // the watch runs, waiting for its next poll
 
-		onArm := armHandler("digest", "rules.yaml", w, discard)
+		onArm := armHandler(func() string { return "digest" }, "rules.yaml", w, discard)
 		if onArm(protocol.Arm{ConfigDigest: "digest"}) {
 			t.Fatal("stepped aside while the watch runs")
 		}
@@ -383,7 +383,7 @@ func TestArmHandlerStepsAsideOnceTheWatchEnded(t *testing.T) {
 }
 
 func TestArmHandlerStepsAsideWhenRulesChanged(t *testing.T) {
-	onArm := armHandler("digest", "rules.yaml", nil, slog.New(slog.DiscardHandler))
+	onArm := armHandler(func() string { return "digest" }, "rules.yaml", nil, slog.New(slog.DiscardHandler))
 	if !onArm(protocol.Arm{ConfigDigest: "other"}) {
 		t.Fatal("kept running with other rules")
 	}
@@ -532,7 +532,7 @@ func TestServeListensOnTheApprovalSocket(t *testing.T) {
 	if err != nil || f.Type != protocol.FrameDaemonInfo || protocol.DecodeJSON(f, &got) != nil {
 		t.Fatalf("hello: frame %v, err %v", f.Type, err)
 	}
-	want := protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: cfg.workspace, ContainerWorkspace: cfg.containerWorkspace, RulesFile: cfg.config}
+	want := protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: cfg.workspace, ContainerWorkspace: cfg.containerWorkspace, RulesFile: cfg.config, RulesDigest: "missing"}
 	if real, err := filepath.EvalSymlinks(cfg.workspace); err == nil {
 		want.Workspace = real
 	}
@@ -614,4 +614,57 @@ func TestServeClosesTheApprovalSocketFirstWhenSteppingAside(t *testing.T) {
 		t.Fatal("the approval socket still listens after the socket closed")
 	}
 	expectServeExit(t, done, cfg.socket)
+}
+
+// A session that adds a rule makes serve reread its rules file: the next
+// arm, carrying the new file's digest, does not make the daemon step aside.
+func TestServeRereadsItsRulesOnceARuleIsAdded(t *testing.T) {
+	cfg := watchConfig(t)
+	cfg.watch = false
+	cfg.config = filepath.Join(cfg.workspace, "hostrun.yaml")
+	if err := os.WriteFile(cfg.config, []byte("rules:\n  - command: echo\n    args: any\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	approvalSocket := launch.ApprovalSocket(filepath.Dir(cfg.socket))
+	t.Cleanup(func() { os.Remove(approvalSocket) })
+	startServe(t, cfg)
+	c, err := transport.Unix{Path: approvalSocket}.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if err := protocol.WriteJSON(c, protocol.FrameHello, protocol.Hello{Version: protocol.ApprovalVersion}); err != nil {
+		t.Fatal(err)
+	}
+	if f, err := protocol.ReadFrame(c); err != nil || f.Type != protocol.FrameDaemonInfo {
+		t.Fatalf("hello: frame %v, err %v", f.Type, err)
+	}
+	if err := protocol.WriteFrame(c, protocol.Frame{Type: protocol.FrameServe}); err != nil {
+		t.Fatal(err)
+	}
+	if f, err := protocol.ReadFrame(c); err != nil || f.Type != protocol.FrameServing {
+		t.Fatalf("serve: frame %v, err %v", f.Type, err)
+	}
+	added := []byte("rules:\n  - command: echo\n    args: any\n  - command: date\n    args: none\n")
+	if err := os.WriteFile(cfg.config, added, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := protocol.WriteJSON(c, protocol.FrameReread, protocol.Reread{Rule: "date", Digest: rules.ContentDigest(added)}); err != nil {
+		t.Fatal(err)
+	}
+	f, err := protocol.ReadFrame(c)
+	var res protocol.RereadResult
+	if err != nil || f.Type != protocol.FrameRereadResult || protocol.DecodeJSON(f, &res) != nil {
+		t.Fatalf("reread: frame %v, err %v", f.Type, err)
+	}
+	p, err := rules.Load(cfg.config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Error != "" || res.Digest != p.Digest() {
+		t.Fatalf("reread: got %+v, want the new file's digest %s", res, p.Digest())
+	}
+	if stepAside := armServe(t, cfg, p.Digest()); stepAside {
+		t.Fatal("stepped aside for the rules it reread")
+	}
 }

@@ -34,6 +34,7 @@ type harness struct {
 	hostRoot       string
 	runtimeDir     string // the directory holding the socket
 	approvalSocket string
+	rulesFile      string // the rules file a session adds rules to
 	stop           func() // shuts the daemon down; safe to call more than once
 }
 
@@ -64,6 +65,15 @@ func startLoggingDaemon(t *testing.T, log *slog.Logger, policies ...daemon.Polic
 // options opts besides its approval socket.
 func startDaemonWith(t *testing.T, log *slog.Logger, p daemon.Policy, opts ...daemon.Option) harness {
 	t.Helper()
+	return startHarness(t, log, func(string) (daemon.Policy, []daemon.Option) { return p, opts })
+}
+
+// startHarness starts a daemon on a new host workspace, whose rules file
+// lies at its .devcontainer/hostrun.yaml; setup returns, for that path,
+// the policy the daemon serves and the Server options besides its approval
+// socket.
+func startHarness(t *testing.T, log *slog.Logger, setup func(rulesFile string) (daemon.Policy, []daemon.Option)) harness {
+	t.Helper()
 	base, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -88,7 +98,9 @@ func startDaemonWith(t *testing.T, log *slog.Logger, p daemon.Policy, opts ...da
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	opts = append([]daemon.Option{daemon.WithApprovals(al, filepath.Join(hostRoot, ".devcontainer", "hostrun.yaml"))}, opts...)
+	rulesFile := filepath.Join(hostRoot, ".devcontainer", "hostrun.yaml")
+	p, opts := setup(rulesFile)
+	opts = append([]daemon.Option{daemon.WithApprovals(al, rulesFile)}, opts...)
 	srv := daemon.New(mapper, p, log, opts...)
 	go func() { done <- srv.Serve(ctx, l) }()
 	stop := sync.OnceFunc(func() {
@@ -98,7 +110,7 @@ func startDaemonWith(t *testing.T, log *slog.Logger, p daemon.Policy, opts ...da
 		}
 	})
 	t.Cleanup(stop)
-	return harness{transport: tr, hostRoot: hostRoot, runtimeDir: base, approvalSocket: approvalSocket, stop: stop}
+	return harness{transport: tr, hostRoot: hostRoot, runtimeDir: base, approvalSocket: approvalSocket, rulesFile: rulesFile, stop: stop}
 }
 
 // result is what the user of hostrun observes.

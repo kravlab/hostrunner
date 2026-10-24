@@ -44,12 +44,18 @@ func (h harness) startSession(t *testing.T) *session {
 // socket.
 func startSessionOn(t *testing.T, socket string) *session {
 	t.Helper()
+	return startSessionWith(t, approval.Config{Socket: socket})
+}
+
+// startSessionWith is startSession as cfg configures it.
+func startSessionWith(t *testing.T, cfg approval.Config) *session {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	pr, pw := io.Pipe()
 	s := &session{in: pw, out: &lockedBuffer{}, ended: make(chan struct{}), cancel: cancel}
 	go func() {
 		defer close(s.ended)
-		s.err = approval.Run(ctx, approval.Config{Socket: socket}, pr, s.out)
+		s.err = approval.Run(ctx, cfg, pr, s.out)
 	}()
 	t.Cleanup(func() {
 		cancel()
@@ -472,10 +478,12 @@ func TestAskSessionDiscardsInputTypedBeforeThePrompt(t *testing.T) {
 	}
 }
 
-// The prompts the session asks for an answer and for a refusal's note with.
+// The prompts the session asks for an answer, to a request and to a
+// guarded one, and for a refusal's note with.
 const (
-	answerPromptText = "answer [r]efuse [o]nce [l]ifetime ? "
-	notePromptText   = "note for the agent (Enter for none): "
+	answerPromptText  = "answer [r]efuse [o]nce [l]ifetime [a]dd rule ? "
+	guardedPromptText = "answer [r]efuse [o]nce [l]ifetime ? " // a guarded request gets no rule
+	notePromptText    = "note for the agent (Enter for none): "
 )
 
 // What came from the container is shown escaped, so an argument or a
@@ -594,7 +602,7 @@ func TestAskGuardedRefusalsNeedYes(t *testing.T) {
 			h := startDaemon(t, policy(t, guardedRules))
 			s := h.startSession(t)
 			ch := h.ask(t, tt.argv...)
-			block := s.waitFor(t, answerPromptText)
+			block := s.waitFor(t, guardedPromptText)
 			if want := "⚠ guarded: " + tt.guard + "\n"; !strings.Contains(block, want) {
 				t.Errorf("the block %q lacks %q", block, want)
 			}
@@ -604,7 +612,7 @@ func TestAskGuardedRefusalsNeedYes(t *testing.T) {
 				t.Errorf("the warning %q lacks %q", warning, tt.guard)
 			}
 			s.answer(t, "no")
-			s.waitFor(t, answerPromptText)
+			s.waitFor(t, guardedPromptText)
 			s.answer(t, "r")
 			s.waitFor(t, notePromptText)
 			s.answer(t, "")
@@ -622,7 +630,7 @@ func TestAskApprovesAGuardedRefusalWithYes(t *testing.T) {
 	h := startLoggingDaemon(t, slog.New(slog.NewTextHandler(&log, nil)), policy(t, guardedRules))
 	s := h.startSession(t)
 	ch := h.ask(t, "touch", "+marker")
-	s.waitFor(t, answerPromptText)
+	s.waitFor(t, guardedPromptText)
 	s.answer(t, "o")
 	s.waitFor(t, `Type "yes" to run it once: `)
 	s.answer(t, "yes")
@@ -640,7 +648,7 @@ func TestAskApprovesAGuardedRefusalWithYes(t *testing.T) {
 // approveYes approves the shown request once, through its warning.
 func (s *session) approveYes(t *testing.T) {
 	t.Helper()
-	s.waitFor(t, answerPromptText)
+	s.waitFor(t, guardedPromptText)
 	s.answer(t, "o")
 	s.waitFor(t, `Type "yes" to run it once: `)
 	s.answer(t, "yes")
@@ -730,7 +738,7 @@ rules:
 `))
 			s := h.startSession(t)
 			ch := h.ask(t, tt.argv...)
-			block := s.waitFor(t, answerPromptText)
+			block := s.waitFor(t, guardedPromptText)
 			if want := `⚠ guarded: path check: argument "/etc/passwd" is not a workspace file: it is an absolute path` + "\n"; !strings.Contains(block, want) {
 				t.Errorf("the block %q lacks %q", block, want)
 			}

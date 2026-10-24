@@ -19,7 +19,11 @@ import (
 func (h harness) grantStanding(t *testing.T, s *session, guarded bool, argv ...string) result {
 	t.Helper()
 	ch := h.ask(t, argv...)
-	s.waitFor(t, answerPromptText)
+	prompt := answerPromptText
+	if guarded {
+		prompt = guardedPromptText
+	}
+	s.waitFor(t, prompt)
 	s.answer(t, "l")
 	if guarded {
 		s.waitFor(t, `Type "yes" to approve it for the daemon's lifetime: `)
@@ -192,7 +196,7 @@ func TestStandingApprovalWithANewPathFailureIsAskedAgain(t *testing.T) {
 		t.Fatalf("got %+v, want a refusal hinting at --ask", got)
 	}
 	ch := h.ask(t, "cat", "-n", "inside")
-	block := s.waitFor(t, answerPromptText)
+	block := s.waitFor(t, guardedPromptText)
 	if !strings.Contains(block, `⚠ guarded: path check: argument "inside"`) {
 		t.Fatalf("the block %q lacks the new path failure", block)
 	}

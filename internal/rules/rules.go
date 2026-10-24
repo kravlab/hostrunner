@@ -131,6 +131,52 @@ func (d *Denial) Guarded() bool {
 type Reason struct {
 	Kind ReasonKind
 	Text string
+	// Refused is what an allow list refused, for ReasonNotAllowed; a rule
+	// widened to allow it lists it (see Propose).
+	Refused Refused
+}
+
+// RefusedKind tells what part of an argv an allow list refused.
+type RefusedKind int
+
+const (
+	RefusedFlag  RefusedKind = iota + 1 // a flag name: Flag
+	RefusedValue                        // a flag's value: Flag, Text
+	RefusedArg                          // a positional argument: Text
+)
+
+// Refused is the part of an argv an allow list refused: Flag names the
+// flag, as given, and Text is the value or the argument. Inline marks a
+// refused flag given a value in its token (--file=x), Text: a rule
+// declares it to take one to allow it.
+type Refused struct {
+	Kind   RefusedKind
+	Flag   string
+	Text   string
+	Inline bool
+}
+
+// getoptKind is how getopt reads a token of argv before "--".
+type getoptKind int
+
+const (
+	tokenEnd        getoptKind = iota + 1 // "--": the tokens after it are positional
+	tokenPositional                       // "-", or a token without a leading dash
+	tokenLong                             // --name or --name=value
+	tokenCluster                          // -abc: short flags, -ovalue included
+)
+
+// getoptToken tells how getopt reads tok, a token of argv before "--".
+func getoptToken(tok string) getoptKind {
+	switch {
+	case tok == "--":
+		return tokenEnd
+	case tok == "-" || !strings.HasPrefix(tok, "-"):
+		return tokenPositional
+	case strings.HasPrefix(tok, "--"):
+		return tokenLong
+	}
+	return tokenCluster
 }
 
 // ReasonKind tells why the rules refuse a command, and so whether
@@ -173,6 +219,11 @@ type findings []Reason
 
 // add records a reason of kind k.
 func (f *findings) add(k ReasonKind, text string) { *f = append(*f, Reason{Kind: k, Text: text}) }
+
+// refuse records that an allow list refused r, for text.
+func (f *findings) refuse(r Refused, text string) {
+	*f = append(*f, Reason{Kind: ReasonNotAllowed, Text: text, Refused: r})
+}
 
 // missingReason is the denial for every command when there is no config.
 // It names no path: the client is in the container and must not learn host
@@ -274,9 +325,29 @@ func Read(path string) (*Policy, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
-	sum := sha256.Sum256(data)
-	p.digest = hex.EncodeToString(sum[:])
+	p.digest = ContentDigest(data)
 	return p, nil
+}
+
+// ContentDigest returns the digest Load gives a rules file with content
+// data.
+func ContentDigest(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+// FileDigest returns the digest Load gives the rules file at path (see
+// Policy.Digest), and the file's content: no content, with the digest of
+// no file, when it is missing.
+func FileDigest(path string) (string, []byte, error) {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return missingDigest, nil, nil
+	}
+	if err != nil {
+		return "", nil, err
+	}
+	return ContentDigest(data), data, nil
 }
 
 // Raw YAML shapes; Parse validates them into rules.
@@ -653,7 +724,7 @@ func (p *Policy) Check(argv []string) (Allowed, error) {
 		return Allowed{}, &Denial{Reason: "empty command"}
 	}
 	if p.missing {
-		return Allowed{}, denial("", Allowed{}, findings{{ReasonNoFile, missingReason}})
+		return Allowed{}, denial("", Allowed{}, findings{{Kind: ReasonNoFile, Text: missingReason}})
 	}
 	var best *rule
 	for _, r := range p.rules {
@@ -663,7 +734,7 @@ func (p *Policy) Check(argv []string) (Allowed, error) {
 		}
 	}
 	if best == nil {
-		return Allowed{}, denial("", Allowed{}, findings{{ReasonNoRule, fmt.Sprintf("no rule allows %q", strings.Join(argv[:min(2, len(argv))], " "))}})
+		return Allowed{}, denial("", Allowed{}, findings{{Kind: ReasonNoRule, Text: fmt.Sprintf("no rule allows %q", strings.Join(argv[:min(2, len(argv))], " "))}})
 	}
 	var paths []PathArg
 	var found findings
@@ -710,15 +781,15 @@ func (r *rule) check(args []string, paths *[]PathArg, found *findings) {
 	var positional []int // indexes into args
 	for i := 0; i < len(args); i++ {
 		tok := args[i]
-		switch {
-		case tok == "--":
+		switch getoptToken(tok) {
+		case tokenEnd:
 			for j := i + 1; j < len(args); j++ {
 				positional = append(positional, j)
 			}
 			i = len(args)
-		case tok == "-" || !strings.HasPrefix(tok, "-"):
+		case tokenPositional:
 			positional = append(positional, i)
-		case strings.HasPrefix(tok, "--"):
+		case tokenLong:
 			name, value, inline := strings.Cut(tok, "=")
 			// A denied flag stays denied even if it also abbreviates a value
 			// flag (--force vs --force-with-lease).
@@ -762,7 +833,7 @@ func (r *rule) check(args []string, paths *[]PathArg, found *findings) {
 				r.flags.addPath(paths, flag, i, prefix)
 				continue
 			}
-			r.flags.checkName(name, inline, found)
+			r.flags.checkName(name, value, inline, found)
 		default: // a cluster of short flags: -abc, -ovalue
 			for j, c := range tok[1:] {
 				flag := "-" + string(c)
@@ -781,7 +852,7 @@ func (r *rule) check(args []string, paths *[]PathArg, found *findings) {
 					r.flags.addPath(paths, flag, i, prefix)
 					break
 				}
-				r.flags.checkName(flag, false, found)
+				r.flags.checkName(flag, "", false, found)
 			}
 		}
 	}
@@ -809,7 +880,7 @@ func (r *rule) checkPositional(arg string, found *findings) bool {
 	}
 	switch m := r.positional.matches(arg); {
 	case r.positional.allow && !m:
-		found.add(ReasonNotAllowed, fmt.Sprintf("argument %q is not allowed", arg))
+		found.refuse(Refused{Kind: RefusedArg, Text: arg}, fmt.Sprintf("argument %q is not allowed", arg))
 		return false
 	case !r.positional.allow && m:
 		found.add(ReasonDenied, fmt.Sprintf("argument %q is denied", arg))
@@ -877,8 +948,9 @@ func (f *flagFilter) resolveLong(name string) (string, string) {
 
 // checkName checks a flag that takes no value, adding to found why it is
 // refused. With an allow list the flag must be listed and must not carry
-// an inline value; with a deny list see checkDenied.
-func (f *flagFilter) checkName(flag string, inlineValue bool, found *findings) {
+// an inline value (value, when inlineValue); with a deny list see
+// checkDenied.
+func (f *flagFilter) checkName(flag, value string, inlineValue bool, found *findings) {
 	if f == nil || f.names == nil {
 		return
 	}
@@ -889,7 +961,7 @@ func (f *flagFilter) checkName(flag string, inlineValue bool, found *findings) {
 		return
 	}
 	if !slices.Contains(f.names.patterns, flag) {
-		found.add(ReasonNotAllowed, fmt.Sprintf("flag %s is not allowed", flag))
+		found.refuse(Refused{Kind: RefusedFlag, Flag: flag, Text: value, Inline: inlineValue}, fmt.Sprintf("flag %s is not allowed", flag))
 		return
 	}
 	if inlineValue {
@@ -928,7 +1000,7 @@ func checkFlagValue(l *list, flag, value string, found *findings) bool {
 	}
 	switch m := l.matches(value); {
 	case l.allow && !m:
-		found.add(ReasonNotAllowed, fmt.Sprintf("value %q of flag %s is not allowed", value, flag))
+		found.refuse(Refused{Kind: RefusedValue, Flag: flag, Text: value}, fmt.Sprintf("value %q of flag %s is not allowed", value, flag))
 		return false
 	case !l.allow && m:
 		found.add(ReasonDenied, fmt.Sprintf("value %q of flag %s is denied", value, flag))

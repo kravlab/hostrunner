@@ -211,7 +211,7 @@ func (a *approvals) answer(c *sessionConn, ans protocol.Answer) (string, endReas
 	if why := a.checkServing(c); why != "" {
 		return why, ""
 	}
-	if ans.Scope != "" && ans.Scope != protocol.ScopeOnce && ans.Scope != protocol.ScopeLifetime {
+	if ans.Scope != "" && ans.Scope != protocol.ScopeOnce && ans.Scope != protocol.ScopeLifetime && ans.Scope != protocol.ScopeRule {
 		return fmt.Sprintf("unknown scope %q", ans.Scope), ""
 	}
 	r, ok := a.waiting[ans.ID]
@@ -305,6 +305,13 @@ func (a *approvals) checkServing(c *sessionConn) string {
 	return ""
 }
 
+// heard is checkServing for a caller that does not hold a.mu.
+func (a *approvals) heard(c *sessionConn) string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.checkServing(c)
+}
+
 // standingFor returns the standing approval that lets req through, its
 // argv byte for byte from the same container directory, or nil. A Server
 // without approvals has none.
@@ -376,8 +383,8 @@ func (s *Server) serveApprovals(ctx context.Context, wg *sync.WaitGroup) {
 
 // handleSession serves one connection to the approval socket. Only a
 // process of the daemon's own uid may use it; it opens with FrameHello and
-// then takes FrameServe, FrameAnswer, FrameStanding and FrameRevoke. Any
-// other frame ends it.
+// then takes FrameServe, FrameAnswer, FrameStanding, FrameRevoke and
+// FrameReread. Any other frame ends it.
 func (s *Server) handleSession(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
 	stop := context.AfterFunc(ctx, func() { conn.Close() })
@@ -413,7 +420,7 @@ func (s *Server) handleSession(ctx context.Context, conn net.Conn) {
 	host, container := s.mapper.Roots()
 	_ = out.writeJSON(protocol.FrameDaemonInfo, protocol.DaemonInfo{
 		Version: protocol.ApprovalVersion, Workspace: host, ContainerWorkspace: container,
-		RulesFile: s.approvals.rulesFile, Served: s.approvals.served(),
+		RulesFile: s.approvals.rulesFile, RulesDigest: s.RulesDigest(), Served: s.approvals.served(),
 	})
 	defer func() {
 		// The daemon stopping closes the connection too: its requests end
@@ -465,11 +472,35 @@ func (s *Server) handleSession(ctx context.Context, conn net.Conn) {
 				s.log.Info("standing approval revoked", "standing", rv.N, "pid", pid)
 			}
 			_ = out.writeJSON(protocol.FrameRevoked, protocol.Revoked{N: rv.N, Error: why})
+		case protocol.FrameReread:
+			var rr protocol.Reread
+			if err := protocol.DecodeJSON(f, &rr); err != nil {
+				s.sessionRefused(out, pid, err)
+				return
+			}
+			_ = out.writeJSON(protocol.FrameRereadResult, s.reread(c, rr))
 		default:
 			s.sessionRefused(out, pid, fmt.Errorf("frame type %d does not belong on the approval socket", f.Type))
 			return
 		}
 	}
+}
+
+// reread rereads the rules file for session c, which wrote rr.Rule into
+// it, and logs both; a failed reread keeps the old rules and is logged as
+// a warning.
+func (s *Server) reread(c *sessionConn, rr protocol.Reread) protocol.RereadResult {
+	if why := s.approvals.heard(c); why != "" {
+		return protocol.RereadResult{Error: why}
+	}
+	s.log.Info("rule added", "file", s.approvals.rulesFile, "rule", rr.Rule, "edited", rr.Edited, "pid", c.pid)
+	digest, err := s.rereadRules(rr.Digest)
+	if err != nil {
+		s.log.Warn("rules reread failed: the old rules stay", "file", s.approvals.rulesFile, "error", err)
+		return protocol.RereadResult{Error: err.Error()}
+	}
+	s.log.Info("rules reread", "file", s.approvals.rulesFile, "digest", digest)
+	return protocol.RereadResult{Digest: digest}
 }
 
 // sessionRefused reports err to the session at pid, in the log too.
@@ -597,6 +628,15 @@ func (s *Server) ask(ctx context.Context, cancel context.CancelFunc, conn net.Co
 	}
 	s.log.Info("approval answered", "approval_id", id, "scope", ans.Scope)
 	_ = out.writeJSON(protocol.FrameApproved, protocol.Approved{Scope: ans.Scope})
+	if ans.Scope == protocol.ScopeRule {
+		// The session added a rule and the daemon reread it: the command
+		// runs under it. Should the rules refuse it still (the file changed
+		// again), it runs as approved once.
+		if p, r := s.prepare(req, false); r == nil {
+			s.start(ctx, cancel, conn, out, req, p, frames.next, "approved", ans.Scope, "approval_id", id)
+			return
+		}
+	}
 	// Only the path failures the human saw are passed as given, for the
 	// reason they saw: one that fails its check only now, or otherwise (a
 	// file swapped for a symlink meanwhile), refuses the command.
@@ -646,7 +686,7 @@ func (s *Server) assessApproval(req protocol.Request) (*approvalNeed, *refusal) 
 			return nil, nil
 		}
 	}
-	approved, err := s.policy.Check(req.Argv)
+	approved, err := s.rules().Check(req.Argv)
 	var d *rules.Denial
 	if err != nil && (!errors.As(err, &d) || !d.Approvable()) {
 		return nil, &refusal{protocol.ExitRejected, err.Error(), err}

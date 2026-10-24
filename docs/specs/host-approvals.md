@@ -187,7 +187,9 @@ from `protocol.Version` of the container's socket.
   reason the human saw; a path check that fails otherwise, or only
   later, takes the command out of the standing approval: it is refused
   with the hint, and `--ask` asks the human again. The log marks the runs
-  `approved=standing`.
+  `approved=standing`. After the daemon rereads its rules (a rule added),
+  it runs under the rule that matches it then, with that rule's `dir`,
+  secrets and checks.
 - Granted once the approved command has passed its checks; granting one
   the daemon holds for the same argv and directory keeps its number.
 - A one-off approval likewise passes a path failure as given only for
@@ -211,8 +213,12 @@ from `protocol.Version` of the container's socket.
   `dir`, secrets and the rest stay.
 - The session shows the unified diff, then `[w]rite [e]dit in $EDITOR
   [c]ancel`.
-- It writes the file the daemon loaded, computed against the file on disk;
-  a missing file is created with `rules:` and the rule. Only the touched
+- It writes the file the daemon loaded, computed against the file on disk,
+  which must be the one the daemon serves (`DaemonInfo.rules_digest`): a
+  file edited by hand since is refused, so its change waits for the next
+  start rather than going live unreviewed with the rule. A rule holding
+  YAML anchors or aliases is not widened, as its lists may be other
+  rules' too. A missing file is created with `rules:` and the rule. Only the touched
   rule's lines change, or the rule is appended. The result, also after the
   editor, must parse as `hostrunner up` parses it and allow the approved
   argv; an invalid result is never written, and the human edits again or
@@ -225,6 +231,24 @@ from `protocol.Version` of the container's socket.
   failed reread keeps the old rules and runs the request once, and the
   session says so. A manual edit still takes effect at the next container
   start.
+- A flag given its value in its token (`--file=x`) is declared in a new
+  rule's `flags.values`, allowing that value; given apart (`--file x`) it
+  is a flag and an argument, as the rules read it. An argument holding `*`
+  or `?` turns its whole list into `allow_regex`, since a list takes one
+  kind of pattern; a rule's `allow` list cannot take such an argument, and
+  the session says it cannot add the rule.
+- When no edit lets the request through (the file does not parse, the
+  rules allow it already, the rule has no list to widen), the session
+  says why and asks for the answer again.
+- `e` opens a temporary copy of the edit in `$VISUAL`, or else `$EDITOR`,
+  as a shell runs it; with neither set the session says `$EDITOR is not
+  set` and asks again. A valid edit is written at once; an invalid one is
+  reported and `[e]dit again [c]ancel` asked. The session reads nothing
+  from the terminal while the editor runs.
+- Session frames: `Reread{rule, edited, digest}`, `digest` that of the
+  file written, answered by `RereadResult{digest, error}`; the daemon
+  keeps its rules when the file it rereads has another digest. The answer
+  then has the scope `rule`, or `once` after a failed reread.
 
 ## Approval session
 
@@ -369,9 +393,8 @@ revoked 1
   was taken over.
 - The daemon steps aside or exits while requests wait: they get 126 before
   the connection closes; standing approvals are gone.
-- The rules file changes between the proposal and the write: the edit is
-  computed against the file on disk; if the result no longer parses or no
-  longer allows the argv, it is not written.
+- The rules file changes between the proposal and the write: nothing is
+  written, and the session asks for the answer again.
 - A failed reread after a write: the request runs once, the old rules
   stay, the session says so.
 - An argv holding terminal escapes, look-alike letters, or megabytes of

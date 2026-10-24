@@ -11,7 +11,8 @@
 // waits for the answer of the approval session that serves the daemon (see
 // approvals.go). The approval socket lies outside what the container
 // mounts, and takes no frames from the container's socket, nor that socket
-// any of its frames.
+// any of its frames. A session that adds a rule to the rules file makes the
+// daemon reread it (WithReload).
 package daemon
 
 import (
@@ -52,11 +53,13 @@ type Server struct {
 	log            *slog.Logger
 	requestTimeout time.Duration
 	onArm          func(protocol.Arm) (stepAside bool) // nil: arming changes nothing
-	policy         Policy
-	approvals      *approvals // nil: no approval socket, so nothing is approved
+	reload         func() (Policy, string, error)      // nil: the rules are never reread
+	approvals      *approvals                          // nil: no approval socket, so nothing is approved
 
 	mu        sync.Mutex
 	stopServe context.CancelFunc // stops the running Serve; nil when not serving
+	policy    Policy             // the rules served; see rules
+	digest    string             // their digest; see RulesDigest
 }
 
 // Policy decides whether a command may run; rules.Policy implements it. A
@@ -77,6 +80,24 @@ func WithRequestTimeout(d time.Duration) Option {
 	return func(s *Server) { s.requestTimeout = d }
 }
 
+// WithReload lets an approval session make the Server reread its rules
+// file, once it has added a rule to it. digest identifies the rules the
+// Server starts with (rules.Policy.Digest); reload returns the rules as
+// `hostrunner up` would load them, and their digest, or why they are not
+// valid, in which case the Server keeps the rules it has. Running
+// commands are untouched; new requests are checked against the new rules.
+func WithReload(digest string, reload func() (Policy, string, error)) Option {
+	return func(s *Server) { s.digest, s.reload = digest, reload }
+}
+
+// RulesDigest returns the digest of the rules the Server serves, as
+// WithReload gave it or a reread changed it; "" without WithReload.
+func (s *Server) RulesDigest() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.digest
+}
+
 // WithArmHandler sets what the Server does when `hostrunner up` arms it on
 // a devcontainer start (e.g. arm the container watcher). If f returns
 // true, the Server steps aside: it answers so and then stops Serve, so
@@ -84,6 +105,35 @@ func WithRequestTimeout(d time.Duration) Option {
 // goroutines, so it must be safe for concurrent use.
 func WithArmHandler(f func(protocol.Arm) (stepAside bool)) Option {
 	return func(s *Server) { s.onArm = f }
+}
+
+// rules returns the rules the Server serves: policy, or what a reread
+// replaced it with.
+func (s *Server) rules() Policy {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.policy
+}
+
+// rereadRules rereads the rules file (see WithReload) and serves the new
+// rules from then on, provided the file has the digest want, the one the
+// session left it with; it returns their digest, or why it keeps the old
+// rules.
+func (s *Server) rereadRules(want string) (string, error) {
+	if s.reload == nil {
+		return "", errors.New("this daemon does not reread its rules")
+	}
+	p, digest, err := s.reload()
+	if err != nil {
+		return "", err
+	}
+	if digest != want {
+		return "", errors.New("the rules file changed since the session wrote it")
+	}
+	s.mu.Lock()
+	s.policy, s.digest = p, digest
+	s.mu.Unlock()
+	return digest, nil
 }
 
 // New returns a Server that runs the commands policy allows, confined to
@@ -334,7 +384,7 @@ type refusal struct {
 // the rule that refused it would run it, and passes as given the path
 // failures the human saw when granting it.
 func (s *Server) prepare(req protocol.Request, dryRun bool) (*prepared, *refusal) {
-	allowed, err := s.policy.Check(req.Argv)
+	allowed, err := s.rules().Check(req.Argv)
 	standing := s.approvals.standingFor(req)
 	// byStanding: the rules refuse req, and its standing approval overrides
 	// them.

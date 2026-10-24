@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"slices"
 	"strconv"
 	"strings"
@@ -37,12 +38,31 @@ type Config struct {
 	Socket string // the approval socket of the daemon to serve
 }
 
+// ErrNoEditor is what EditInEditor returns when neither $VISUAL nor
+// $EDITOR names an editor.
+var ErrNoEditor = errors.New("$EDITOR is not set")
+
+// EditInEditor opens the file at path in $VISUAL, or else $EDITOR, as a
+// shell runs it, on the process's terminal, and waits for it to exit.
+func EditInEditor(path string) error {
+	editor := cmp.Or(os.Getenv("VISUAL"), os.Getenv("EDITOR"))
+	if editor == "" {
+		return ErrNoEditor
+	}
+	cmd := exec.Command("sh", "-c", editor+` "$1"`, "editor", path)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	return cmd.Run()
+}
+
 // Prompts and lines the session prints.
 const (
-	answerPrompt = "answer [r]efuse [o]nce [l]ifetime ? "
-	notePrompt   = "note for the agent (Enter for none): "
-	idlePrompt   = "> "
-	idleCommands = "commands: standing, revoke <n>"
+	answerPrompt        = "answer [r]efuse [o]nce [l]ifetime [a]dd rule ? "
+	guardedAnswerPrompt = "answer [r]efuse [o]nce [l]ifetime ? " // no rule for a guarded refusal
+	addPrompt           = "[w]rite [e]dit in $EDITOR [c]ancel ? "
+	editAgainPrompt     = "[e]dit again [c]ancel ? "
+	notePrompt          = "note for the agent (Enter for none): "
+	idlePrompt          = "> "
+	idleCommands        = "commands: standing, revoke <n>"
 )
 
 // scopeTexts are what the session says of an approval, by its scope: the
@@ -51,6 +71,7 @@ const (
 var scopeTexts = map[protocol.Scope]struct{ outcome, confirm string }{
 	protocol.ScopeOnce:     {"approved once", `Type "yes" to run it once: `},
 	protocol.ScopeLifetime: {"approved for the daemon's lifetime", `Type "yes" to approve it for the daemon's lifetime: `},
+	protocol.ScopeRule:     {"approved under the new rule", ""},
 }
 
 // Run serves the daemon on cfg.Socket until ctx ends, in ends, or the
@@ -58,9 +79,11 @@ var scopeTexts = map[protocol.Scope]struct{ outcome, confirm string }{
 // terminal bell, and sends the answer the human types on in. Requests that
 // end unanswered are dropped as the daemon reports them; leaving refuses
 // the ones still waiting (the daemon does, as the connection closes), and
-// Run says how many. While no request is shown, the idle prompt takes
-// commands: standing lists the daemon's standing approvals, revoke <n>
-// revokes one. It returns an error when it cannot serve the daemon.
+// Run says how many. The answer "add a rule" edits the daemon's rules file
+// (see proposeRule), opening it in $VISUAL or $EDITOR when the human
+// asks. While no request is shown, the idle prompt takes commands:
+// standing lists the daemon's standing approvals, revoke <n> revokes one.
+// It returns an error when it cannot serve the daemon.
 func Run(ctx context.Context, cfg Config, in io.Reader, out io.Writer) error {
 	conn, err := transport.Unix{Path: cfg.Socket}.Dial(ctx)
 	if err != nil {
@@ -84,8 +107,9 @@ func Run(ctx context.Context, cfg Config, in io.Reader, out io.Writer) error {
 
 	done := make(chan struct{})
 	defer close(done)
-	s := &session{conn: conn, out: out, in: in}
-	s.lines = readLines(in, &s.read, done)
+	s := &session{conn: conn, out: out, in: in, want: make(chan struct{}, 1), rulesFile: info.RulesFile, rulesDigest: info.RulesDigest, workspace: info.Workspace}
+	s.want <- struct{}{}
+	s.lines = readLines(in, &s.read, s.want, done)
 	s.prompt(idlePrompt)
 	return s.loop(ctx, readDaemon(conn, done))
 }
@@ -156,6 +180,18 @@ type session struct {
 	fresh uint64
 	// asking is the current prompt.
 	asking string
+	// want lets readLines read on: it reads only while the session waits
+	// for the human, never while an editor has the terminal.
+	want chan struct{}
+
+	// rulesFile is the daemon's rules file, in its host workspace, which
+	// a rule is added to; rulesDigest is the digest of the rules the daemon
+	// serves, which the file must have for a rule to be proposed.
+	rulesFile, rulesDigest, workspace string
+	// adding is the rule being added, while the human writes, edits or
+	// cancels it; rereading is set while the daemon rereads the rules.
+	adding    *addition
+	rereading bool
 }
 
 // waiting is an approval request and when its time runs out. ended is why
@@ -190,6 +226,9 @@ func (s *session) loop(ctx context.Context, frames <-chan protocol.Frame) error 
 			}
 			if l.n >= s.fresh {
 				s.typed(l.text)
+			}
+			if l.last {
+				s.want <- struct{}{}
 			}
 		}
 	}
@@ -254,6 +293,12 @@ func (s *session) daemonFrame(f protocol.Frame) error {
 			fmt.Fprintln(s.out, line)
 		}
 		s.idle()
+	case protocol.FrameRereadResult:
+		var r protocol.RereadResult
+		if err := protocol.DecodeJSON(f, &r); err != nil {
+			return err
+		}
+		s.reread(r)
 	case protocol.FrameRevoked:
 		var r protocol.Revoked
 		if err := protocol.DecodeJSON(f, &r); err != nil {
@@ -293,10 +338,14 @@ func (s *session) typed(text string) {
 		s.command(text)
 		return
 	}
-	if s.sent != "" {
+	if s.sent != "" || s.rereading {
 		return
 	}
 	r := s.queue[0]
+	if s.adding != nil {
+		s.addTyped(r, text)
+		return
+	}
 	if s.note {
 		s.note = false
 		s.send(protocol.Answer{ID: r.ID, Note: text}, "refused")
@@ -307,7 +356,7 @@ func (s *session) typed(text string) {
 		if text == "yes" {
 			s.approve(r.ID, scope)
 		} else {
-			s.prompt(answerPrompt)
+			s.askAnswer()
 		}
 		return
 	}
@@ -317,7 +366,7 @@ func (s *session) typed(text string) {
 		if text == "l" {
 			scope = protocol.ScopeLifetime
 		}
-		if len(r.Guards) == 0 {
+		if !r.guarded() {
 			s.approve(r.ID, scope)
 			return
 		}
@@ -329,11 +378,17 @@ func (s *session) typed(text string) {
 		}
 		s.confirm = scope
 		s.prompt(scopeTexts[scope].confirm)
+	case "a":
+		if r.guarded() {
+			s.askAnswer()
+			return
+		}
+		s.proposeRule(r)
 	case "r":
 		s.note = true
 		s.prompt(notePrompt)
 	default:
-		s.prompt(answerPrompt)
+		s.askAnswer()
 	}
 }
 
@@ -388,6 +443,9 @@ func (s *session) withdrawn(w protocol.Withdrawn) {
 	default:
 		fmt.Fprintf(s.out, "\nrequest %d %s\n", w.ID, w.Reason)
 		s.note, s.confirm = false, ""
+		if !s.rereading {
+			s.adding = nil
+		}
 		s.next()
 	}
 }
@@ -442,7 +500,7 @@ func (s *session) show() {
 	if more := len(s.queue) - 1; more > 0 {
 		fmt.Fprintf(s.out, "  (%d more waiting)\n", more)
 	}
-	s.prompt(answerPrompt)
+	s.askAnswer()
 }
 
 // prompt prints p and discards what the human typed before it, so a key
@@ -476,10 +534,12 @@ func display(text string) string {
 	return text
 }
 
-// line is a line the human typed and its number, counting from 1.
+// line is a line the human typed, its number, counting from 1, and
+// whether it is the last of what one read returned.
 type line struct {
 	n    uint64
 	text string
+	last bool
 }
 
 // readLines reads lines from in into the returned channel, counting each
@@ -489,23 +549,39 @@ type line struct {
 // when it is typed, not when the session gets to it, so prompt can tell
 // the lines typed before it. Only a read returning between prompt's count
 // and its own counting escapes that.
-func readLines(in io.Reader, read *atomic.Uint64, done <-chan struct{}) <-chan line {
+//
+// It reads only once want lets it, after the lines of the last read are
+// handled: an editor the session runs meanwhile has the terminal to
+// itself.
+func readLines(in io.Reader, read *atomic.Uint64, want <-chan struct{}, done <-chan struct{}) <-chan line {
 	ch := make(chan line)
 	go func() {
 		defer close(ch)
 		var partial []byte
 		buf := make([]byte, 4096)
 		for {
-			n, err := in.Read(buf)
-			partial = append(partial, buf[:n]...)
+			select {
+			case <-want:
+			case <-done:
+				return
+			}
 			var lines []line
-			for {
-				i := bytes.IndexByte(partial, '\n')
-				if i < 0 {
-					break
+			var err error
+			for len(lines) == 0 && err == nil {
+				var n int
+				n, err = in.Read(buf)
+				partial = append(partial, buf[:n]...)
+				for {
+					i := bytes.IndexByte(partial, '\n')
+					if i < 0 {
+						break
+					}
+					lines = append(lines, line{n: read.Add(1), text: string(partial[:i])})
+					partial = partial[i+1:]
 				}
-				lines = append(lines, line{read.Add(1), string(partial[:i])})
-				partial = partial[i+1:]
+			}
+			if len(lines) > 0 {
+				lines[len(lines)-1].last = true
 			}
 			for _, l := range lines {
 				select {

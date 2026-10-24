@@ -144,7 +144,7 @@ func (r *rule) goPositional(args []string, i int, ambiguous bool, paths *[]PathA
 func (r *rule) goFlag(args []string, i int, ambiguous bool, paths *[]PathArg, found *findings) bool {
 	tok := args[i]
 	t := strings.TrimSpace(tok)
-	name, _, inline := strings.Cut(t, "=")
+	name, value, inline := strings.Cut(t, "=")
 	shown := name // the flag as written in argv, for messages
 	if t != tok {
 		given, _, _ := strings.Cut(tok, "=")
@@ -173,7 +173,7 @@ func (r *rule) goFlag(args []string, i int, ambiguous bool, paths *[]PathArg, fo
 		return goValue(args, i, l, shown, ambiguous, paths, found)
 	}
 	if f.names != nil && f.names.allow && !slices.Contains(f.names.patterns, key) {
-		found.add(ReasonNotAllowed, fmt.Sprintf("flag %s is not allowed", shown))
+		found.refuse(Refused{Kind: RefusedFlag, Flag: name, Text: value, Inline: inline}, fmt.Sprintf("flag %s is not allowed", shown))
 		return false
 	}
 	if inline {

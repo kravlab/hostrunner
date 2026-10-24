@@ -172,9 +172,9 @@ It serves that devcontainer's daemon: it prints each approval request as
 it arrives, with the container directory, the argv and why the rules
 refused it, rings the terminal bell, and takes the answer, a letter and
 Enter: `r` refuses it (then an optional note for the agent), `o` approves
-this request only, `l` grants a standing approval (below). Input typed
-before the prompt is discarded, and what came from the container is
-shown quoted, so it cannot steer the terminal.
+this request only, `l` grants a standing approval, `a` adds a rule (both
+below). Input typed before the prompt is discarded, and what came from
+the container is shown quoted, so it cannot steer the terminal.
 Requests are shown one at a time, first in, first out; a new one rings
 the bell without interrupting the prompt and is counted in the next
 block (`(1 more waiting)`). A shown request whose agent goes away or
@@ -194,6 +194,23 @@ session's `>` prompt takes `standing`, which lists them (number, argv,
 directory, `guarded`), and `revoke <n>`, which ends one; a command it
 let through keeps running. A dry run of a command one lets through
 reports `hostrun: dry run: allowed by a standing approval`.
+
+Adding a rule (`a`, not offered for a guarded refusal) proposes the
+narrowest edit of the rules file the daemon loaded, as a diff: a new rule
+for a command no rule matches (the program and the next token unless it
+is a flag, allowing exactly the flags, values and arguments given), or
+the matching rule's allow lists widened by what they refused. `w` writes
+it, `e` opens it in `$VISUAL` or `$EDITOR` first, `c` goes back to the
+answer. Only the rule's lines change; the file is written at once, and
+only when it parses and allows the request, so an edit that does not is
+offered for editing again. The daemon then rereads the file and the
+request runs under the new rule; later runs need no approval, and the
+next container start keeps the daemon. If the reread fails, the old
+rules stay and the request runs once. A rule is added only while the file
+on disk is the one the daemon serves, and written only when it has not
+changed since the proposal: an edit of the file by hand never goes live
+with a rule, but at the next container start. A rule sharing YAML
+anchors or aliases is not widened.
 
 In the container, ask with `--ask` as hostrun's first argument:
 

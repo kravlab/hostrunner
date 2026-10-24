@@ -33,7 +33,8 @@
 // that serves the daemon, which then sends it each FrameApprovalRequest
 // and takes its FrameAnswer, confirmed by FrameAnswered, or tells it with
 // FrameWithdrawn that a request ended unanswered. FrameStanding and
-// FrameRevoke list and revoke the standing approvals.
+// FrameRevoke list and revoke the standing approvals; FrameReread makes
+// the daemon reread its rules file once the session has added a rule.
 package protocol
 
 import (
@@ -94,8 +95,10 @@ const (
 	FrameStandingList    // daemon → session, JSON StandingList
 	FrameRevoke          // session → daemon, JSON Revoke
 	FrameRevoked         // daemon → session, JSON Revoked
+	FrameReread          // session → daemon, JSON Reread
+	FrameRereadResult    // daemon → session, JSON RereadResult
 
-	lastFrameType = FrameRevoked
+	lastFrameType = FrameRereadResult
 )
 
 // Exit codes for failures of hostrun itself rather than of the command,
@@ -210,6 +213,7 @@ type Scope string
 const (
 	ScopeOnce     Scope = "once"     // this request only
 	ScopeLifetime Scope = "lifetime" // a standing approval: the daemon's lifetime
+	ScopeRule     Scope = "rule"     // a rule added to the rules file
 )
 
 // Approved tells the client that a human approved its command, which the
@@ -226,6 +230,8 @@ func (a Approved) String() string {
 		reach = "this request only"
 	case ScopeLifetime:
 		reach = "for the daemon's lifetime"
+	case ScopeRule:
+		reach = "rule added"
 	}
 	return "approved on the host: " + reach
 }
@@ -241,13 +247,15 @@ type Hello struct {
 }
 
 // DaemonInfo answers Hello: the daemon's approval protocol version, its
-// workspace on the host and in the container, the rules file it loaded,
-// and whether a session serves it.
+// workspace on the host and in the container, the rules file it loaded
+// and the digest of the rules it serves (empty when it never rereads
+// them), and whether a session serves it.
 type DaemonInfo struct {
 	Version            int    `json:"version"`
 	Workspace          string `json:"workspace"`
 	ContainerWorkspace string `json:"container_workspace"`
 	RulesFile          string `json:"rules_file"`
+	RulesDigest        string `json:"rules_digest,omitempty"`
 	Served             bool   `json:"served,omitempty"`
 }
 
@@ -311,6 +319,24 @@ type Revoke struct {
 type Revoked struct {
 	N     uint64 `json:"n"`
 	Error string `json:"error,omitempty"`
+}
+
+// Reread asks the daemon to reread its rules file, into which the session
+// has written Rule, the command of a rule it added or widened (Edited: by
+// the human, in an editor), leaving the file with Digest. The daemon keeps
+// its rules when the file it rereads has another digest: an edit nobody
+// reviewed waits for the next start.
+type Reread struct {
+	Rule   string `json:"rule"`
+	Edited bool   `json:"edited,omitempty"`
+	Digest string `json:"digest"`
+}
+
+// RereadResult answers Reread: Digest identifies the rules the daemon now
+// serves, or Error says why it kept its old ones.
+type RereadResult struct {
+	Digest string `json:"digest,omitempty"`
+	Error  string `json:"error,omitempty"`
 }
 
 // Withdrawn tells the session that request ID ended unanswered, for

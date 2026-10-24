@@ -353,9 +353,11 @@ func updateMessage(res update.Result) string {
 // devcontainer has stopped (as reported by runtimes). An arm request from
 // `hostrunner up` puts the watcher back into waiting for the container.
 //
-// The rules file is read once, here: an invalid file stops the daemon from
+// The rules file is read here: an invalid file stops the daemon from
 // starting (fail closed), a missing one makes it deny every command. Later
-// edits, e.g. by a `git pull` on the host, take effect only in a new daemon.
+// edits, e.g. by a `git pull` on the host, take effect only in a new
+// daemon, except that an approval session which adds a rule makes the
+// daemon reread the file; the digest of the rules reread is the one arms compare.
 func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []watch.Runtime) error {
 	policy, err := rules.Load(cfg.config)
 	if err != nil {
@@ -401,8 +403,19 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 			}
 		}()
 	}
-	onArm := armHandler(policy.Digest(), cfg.config, watcher, log)
-	return daemon.New(mapper, policy, log, daemon.WithArmHandler(onArm), daemon.WithApprovals(al, cfg.config)).Serve(ctx, l)
+	reload := func() (daemon.Policy, string, error) {
+		p, err := rules.Load(cfg.config)
+		if err != nil {
+			return nil, "", err
+		}
+		return p, p.Digest(), nil
+	}
+	// The arms compare the digest of the rules the daemon serves, which a
+	// reread changes.
+	var srv *daemon.Server
+	onArm := armHandler(func() string { return srv.RulesDigest() }, cfg.config, watcher, log)
+	srv = daemon.New(mapper, policy, log, daemon.WithArmHandler(onArm), daemon.WithApprovals(al, cfg.config), daemon.WithReload(policy.Digest(), reload))
+	return srv.Serve(ctx, l)
 }
 
 // checkApprovalSocket refuses an approval socket inside the workspace,
@@ -427,13 +440,13 @@ func checkApprovalSocket(workspace, socket string) error {
 
 // armHandler answers the arms of `hostrunner up`, which arms the daemon on
 // every container start with the digest of the rules it validated. digest
-// is the digest of the rules this daemon loaded from config. The daemon
+// returns the digest of the rules this daemon serves from config. The daemon
 // steps aside for a new one when the digests differ, or when watcher has
 // ended and will not follow the arm; otherwise watcher, if any, waits for
 // the container of this arm.
-func armHandler(digest, config string, watcher *watch.Watcher, log *slog.Logger) func(protocol.Arm) (stepAside bool) {
+func armHandler(digest func() string, config string, watcher *watch.Watcher, log *slog.Logger) func(protocol.Arm) (stepAside bool) {
 	return func(a protocol.Arm) bool {
-		if a.ConfigDigest != digest {
+		if a.ConfigDigest != digest() {
 			log.Info("stepping aside: the rules file changed", "config", config)
 			return true
 		}
