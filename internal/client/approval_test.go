@@ -484,8 +484,8 @@ func TestAskSessionDiscardsInputTypedBeforeThePrompt(t *testing.T) {
 // The prompts the session asks for an answer, to a request and to a
 // guarded one, and for a refusal's note with.
 const (
-	answerPromptText  = "answer [r]efuse [o]nce [l]ifetime [a]dd rule ? "
-	guardedPromptText = "answer [r]efuse [o]nce [l]ifetime ? " // a guarded request gets no rule
+	answerPromptText  = "answer [r]efuse [o]nce [l]ifetime [a]dd rule [?]more ? "
+	guardedPromptText = "answer [r]efuse [o]nce [l]ifetime [?]more ? " // a guarded request gets no rule
 	notePromptText    = "note for the agent (Enter for none): "
 )
 

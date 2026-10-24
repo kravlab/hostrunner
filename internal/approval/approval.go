@@ -25,6 +25,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"golang.org/x/sys/unix"
@@ -64,8 +65,8 @@ func EditInEditor(path string) error {
 
 // Prompts and lines the session prints.
 const (
-	answerPrompt        = "answer [r]efuse [o]nce [l]ifetime [a]dd rule ? "
-	guardedAnswerPrompt = "answer [r]efuse [o]nce [l]ifetime ? " // no rule for a guarded refusal
+	answerPrompt        = "answer [r]efuse [o]nce [l]ifetime [a]dd rule [?]more ? "
+	guardedAnswerPrompt = "answer [r]efuse [o]nce [l]ifetime [?]more ? " // no rule for a guarded refusal
 	addPrompt           = "[w]rite [e]dit in $EDITOR [c]ancel ? "
 	editAgainPrompt     = "[e]dit again [c]ancel ? "
 	notePrompt          = "note for the agent (Enter for none): "
@@ -181,7 +182,7 @@ func (t *term) serveDaemon(ctx context.Context, socket string, takeOver, canList
 	if err := serve(conn, takeOver); err != nil {
 		return endFailed, err
 	}
-	fmt.Fprintf(t.out, "serving %s (container %s)\nwaiting for requests · %s\n", info.Workspace, info.ContainerWorkspace, idleCommands)
+	fmt.Fprintf(t.out, "serving %s (container %s)\nwaiting for requests · %s\n", display(info.Workspace), display(info.ContainerWorkspace), idleCommands)
 
 	done := make(chan struct{})
 	defer close(done)
@@ -392,11 +393,12 @@ func (s *session) daemonFrame(f protocol.Frame) error {
 			fmt.Fprintln(s.out, "no standing approvals")
 		}
 		for _, a := range l.Approvals {
-			line := fmt.Sprintf("  %d  %s   in %s", a.N, quoteArgv(a.Argv), display(a.Cwd))
+			line := fmt.Sprintf("  %d  %s   in %s", a.N, argvLine(a.Argv), display(a.Cwd))
 			if a.Guarded {
 				line += "   guarded"
 			}
 			fmt.Fprintln(s.out, line)
+			s.printMarks(a.Argv)
 		}
 		s.idle()
 	case protocol.FrameRereadResult:
@@ -454,7 +456,7 @@ func (s *session) typed(text string) {
 	}
 	if s.note {
 		s.note = false
-		s.send(protocol.Answer{ID: r.ID, Note: text}, "refused")
+		s.send(protocol.Answer{ID: r.ID, Note: display(text)}, "refused")
 		return
 	}
 	if scope := s.confirm; scope != "" {
@@ -490,6 +492,9 @@ func (s *session) typed(text string) {
 			return
 		}
 		s.proposeRule(r)
+	case "?":
+		s.showAll(r)
+		s.askAnswer()
 	case "r":
 		s.note = true
 		s.prompt(notePrompt)
@@ -602,7 +607,11 @@ func (s *session) show() {
 	head := fmt.Sprintf("── request %d ── %d:%02d left ", r.ID, int(left.Minutes()), int(left.Seconds())%60)
 	fmt.Fprintf(s.out, "\n%s%s\n", head, strings.Repeat("─", max(0, 58-len([]rune(head)))))
 	fmt.Fprintf(s.out, "  dir   %s\n", display(r.Cwd))
-	fmt.Fprintf(s.out, "  argv  %s\n", quoteArgv(r.Argv))
+	fmt.Fprintf(s.out, "  argv  %s\n", argvLine(r.Argv))
+	s.printMarks(r.Argv)
+	if len(r.Argv) > maxShownArgs || slices.ContainsFunc(shownArgs(r.Argv), isLong) {
+		fmt.Fprintln(s.out, "  argv truncated: ? shows all")
+	}
 	for i, reason := range r.Reasons {
 		label := "why "
 		if i > 0 {
@@ -630,14 +639,75 @@ func (t *term) prompt(p string) {
 	fmt.Fprint(t.out, p)
 }
 
-// quoteArgv shows argv as the session does: every argument Go-quoted, so
-// none can steer the terminal or hide where it ends.
-func quoteArgv(argv []string) string {
-	quoted := make([]string, len(argv))
-	for i, arg := range argv {
-		quoted[i] = strconv.Quote(arg)
+// How much of an argv a request's block, and the list of standing
+// approvals, show; `?` shows all of a request's.
+const (
+	maxShownArgs  = 20  // arguments; more are counted, not shown
+	maxShownRunes = 200 // characters of one argument; more are counted
+)
+
+// isLong reports whether arg is longer than a block shows.
+func isLong(arg string) bool { return utf8.RuneCountInString(arg) > maxShownRunes }
+
+// shownArgs returns the arguments of argv a block shows.
+func shownArgs(argv []string) []string { return argv[:min(len(argv), maxShownArgs)] }
+
+// argvLine shows argv as a block does: the arguments shownArgs returns,
+// each Go-quoted, so none can steer the terminal or hide where it ends,
+// and cut (see quoteCut), the arguments left out counted.
+func argvLine(argv []string) string {
+	shown := shownArgs(argv)
+	cut := make([]string, len(shown))
+	for i, arg := range shown {
+		cut[i] = quoteCut(arg, strconv.Quote)
 	}
-	return strings.Join(quoted, " ")
+	line := strings.Join(cut, " ")
+	if more := len(argv) - len(shown); more > 0 {
+		line += fmt.Sprintf(" …(+%d args)", more)
+	}
+	return line
+}
+
+// printMarks prints a `⚠ non-ASCII` line for every argument argvLine
+// shows that holds non-ASCII: the argument as argvLine shows it, and its
+// ASCII form, where a look-alike letter shows its code, cut alike.
+func (t *term) printMarks(argv []string) {
+	for i, arg := range shownArgs(argv) {
+		if holdsNonASCII(arg) {
+			fmt.Fprintf(t.out, "  ⚠ non-ASCII: argument %d %s is %s\n", i+1, quoteCut(arg, strconv.Quote), quoteCut(arg, strconv.QuoteToASCII))
+		}
+	}
+}
+
+// quoteCut shows arg quoted by quote, cut after maxShownRunes
+// characters, the bytes left out counted. The cut falls between two
+// characters, so an argument of megabytes shows in a few hundred bytes.
+func quoteCut(arg string, quote func(string) string) string {
+	n := 0
+	for i := range arg {
+		if n == maxShownRunes {
+			return fmt.Sprintf("%s…(+%d bytes)", quote(arg[:i]), len(arg)-i)
+		}
+		n++
+	}
+	return quote(arg)
+}
+
+// holdsNonASCII reports whether arg holds a character outside ASCII.
+func holdsNonASCII(arg string) bool {
+	return strings.IndexFunc(arg, func(r rune) bool { return r > unicode.MaxASCII }) >= 0
+}
+
+// showAll prints every argument of r whole, one numbered per line, an
+// argument holding non-ASCII with its ASCII form.
+func (s *session) showAll(r waiting) {
+	for i, arg := range r.Argv {
+		line := fmt.Sprintf("  %d  %s", i+1, strconv.Quote(arg))
+		if holdsNonASCII(arg) {
+			line += "   ⚠ non-ASCII: " + strconv.QuoteToASCII(arg)
+		}
+		fmt.Fprintln(s.out, line)
+	}
 }
 
 // display returns text as it may be shown on the terminal: as it is when

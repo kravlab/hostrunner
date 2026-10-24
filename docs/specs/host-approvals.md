@@ -321,7 +321,12 @@ revoked 1
   and an argument holding non-ASCII gets `⚠ non-ASCII` and its ASCII form.
   An argument over 200 characters is cut with `…(+N bytes)`, an argv over
   20 arguments with `…(+N args)`, and `argv truncated: ? shows all` is
-  printed; `?` prints every argument, one numbered per line.
+  printed; `?` prints every argument, one numbered per line, and asks
+  again. A non-ASCII argument gets a line of its own, `⚠ non-ASCII:
+  argument N "<as is>" is "<ASCII form>"`, the ASCII form Go-quoted with
+  every character outside ASCII escaped, both cut alike. `standing` shows
+  an argv as the block does, cut and marked. A note for the agent holding
+  control characters is sent Go-quoted.
 - Requests come one at a time, first in, first out. A new one rings the
   bell (BEL) and counts in `(N more waiting)` at the next block; nothing
   is printed in the middle of a prompt. A current request that is

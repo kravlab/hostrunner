@@ -189,7 +189,14 @@ refused it, rings the terminal bell, and takes the answer, a letter and
 Enter: `r` refuses it (then an optional note for the agent), `o` approves
 this request only, `l` grants a standing approval, `a` adds a rule (both
 below). Input typed before the prompt is discarded, and what came from
-the container is shown quoted, so it cannot steer the terminal.
+the container is shown quoted, so it cannot steer the terminal; a note
+for the agent with control characters reaches it quoted too. An argument
+holding non-ASCII is shown as it is, with `⚠ non-ASCII` and its ASCII
+form (`"-\u0430"`), so a look-alike letter in a flag stands out. An
+argument over 200 characters is cut (`…(+N bytes)`) and an argv over 20
+arguments too (`…(+N args)`), with `argv truncated: ? shows all`; `?`
+prints every argument, one numbered per line, and asks again. The ASCII
+form is cut alike, and `standing` shows an argv as a request's block does.
 Requests are shown one at a time, first in, first out; a new one rings
 the bell without interrupting the prompt and is counted in the next
 block (`(1 more waiting)`). A shown request whose agent goes away or
