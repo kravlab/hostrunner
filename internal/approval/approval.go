@@ -35,7 +35,15 @@ import (
 
 // Config describes one approval session.
 type Config struct {
-	Socket string // the approval socket of the daemon to serve
+	// Socket is the approval socket of the daemon to serve; "" lists the
+	// daemons under Root to choose from.
+	Socket string
+	// Root is where the runtime directories lie, whose approval sockets
+	// the session lists; "" lists none.
+	Root string
+	// Cwd is the directory the session runs in: the daemon whose host
+	// workspace holds it is marked and chosen by default.
+	Cwd string
 }
 
 // ErrNoEditor is what EditInEditor returns when neither $VISUAL nor
@@ -62,7 +70,7 @@ const (
 	editAgainPrompt     = "[e]dit again [c]ancel ? "
 	notePrompt          = "note for the agent (Enter for none): "
 	idlePrompt          = "> "
-	idleCommands        = "commands: standing, revoke <n>"
+	idleCommands        = "commands: standing, revoke <n>, daemons, quit"
 )
 
 // scopeTexts are what the session says of an approval, by its scope: the
@@ -82,12 +90,82 @@ var scopeTexts = map[protocol.Scope]struct{ outcome, confirm string }{
 // Run says how many. The answer "add a rule" edits the daemon's rules file
 // (see proposeRule), opening it in $VISUAL or $EDITOR when the human
 // asks. While no request is shown, the idle prompt takes commands:
-// standing lists the daemon's standing approvals, revoke <n> revokes one.
-// It returns an error when it cannot serve the daemon.
+// standing lists the daemon's standing approvals, revoke <n> revokes one,
+// daemons leaves the daemon for the list, quit ends the session.
+//
+// Without cfg.Socket it lists the daemons under cfg.Root to choose from
+// (see choose), and a daemon another session serves can be taken over:
+// the session taken over says so and ends. When its daemon ends, the
+// session waits for the next one in the same runtime directory. It returns
+// an error when it cannot serve the daemon cfg.Socket names: one without
+// an approval socket has no approvals.
 func Run(ctx context.Context, cfg Config, in io.Reader, out io.Writer) error {
-	conn, err := transport.Unix{Path: cfg.Socket}.Dial(ctx)
+	done := make(chan struct{})
+	defer close(done)
+	t := &term{out: out, in: in, want: make(chan struct{}, 1)}
+	t.want <- struct{}{}
+	t.lines = readLines(in, &t.read, t.want, done)
+	socket, takeOver := cfg.Socket, false
+	first := socket != ""
+	for {
+		if socket == "" {
+			var ok bool
+			if socket, takeOver, ok = t.choose(ctx, cfg); !ok {
+				return nil
+			}
+		}
+		end, err := t.serveDaemon(ctx, socket, takeOver, cfg.Root != "")
+		takeOver = false
+		switch {
+		case end == endNoDaemon && first:
+			return fmt.Errorf("%s has no approvals: no daemon takes them there: %w", strings.TrimSuffix(socket, approvalSuffix), err)
+		case end == endFailed || end == endNoDaemon:
+			if cfg.Root == "" {
+				return err
+			}
+			fmt.Fprintf(out, "cannot serve the daemon: %s\n", display(err.Error()))
+			socket = ""
+		case end == endList:
+			socket = ""
+		case end == endGone:
+			switch t.awaitDaemon(ctx, socket, cfg.Root != "") {
+			case endBack: // serve it
+			case endList:
+				socket = ""
+			default:
+				return nil
+			}
+		default: // quit, input ended, taken over
+			return err
+		}
+		first = false
+	}
+}
+
+// approvalSuffix ends an approval socket's path: it lies beside the
+// runtime directory it is named after (see launch.ApprovalSocket).
+const approvalSuffix = ".approval.sock"
+
+// end is how serving a daemon ended.
+type end int
+
+const (
+	endQuit      end = iota + 1 // the human quit, or input ended
+	endTakenOver                // another session took the daemon over
+	endList                     // the human asked for the list of daemons
+	endGone                     // the daemon ended
+	endBack                     // a daemon answers on the socket again
+	endNoDaemon                 // no daemon answered on the socket
+	endFailed                   // the daemon would not be served
+)
+
+// serveDaemon serves the daemon on socket, taking it over from the session
+// serving it with takeOver, until the human or the daemon ends it; canList
+// lets the human ask for the list of daemons.
+func (t *term) serveDaemon(ctx context.Context, socket string, takeOver, canList bool) (end, error) {
+	conn, err := transport.Unix{Path: socket}.Dial(ctx)
 	if err != nil {
-		return err
+		return endNoDaemon, err
 	}
 	defer conn.Close()
 	stop := context.AfterFunc(ctx, func() { conn.Close() })
@@ -95,21 +173,19 @@ func Run(ctx context.Context, cfg Config, in io.Reader, out io.Writer) error {
 
 	info, err := hello(conn)
 	if err != nil {
-		return err
+		return endFailed, err
 	}
 	if info.Version != protocol.ApprovalVersion {
-		return fmt.Errorf("the daemon speaks approval protocol version %d, this session %d: restart its container", info.Version, protocol.ApprovalVersion)
+		return endFailed, fmt.Errorf("the daemon speaks approval protocol version %d, this session %d: restart its container", info.Version, protocol.ApprovalVersion)
 	}
-	if err := serve(conn); err != nil {
-		return err
+	if err := serve(conn, takeOver); err != nil {
+		return endFailed, err
 	}
-	fmt.Fprintf(out, "serving %s (container %s)\nwaiting for requests · %s\n", info.Workspace, info.ContainerWorkspace, idleCommands)
+	fmt.Fprintf(t.out, "serving %s (container %s)\nwaiting for requests · %s\n", info.Workspace, info.ContainerWorkspace, idleCommands)
 
 	done := make(chan struct{})
 	defer close(done)
-	s := &session{conn: conn, out: out, in: in, want: make(chan struct{}, 1), rulesFile: info.RulesFile, rulesDigest: info.RulesDigest, workspace: info.Workspace}
-	s.want <- struct{}{}
-	s.lines = readLines(in, &s.read, s.want, done)
+	s := &session{term: t, conn: conn, canList: canList, rulesFile: info.RulesFile, rulesDigest: info.RulesDigest, workspace: info.Workspace}
 	s.prompt(idlePrompt)
 	return s.loop(ctx, readDaemon(conn, done))
 }
@@ -130,9 +206,10 @@ func hello(conn io.ReadWriter) (protocol.DaemonInfo, error) {
 	return info, protocol.DecodeJSON(f, &info)
 }
 
-// serve makes the session the one that serves the daemon.
-func serve(conn io.ReadWriter) error {
-	if err := protocol.WriteFrame(conn, protocol.Frame{Type: protocol.FrameServe}); err != nil {
+// serve makes the session the one that serves the daemon, taking it over
+// from the session serving it with takeOver.
+func serve(conn io.ReadWriter, takeOver bool) error {
+	if err := protocol.WriteJSON(conn, protocol.FrameServe, protocol.Serve{TakeOver: takeOver}); err != nil {
 		return err
 	}
 	f, err := protocol.ReadFrame(conn)
@@ -155,16 +232,42 @@ func frameError(f protocol.Frame) error {
 	return fmt.Errorf("unexpected frame type %d from the daemon", f.Type)
 }
 
-// session is a serving session's state: the requests waiting in arrival
-// order, the first of which is the one shown, and what it waits for: the
-// human to type, or the daemon to take the answer sent. While no request
-// is shown, the human types commands at the idle prompt.
-type session struct {
-	conn  io.Writer
+// term is the human's side of a session, kept across the daemons it
+// serves: where it prints, the lines typed, and the prompt they answer.
+type term struct {
 	out   io.Writer
 	in    io.Reader
 	lines <-chan line
 	read  atomic.Uint64 // lines read from in so far
+	// fresh is the number of the first line typed after the current
+	// prompt; lines typed before it are discarded.
+	fresh uint64
+	// asking is the current prompt.
+	asking string
+	// want lets readLines read on: it reads only while the session waits
+	// for the human, never while an editor has the terminal.
+	want chan struct{}
+}
+
+// handled lets readLines read on once the lines of its last read are
+// handled, l being one of them.
+func (t *term) handled(l line) {
+	if l.last {
+		t.want <- struct{}{}
+	}
+}
+
+// session is the state of a session serving one daemon: the requests
+// waiting in arrival order, the first of which is the one shown, and what
+// it waits for: the human to type, or the daemon to take the answer sent.
+// While no request is shown, the human types commands at the idle prompt.
+type session struct {
+	*term
+	conn io.Writer
+	// canList lets the human leave the daemon for the list of daemons.
+	canList bool
+	// end is set once the human ends serving the daemon.
+	end end
 
 	queue []waiting
 	// note is set while the human types the note of a refusal.
@@ -175,14 +278,6 @@ type session struct {
 	// sent is the outcome of the answer sent for the first request,
 	// printed once the daemon has taken it; "" while none is sent.
 	sent string
-	// fresh is the number of the first line typed after the current
-	// prompt; lines typed before it are discarded.
-	fresh uint64
-	// asking is the current prompt.
-	asking string
-	// want lets readLines read on: it reads only while the session waits
-	// for the human, never while an editor has the terminal.
-	want chan struct{}
 
 	// rulesFile is the daemon's rules file, in its host workspace, which
 	// a rule is added to; rulesDigest is the digest of the rules the daemon
@@ -204,31 +299,42 @@ type waiting struct {
 }
 
 // loop handles the daemon's frames and the human's lines until one of them
-// ends or ctx does. Leaving refuses the requests still waiting.
-func (s *session) loop(ctx context.Context, frames <-chan protocol.Frame) error {
+// ends serving the daemon, or ctx does, and returns how. Leaving refuses
+// the requests still waiting.
+func (s *session) loop(ctx context.Context, frames <-chan protocol.Frame) (end, error) {
 	for {
 		select {
 		case <-ctx.Done():
 			s.leave()
-			return nil
+			return endQuit, nil
 		case f, ok := <-frames:
+			if !ok && ctx.Err() != nil {
+				// Ctrl+C closed the connection before ctx.Done was seen.
+				s.leave()
+				return endQuit, nil
+			}
 			if !ok {
-				fmt.Fprintln(s.out, "the daemon ended")
-				return nil
+				fmt.Fprintln(s.out, "\nthe daemon ended: waiting for the next one")
+				return endGone, nil
+			}
+			if f.Type == protocol.FrameTakenOver {
+				fmt.Fprintln(s.out, "\ntaken over by another session")
+				return endTakenOver, nil
 			}
 			if err := s.daemonFrame(f); err != nil {
-				return err
+				return endFailed, err
 			}
 		case l, ok := <-s.lines:
 			if !ok {
 				s.leave()
-				return nil
+				return endQuit, nil
 			}
 			if l.n >= s.fresh {
 				s.typed(l.text)
 			}
-			if l.last {
-				s.want <- struct{}{}
+			s.handled(l)
+			if s.end != 0 {
+				return s.end, nil
 			}
 		}
 	}
@@ -393,8 +499,9 @@ func (s *session) typed(text string) {
 }
 
 // command runs a command typed at the idle prompt: standing lists the
-// standing approvals, revoke <n> revokes one; the daemon's answer prints
-// the outcome.
+// standing approvals, revoke <n> revokes one, the daemon's answer printing
+// the outcome; daemons leaves the daemon for the list of daemons, quit
+// ends the session.
 func (s *session) command(text string) {
 	name, arg, _ := strings.Cut(text, " ")
 	switch name {
@@ -410,6 +517,15 @@ func (s *session) command(text string) {
 			return
 		}
 		_ = protocol.WriteJSON(s.conn, protocol.FrameRevoke, protocol.Revoke{N: n})
+	case "daemons":
+		if !s.canList {
+			fmt.Fprintln(s.out, "this session serves the one daemon it was given")
+			s.prompt(idlePrompt)
+			return
+		}
+		s.end = endList
+	case "quit":
+		s.end = endQuit
 	default:
 		fmt.Fprintf(s.out, "unknown command %q: %s\n", display(text), idleCommands)
 		s.prompt(idlePrompt)
@@ -507,11 +623,11 @@ func (s *session) show() {
 // meant for something else never answers a request. The lines counted
 // before p is printed are the ones discarded, so an answer typed once p
 // shows always counts.
-func (s *session) prompt(p string) {
-	discardTypedAhead(s.in)
-	s.fresh = s.read.Load() + 1
-	s.asking = p
-	fmt.Fprint(s.out, p)
+func (t *term) prompt(p string) {
+	discardTypedAhead(t.in)
+	t.fresh = t.read.Load() + 1
+	t.asking = p
+	fmt.Fprint(t.out, p)
 }
 
 // quoteArgv shows argv as the session does: every argument Go-quoted, so

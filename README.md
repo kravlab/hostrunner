@@ -161,14 +161,29 @@ dry runs refuses one with 125 rather than running the command.
 
 A command the rules refuse can be approved by a human on the host, one
 request at a time. In a host terminal (not one inside the container),
-start an approval session for the devcontainer's runtime directory, the
-`--dir` its `initializeCommand` gives `hostrunner up`:
+start an approval session:
 
 ```sh
-hostrunner approve --dir "$XDG_RUNTIME_DIR/hostrunner/<devcontainerId>"
+hostrunner approve                                                  # choose from the list
+hostrunner approve --dir "$XDG_RUNTIME_DIR/hostrunner/<devcontainerId>"   # that devcontainer's daemon
 ```
 
-It serves that devcontainer's daemon: it prints each approval request as
+Without `--dir` it lists the daemons under `$XDG_RUNTIME_DIR/hostrunner`,
+looking again every 2 seconds and waiting while there is none: the one
+whose host workspace holds the current directory is marked `*` and is
+chosen with Enter, one another session serves is marked, and one of
+another approval protocol version cannot be chosen (restart its
+container). Choosing a served daemon asks `Take over? [y/N]`: the other
+session says it was taken over and ends, and the requests waiting pass to
+this one with the rest of their limit. `--dir` serves the daemon of that
+runtime directory, the `--dir` its `initializeCommand` gives
+`hostrunner up`; a directory without an approval socket has no
+approvals; a session given `--dir` serves that daemon alone. When its
+daemon ends, the session waits for the next one in the same runtime
+directory. At the idle `>` prompt, `daemons` leaves the daemon for the
+list (without `--dir`) and `quit` ends the session.
+
+It serves the daemon chosen: it prints each approval request as
 it arrives, with the container directory, the argv and why the rules
 refused it, rings the terminal bell, and takes the answer, a letter and
 Enter: `r` refuses it (then an optional note for the agent), `o` approves

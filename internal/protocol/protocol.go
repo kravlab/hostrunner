@@ -34,7 +34,9 @@
 // and takes its FrameAnswer, confirmed by FrameAnswered, or tells it with
 // FrameWithdrawn that a request ended unanswered. FrameStanding and
 // FrameRevoke list and revoke the standing approvals; FrameReread makes
-// the daemon reread its rules file once the session has added a rule.
+// the daemon reread its rules file once the session has added a rule. A
+// session that takes the daemon over from another (Serve.TakeOver) gets
+// its waiting requests, and the other FrameTakenOver.
 package protocol
 
 import (
@@ -85,7 +87,7 @@ const (
 	// refuses every other frame.
 	FrameHello           // session → daemon, JSON Hello
 	FrameDaemonInfo      // daemon → session, JSON DaemonInfo
-	FrameServe           // session → daemon, no payload: serve the daemon
+	FrameServe           // session → daemon, JSON Serve (or no payload): serve the daemon
 	FrameServing         // daemon → session, no payload: the session serves it
 	FrameApprovalRequest // daemon → session, JSON ApprovalRequest
 	FrameAnswer          // session → daemon, JSON Answer
@@ -97,8 +99,9 @@ const (
 	FrameRevoked         // daemon → session, JSON Revoked
 	FrameReread          // session → daemon, JSON Reread
 	FrameRereadResult    // daemon → session, JSON RereadResult
+	FrameTakenOver       // daemon → session, no payload: another session took over
 
-	lastFrameType = FrameRereadResult
+	lastFrameType = FrameTakenOver
 )
 
 // Exit codes for failures of hostrun itself rather than of the command,
@@ -240,6 +243,13 @@ func (a Approved) String() string {
 // the session and the daemon exchange in Hello and DaemonInfo. A session
 // serves only a daemon of its own version.
 const ApprovalVersion = 1
+
+// Serve asks the daemon to be served by the session; TakeOver replaces
+// the session that serves it, which is told so (FrameTakenOver) and whose
+// waiting requests pass to the new one with the rest of their limit.
+type Serve struct {
+	TakeOver bool `json:"take_over,omitempty"`
+}
 
 // Hello opens a session's connection to an approval socket.
 type Hello struct {

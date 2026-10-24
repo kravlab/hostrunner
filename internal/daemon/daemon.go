@@ -960,6 +960,21 @@ func (w *frameWriter) writeJSON(t protocol.FrameType, v any) error {
 	return protocol.WriteJSON(w.conn, t, v)
 }
 
+// batch calls f holding w: the frames f sends, a JSON frame of type t
+// with v or, for a nil v, one without payload, go out with no other frame
+// between them, and frames others write wait until f returns.
+func (w *frameWriter) batch(f func(send func(t protocol.FrameType, v any) error) error) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return f(func(t protocol.FrameType, v any) error {
+		w.setDeadline()
+		if v == nil {
+			return protocol.WriteFrame(w.conn, protocol.Frame{Type: t})
+		}
+		return protocol.WriteJSON(w.conn, t, v)
+	})
+}
+
 // setDeadline bounds the next write by w's timeout, if it has one.
 func (w *frameWriter) setDeadline() {
 	if w.timeout > 0 {

@@ -78,6 +78,14 @@ func startHarness(t *testing.T, log *slog.Logger, setup func(rulesFile string) (
 	if err != nil {
 		t.Fatal(err)
 	}
+	return startHarnessAt(t, log, base, setup)
+}
+
+// startHarnessAt is startHarness with the daemon's runtime directory, its
+// socket's, at base, the host workspace in it: a daemon started again at
+// the same base serves the same sockets.
+func startHarnessAt(t *testing.T, log *slog.Logger, base string, setup func(rulesFile string) (daemon.Policy, []daemon.Option)) harness {
+	t.Helper()
 	hostRoot := filepath.Join(base, "app")
 	if err := os.MkdirAll(filepath.Join(hostRoot, "sub"), 0o755); err != nil {
 		t.Fatal(err)

@@ -7,7 +7,7 @@
 //	hostrunner serve --socket <path> --workspace <host-path> --container-workspace <path>
 //	    [--config <path>] [--watch [--startup-timeout 30m] [--grace 15s]]
 //	hostrunner test [--config <path>] [--] <command> [args...]
-//	hostrunner approve --dir <runtime-dir>
+//	hostrunner approve [--dir <runtime-dir>]
 //	hostrunner update [--check]
 //	hostrunner version
 //
@@ -20,8 +20,9 @@
 // of hostrunner and hostrun to the latest release (see internal/update).
 // `version` prints the module version Go stamped into the binary (see
 // buildVersion). `approve` runs an approval session in a host terminal: it
-// serves the daemon of the runtime directory, showing each approval request
-// and sending the human's answer (see internal/approval).
+// serves the daemon of the runtime directory, or one chosen from the list
+// of daemons, showing each approval request and sending the human's
+// answer (see internal/approval).
 package main
 
 import (
@@ -55,7 +56,7 @@ const (
 	usage        = "usage: hostrunner up|serve|test|approve|update|version [flags]; see `hostrunner <command> -h`"
 	upUsage      = "usage: hostrunner up --dir <runtime-dir> --workspace <host-path> --container-workspace <path>"
 	serveUsage   = "usage: hostrunner serve --socket <path> --workspace <host-path> --container-workspace <path> [--config <path>] [--watch]"
-	approveUsage = "usage: hostrunner approve --dir <runtime-dir>"
+	approveUsage = "usage: hostrunner approve [--dir <runtime-dir>]"
 	updateUsage  = "usage: hostrunner update [--check]"
 	versionUsage = "usage: hostrunner version"
 )
@@ -270,20 +271,31 @@ func parseServe(args []string, output io.Writer) (serveConfig, error) {
 }
 
 // parseApprove parses the flags of `hostrunner approve`: --dir, the runtime
-// directory of the daemon to serve, is required, and its approval socket
-// is beside it.
+// directory of the daemon to serve, whose approval socket is beside it.
+// Without it the session lists the daemons of $XDG_RUNTIME_DIR/hostrunner,
+// where `hostrunner up` puts their runtime directories, and the current
+// directory chooses the default; with it, the session serves that daemon
+// alone.
 func parseApprove(args []string, output io.Writer) (approval.Config, error) {
 	var dir string
 	fs := flag.NewFlagSet("approve", flag.ContinueOnError)
 	fs.SetOutput(output)
-	fs.StringVar(&dir, "dir", "", "runtime directory of the daemon to serve")
+	fs.StringVar(&dir, "dir", "", "runtime directory of the daemon to serve (default: choose from the list)")
 	if err := parseFlags(fs, args, approveUsage); err != nil {
 		return approval.Config{}, err
 	}
-	if dir == "" {
-		return approval.Config{}, errors.New(approveUsage)
+	cwd, err := os.Getwd()
+	if err != nil {
+		return approval.Config{}, err
 	}
-	return approval.Config{Socket: launch.ApprovalSocket(dir)}, nil
+	if dir != "" {
+		return approval.Config{Socket: launch.ApprovalSocket(dir), Cwd: cwd}, nil
+	}
+	xdg := os.Getenv("XDG_RUNTIME_DIR")
+	if xdg == "" {
+		return approval.Config{}, errors.New("XDG_RUNTIME_DIR is not set: give the runtime directory with --dir")
+	}
+	return approval.Config{Root: filepath.Join(xdg, "hostrunner"), Cwd: cwd}, nil
 }
 
 // parseVersion parses the arguments of `hostrunner version`, which takes

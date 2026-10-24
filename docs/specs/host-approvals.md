@@ -337,13 +337,21 @@ revoked 1
   is marked and cannot be chosen; an empty list waits; dead sockets are
   skipped and only daemons remove them. `--dir X` goes straight to
   `X.approval.sock`; a daemon without one has no approvals, and the
-  session says so.
+  session says so and ends; it serves that daemon alone, with no list.
+  Without `--dir`, `$XDG_RUNTIME_DIR` must be set.
 - Choosing a served daemon asks `Take over? [y/N]`; no returns to the
   list. A session that is taken over prints `taken over by another
   session` and exits. Ctrl+C refuses the waiting requests, says how many,
   and exits. A session learns that its daemon ended from the connection
-  closing; it says so and waits for the next daemon in the same runtime
-  directory.
+  closing; it says so (`the daemon ended: waiting for the next one`) and
+  waits for the next daemon in the same runtime directory; `q` quits and
+  `daemons` lists them meanwhile.
+- `daemons` at the idle prompt leaves the daemon served (nothing waits at
+  that prompt) and shows the list; choosing it again serves it again. One
+  session serves one daemon.
+- Session frames: `Serve{take_over}` (an empty `Serve` serves a daemon
+  nobody serves), answered by `FrameServing` and the requests passed on;
+  the session replaced gets `FrameTakenOver`.
 
 ## Dry run and Rules test
 

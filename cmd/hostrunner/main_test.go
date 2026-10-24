@@ -15,6 +15,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/kravlab/hostrunner/internal/approval"
 	"github.com/kravlab/hostrunner/internal/client"
 	"github.com/kravlab/hostrunner/internal/launch"
 	"github.com/kravlab/hostrunner/internal/protocol"
@@ -556,11 +557,29 @@ func TestParseApproveServesTheRuntimeDirectorysApprovalSocket(t *testing.T) {
 	if want := "/run/user/1000/hostrunner/abc.approval.sock"; got.Socket != want {
 		t.Fatalf("socket %q, want %q", got.Socket, want)
 	}
+	if got.Root != "" {
+		t.Fatalf("root %q: a session given --dir serves that daemon alone", got.Root)
+	}
 }
 
-func TestParseApproveRequiresTheRuntimeDirectory(t *testing.T) {
-	if _, err := parseApprove(nil, io.Discard); err == nil || err.Error() != approveUsage {
-		t.Fatalf("got %v, want the usage", err)
+// Without --dir, the session lists the daemons of the user's runtime
+// directory, the current directory choosing the default.
+func TestParseApproveListsTheDaemonsWithoutADirectory(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", "/run/user/1000")
+	got, err := parseApprove(nil, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := (approval.Config{Root: "/run/user/1000/hostrunner", Cwd: cwd}); got != want {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	if _, err := parseApprove(nil, io.Discard); err == nil || !strings.Contains(err.Error(), "XDG_RUNTIME_DIR") {
+		t.Fatalf("got %v, want it to need XDG_RUNTIME_DIR", err)
 	}
 	if _, err := parseApprove([]string{"--dir", "/d", "extra"}, io.Discard); err == nil {
 		t.Fatal("expected an error for an unexpected positional argument")

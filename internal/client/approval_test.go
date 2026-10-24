@@ -47,7 +47,8 @@ func startSessionOn(t *testing.T, socket string) *session {
 	return startSessionWith(t, approval.Config{Socket: socket})
 }
 
-// startSessionWith is startSession as cfg configures it.
+// startSessionWith is startSession as cfg configures it; without a socket
+// it returns at once, the session listing the daemons.
 func startSessionWith(t *testing.T, cfg approval.Config) *session {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -66,7 +67,9 @@ func startSessionWith(t *testing.T, cfg approval.Config) *session {
 			t.Error("the approval session did not end")
 		}
 	})
-	s.waitFor(t, "waiting for requests")
+	if cfg.Socket != "" {
+		s.waitFor(t, "waiting for requests")
+	}
 	return s
 }
 

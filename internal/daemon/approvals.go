@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -66,6 +67,9 @@ type approvals struct {
 	listener  net.Listener
 	rulesFile string
 
+	// takeovers makes take-overs one at a time: the last wins.
+	takeovers sync.Mutex
+
 	mu      sync.Mutex
 	serving *sessionConn // nil while no session serves the daemon
 	lastID  uint64
@@ -95,12 +99,14 @@ type sessionConn struct {
 }
 
 // approvalRequest is a request waiting for its outcome, which arrives once
-// on done: the answer of the session it was sent to, or why it ended
-// unanswered. Whatever ends it first is its outcome; the rest find it no
-// longer waiting.
+// on done: the answer of session, the session it waits for (one that
+// takes the daemon over gets it), or why it ended unanswered. Whatever
+// ends it first is its outcome; the rest find it no longer waiting.
 type approvalRequest struct {
-	session *sessionConn
-	done    chan outcome
+	session  *sessionConn
+	done     chan outcome
+	msg      protocol.ApprovalRequest // as sent, for a session that takes over
+	deadline time.Time                // when its limit runs out
 }
 
 // outcome is how an approval request ended: the human's answer, or, when
@@ -156,13 +162,21 @@ func (a *approvals) enqueue(msg protocol.ApprovalRequest) (uint64, *approvalRequ
 	}
 	a.lastID++
 	msg.ID = a.lastID
-	r := &approvalRequest{session: c, done: make(chan outcome, 1)}
+	r := &approvalRequest{session: c, done: make(chan outcome, 1), msg: msg, deadline: time.Now().Add(time.Duration(msg.TimeoutMs) * time.Millisecond)}
 	a.waiting[msg.ID] = r
 	a.mu.Unlock()
 	if err := c.out.writeJSON(protocol.FrameApprovalRequest, msg); err != nil {
 		a.mu.Lock()
-		delete(a.waiting, msg.ID)
+		// A take-over may have passed the request on as c went: it waits
+		// for the session that took over.
+		moved := r.session != c
+		if !moved {
+			delete(a.waiting, msg.ID)
+		}
 		a.mu.Unlock()
+		if moved {
+			return msg.ID, r, nil
+		}
 		if errors.Is(err, protocol.ErrPayloadTooLarge) {
 			return 0, nil, errTooLarge
 		}
@@ -185,15 +199,18 @@ func (a *approvals) end(id uint64, r *approvalRequest, reason endReason) outcome
 		delete(a.waiting, id)
 		r.done <- outcome{ended: reason}
 	}
-	tell := waiting && reason.told() && a.serving == r.session
+	// A take-over may move the request to another session: the one told is
+	// the one it has under the lock.
+	session := r.session
+	tell := waiting && reason.told() && a.serving == session
 	if tell {
 		a.telling[id] = reason
 	}
 	a.mu.Unlock()
 	if tell {
-		if err := r.session.out.writeJSON(protocol.FrameWithdrawn, protocol.Withdrawn{ID: id, Reason: string(reason)}); err != nil {
+		if err := session.out.writeJSON(protocol.FrameWithdrawn, protocol.Withdrawn{ID: id, Reason: string(reason)}); err != nil {
 			// As in enqueue: a session that does not take it is gone.
-			r.session.conn.Close()
+			session.conn.Close()
 		}
 		a.mu.Lock()
 		delete(a.telling, id)
@@ -224,15 +241,29 @@ func (a *approvals) answer(c *sessionConn, ans protocol.Answer) (string, endReas
 }
 
 // serve makes c the session that serves the daemon and returns why not, or
-// "".
-func (a *approvals) serve(c *sessionConn) string {
+// "". With takeOver it replaces the session serving it, which it returns
+// with the requests waiting for its answer, now waiting for c's: the caller
+// sends them to c and tells the old session (see serveSession).
+func (a *approvals) serve(c *sessionConn, takeOver bool) (string, *sessionConn, []*approvalRequest) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.serving != nil && a.serving != c {
-		return "another approval session serves this daemon"
+	old := a.serving
+	if old == c {
+		return "", nil, nil
+	}
+	if old != nil && !takeOver {
+		return "another approval session serves this daemon", nil, nil
 	}
 	a.serving = c
-	return ""
+	var moved []*approvalRequest
+	for _, r := range a.waiting {
+		if r.session == old {
+			r.session = c
+			moved = append(moved, r)
+		}
+	}
+	slices.SortFunc(moved, func(x, y *approvalRequest) int { return cmp.Compare(x.msg.ID, y.msg.ID) })
+	return "", old, moved
 }
 
 // leave drops c, if it served the daemon, and reports whether it did. Every
@@ -444,12 +475,17 @@ func (s *Server) handleSession(ctx context.Context, conn net.Conn) {
 				s.sessionRefused(out, pid, fmt.Errorf("approval protocol version mismatch: session %d, daemon %d", hello.Version, protocol.ApprovalVersion))
 				return
 			}
-			if why := s.approvals.serve(c); why != "" {
+			var sv protocol.Serve
+			if len(f.Payload) > 0 {
+				if err := protocol.DecodeJSON(f, &sv); err != nil {
+					s.sessionRefused(out, pid, err)
+					return
+				}
+			}
+			if why := s.serveSession(c, sv.TakeOver); why != "" {
 				_ = out.writeJSON(protocol.FrameError, protocol.Error{Code: protocol.ExitRejected, Message: why})
 				continue
 			}
-			s.log.Info("approval session serving", "pid", pid)
-			_ = out.write(protocol.Frame{Type: protocol.FrameServing})
 		case protocol.FrameAnswer:
 			var ans protocol.Answer
 			if err := protocol.DecodeJSON(f, &ans); err != nil {
@@ -501,6 +537,53 @@ func (s *Server) reread(c *sessionConn, rr protocol.Reread) protocol.RereadResul
 	}
 	s.log.Info("rules reread", "file", s.approvals.rulesFile, "digest", digest)
 	return protocol.RereadResult{Digest: digest}
+}
+
+// serveSession makes c the session that serves the daemon, taking it over
+// from the one serving it with takeOver, and returns why not, or "". It
+// confirms with FrameServing and sends c the requests a take-over passed
+// to it, each with the rest of its limit, holding c's writer from before
+// c serves: no request or end of one reaches c before them. It then tells
+// the session it replaced, which it drops. Take-overs run one at a time.
+func (s *Server) serveSession(c *sessionConn, takeOver bool) string {
+	s.approvals.takeovers.Lock()
+	defer s.approvals.takeovers.Unlock()
+	var (
+		why   string
+		old   *sessionConn
+		moved []*approvalRequest
+	)
+	err := c.out.batch(func(send func(protocol.FrameType, any) error) error {
+		if why, old, moved = s.approvals.serve(c, takeOver); why != "" {
+			return nil
+		}
+		if err := send(protocol.FrameServing, nil); err != nil {
+			return err
+		}
+		for _, r := range moved {
+			msg := r.msg
+			msg.TimeoutMs = max(time.Until(r.deadline).Milliseconds(), 1)
+			if err := send(protocol.FrameApprovalRequest, msg); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if why != "" {
+		return why
+	}
+	if err != nil {
+		// As in enqueue: a session that does not take its frames is gone.
+		c.conn.Close()
+	}
+	if old != nil {
+		s.log.Info("approval session taken over", "pid", old.pid, "by", c.pid)
+		_ = old.out.write(protocol.Frame{Type: protocol.FrameTakenOver})
+		// Its handleSession sees the connection end; it no longer serves.
+		old.conn.Close()
+	}
+	s.log.Info("approval session serving", "pid", c.pid)
+	return ""
 }
 
 // sessionRefused reports err to the session at pid, in the log too.
