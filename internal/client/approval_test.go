@@ -27,8 +27,9 @@ import (
 type session struct {
 	in     *io.PipeWriter
 	out    *lockedBuffer
-	seen   int // how much of out the test has read
-	done   chan error
+	seen   int                // how much of out the test has read
+	ended  chan struct{}      // closed once the session has ended, err set
+	err    error              // what Run returned
 	cancel context.CancelFunc // stops the session, as Ctrl+C does
 }
 
@@ -45,13 +46,16 @@ func startSessionOn(t *testing.T, socket string) *session {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	pr, pw := io.Pipe()
-	s := &session{in: pw, out: &lockedBuffer{}, done: make(chan error, 1), cancel: cancel}
-	go func() { s.done <- approval.Run(ctx, approval.Config{Socket: socket}, pr, s.out) }()
+	s := &session{in: pw, out: &lockedBuffer{}, ended: make(chan struct{}), cancel: cancel}
+	go func() {
+		defer close(s.ended)
+		s.err = approval.Run(ctx, approval.Config{Socket: socket}, pr, s.out)
+	}()
 	t.Cleanup(func() {
 		cancel()
 		pw.Close()
 		select {
-		case <-s.done:
+		case <-s.ended:
 		case <-time.After(5 * time.Second):
 			t.Error("the approval session did not end")
 		}
@@ -114,7 +118,7 @@ func TestAskRunsACommandApprovedOnce(t *testing.T) {
 	h := startDaemon(t, policy(t, echoOnly))
 	s := h.startSession(t)
 	ch := h.ask(t, "touch", "marker")
-	block := s.waitFor(t, "answer [r]efuse [o]nce ? ")
+	block := s.waitFor(t, answerPromptText)
 	for _, want := range []string{"\a", "── request 1 ──", "dir   " + containerRoot + "\n", `argv  "touch" "marker"`, `why   no rule allows "touch marker"`} {
 		if !strings.Contains(block, want) {
 			t.Errorf("the request block %q lacks %q", block, want)
@@ -141,7 +145,7 @@ func TestAskReportsAHumansRefusal(t *testing.T) {
 			h := startDaemon(t, policy(t, echoOnly))
 			s := h.startSession(t)
 			ch := h.ask(t, "touch", "marker")
-			s.waitFor(t, "answer [r]efuse [o]nce ? ")
+			s.waitFor(t, answerPromptText)
 			s.answer(t, "r")
 			s.waitFor(t, "note for the agent (Enter for none): ")
 			s.answer(t, tt.note)
@@ -160,9 +164,9 @@ func TestAskSessionAsksAgainOnAnInvalidAnswer(t *testing.T) {
 	h := startDaemon(t, policy(t, echoOnly))
 	s := h.startSession(t)
 	ch := h.ask(t, "touch", "marker")
-	s.waitFor(t, "answer [r]efuse [o]nce ? ")
+	s.waitFor(t, answerPromptText)
 	s.answer(t, "x")
-	s.waitFor(t, "answer [r]efuse [o]nce ? ")
+	s.waitFor(t, answerPromptText)
 	s.answer(t, "o")
 	if got := awaitResult(t, ch); got.code != 0 {
 		t.Fatalf("got %+v, want the approved command's result", got)
@@ -225,7 +229,7 @@ func TestAskAsksForARefusalByAMatchingRule(t *testing.T) {
 	h := startDaemon(t, policy(t, echoOnly))
 	s := h.startSession(t)
 	ch := h.ask(t, "sh", "-x", "script")
-	block := s.waitFor(t, "answer [r]efuse [o]nce ? ")
+	block := s.waitFor(t, answerPromptText)
 	if want := "why   denied by rule \"sh\": flag -x is not allowed\n"; !strings.Contains(block, want) {
 		t.Errorf("the block %q lacks %q", block, want)
 	}
@@ -323,7 +327,7 @@ func TestAskIsLogged(t *testing.T) {
 	h := startLoggingDaemon(t, slog.New(slog.NewTextHandler(&log, nil)), policy(t, echoOnly))
 	s := h.startSession(t)
 	ch := h.ask(t, "touch", "marker")
-	s.waitFor(t, "answer [r]efuse [o]nce ? ")
+	s.waitFor(t, answerPromptText)
 	s.answer(t, "o")
 	awaitResult(t, ch)
 	for _, want := range []string{
@@ -421,7 +425,7 @@ func TestAskWithdrawnWhenTheClientGoesAway(t *testing.T) {
 	go func() {
 		done <- client.Run(ctx, h.transport, []string{"--ask", "touch", "marker"}, containerRoot, strings.NewReader(""), io.Discard, io.Discard)
 	}()
-	s.waitFor(t, "answer [r]efuse [o]nce ? ")
+	s.waitFor(t, answerPromptText)
 	cancel()
 	if code := <-done; code != client.ExitInterrupted {
 		t.Fatalf("exit code %d, want %d", code, client.ExitInterrupted)
@@ -429,9 +433,9 @@ func TestAskWithdrawnWhenTheClientGoesAway(t *testing.T) {
 	waitForLog(t, &log, `msg="approval not answered" approval_id=1 reason=withdrawn`)
 	s.waitFor(t, "request 1 withdrawn\n")
 	s.answer(t, "o")
-	time.Sleep(50 * time.Millisecond)
-	if out := s.out.String()[s.seen:]; out != "" {
-		t.Fatalf("the session answered a withdrawn request: %q", out)
+	s.waitFor(t, `unknown command "o"`)
+	if out := s.out.String(); strings.Contains(out, "approved once") {
+		t.Fatalf("the session answered a withdrawn request:\n%s", out)
 	}
 	assertNotRun(t, h, "marker")
 }
@@ -455,7 +459,7 @@ func TestAskSessionDiscardsInputTypedBeforeThePrompt(t *testing.T) {
 	s.answer(t, "o") // nothing waits yet
 	time.Sleep(50 * time.Millisecond)
 	ch := h.ask(t, "touch", "marker")
-	s.waitFor(t, "answer [r]efuse [o]nce ? ")
+	s.waitFor(t, answerPromptText)
 	if _, err := io.WriteString(s.in, "r\nfoo\n"); err != nil { // foo typed before the note's prompt
 		t.Fatal(err)
 	}
@@ -468,7 +472,11 @@ func TestAskSessionDiscardsInputTypedBeforeThePrompt(t *testing.T) {
 	}
 }
 
-const notePromptText = "note for the agent (Enter for none): "
+// The prompts the session asks for an answer and for a refusal's note with.
+const (
+	answerPromptText = "answer [r]efuse [o]nce [l]ifetime ? "
+	notePromptText   = "note for the agent (Enter for none): "
+)
 
 // What came from the container is shown escaped, so an argument or a
 // directory name cannot steer the human's terminal.
@@ -480,7 +488,7 @@ func TestAskSessionShowsTerminalEscapesEscaped(t *testing.T) {
 	s := h.startSession(t)
 	ch := make(chan result, 1)
 	go func() { ch <- h.run(t, containerRoot+"/d\x1b[2J", "", "--ask", "touch", "\x1b]0;owned\a") }()
-	block := s.waitFor(t, "answer [r]efuse [o]nce ? ")
+	block := s.waitFor(t, answerPromptText)
 	for _, want := range []string{`dir   "/workspaces/app/d\x1b[2J"`, `argv  "touch" "\x1b]0;owned\a"`} {
 		if !strings.Contains(block, want) {
 			t.Errorf("the block %q lacks %q", block, want)
@@ -586,7 +594,7 @@ func TestAskGuardedRefusalsNeedYes(t *testing.T) {
 			h := startDaemon(t, policy(t, guardedRules))
 			s := h.startSession(t)
 			ch := h.ask(t, tt.argv...)
-			block := s.waitFor(t, "answer [r]efuse [o]nce ? ")
+			block := s.waitFor(t, answerPromptText)
 			if want := "⚠ guarded: " + tt.guard + "\n"; !strings.Contains(block, want) {
 				t.Errorf("the block %q lacks %q", block, want)
 			}
@@ -596,7 +604,7 @@ func TestAskGuardedRefusalsNeedYes(t *testing.T) {
 				t.Errorf("the warning %q lacks %q", warning, tt.guard)
 			}
 			s.answer(t, "no")
-			s.waitFor(t, "answer [r]efuse [o]nce ? ")
+			s.waitFor(t, answerPromptText)
 			s.answer(t, "r")
 			s.waitFor(t, notePromptText)
 			s.answer(t, "")
@@ -614,7 +622,7 @@ func TestAskApprovesAGuardedRefusalWithYes(t *testing.T) {
 	h := startLoggingDaemon(t, slog.New(slog.NewTextHandler(&log, nil)), policy(t, guardedRules))
 	s := h.startSession(t)
 	ch := h.ask(t, "touch", "+marker")
-	s.waitFor(t, "answer [r]efuse [o]nce ? ")
+	s.waitFor(t, answerPromptText)
 	s.answer(t, "o")
 	s.waitFor(t, `Type "yes" to run it once: `)
 	s.answer(t, "yes")
@@ -632,7 +640,7 @@ func TestAskApprovesAGuardedRefusalWithYes(t *testing.T) {
 // approveYes approves the shown request once, through its warning.
 func (s *session) approveYes(t *testing.T) {
 	t.Helper()
-	s.waitFor(t, "answer [r]efuse [o]nce ? ")
+	s.waitFor(t, answerPromptText)
 	s.answer(t, "o")
 	s.waitFor(t, `Type "yes" to run it once: `)
 	s.answer(t, "yes")
@@ -722,7 +730,7 @@ rules:
 `))
 			s := h.startSession(t)
 			ch := h.ask(t, tt.argv...)
-			block := s.waitFor(t, "answer [r]efuse [o]nce ? ")
+			block := s.waitFor(t, answerPromptText)
 			if want := `⚠ guarded: path check: argument "/etc/passwd" is not a workspace file: it is an absolute path` + "\n"; !strings.Contains(block, want) {
 				t.Errorf("the block %q lacks %q", block, want)
 			}
@@ -756,7 +764,7 @@ rules:
 	}
 	s := h.startSession(t)
 	ch := h.ask(t, "cat", "-n", "inside")
-	s.waitFor(t, "answer [r]efuse [o]nce ? ")
+	s.waitFor(t, answerPromptText)
 	if err := os.Remove(inside); err != nil {
 		t.Fatal(err)
 	}
@@ -900,7 +908,7 @@ func TestAskLimitOverAnHourIsRefused(t *testing.T) {
 	}
 	ch := h.askFor(t, "1h", "touch", "marker")
 	s.waitFor(t, "── request 1 ── 60:00 left")
-	s.waitFor(t, "answer [r]efuse [o]nce ? ")
+	s.waitFor(t, answerPromptText)
 	s.answer(t, "o")
 	if got := awaitResult(t, ch); got.code != 0 {
 		t.Fatalf("got %+v, want the approved command's result", got)
@@ -914,7 +922,7 @@ func TestAskExpiresAtItsLimit(t *testing.T) {
 	h := startLoggingDaemon(t, slog.New(slog.NewTextHandler(&log, nil)), policy(t, echoOnly))
 	s := h.startSession(t)
 	ch := h.askFor(t, "300ms", "touch", "marker")
-	s.waitFor(t, "answer [r]efuse [o]nce ? ")
+	s.waitFor(t, answerPromptText)
 	got := awaitResult(t, ch)
 	if want := (result{code: protocol.ExitRejected, stderr: waitingNoRule + "hostrun: not approved: nobody answered on the host\n"}); got != want {
 		t.Fatalf("got %+v, want %+v", got, want)
@@ -931,7 +939,7 @@ func TestAskSessionShowsRequestsInTurn(t *testing.T) {
 	h := startDaemon(t, policy(t, echoOnly))
 	s := h.startSession(t)
 	first := h.ask(t, "touch", "first")
-	block := s.waitFor(t, "answer [r]efuse [o]nce ? ")
+	block := s.waitFor(t, answerPromptText)
 	if strings.Contains(block, "more waiting") {
 		t.Errorf("the first block counts others: %q", block)
 	}
@@ -947,7 +955,7 @@ func TestAskSessionShowsRequestsInTurn(t *testing.T) {
 	if got := awaitResult(t, first); got.code != 0 {
 		t.Fatalf("first: got %+v", got)
 	}
-	block = s.waitFor(t, "answer [r]efuse [o]nce ? ")
+	block = s.waitFor(t, answerPromptText)
 	for _, want := range []string{"── request 2 ──", `"touch" "second"`, "  (1 more waiting)\n"} {
 		if !strings.Contains(block, want) {
 			t.Errorf("the second block %q lacks %q", block, want)
@@ -955,7 +963,7 @@ func TestAskSessionShowsRequestsInTurn(t *testing.T) {
 	}
 	s.answer(t, "o")
 	awaitResult(t, second)
-	block = s.waitFor(t, "answer [r]efuse [o]nce ? ")
+	block = s.waitFor(t, answerPromptText)
 	if !strings.Contains(block, `"touch" "third"`) || strings.Contains(block, "more waiting") {
 		t.Errorf("the third block %q", block)
 	}
@@ -975,7 +983,7 @@ func TestAskSessionDropsRequestsThatEnd(t *testing.T) {
 	go func() {
 		current <- client.Run(ctx, h.transport, []string{"--ask", "touch", "current"}, containerRoot, strings.NewReader(""), io.Discard, io.Discard)
 	}()
-	s.waitFor(t, "answer [r]efuse [o]nce ? ")
+	s.waitFor(t, answerPromptText)
 	expiring := h.askFor(t, "200ms", "touch", "expiring")
 	s.waitFor(t, "\a")
 	if got := awaitResult(t, expiring); got.code != protocol.ExitRejected {
@@ -992,7 +1000,7 @@ func TestAskSessionDropsRequestsThatEnd(t *testing.T) {
 	cancel()
 	<-current
 	s.waitFor(t, "request 1 withdrawn\n")
-	block := s.waitFor(t, "answer [r]efuse [o]nce ? ")
+	block := s.waitFor(t, answerPromptText)
 	if !strings.Contains(block, "── request 3 ──") || strings.Contains(block, "request 2") || strings.Contains(block, "more waiting") {
 		t.Fatalf("after the withdrawn request the session showed %q, want request 3 alone", block)
 	}
@@ -1012,7 +1020,7 @@ func TestASessionLeavingRefusesWaitingRequests(t *testing.T) {
 	h := startLoggingDaemon(t, slog.New(slog.NewTextHandler(&log, nil)), policy(t, echoOnly))
 	s := h.startSession(t)
 	first := h.ask(t, "touch", "first")
-	s.waitFor(t, "answer [r]efuse [o]nce ? ")
+	s.waitFor(t, answerPromptText)
 	second := h.ask(t, "touch", "second")
 	s.waitFor(t, "\a")
 	s.in.Close()
@@ -1032,7 +1040,7 @@ func TestAStoppingDaemonAnswersWaitingRequests(t *testing.T) {
 	h := startLoggingDaemon(t, slog.New(slog.NewTextHandler(&log, nil)), policy(t, echoOnly))
 	s := h.startSession(t)
 	ch := h.ask(t, "touch", "marker")
-	s.waitFor(t, "answer [r]efuse [o]nce ? ")
+	s.waitFor(t, answerPromptText)
 	h.stop()
 	got := awaitResult(t, ch)
 	if want := (result{code: protocol.ExitRejected, stderr: waitingNoRule + "hostrun: not approved: the hostrunner daemon is stopping\n"}); got != want {
@@ -1047,7 +1055,7 @@ func TestASessionInterruptedRefusesWaitingRequests(t *testing.T) {
 	h := startDaemon(t, policy(t, echoOnly))
 	s := h.startSession(t)
 	ch := h.ask(t, "touch", "marker")
-	s.waitFor(t, "answer [r]efuse [o]nce ? ")
+	s.waitFor(t, answerPromptText)
 	s.cancel()
 	s.waitFor(t, "refused 1 waiting request\n")
 	if got := awaitResult(t, ch); got != (result{code: protocol.ExitRejected, stderr: waitingNoRule + "hostrun: refused on the host\n"}) {
@@ -1061,7 +1069,7 @@ func TestADaemonSteppingAsideAnswersWaitingRequests(t *testing.T) {
 	h := startDaemonWith(t, slog.New(slog.DiscardHandler), policy(t, echoOnly), daemon.WithArmHandler(func(protocol.Arm) bool { return true }))
 	s := h.startSession(t)
 	ch := h.ask(t, "touch", "marker")
-	s.waitFor(t, "answer [r]efuse [o]nce ? ")
+	s.waitFor(t, answerPromptText)
 	conn, err := h.transport.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -1137,7 +1145,7 @@ func TestAskSessionReportsAnAnswerTooLate(t *testing.T) {
 			socket, served := fakeDaemon(t)
 			s := startSessionOn(t, socket)
 			conn := <-served
-			s.waitFor(t, "answer [r]efuse [o]nce ? ")
+			s.waitFor(t, answerPromptText)
 			s.answer(t, "o")
 			if f, err := protocol.ReadFrame(conn); err != nil || f.Type != protocol.FrameAnswer {
 				t.Fatalf("frame %v, err %v; want the answer", f.Type, err)

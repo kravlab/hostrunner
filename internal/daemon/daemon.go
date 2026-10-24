@@ -244,7 +244,7 @@ func (s *Server) dryRun(out *frameWriter, req protocol.Request) {
 	}
 	p.close()
 	s.log.Info("dry run allowed", append(append(p.logArgs(req), "rule", p.rule), dryRunLogArgs...)...)
-	_ = out.writeJSON(protocol.FrameAllowed, protocol.Allowed{Rule: p.rule, Dir: p.fixedDir, Secrets: p.secrets})
+	_ = out.writeJSON(protocol.FrameAllowed, protocol.Allowed{Rule: p.rule, Dir: p.fixedDir, Secrets: p.secrets, Standing: p.standing})
 }
 
 // arm handles FrameArm from `hostrunner up`. When the handler steps aside,
@@ -283,8 +283,10 @@ type prepared struct {
 	secrets  []string   // names of the secrets injected, for the log
 	masked   []string   // their values, masked in the command's output
 	// pathFailures are the arguments that failed their path checks and are
-	// passed as given, as asGiven allowed (see prepareAllowed).
+	// passed as given, as the passes allowed (see prepareAllowed).
 	pathFailures []pathFailure
+	// standing is set when a standing approval lets the command through.
+	standing bool
 }
 
 // close releases the daemon's copies of the directory and of the files
@@ -301,6 +303,9 @@ func (p *prepared) logArgs(req protocol.Request) []any {
 	args := []any{"argv", req.Argv, "dir", p.hostPath}
 	if len(p.secrets) > 0 {
 		args = append(args, "secrets", p.secrets)
+	}
+	if p.standing {
+		args = append(args, "approved", "standing")
 	}
 	return args
 }
@@ -324,20 +329,40 @@ type refusal struct {
 // rule's injection is placed in the argv to run; for a dry run they are
 // only checked (see checkSources), and the argv is the container's. On
 // refusal nothing is left open.
+//
+// A standing approval for req lets it through what the rules refuse, as
+// the rule that refused it would run it, and passes as given the path
+// failures the human saw when granting it.
 func (s *Server) prepare(req protocol.Request, dryRun bool) (*prepared, *refusal) {
 	allowed, err := s.policy.Check(req.Argv)
+	standing := s.approvals.standingFor(req)
+	// byStanding: the rules refuse req, and its standing approval overrides
+	// them.
+	byStanding := false
 	if err != nil {
-		return nil, &refusal{protocol.ExitRejected, err.Error(), err}
+		var d *rules.Denial
+		if standing == nil || !errors.As(err, &d) || !d.Approvable() {
+			return nil, &refusal{protocol.ExitRejected, err.Error(), err}
+		}
+		allowed, byStanding = d.Approved, true
 	}
-	return s.prepareAllowed(req, allowed, dryRun, nil)
+	var passes pathPasses
+	if standing != nil {
+		passes = standing.passes
+	}
+	p, r := s.prepareAllowed(req, allowed, dryRun, passes)
+	if p != nil {
+		p.standing = byStanding || len(p.pathFailures) > 0
+	}
+	return p, r
 }
 
 // prepareAllowed runs the checks after the rules for req, a command the
 // rules allowed, or a human approved, as allowed describes: its working
-// directory, path checks, fixed directory and secrets (see prepare). A failed
-// path check of an argument whose argv index asGiven holds does not refuse
-// it: the argument is passed as given, and the failure is in pathFailures.
-func (s *Server) prepareAllowed(req protocol.Request, allowed rules.Allowed, dryRun bool, asGiven map[int]bool) (*prepared, *refusal) {
+// directory, path checks, fixed directory and secrets (see prepare). A
+// path failure that passes.pass lets through does not refuse it: the
+// argument is passed as given, and the failure is in pathFailures.
+func (s *Server) prepareAllowed(req protocol.Request, allowed rules.Allowed, dryRun bool, passes pathPasses) (*prepared, *refusal) {
 	var err error
 	p := &prepared{rule: allowed.Rule, fixedDir: allowed.Dir, secrets: allowed.SecretNames()}
 	if p.dir, p.hostPath, err = s.mapper.Open(req.Cwd); err != nil {
@@ -349,7 +374,7 @@ func (s *Server) prepareAllowed(req protocol.Request, allowed rules.Allowed, dry
 		return nil, &refusal{code, message, err}
 	}
 	var message string
-	if p.argv, p.files, p.pathFailures, message, err = s.openPaths(req.Argv, allowed.Paths, p.hostPath, asGiven); err != nil {
+	if p.argv, p.files, p.pathFailures, message, err = s.openPaths(req.Argv, allowed.Paths, p.hostPath, passes); err != nil {
 		return refuse(protocol.ExitRejected, message, err)
 	}
 	if allowed.Dir != "" {
@@ -491,14 +516,15 @@ func fixedMessage(dir string, err error) string {
 // run and the files to hand to the command as its descriptors 3, 4, …; the
 // caller closes the files, which it gets on failure too. A failed check
 // returns a message for the client, in container terms only, and an error
-// with host paths for the daemon log. An argument whose argv index asGiven
-// holds refuses nothing: it is passed as given, and its failure returned.
+// with host paths for the daemon log. A failure that passes.pass lets
+// through refuses nothing: the argument is passed as given, and its
+// failure returned.
 //
 // A PathModeCheck argument is opened to check it and closed again; the
 // program gets it as given. A PathModeOpen argument stays open and is
 // replaced with the /proc/self/fd path of the descriptor the program
 // inherits, keeping the part of its token before the path (--file=, -f).
-func (s *Server) openPaths(argv []string, paths []rules.PathArg, dirPath string, asGiven map[int]bool) ([]string, []*os.File, []pathFailure, string, error) {
+func (s *Server) openPaths(argv []string, paths []rules.PathArg, dirPath string, passes pathPasses) ([]string, []*os.File, []pathFailure, string, error) {
 	if len(paths) == 0 {
 		return argv, nil, nil, "", nil
 	}
@@ -508,7 +534,7 @@ func (s *Server) openPaths(argv []string, paths []rules.PathArg, dirPath string,
 	for _, p := range paths {
 		name := argv[p.Index][len(p.Prefix):]
 		f, err := s.mapper.OpenFile(dirPath, name)
-		if err != nil && asGiven[p.Index] {
+		if err != nil && passes.pass(p.Index, pathMessage(name, err)) {
 			failed = append(failed, pathFailure{p.Index, pathMessage(name, err)})
 			continue
 		}
@@ -531,6 +557,32 @@ func (s *Server) openPaths(argv []string, paths []rules.PathArg, dirPath string,
 type pathFailure struct {
 	index   int
 	message string
+}
+
+// pathPasses says which failed path checks are passed as given rather than
+// refusing the command. The zero value passes none.
+type pathPasses struct {
+	// all passes every failure: they are collected to ask a human about.
+	all bool
+	// seen passes, by argv index, the failure a human saw and approved,
+	// for that reason only: the same argument failing otherwise (a file
+	// swapped for a symlink since) is refused.
+	seen map[int]string
+}
+
+// pass reports whether the failure of the argument at argv index i, for
+// message, is passed as given.
+func (pp pathPasses) pass(i int, message string) bool {
+	return pp.all || pp.seen[i] != "" && pp.seen[i] == message
+}
+
+// seenPaths passes the failures a human saw and approved.
+func seenPaths(failures []pathFailure) pathPasses {
+	seen := make(map[int]string, len(failures))
+	for _, f := range failures {
+		seen[f.index] = f.message
+	}
+	return pathPasses{seen: seen}
 }
 
 // closeAll closes the daemon's copies of the files openPaths opened. Close

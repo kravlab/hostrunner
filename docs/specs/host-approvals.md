@@ -182,6 +182,20 @@ from `protocol.Version` of the container's socket.
   (step aside, exit). They work without a session.
 - The session lists them and revokes any one; revoking does not stop a
   running command.
+- It runs as the approved request did: under the rule that refused it,
+  with the path failures the human saw passed as given, each for the
+  reason the human saw; a path check that fails otherwise, or only
+  later, takes the command out of the standing approval: it is refused
+  with the hint, and `--ask` asks the human again. The log marks the runs
+  `approved=standing`.
+- Granted once the approved command has passed its checks; granting one
+  the daemon holds for the same argv and directory keeps its number.
+- A one-off approval likewise passes a path failure as given only for
+  the reason the human saw.
+- Session frames: `Standing` (no payload) answered by `StandingList{
+  approvals: [{n, argv, cwd, guarded}]}`; `Revoke{n}` answered by
+  `Revoked{n, error}`. The guarded confirmation for `l` reads `Type "yes"
+  to approve it for the daemon's lifetime: `.
 
 ## Add a rule
 

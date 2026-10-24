@@ -172,8 +172,9 @@ It serves that devcontainer's daemon: it prints each approval request as
 it arrives, with the container directory, the argv and why the rules
 refused it, rings the terminal bell, and takes the answer, a letter and
 Enter: `r` refuses it (then an optional note for the agent), `o` approves
-this request only. Input typed before the prompt is discarded, and what
-came from the container is shown quoted, so it cannot steer the terminal.
+this request only, `l` grants a standing approval (below). Input typed
+before the prompt is discarded, and what came from the container is
+shown quoted, so it cannot steer the terminal.
 Requests are shown one at a time, first in, first out; a new one rings
 the bell without interrupting the prompt and is counted in the next
 block (`(1 more waiting)`). A shown request whose agent goes away or
@@ -181,6 +182,18 @@ whose time runs out is announced (`request 7 withdrawn`, `request 7
 expired`) and the next is shown; a queued one drops out silently.
 Leaving the session (Ctrl+C, end of input) refuses the requests still
 waiting and says how many.
+
+A standing approval (`l`, "for the daemon's lifetime") lets the same argv,
+byte for byte, from the same container directory through from then on,
+with or without `--ask`, printing nothing of hostrun's own; it runs as
+the approved request did. A guarded request gets one after one `yes`,
+when it is granted. Standing approvals live in the daemon's memory: they
+work without a session, survive a container restart or rebuild that
+keeps the daemon, and end with it. While no request is shown, the
+session's `>` prompt takes `standing`, which lists them (number, argv,
+directory, `guarded`), and `revoke <n>`, which ends one; a command it
+let through keeps running. A dry run of a command one lets through
+reports `hostrun: dry run: allowed by a standing approval`.
 
 In the container, ask with `--ask` as hostrun's first argument:
 
@@ -239,7 +252,8 @@ workspace, and a session that stops reading (suspended) is dropped
 rather than holding up its daemon. A daemon older than
 `--ask` refuses it with 125 rather than running the command. The daemon
 log, `daemon.log` in the runtime directory, records the requests and
-answers; the container can read it.
+answers, standing approvals granted and revoked, and marks the runs one
+lets through `approved=standing`; the container can read it.
 
 ## Rules
 

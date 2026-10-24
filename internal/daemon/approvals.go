@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"runtime/debug"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -71,6 +72,17 @@ type approvals struct {
 	waiting map[uint64]*approvalRequest
 	// telling holds the requests that ended while the session is told so.
 	telling map[uint64]endReason
+	// standing holds the standing approvals, oldest first; they live as
+	// long as the daemon, with a session or without.
+	standing     []standingApproval
+	lastStanding uint64
+}
+
+// standingApproval is a standing approval, and the path failures it
+// passes as given: those the human saw when granting it.
+type standingApproval struct {
+	protocol.Standing
+	passes pathPasses
 }
 
 // sessionConn is a connected approval session: its connection, where its
@@ -196,10 +208,10 @@ func (a *approvals) end(id uint64, r *approvalRequest, reason endReason) outcome
 func (a *approvals) answer(c *sessionConn, ans protocol.Answer) (string, endReason) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.serving != c {
-		return "this session does not serve the daemon", ""
+	if why := a.checkServing(c); why != "" {
+		return why, ""
 	}
-	if ans.Scope != "" && ans.Scope != protocol.ScopeOnce {
+	if ans.Scope != "" && ans.Scope != protocol.ScopeOnce && ans.Scope != protocol.ScopeLifetime {
 		return fmt.Sprintf("unknown scope %q", ans.Scope), ""
 	}
 	r, ok := a.waiting[ans.ID]
@@ -250,6 +262,97 @@ func (a *approvals) served() bool {
 	return a.serving != nil
 }
 
+// grant grants a standing approval for req's argv from its container
+// directory, guarded or not, passing as given the path failures passes
+// does, and returns its number. One the daemon holds for the same argv
+// and directory already takes the new approval's terms and keeps its
+// number, so one revoke ends it.
+func (a *approvals) grant(req protocol.Request, guarded bool, passes pathPasses) uint64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if i := a.standingIndex(req); i >= 0 {
+		a.standing[i].Guarded = guarded
+		a.standing[i].passes = passes
+		return a.standing[i].N
+	}
+	a.lastStanding++
+	a.standing = append(a.standing, standingApproval{
+		Standing: protocol.Standing{N: a.lastStanding, Argv: slices.Clone(req.Argv), Cwd: req.Cwd, Guarded: guarded},
+		passes:   passes,
+	})
+	return a.lastStanding
+}
+
+// standingIndex returns the index in a.standing of the standing approval
+// for req, its argv byte for byte from the same container directory, or
+// -1. The caller holds a.mu.
+func (a *approvals) standingIndex(req protocol.Request) int {
+	return slices.IndexFunc(a.standing, func(sa standingApproval) bool {
+		return sa.Cwd == req.Cwd && slices.Equal(sa.Argv, req.Argv)
+	})
+}
+
+// notServing is why a session that does not serve the daemon is not
+// heard.
+const notServing = "this session does not serve the daemon"
+
+// checkServing returns notServing unless c serves the daemon, or "". The
+// caller holds a.mu.
+func (a *approvals) checkServing(c *sessionConn) string {
+	if a.serving != c {
+		return notServing
+	}
+	return ""
+}
+
+// standingFor returns the standing approval that lets req through, its
+// argv byte for byte from the same container directory, or nil. A Server
+// without approvals has none.
+func (a *approvals) standingFor(req protocol.Request) *standingApproval {
+	if a == nil {
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	i := a.standingIndex(req)
+	if i < 0 {
+		return nil
+	}
+	sa := a.standing[i]
+	return &sa
+}
+
+// list returns the standing approvals for session c, or why c may not see
+// them.
+func (a *approvals) list(c *sessionConn) ([]protocol.Standing, string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if why := a.checkServing(c); why != "" {
+		return nil, why
+	}
+	list := make([]protocol.Standing, len(a.standing))
+	for i, sa := range a.standing {
+		list[i] = sa.Standing
+	}
+	return list, ""
+}
+
+// revoke revokes standing approval n for session c and returns why not, or
+// "". A command it let through keeps running.
+func (a *approvals) revoke(c *sessionConn, n uint64) string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if why := a.checkServing(c); why != "" {
+		return why
+	}
+	i := slices.IndexFunc(a.standing, func(sa standingApproval) bool { return sa.N == n })
+	if i < 0 {
+		return fmt.Sprintf("no standing approval %d", n)
+	}
+	a.standing = slices.Delete(a.standing, i, i+1)
+	return ""
+}
+
 // serveApprovals accepts approval sessions on the approval socket until it
 // is closed, handling each in wg. An accept error it cannot retry ends
 // approvals, not the daemon.
@@ -273,7 +376,8 @@ func (s *Server) serveApprovals(ctx context.Context, wg *sync.WaitGroup) {
 
 // handleSession serves one connection to the approval socket. Only a
 // process of the daemon's own uid may use it; it opens with FrameHello and
-// then takes FrameServe and FrameAnswer. Any other frame ends it.
+// then takes FrameServe, FrameAnswer, FrameStanding and FrameRevoke. Any
+// other frame ends it.
 func (s *Server) handleSession(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
 	stop := context.AfterFunc(ctx, func() { conn.Close() })
@@ -347,6 +451,20 @@ func (s *Server) handleSession(ctx context.Context, conn net.Conn) {
 			}
 			why, ended := s.approvals.answer(c, ans)
 			_ = out.writeJSON(protocol.FrameAnswered, protocol.Answered{ID: ans.ID, Error: why, Ended: string(ended)})
+		case protocol.FrameStanding:
+			list, why := s.approvals.list(c)
+			_ = out.writeJSON(protocol.FrameStandingList, protocol.StandingList{Approvals: list, Error: why})
+		case protocol.FrameRevoke:
+			var rv protocol.Revoke
+			if err := protocol.DecodeJSON(f, &rv); err != nil {
+				s.sessionRefused(out, pid, err)
+				return
+			}
+			why := s.approvals.revoke(c, rv.N)
+			if why == "" {
+				s.log.Info("standing approval revoked", "standing", rv.N, "pid", pid)
+			}
+			_ = out.writeJSON(protocol.FrameRevoked, protocol.Revoked{N: rv.N, Error: why})
 		default:
 			s.sessionRefused(out, pid, fmt.Errorf("frame type %d does not belong on the approval socket", f.Type))
 			return
@@ -365,7 +483,10 @@ func (s *Server) sessionRefused(out *frameWriter, pid int, err error) {
 // checks fail, waits for the serving session's answer and runs if
 // approved, as the rule that refused it runs its allowed commands (in the
 // mirrored directory with nothing injected when no rule matched). A
-// refusal that cannot be approved is the one a plain request gets.
+// refusal that cannot be approved is the one a plain request gets. A
+// command a standing approval lets through runs at once, as for a plain
+// request; the answer "for the daemon's lifetime" grants one, once the
+// approved command has passed its checks.
 //
 // A waiting request ends unanswered when its client goes away, its limit
 // runs out, its session leaves or the daemon stops; but for the first,
@@ -471,13 +592,20 @@ func (s *Server) ask(ctx context.Context, cancel context.CancelFunc, conn net.Co
 	}
 	s.log.Info("approval answered", "approval_id", id, "scope", ans.Scope)
 	_ = out.writeJSON(protocol.FrameApproved, protocol.Approved{Scope: ans.Scope})
-	// Only the path failures the human saw are passed as given: one that
-	// fails its check only now (a file swapped for a symlink meanwhile)
-	// refuses the command.
-	p, r := s.prepareAllowed(req, need.approved, false, failedPaths(need.pathFailures))
+	// Only the path failures the human saw are passed as given, for the
+	// reason they saw: one that fails its check only now, or otherwise (a
+	// file swapped for a symlink meanwhile), refuses the command.
+	seen := seenPaths(need.pathFailures)
+	p, r := s.prepareAllowed(req, need.approved, false, seen)
 	if r != nil {
 		s.reject(out, r.code, r.message, r.err)
 		return
+	}
+	if ans.Scope == protocol.ScopeLifetime {
+		// Granted once the approved command has passed its checks, so a
+		// request refused at its start leaves nothing standing.
+		n := s.approvals.grant(req, len(need.text.guards) > 0, seen)
+		s.log.Info("standing approval granted", "standing", n, "argv", req.Argv, "dir", need.hostDir, "approval_id", id)
 	}
 	s.start(ctx, cancel, conn, out, req, p, frames.next, "approved", ans.Scope, "approval_id", id)
 }
@@ -497,9 +625,22 @@ type approvalNeed struct {
 // the rules, then, as a dry run, every check an approval cannot lift
 // (directories, secrets' sources, the program), with the path checks
 // collected rather than refusing. It returns nil and nil when req would run
-// without asking, a refusal when it would be refused without asking, or
-// what the human would be asked.
+// without asking (the rules, or a standing approval, let it through), a
+// refusal when it would be refused without asking, or what the human
+// would be asked. A command whose standing approval no longer lets it
+// through (a path check failing for a reason the human did not see) is
+// assessed as if it had none, so the human is asked again.
 func (s *Server) assessApproval(req protocol.Request) (*approvalNeed, *refusal) {
+	if s.approvals.standingFor(req) != nil {
+		p, r := s.prepare(req, true)
+		if r == nil {
+			r = lookupStart(p, req)
+		}
+		if r == nil {
+			p.close()
+			return nil, nil
+		}
+	}
 	approved, err := s.policy.Check(req.Argv)
 	var d *rules.Denial
 	if err != nil && (!errors.As(err, &d) || !d.Approvable()) {
@@ -510,7 +651,7 @@ func (s *Server) assessApproval(req protocol.Request) (*approvalNeed, *refusal) 
 	}
 	// Starting the command checks all of it again. Every path check may
 	// fail here: its failure is asked about.
-	p, r := s.prepareAllowed(req, approved, true, everyPath(approved.Paths))
+	p, r := s.prepareAllowed(req, approved, true, pathPasses{all: true})
 	if r == nil {
 		r = lookupStart(p, req)
 	}
@@ -592,25 +733,6 @@ func describeRequest(d *rules.Denial, approved rules.Allowed, pathFailures []pat
 		text.guards = append(text.guards, "injects secrets: "+strings.Join(names, ", "))
 	}
 	return text
-}
-
-// everyPath returns the argv indices of paths, the arguments under a path
-// check.
-func everyPath(paths []rules.PathArg) map[int]bool {
-	indices := make(map[int]bool, len(paths))
-	for _, p := range paths {
-		indices[p.Index] = true
-	}
-	return indices
-}
-
-// failedPaths returns the argv indices of the arguments in failures.
-func failedPaths(failures []pathFailure) map[int]bool {
-	indices := make(map[int]bool, len(failures))
-	for _, f := range failures {
-		indices[f.index] = true
-	}
-	return indices
 }
 
 // clientFrames carries what the client sends, read once, so that waiting

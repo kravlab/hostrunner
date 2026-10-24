@@ -39,17 +39,28 @@ type Config struct {
 
 // Prompts and lines the session prints.
 const (
-	answerPrompt = "answer [r]efuse [o]nce ? "
+	answerPrompt = "answer [r]efuse [o]nce [l]ifetime ? "
 	notePrompt   = "note for the agent (Enter for none): "
-	yesPrompt    = `Type "yes" to run it once: `
+	idlePrompt   = "> "
+	idleCommands = "commands: standing, revoke <n>"
 )
+
+// scopeTexts are what the session says of an approval, by its scope: the
+// outcome once the daemon has taken it, and the prompt confirming one for
+// a guarded request.
+var scopeTexts = map[protocol.Scope]struct{ outcome, confirm string }{
+	protocol.ScopeOnce:     {"approved once", `Type "yes" to run it once: `},
+	protocol.ScopeLifetime: {"approved for the daemon's lifetime", `Type "yes" to approve it for the daemon's lifetime: `},
+}
 
 // Run serves the daemon on cfg.Socket until ctx ends, in ends, or the
 // daemon goes away: it shows each approval request on out, ringing the
 // terminal bell, and sends the answer the human types on in. Requests that
 // end unanswered are dropped as the daemon reports them; leaving refuses
 // the ones still waiting (the daemon does, as the connection closes), and
-// Run says how many. It returns an error when it cannot serve the daemon.
+// Run says how many. While no request is shown, the idle prompt takes
+// commands: standing lists the daemon's standing approvals, revoke <n>
+// revokes one. It returns an error when it cannot serve the daemon.
 func Run(ctx context.Context, cfg Config, in io.Reader, out io.Writer) error {
 	conn, err := transport.Unix{Path: cfg.Socket}.Dial(ctx)
 	if err != nil {
@@ -69,12 +80,13 @@ func Run(ctx context.Context, cfg Config, in io.Reader, out io.Writer) error {
 	if err := serve(conn); err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "serving %s (container %s)\nwaiting for requests\n", info.Workspace, info.ContainerWorkspace)
+	fmt.Fprintf(out, "serving %s (container %s)\nwaiting for requests · %s\n", info.Workspace, info.ContainerWorkspace, idleCommands)
 
 	done := make(chan struct{})
 	defer close(done)
 	s := &session{conn: conn, out: out, in: in}
 	s.lines = readLines(in, &s.read, done)
+	s.prompt(idlePrompt)
 	return s.loop(ctx, readDaemon(conn, done))
 }
 
@@ -121,7 +133,8 @@ func frameError(f protocol.Frame) error {
 
 // session is a serving session's state: the requests waiting in arrival
 // order, the first of which is the one shown, and what it waits for: the
-// human to type, or the daemon to take the answer sent.
+// human to type, or the daemon to take the answer sent. While no request
+// is shown, the human types commands at the idle prompt.
 type session struct {
 	conn  io.Writer
 	out   io.Writer
@@ -132,14 +145,17 @@ type session struct {
 	queue []waiting
 	// note is set while the human types the note of a refusal.
 	note bool
-	// confirm is set while the human confirms approving a guarded request.
-	confirm bool
+	// confirm is the scope the human confirms approving a guarded request
+	// for; "" while no confirmation is asked.
+	confirm protocol.Scope
 	// sent is the outcome of the answer sent for the first request,
 	// printed once the daemon has taken it; "" while none is sent.
 	sent string
 	// fresh is the number of the first line typed after the current
 	// prompt; lines typed before it are discarded.
 	fresh uint64
+	// asking is the current prompt.
+	asking string
 }
 
 // waiting is an approval request and when its time runs out. ended is why
@@ -219,47 +235,100 @@ func (s *session) daemonFrame(f protocol.Frame) error {
 			return err
 		}
 		s.withdrawn(w)
+	case protocol.FrameStandingList:
+		var l protocol.StandingList
+		if err := protocol.DecodeJSON(f, &l); err != nil {
+			return err
+		}
+		switch {
+		case l.Error != "":
+			fmt.Fprintf(s.out, "standing: %s\n", l.Error)
+		case len(l.Approvals) == 0:
+			fmt.Fprintln(s.out, "no standing approvals")
+		}
+		for _, a := range l.Approvals {
+			line := fmt.Sprintf("  %d  %s   in %s", a.N, quoteArgv(a.Argv), display(a.Cwd))
+			if a.Guarded {
+				line += "   guarded"
+			}
+			fmt.Fprintln(s.out, line)
+		}
+		s.idle()
+	case protocol.FrameRevoked:
+		var r protocol.Revoked
+		if err := protocol.DecodeJSON(f, &r); err != nil {
+			return err
+		}
+		if r.Error != "" {
+			fmt.Fprintf(s.out, "revoke %d: %s\n", r.N, r.Error)
+		} else {
+			fmt.Fprintf(s.out, "revoked %d\n", r.N)
+		}
+		s.idle()
 	default:
 		return frameError(f)
 	}
 	return nil
 }
 
-// typed handles a line the human typed after the current prompt. Nothing
-// is asked while an answer waits for the daemon.
+// idle asks again, after a command's outcome, what was asked before it:
+// the idle prompt, or, when a request arrived meanwhile, its prompt, which
+// the outcome printed below would bury. Nothing is asked while an answer
+// waits for the daemon.
+func (s *session) idle() {
+	switch {
+	case len(s.queue) == 0:
+		s.prompt(idlePrompt)
+	case s.sent == "":
+		s.prompt(s.asking)
+	}
+}
+
+// typed handles a line the human typed after the current prompt: an
+// answer while a request is shown, a command while none is. Nothing is
+// asked while an answer waits for the daemon.
 func (s *session) typed(text string) {
-	if len(s.queue) == 0 || s.sent != "" {
+	text = strings.TrimSpace(text)
+	if len(s.queue) == 0 {
+		s.command(text)
+		return
+	}
+	if s.sent != "" {
 		return
 	}
 	r := s.queue[0]
-	text = strings.TrimSpace(text)
 	if s.note {
 		s.note = false
 		s.send(protocol.Answer{ID: r.ID, Note: text}, "refused")
 		return
 	}
-	if s.confirm {
-		s.confirm = false
+	if scope := s.confirm; scope != "" {
+		s.confirm = ""
 		if text == "yes" {
-			s.approveOnce(r.ID)
+			s.approve(r.ID, scope)
 		} else {
 			s.prompt(answerPrompt)
 		}
 		return
 	}
 	switch text {
-	case "o":
+	case "o", "l":
+		scope := protocol.ScopeOnce
+		if text == "l" {
+			scope = protocol.ScopeLifetime
+		}
 		if len(r.Guards) == 0 {
-			s.approveOnce(r.ID)
+			s.approve(r.ID, scope)
 			return
 		}
-		// A guarded request runs only once the human has read its guards
-		// again and typed "yes"; anything else asks for the answer again.
+		// A guarded request is approved only once the human has read its
+		// guards again and typed "yes"; anything else asks for the answer
+		// again. A standing approval is confirmed so once, here.
 		for _, guard := range r.Guards {
 			fmt.Fprintf(s.out, "⚠ %s\n", display(guard))
 		}
-		s.confirm = true
-		s.prompt(yesPrompt)
+		s.confirm = scope
+		s.prompt(scopeTexts[scope].confirm)
 	case "r":
 		s.note = true
 		s.prompt(notePrompt)
@@ -268,9 +337,33 @@ func (s *session) typed(text string) {
 	}
 }
 
-// approveOnce approves request id for this request only.
-func (s *session) approveOnce(id uint64) {
-	s.send(protocol.Answer{ID: id, Scope: protocol.ScopeOnce}, "approved once")
+// command runs a command typed at the idle prompt: standing lists the
+// standing approvals, revoke <n> revokes one; the daemon's answer prints
+// the outcome.
+func (s *session) command(text string) {
+	name, arg, _ := strings.Cut(text, " ")
+	switch name {
+	case "":
+		s.prompt(idlePrompt)
+	case "standing":
+		_ = protocol.WriteFrame(s.conn, protocol.Frame{Type: protocol.FrameStanding})
+	case "revoke":
+		n, err := strconv.ParseUint(strings.TrimSpace(arg), 10, 64)
+		if err != nil {
+			fmt.Fprintln(s.out, "usage: revoke <n>, n from standing")
+			s.prompt(idlePrompt)
+			return
+		}
+		_ = protocol.WriteJSON(s.conn, protocol.FrameRevoke, protocol.Revoke{N: n})
+	default:
+		fmt.Fprintf(s.out, "unknown command %q: %s\n", display(text), idleCommands)
+		s.prompt(idlePrompt)
+	}
+}
+
+// approve approves request id for scope.
+func (s *session) approve(id uint64, scope protocol.Scope) {
+	s.send(protocol.Answer{ID: id, Scope: scope}, scopeTexts[scope].outcome)
 }
 
 // send sends ans to the daemon; outcome is printed once the daemon has
@@ -294,7 +387,7 @@ func (s *session) withdrawn(w protocol.Withdrawn) {
 		s.queue[0].ended = w.Reason
 	default:
 		fmt.Fprintf(s.out, "\nrequest %d %s\n", w.ID, w.Reason)
-		s.note, s.confirm = false, false
+		s.note, s.confirm = false, ""
 		s.next()
 	}
 }
@@ -322,7 +415,9 @@ func (s *session) next() {
 	s.queue = s.queue[1:]
 	if len(s.queue) > 0 {
 		s.show()
+		return
 	}
+	s.prompt(idlePrompt)
 }
 
 // show prints the first waiting request as a block and asks for the
@@ -333,11 +428,7 @@ func (s *session) show() {
 	head := fmt.Sprintf("── request %d ── %d:%02d left ", r.ID, int(left.Minutes()), int(left.Seconds())%60)
 	fmt.Fprintf(s.out, "\n%s%s\n", head, strings.Repeat("─", max(0, 58-len([]rune(head)))))
 	fmt.Fprintf(s.out, "  dir   %s\n", display(r.Cwd))
-	quoted := make([]string, len(r.Argv))
-	for i, arg := range r.Argv {
-		quoted[i] = strconv.Quote(arg)
-	}
-	fmt.Fprintf(s.out, "  argv  %s\n", strings.Join(quoted, " "))
+	fmt.Fprintf(s.out, "  argv  %s\n", quoteArgv(r.Argv))
 	for i, reason := range r.Reasons {
 		label := "why "
 		if i > 0 {
@@ -361,7 +452,18 @@ func (s *session) show() {
 func (s *session) prompt(p string) {
 	discardTypedAhead(s.in)
 	s.fresh = s.read.Load() + 1
+	s.asking = p
 	fmt.Fprint(s.out, p)
+}
+
+// quoteArgv shows argv as the session does: every argument Go-quoted, so
+// none can steer the terminal or hide where it ends.
+func quoteArgv(argv []string) string {
+	quoted := make([]string, len(argv))
+	for i, arg := range argv {
+		quoted[i] = strconv.Quote(arg)
+	}
+	return strings.Join(quoted, " ")
 }
 
 // display returns text as it may be shown on the terminal: as it is when

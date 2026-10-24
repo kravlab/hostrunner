@@ -32,7 +32,8 @@
 // daemon answers FrameDaemonInfo; FrameServe makes the session the one
 // that serves the daemon, which then sends it each FrameApprovalRequest
 // and takes its FrameAnswer, confirmed by FrameAnswered, or tells it with
-// FrameWithdrawn that a request ended unanswered.
+// FrameWithdrawn that a request ended unanswered. FrameStanding and
+// FrameRevoke list and revoke the standing approvals.
 package protocol
 
 import (
@@ -89,8 +90,12 @@ const (
 	FrameAnswer          // session → daemon, JSON Answer
 	FrameAnswered        // daemon → session, JSON Answered
 	FrameWithdrawn       // daemon → session, JSON Withdrawn
+	FrameStanding        // session → daemon, no payload: list the standing approvals
+	FrameStandingList    // daemon → session, JSON StandingList
+	FrameRevoke          // session → daemon, JSON Revoke
+	FrameRevoked         // daemon → session, JSON Revoked
 
-	lastFrameType = FrameWithdrawn
+	lastFrameType = FrameRevoked
 )
 
 // Exit codes for failures of hostrun itself rather than of the command,
@@ -144,16 +149,22 @@ type Armed struct {
 // fixed directory, the command's working directory, and is omitted when
 // the command would run in the mirrored directory. Secrets are the names
 // of the secrets the rule would inject, omitted when there are none; a
-// client that predates them ignores the field.
+// client that predates them ignores the field. Standing is set when a
+// standing approval lets the command through, which runs it as the rule
+// that refused it would (Dir, Secrets).
 type Allowed struct {
-	Rule    string   `json:"rule"`
-	Dir     string   `json:"dir,omitempty"`
-	Secrets []string `json:"secrets,omitempty"`
+	Rule     string   `json:"rule"`
+	Dir      string   `json:"dir,omitempty"`
+	Secrets  []string `json:"secrets,omitempty"`
+	Standing bool     `json:"standing,omitempty"`
 }
 
 // String describes a, as the dry run and the Rules test report it.
 func (a Allowed) String() string {
 	s := fmt.Sprintf("allowed by rule %q", a.Rule)
+	if a.Standing {
+		s = "allowed by a standing approval"
+	}
 	if a.Dir != "" {
 		s += ", runs in " + a.Dir
 	}
@@ -197,7 +208,8 @@ type Scope string
 
 // Scopes of an approval.
 const (
-	ScopeOnce Scope = "once" // this request only
+	ScopeOnce     Scope = "once"     // this request only
+	ScopeLifetime Scope = "lifetime" // a standing approval: the daemon's lifetime
 )
 
 // Approved tells the client that a human approved its command, which the
@@ -209,8 +221,11 @@ type Approved struct {
 // String is the line the client prints before the approved command runs.
 func (a Approved) String() string {
 	reach := string(a.Scope)
-	if a.Scope == ScopeOnce {
+	switch a.Scope {
+	case ScopeOnce:
 		reach = "this request only"
+	case ScopeLifetime:
+		reach = "for the daemon's lifetime"
 	}
 	return "approved on the host: " + reach
 }
@@ -268,6 +283,34 @@ type Answered struct {
 	ID    uint64 `json:"id"`
 	Error string `json:"error,omitempty"`
 	Ended string `json:"ended,omitempty"`
+}
+
+// StandingList answers FrameStanding with the daemon's standing approvals,
+// oldest first, or Error, why they are not listed.
+type StandingList struct {
+	Approvals []Standing `json:"approvals"`
+	Error     string     `json:"error,omitempty"`
+}
+
+// Standing is a standing approval: N, its number, lets Argv through from
+// the container directory Cwd; Guarded says it was granted for a guarded
+// refusal.
+type Standing struct {
+	N       uint64   `json:"n"`
+	Argv    []string `json:"argv"`
+	Cwd     string   `json:"cwd"`
+	Guarded bool     `json:"guarded,omitempty"`
+}
+
+// Revoke asks the daemon to revoke standing approval N.
+type Revoke struct {
+	N uint64 `json:"n"`
+}
+
+// Revoked answers Revoke; Error says why N was not revoked.
+type Revoked struct {
+	N     uint64 `json:"n"`
+	Error string `json:"error,omitempty"`
 }
 
 // Withdrawn tells the session that request ID ended unanswered, for
