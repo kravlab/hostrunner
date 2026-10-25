@@ -348,7 +348,8 @@ func TestAskIsLogged(t *testing.T) {
 	s.answer(t, "o")
 	awaitResult(t, ch)
 	for _, want := range []string{
-		"msg=\"approval session serving\" pid=",
+		// The session runs in this process, which the kernel names.
+		"msg=\"approval session serving\" pid=" + strconv.Itoa(os.Getpid()) + "\n",
 		"msg=\"approval requested\" approval_id=1 argv=\"[touch marker]\"",
 		"msg=\"approval answered\" approval_id=1 scope=once",
 		"approved=once approval_id=1",
