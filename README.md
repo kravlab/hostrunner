@@ -179,14 +179,15 @@ this one with the rest of their limit. `--dir` serves the daemon of that
 runtime directory, the `--dir` its `initializeCommand` gives
 `hostrunner up`; a directory without an approval socket has no
 approvals; a session given `--dir` serves that daemon alone. When its
-daemon ends, the session waits for the next one in the same runtime
-directory. At the idle `>` prompt, `daemons` leaves the daemon for the
+daemon ends, or its connection to it fails, the session waits for the
+next one in the same runtime directory. At the idle `>` prompt, `daemons` leaves the daemon for the
 list (without `--dir`) and `quit` ends the session.
 
 It serves the daemon chosen: it prints each approval request as
 it arrives, with the container directory, the argv and why the rules
 refused it, rings the terminal bell, and takes the answer, a letter and
-Enter: `r` refuses it (then an optional note for the agent), `o` approves
+Enter: `r` refuses it (then an optional note for the agent, at most
+4096 bytes), `o` approves
 this request only, `l` grants a standing approval, `a` adds a rule (both
 below). Input typed before the prompt is discarded, and what came from
 the container is shown quoted, so it cannot steer the terminal; a note

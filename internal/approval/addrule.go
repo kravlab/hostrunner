@@ -182,7 +182,7 @@ func (s *session) writeRule() {
 		return
 	}
 	s.rereading = true
-	_ = protocol.WriteJSON(s.conn, protocol.FrameReread, protocol.Reread{Rule: a.rule, Edited: a.edited, Digest: rules.ContentDigest(a.data), ID: a.id})
+	s.write(protocol.FrameReread, protocol.Reread{Rule: a.rule, Edited: a.edited, Digest: rules.ContentDigest(a.data), ID: a.id})
 }
 
 // editRule opens the rules file to write in $VISUAL or $EDITOR and writes

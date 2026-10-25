@@ -357,7 +357,14 @@ revoked 1
   and exits. A session learns that its daemon ended from the connection
   closing; it says so (`the daemon ended: waiting for the next one`) and
   waits for the next daemon in the same runtime directory; `q` quits and
-  `daemons` lists them meanwhile.
+  `daemons` lists them meanwhile. A write to the daemon that fails (an
+  answer, `standing`, `revoke`, a reread) ends serving it alike: the
+  session says `the connection to the daemon failed: …`, that a rule
+  written was not reread (`it takes effect at the next container
+  start`), how many waiting requests the daemon refused, the one whose
+  answer did not reach it among them, and `waiting for the next one`. A
+  note longer than 4096 bytes, as sent, is asked for again (`note too
+  long`).
 - `daemons` at the idle prompt leaves the daemon served (nothing waits at
   that prompt) and shows the list; choosing it again serves it again. One
   session serves one daemon. A session that ends, by `daemons`, `quit` or

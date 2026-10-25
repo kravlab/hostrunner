@@ -75,6 +75,10 @@ const (
 	idleCommands        = "commands: standing, revoke <n>, daemons, quit"
 )
 
+// maxNoteBytes bounds a refusal's note, as sent: one of any length could
+// not fit a frame.
+const maxNoteBytes = 4096
+
 // scopeTexts are what the session says of an approval, by its scope: the
 // outcome once the daemon has taken it, and the prompt confirming one for
 // a guarded request.
@@ -322,6 +326,8 @@ type session struct {
 	// said is what the session said of its daemon gone, the prompt of the
 	// wait for the next one (see serveDaemon).
 	said string
+	// failed is why a write to the daemon failed, which ends serving it.
+	failed error
 
 	queue []waiting
 	// note is set while the human types the note of a refusal.
@@ -353,10 +359,19 @@ type waiting struct {
 }
 
 // loop handles the daemon's frames and the human's lines until one of them
-// ends serving the daemon, or ctx does, and returns how. Leaving refuses
-// the requests still waiting.
+// ends serving the daemon, a write to the daemon fails, or ctx ends it,
+// and returns how. Leaving refuses the requests still waiting.
 func (s *session) loop(ctx context.Context, frames <-chan protocol.Frame) (end, error) {
 	for {
+		if s.failed != nil && ctx.Err() != nil {
+			// Ctrl+C hung up, which is why the write failed.
+			s.leave()
+			return endQuit, nil
+		}
+		if s.failed != nil {
+			s.connectionFailed()
+			return endGone, nil
+		}
 		select {
 		case <-ctx.Done():
 			s.leave()
@@ -509,8 +524,14 @@ func (s *session) typed(text string) {
 		return
 	}
 	if s.note {
+		note := display(text)
+		if len(note) > maxNoteBytes {
+			fmt.Fprintf(s.out, "note too long: at most %d bytes\n", maxNoteBytes)
+			s.prompt(notePrompt)
+			return
+		}
 		s.note = false
-		s.send(protocol.Answer{ID: r.ID, Note: display(text)}, "refused")
+		s.send(protocol.Answer{ID: r.ID, Note: note}, "refused")
 		return
 	}
 	if scope := s.confirm; scope != "" {
@@ -567,7 +588,7 @@ func (s *session) command(text string) {
 	case "":
 		s.prompt(idlePrompt)
 	case "standing":
-		_ = protocol.WriteFrame(s.conn, protocol.Frame{Type: protocol.FrameStanding})
+		s.write(protocol.FrameStanding, nil)
 	case "revoke":
 		n, err := strconv.ParseUint(strings.TrimSpace(arg), 10, 64)
 		if err != nil {
@@ -575,7 +596,7 @@ func (s *session) command(text string) {
 			s.prompt(idlePrompt)
 			return
 		}
-		_ = protocol.WriteJSON(s.conn, protocol.FrameRevoke, protocol.Revoke{N: n})
+		s.write(protocol.FrameRevoke, protocol.Revoke{N: n})
 	case "daemons":
 		if !s.canList {
 			fmt.Fprintln(s.out, "this session serves the one daemon it was given")
@@ -600,7 +621,23 @@ func (s *session) approve(id uint64, scope protocol.Scope) {
 // taken it.
 func (s *session) send(ans protocol.Answer, outcome string) {
 	s.sent = outcome
-	_ = protocol.WriteJSON(s.conn, protocol.FrameAnswer, ans)
+	s.write(protocol.FrameAnswer, ans)
+}
+
+// write sends the daemon a frame of type t carrying v, none when v is nil.
+// A write that fails ends serving the daemon (see loop): what it carried
+// never reached it.
+func (s *session) write(t protocol.FrameType, v any) {
+	if s.failed != nil {
+		return
+	}
+	var err error
+	if v == nil {
+		err = protocol.WriteFrame(s.conn, protocol.Frame{Type: t})
+	} else {
+		err = protocol.WriteJSON(s.conn, t, v)
+	}
+	s.failed = err
 }
 
 // withdrawn drops the request w names, which ended unanswered. A queued
@@ -635,11 +672,34 @@ func (s *session) leave() {
 	if s.sent != "" {
 		n--
 	}
+	if n > 0 {
+		fmt.Fprintln(s.out)
+	}
+	s.sayRefused(n)
+}
+
+// connectionFailed says that a write to the daemon failed (see write):
+// the daemon, if it is there, has dropped the session and refused every
+// request waiting, the one whose answer did not reach it among them; a
+// rule written but not reread takes effect at the next container start.
+// The daemon may well be there: it is served again once it answers on
+// its socket.
+func (s *session) connectionFailed() {
+	fmt.Fprintf(s.out, "\nthe connection to the daemon failed: %s\n", display(s.failed.Error()))
+	if s.rereading {
+		fmt.Fprintln(s.out, "rule written, but the daemon did not reread it: it takes effect at the next container start")
+	}
+	s.sayRefused(len(s.queue))
+	s.said = "waiting for the next one\n"
+}
+
+// sayRefused says that the daemon refused n waiting requests, if any.
+func (s *session) sayRefused(n int) {
 	switch {
 	case n == 1:
-		fmt.Fprintln(s.out, "\nrefused 1 waiting request")
+		fmt.Fprintln(s.out, "refused 1 waiting request")
 	case n > 1:
-		fmt.Fprintf(s.out, "\nrefused %d waiting requests\n", n)
+		fmt.Fprintf(s.out, "refused %d waiting requests\n", n)
 	}
 }
 

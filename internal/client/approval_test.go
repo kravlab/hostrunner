@@ -1112,6 +1112,12 @@ func TestAskLimitUnderAMillisecondExpiresAtOnce(t *testing.T) {
 // serves it; the test plays the daemon's part from there.
 func fakeDaemon(t *testing.T) (string, <-chan net.Conn) {
 	t.Helper()
+	return fakeDaemonWith(t, protocol.DaemonInfo{Version: protocol.ApprovalVersion})
+}
+
+// fakeDaemonWith is fakeDaemon saying it is info.
+func fakeDaemonWith(t *testing.T, info protocol.DaemonInfo) (string, <-chan net.Conn) {
+	t.Helper()
 	socket := filepath.Join(t.TempDir(), "fake.approval.sock")
 	l, err := transport.Unix{Path: socket}.Listen()
 	if err != nil {
@@ -1130,7 +1136,7 @@ func fakeDaemon(t *testing.T) (string, <-chan net.Conn) {
 			reply protocol.FrameType
 			v     any
 		}{
-			{protocol.FrameHello, protocol.FrameDaemonInfo, protocol.DaemonInfo{Version: protocol.ApprovalVersion}},
+			{protocol.FrameHello, protocol.FrameDaemonInfo, info},
 			{protocol.FrameServe, protocol.FrameServing, nil},
 		} {
 			if f, err := protocol.ReadFrame(conn); err != nil || f.Type != step.read {
@@ -1180,5 +1186,77 @@ func TestAskSessionReportsAnAnswerTooLate(t *testing.T) {
 				t.Fatalf("the session reported the answer as such:\n%s", out)
 			}
 		})
+	}
+}
+
+// A write to the daemon that fails ends serving it, even while reading
+// from it still works: the session says so, and that the daemon refused
+// the requests waiting, the one whose answer did not reach it among them,
+// and waits for the daemon as when it ends.
+func TestSessionEndsWhenAWriteToTheDaemonFails(t *testing.T) {
+	for _, tt := range []struct{ name, typed string }{
+		{"an answer", "o"},
+		{"a refusal with a note", "use echo"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			socket, served := fakeDaemon(t)
+			s := startSessionOn(t, socket)
+			conn := <-served
+			s.waitFor(t, answerPromptText)
+			// The daemon reads no more: a write to it fails, a read waits.
+			if err := conn.(*net.UnixConn).CloseRead(); err != nil {
+				t.Fatal(err)
+			}
+			if tt.typed != "o" {
+				s.answer(t, "r")
+				s.waitFor(t, notePromptText)
+			}
+			s.answer(t, tt.typed)
+			s.waitFor(t, "\nthe connection to the daemon failed: ")
+			if out := s.waitFor(t, "\nrefused 1 waiting request\nwaiting for the next one\n"); strings.Contains(out, "approved once") || strings.Contains(out, "\nrefused\n") {
+				t.Errorf("the session said the answer was taken: %q", out)
+			}
+		})
+	}
+}
+
+// A rule written whose reread the daemon was never asked for is in the
+// rules file only: the session says it takes effect at the next start.
+func TestSessionSaysARuleWasNotRereadWhenTheWriteFails(t *testing.T) {
+	rulesFile := filepath.Join(t.TempDir(), "hostrun.yaml")
+	if err := os.WriteFile(rulesFile, []byte("rules:\n  - command: echo\n    args: any\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	socket, served := fakeDaemonWith(t, protocol.DaemonInfo{Version: protocol.ApprovalVersion, RulesFile: rulesFile})
+	s := startSessionOn(t, socket)
+	conn := <-served
+	s.waitFor(t, answerPromptText)
+	s.answer(t, "a")
+	s.waitFor(t, addPromptText)
+	if err := conn.(*net.UnixConn).CloseRead(); err != nil {
+		t.Fatal(err)
+	}
+	s.answer(t, "w")
+	s.waitFor(t, "\nthe connection to the daemon failed: ")
+	s.waitFor(t, "\nrule written, but the daemon did not reread it: it takes effect at the next container start\n")
+	if file := readFile(t, rulesFile); !strings.Contains(file, "- command: touch") {
+		t.Fatalf("the rules file lacks the rule:\n%s", file)
+	}
+}
+
+// A note too long for a frame is not sent: the session says so and asks
+// for the note again.
+func TestAskNoteTooLongIsAskedAgain(t *testing.T) {
+	h := startDaemon(t, policy(t, echoOnly))
+	s := h.startSession(t)
+	ch := h.ask(t, "touch", "marker")
+	s.waitFor(t, answerPromptText)
+	s.answer(t, "r")
+	s.waitFor(t, notePromptText)
+	s.answer(t, strings.Repeat("x", 4097))
+	s.waitFor(t, "note too long: at most 4096 bytes\n"+notePromptText)
+	s.answer(t, "shorter")
+	if got := awaitResult(t, ch); !strings.HasSuffix(got.stderr, "hostrun: refused on the host: shorter\n") {
+		t.Fatalf("got %+v, want the shorter note", got)
 	}
 }
