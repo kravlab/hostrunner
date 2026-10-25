@@ -317,9 +317,9 @@ type Answer struct {
 // when the daemon has not finished telling the session of it, so the
 // session reports the end whichever frame comes first.
 type Answered struct {
-	ID    uint64 `json:"id"`
-	Error string `json:"error,omitempty"`
-	Ended string `json:"ended,omitempty"`
+	ID    uint64    `json:"id"`
+	Error string    `json:"error,omitempty"`
+	Ended EndReason `json:"ended,omitempty"`
 }
 
 // StandingList answers FrameStanding with the daemon's standing approvals,
@@ -379,15 +379,18 @@ type RereadResult struct {
 // Reason: WithdrawnByClient or WithdrawnExpired. It takes no answer any
 // more.
 type Withdrawn struct {
-	ID     uint64 `json:"id"`
-	Reason string `json:"reason"`
+	ID     uint64    `json:"id"`
+	Reason EndReason `json:"reason"`
 }
 
-// Reasons a request ends unanswered, as Withdrawn and the daemon log give
-// them.
+// EndReason is why a request ended unanswered, as Withdrawn and Answered
+// give it.
+type EndReason string
+
+// Reasons a request ends unanswered that the session is told.
 const (
-	WithdrawnByClient = "withdrawn" // the client went away
-	WithdrawnExpired  = "expired"   // its limit ran out
+	WithdrawnByClient EndReason = "withdrawn" // the client went away
+	WithdrawnExpired  EndReason = "expired"   // its limit ran out
 )
 
 // Exit reports the exit code of a command that ran.

@@ -57,7 +57,7 @@ var (
 // stops. Without it, nothing is approved.
 func WithApprovals(l net.Listener, rulesFile string) Option {
 	return func(s *Server) {
-		s.approvals = &approvals{listener: l, rulesFile: rulesFile, waiting: map[uint64]*approvalRequest{}, telling: map[uint64]endReason{}}
+		s.approvals = &approvals{listener: l, rulesFile: rulesFile, waiting: map[uint64]*approvalRequest{}, telling: map[uint64]protocol.EndReason{}}
 	}
 }
 
@@ -75,7 +75,7 @@ type approvals struct {
 	lastID  uint64
 	waiting map[uint64]*approvalRequest
 	// telling holds the requests that ended while the session is told so.
-	telling map[uint64]endReason
+	telling map[uint64]protocol.EndReason
 	// standing holds the standing approvals, oldest first; they live as
 	// long as the daemon, with a session or without.
 	standing     []standingApproval
@@ -121,16 +121,22 @@ type endReason string
 
 // Reasons an approval request ends unanswered; the daemon log gives them.
 const (
-	endedWithdrawn   endReason = protocol.WithdrawnByClient // the client went away
-	endedExpired     endReason = protocol.WithdrawnExpired  // its limit ran out
-	endedSessionLeft endReason = "session left"             // its session left
-	endedStopping    endReason = "daemon stopping"          // the daemon stops or steps aside
+	endedWithdrawn             = endReason(protocol.WithdrawnByClient) // the client went away
+	endedExpired               = endReason(protocol.WithdrawnExpired)  // its limit ran out
+	endedSessionLeft endReason = "session left"                        // its session left
+	endedStopping    endReason = "daemon stopping"                     // the daemon stops or steps aside
 )
 
-// told reports whether the session is told of the end (FrameWithdrawn): it
-// still shows the request, while a session that left or a stopping daemon
-// takes it along.
-func (r endReason) told() bool { return r == endedWithdrawn || r == endedExpired }
+// withdrawn returns the reason the session is told of the end with
+// (FrameWithdrawn), and whether it is told: it still shows the request,
+// while a session that left or a stopping daemon takes it along.
+func (r endReason) withdrawn() (protocol.EndReason, bool) {
+	switch r {
+	case endedWithdrawn, endedExpired:
+		return protocol.EndReason(r), true
+	}
+	return "", false
+}
 
 // refusal is what the client of a request that ended for r is told, or nil
 // when it went away.
@@ -202,13 +208,14 @@ func (a *approvals) end(id uint64, r *approvalRequest, reason endReason) outcome
 	// A take-over may move the request to another session: the one told is
 	// the one it has under the lock.
 	session := r.session
-	tell := waiting && reason.told() && a.serving == session
+	told, tell := reason.withdrawn()
+	tell = tell && waiting && a.serving == session
 	if tell {
-		a.telling[id] = reason
+		a.telling[id] = told
 	}
 	a.mu.Unlock()
 	if tell {
-		if err := session.out.writeJSON(protocol.FrameWithdrawn, protocol.Withdrawn{ID: id, Reason: string(reason)}); err != nil {
+		if err := session.out.writeJSON(protocol.FrameWithdrawn, protocol.Withdrawn{ID: id, Reason: told}); err != nil {
 			// As in enqueue: a session that does not take it is gone.
 			session.conn.Close()
 		}
@@ -222,7 +229,7 @@ func (a *approvals) end(id uint64, r *approvalRequest, reason endReason) outcome
 // answer delivers ans from session c to its request and returns why it was
 // not taken, or "", and, for a request that ended unanswered while the
 // session is being told so, the reason (see end).
-func (a *approvals) answer(c *sessionConn, ans protocol.Answer) (string, endReason) {
+func (a *approvals) answer(c *sessionConn, ans protocol.Answer) (string, protocol.EndReason) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if why := a.checkServing(c); why != "" {
@@ -493,7 +500,7 @@ func (s *Server) handleSession(ctx context.Context, conn net.Conn) {
 				return
 			}
 			why, ended := s.approvals.answer(c, ans)
-			_ = out.writeJSON(protocol.FrameAnswered, protocol.Answered{ID: ans.ID, Error: why, Ended: string(ended)})
+			_ = out.writeJSON(protocol.FrameAnswered, protocol.Answered{ID: ans.ID, Error: why, Ended: ended})
 		case protocol.FrameStanding:
 			list, why := s.approvals.list(c)
 			_ = out.writeJSON(protocol.FrameStandingList, protocol.StandingList{Approvals: list, Error: why})

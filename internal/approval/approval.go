@@ -389,12 +389,12 @@ type session struct {
 }
 
 // waiting is an approval request and when its time runs out. ended is why
-// it ended unanswered (a protocol.Withdrawn reason) while its answer was
+// it ended unanswered (a protocol.EndReason) while its answer was
 // on the way to the daemon, which will not take it.
 type waiting struct {
 	protocol.ApprovalRequest
 	deadline time.Time
-	ended    string
+	ended    protocol.EndReason
 }
 
 // loop handles the daemon's frames and the human's lines until one of them
