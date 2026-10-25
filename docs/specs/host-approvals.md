@@ -125,7 +125,14 @@ from `protocol.Version` of the container's socket.
   socket is (mode 0600, a stale socket removed, refused when something
   listens) and removed on exit. Not an abstract socket, which a container
   on the host's network would share.
+- `hostrunner serve` refuses to start when the approval socket would lie
+  inside the host workspace (symlinks followed), which the container
+  mounts and so could reach to answer its own requests.
 - Only the daemon's own uid may connect (`SO_PEERCRED`).
+- A write to a session is bounded by 2 seconds: a session that does not
+  take a request or a withdrawal in time (suspended, its terminal
+  stopped) is dropped (see Unanswered requests), so it holds up neither
+  requests nor other sessions.
 - Session frames (answer, revoke a standing approval, reread the rules,
   take over) are accepted only there and refused on the container's
   socket; the approval socket accepts no container frames.
@@ -153,9 +160,13 @@ from `protocol.Version` of the container's socket.
   with "nobody answered" and leaves the session.
 - A session that leaves without a take-over refuses every request still
   waiting (126 `refused on the host`, logged `session left`); the session
-  says how many (`refused 2 waiting requests`). A daemon that stops or
-  steps aside answers every waiting request with 126 before closing,
-  also when its session goes with it.
+  says how many (`refused 2 waiting requests`).
+- A session that does not take a request within 2 seconds is dropped:
+  that request gets 126 `not approved: no approval session serves this
+  devcontainer` (logged `no session`), and those already waiting end as
+  for a session that left.
+- A daemon that stops or steps aside answers every waiting request with
+  126 before closing, also when its session goes with it.
 
 ## Running an approved command
 
@@ -409,11 +420,13 @@ revoked 1
 - Info: `approval requested` (`approval_id`, `argv`, `dir`, `reasons`,
   `guarded`, `timeout`); `approval answered` (`approval_id`, `scope` or
   `refused`, `note`); `approval not answered` (`approval_id`, `reason`:
-  `withdrawn`, `expired`, `no session`, `session left`, `daemon
-  stopping`); `standing approval granted` and `revoked`; `rule added`
-  (file, rule), `hand-edited rules reread` (file) and
-  `rules reread` (digest); `approval session serving`,
-  `taken over`, `left` (pid).
+  `withdrawn`, `expired`, `session left`, `daemon stopping`, or, for a
+  request no session received, `no session` (none serves, or the serving
+  one did not take it) or `too large`, logged without `approval_id` but
+  with `argv` and `dir`); `standing approval granted` and `revoked`;
+  `rule added` (file, rule), `hand-edited rules reread` (file) and
+  `rules reread` (digest); `approval session serving`, `taken over`,
+  `left` (pid).
 - Runs an approval let through: `command finished` and `command
   cancelled` gain `approved` (`once`, `lifetime`, `rule` for the answer
   that started them, `standing` for a later run a standing approval let
@@ -461,8 +474,13 @@ revoked 1
   (a fixed directory missing): the request runs once, the session says
   so and why (`request 9 runs once: fixed directory … does not exist`),
   and the agent and the log get `once`, not `rule`.
-- An argv holding terminal escapes, look-alike letters, or megabytes of
+- An argv holding terminal escapes, look-alike letters, or long
   arguments: shown escaped, marked and cut; `?` shows all.
+- An approval request whose content for the session (argv, directory,
+  reasons and guards) exceeds a frame (1 MiB), though its `FrameAsk` fit
+  one, is refused at once while a session serves, before anyone is
+  asked: 126 `not approved: the request is too large to show`, logged
+  `too large`.
 
 ## Docs
 

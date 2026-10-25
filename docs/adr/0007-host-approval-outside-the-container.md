@@ -42,6 +42,8 @@ while a session serves the daemon.
 
 ## Consequences
 
+- `hostrunner serve` refuses to start when the approval socket would lie
+  inside the host workspace, which the container mounts.
 - Guarded refusals (deny patterns, failed path checks, an argv the rules
   cannot read, rules with secrets) need a second confirmation and get no
   "add a rule" answer.
