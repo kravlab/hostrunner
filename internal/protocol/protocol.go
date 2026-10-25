@@ -219,6 +219,20 @@ const (
 	ScopeRule     Scope = "rule"     // a rule added to the rules file
 )
 
+// scopeReach is what an approval of each scope reaches, as the client
+// says it; its keys are the scopes there are.
+var scopeReach = map[Scope]string{
+	ScopeOnce:     "this request only",
+	ScopeLifetime: "for the daemon's lifetime",
+	ScopeRule:     "rule added",
+}
+
+// Valid reports whether s is a scope of an approval.
+func (s Scope) Valid() bool {
+	_, ok := scopeReach[s]
+	return ok
+}
+
 // Approved tells the client that a human approved its command, which the
 // ordinary run stream (FrameStdinCredit, output, FrameExit) then follows.
 type Approved struct {
@@ -227,14 +241,9 @@ type Approved struct {
 
 // String is the line the client prints before the approved command runs.
 func (a Approved) String() string {
-	reach := string(a.Scope)
-	switch a.Scope {
-	case ScopeOnce:
-		reach = "this request only"
-	case ScopeLifetime:
-		reach = "for the daemon's lifetime"
-	case ScopeRule:
-		reach = "rule added"
+	reach, ok := scopeReach[a.Scope]
+	if !ok {
+		reach = string(a.Scope)
 	}
 	return "approved on the host: " + reach
 }
@@ -302,7 +311,8 @@ type Answer struct {
 }
 
 // Answered tells the session whether the daemon took its Answer to ID;
-// Error says why not (the request was answered, withdrawn or expired).
+// Error says why not (the session does not serve the daemon; the scope
+// is unknown; the request is unknown, answered, withdrawn or expired).
 // Ended is the Withdrawn reason of a request that ended as the answer came,
 // when the daemon has not finished telling the session of it, so the
 // session reports the end whichever frame comes first.

@@ -228,7 +228,7 @@ func (a *approvals) answer(c *sessionConn, ans protocol.Answer) (string, endReas
 	if why := a.checkServing(c); why != "" {
 		return why, ""
 	}
-	if ans.Scope != "" && ans.Scope != protocol.ScopeOnce && ans.Scope != protocol.ScopeLifetime && ans.Scope != protocol.ScopeRule {
+	if ans.Scope != "" && !ans.Scope.Valid() {
 		return fmt.Sprintf("unknown scope %q", ans.Scope), ""
 	}
 	r, ok := a.waiting[ans.ID]

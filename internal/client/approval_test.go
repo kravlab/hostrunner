@@ -1460,3 +1460,31 @@ func TestAskRunsAnApprovedCommandInAnInheritedDirectory(t *testing.T) {
 		t.Fatalf("got %+v, want it run in %s", got, dir)
 	}
 }
+
+// An answer of a scope there is not is refused, and the request still
+// waits for an answer.
+func TestAnAnswerOfAnUnknownScopeIsRefused(t *testing.T) {
+	h := startDaemon(t, policy(t, echoOnly))
+	conn := h.serveRaw(t)
+	ch := h.ask(t, "touch", "marker")
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	f, err := protocol.ReadFrame(conn)
+	var req protocol.ApprovalRequest
+	if err != nil || f.Type != protocol.FrameApprovalRequest || protocol.DecodeJSON(f, &req) != nil {
+		t.Fatalf("frame %v, err %v; want the request", f.Type, err)
+	}
+	if err := protocol.WriteJSON(conn, protocol.FrameAnswer, protocol.Answer{ID: req.ID, Scope: "forever"}); err != nil {
+		t.Fatal(err)
+	}
+	f, err = protocol.ReadFrame(conn)
+	var answered protocol.Answered
+	if err != nil || f.Type != protocol.FrameAnswered || protocol.DecodeJSON(f, &answered) != nil || answered.Error != `unknown scope "forever"` {
+		t.Fatalf("frame %v %+v, err %v; want the answer refused for its scope", f.Type, answered, err)
+	}
+	if err := protocol.WriteJSON(conn, protocol.FrameAnswer, protocol.Answer{ID: req.ID, Scope: protocol.ScopeOnce}); err != nil {
+		t.Fatal(err)
+	}
+	if got := awaitResult(t, ch); got.code != 0 {
+		t.Fatalf("got %+v, want the request approved by the next answer", got)
+	}
+}

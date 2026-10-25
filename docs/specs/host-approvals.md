@@ -135,8 +135,9 @@ from `protocol.Version` of the container's socket.
   protocol version; there is no backward compatibility.
 - Each approval request has an id (a counter in the daemon), sent with its
   content. The session answers by id; only the serving session is heard;
-  an answer for an unknown, answered, withdrawn or expired request is
-  refused, and the session says so. The daemon tells the serving session
+  an answer for an unknown, answered, withdrawn or expired request, or of
+  a scope other than `once`, `lifetime` or `rule`, is refused, and the
+  session says so. The daemon tells the serving session
   of a request withdrawn or expired (`Withdrawn{id, reason}`), so it
   drops it; an answer that crosses it is refused with that reason
   (`Answered{id, error, ended}`), so the session reports the end
