@@ -1367,3 +1367,49 @@ func TestAskNoteTooLongIsAskedAgain(t *testing.T) {
 		t.Fatalf("got %+v, want the shorter note", got)
 	}
 }
+
+// Run stops reading its input when it returns, a pipe as well: a line
+// typed after it is left for whoever reads the input next.
+func TestRunLeavesItsInputOnceItReturns(t *testing.T) {
+	h := startDaemon(t, policy(t, echoOnly))
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	defer w.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := &session{out: &lockedBuffer{}, ended: make(chan struct{})}
+	go func() {
+		defer close(s.ended)
+		s.err = approval.Run(ctx, approval.Config{Socket: h.approvalSocket}, r, s.out)
+	}()
+	s.waitFor(t, "waiting for requests")
+	s.waitFor(t, "> ")
+	// A line answered: the session reads on, after a prompt.
+	if _, err := io.WriteString(w, "x\n"); err != nil {
+		t.Fatal(err)
+	}
+	s.waitFor(t, "unknown command")
+	s.waitFor(t, "> ")
+	cancel()
+	waitEnded(t, s)
+	if _, err := io.WriteString(w, "late\n"); err != nil {
+		t.Fatal(err)
+	}
+	read := make(chan string, 1)
+	go func() {
+		buf := make([]byte, 16)
+		n, _ := r.Read(buf)
+		read <- string(buf[:n])
+	}()
+	select {
+	case got := <-read:
+		if got != "late\n" {
+			t.Fatalf("read %q after Run returned, want the line typed after it", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("the line typed after Run returned was taken")
+	}
+}

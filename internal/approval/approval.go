@@ -113,10 +113,10 @@ var scopeTexts = map[protocol.Scope]struct{ outcome, confirm string }{
 // over.
 func Run(ctx context.Context, cfg Config, in io.Reader, out io.Writer) error {
 	done := make(chan struct{})
-	defer close(done)
 	t := &term{out: out, in: in, want: make(chan struct{}, 1)}
 	t.want <- struct{}{}
 	t.lines = readLines(in, &t.read, t.want, done)
+	defer stopReading(in, done, t.lines)
 	socket, takeOver := cfg.Socket, false
 	first := socket != ""
 	for {
@@ -890,6 +890,24 @@ type line struct {
 	last bool
 }
 
+// stopReading stops readLines reading in, closing done: a read it waits in
+// would otherwise take the next line typed after the session. An in that
+// takes a read deadline (a file the process opened, a pipe from os.Pipe)
+// has the read cut short, and once readLines has ended, lines closed, the
+// deadline is lifted again, a deadline set before Run too. Any other (an
+// inherited stdin, terminal or pipe, which Go cannot interrupt; the
+// process leaves with the session) is left to its read.
+func stopReading(in io.Reader, done chan struct{}, lines <-chan line) {
+	close(done)
+	d, ok := in.(interface{ SetReadDeadline(time.Time) error })
+	if !ok || d.SetReadDeadline(time.Now()) != nil {
+		return
+	}
+	for range lines {
+	}
+	_ = d.SetReadDeadline(time.Time{})
+}
+
 // readLines reads lines from in into the returned channel, counting each
 // with read as soon as it is read, and closes the channel when in ends or
 // done is closed. It reads in directly, without a buffered reader, and
@@ -968,15 +986,22 @@ func readDaemon(conn io.Reader, done <-chan struct{}) <-chan protocol.Frame {
 }
 
 // discardTypedAhead drops the input a terminal holds that nobody has read
-// yet. Input that is not a terminal (a pipe, a file) is left alone.
+// yet. Input that is not a terminal (a pipe, a file) is left alone. The
+// descriptor is reached through SyscallConn, not Fd, which would put a
+// pipe into blocking mode, where a read deadline no longer cuts a read
+// short (see stopReading).
 func discardTypedAhead(in io.Reader) {
 	f, ok := in.(*os.File)
 	if !ok {
 		return
 	}
-	fd := int(f.Fd())
-	if _, err := unix.IoctlGetTermios(fd, unix.TCGETS); err != nil {
+	raw, err := f.SyscallConn()
+	if err != nil {
 		return
 	}
-	_ = unix.IoctlSetInt(fd, unix.TCFLSH, unix.TCIFLUSH)
+	_ = raw.Control(func(fd uintptr) {
+		if _, err := unix.IoctlGetTermios(int(fd), unix.TCGETS); err == nil {
+			_ = unix.IoctlSetInt(int(fd), unix.TCFLSH, unix.TCIFLUSH)
+		}
+	})
 }
