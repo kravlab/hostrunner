@@ -126,17 +126,17 @@ func Run(ctx context.Context, cfg Config, in io.Reader, out io.Writer) error {
 				return nil
 			}
 		}
-		end, said, err := t.serveDaemon(ctx, socket, takeOver, cfg.Root != "")
+		then, said, err := t.serveDaemon(ctx, socket, takeOver, cfg.Root != "")
 		takeOver = false
-		if end == endNoDaemon && !first && cfg.Root == "" {
+		if then == nextNoDaemon && !first && cfg.Root == "" {
 			// Its daemon went away between waits or at the question: the
 			// session waits for the next one, as when it ends while served.
-			end, said = endGone, goneSaid
+			then, said = nextAwait, goneSaid
 		}
 		switch {
-		case end == endNoDaemon && first:
+		case then == nextNoDaemon && first:
 			return fmt.Errorf("%s has no approvals: no daemon takes them there: %w", strings.TrimSuffix(socket, protocol.ApprovalSuffix), err)
-		case end == endServed && cfg.Root == "":
+		case then == nextServedElsewhere && cfg.Root == "":
 			// A session given its daemon asks, as the list does.
 			yes, more := t.askTakeOver(ctx, protocol.ServedRefusal+"\n"+takeOverPrompt)
 			if !more {
@@ -151,18 +151,18 @@ func Run(ctx context.Context, cfg Config, in io.Reader, out io.Writer) error {
 			}
 			takeOver, first = yes, false
 			continue
-		case end == endFailed || end == endNoDaemon || end == endServed:
+		case then == nextFailed || then == nextNoDaemon || then == nextServedElsewhere:
 			if cfg.Root == "" {
 				return err
 			}
 			fmt.Fprintf(out, "cannot serve the daemon: %s\n", display(err.Error()))
 			socket = ""
-		case end == endList:
+		case then == nextList:
 			socket = ""
-		case end == endGone:
+		case then == nextAwait:
 			switch t.awaitDaemon(ctx, socket, cfg.Root != "", said) {
-			case endBack: // serve it
-			case endList:
+			case nextServe: // serve it
+			case nextList:
 				socket = ""
 			default:
 				return nil
@@ -178,18 +178,18 @@ func Run(ctx context.Context, cfg Config, in io.Reader, out io.Writer) error {
 // serves, unless it takes it over.
 var errServed = errors.New(protocol.ServedRefusal)
 
-// end is how serving a daemon ended.
-type end int
+// next is how serving a daemon ended, and so what the session does next.
+type next int
 
 const (
-	endQuit      end = iota + 1 // the human quit, or input ended
-	endTakenOver                // another session took the daemon over
-	endList                     // the human asked for the list of daemons
-	endGone                     // the daemon ended
-	endBack                     // a daemon answers on the socket again
-	endNoDaemon                 // no daemon answered on the socket
-	endFailed                   // the daemon would not be served, for another reason
-	endServed                   // another session serves the daemon, not taken over
+	nextQuit            next = iota + 1 // the human quit, or input ended
+	nextTakenOver                       // another session took the daemon over
+	nextList                            // the human asked for the list of daemons
+	nextAwait                           // the daemon ended: the next one is awaited
+	nextServe                           // a daemon answers on the socket again: it is served
+	nextNoDaemon                        // no daemon answered on the socket
+	nextFailed                          // the daemon would not be served, for another reason
+	nextServedElsewhere                 // another session serves the daemon, not taken over
 )
 
 // serveDaemon serves the daemon on socket, taking it over from the session
@@ -197,15 +197,15 @@ const (
 // lets the human ask for the list of daemons. It returns once the daemon
 // has dropped the session (see hangUp), so a list of daemons asked for
 // right after shows the daemon unserved; an interruption (ctx) hangs up
-// alike. When the daemon has gone (endGone), it also returns what the
+// alike. When the daemon has gone (nextAwait), it also returns what the
 // session said of that, the prompt of the wait for the next one (see
 // awaitDaemon).
 // Without takeOver, a daemon another session serves is not served
-// (endServed, errServed).
-func (t *term) serveDaemon(ctx context.Context, socket string, takeOver, canList bool) (end, string, error) {
+// (nextServedElsewhere, errServed).
+func (t *term) serveDaemon(ctx context.Context, socket string, takeOver, canList bool) (next, string, error) {
 	conn, err := transport.Unix{Path: socket}.Dial(ctx)
 	if err != nil {
-		return endNoDaemon, "", err
+		return nextNoDaemon, "", err
 	}
 	defer conn.Close()
 	stop := context.AfterFunc(ctx, func() {
@@ -218,16 +218,16 @@ func (t *term) serveDaemon(ctx context.Context, socket string, takeOver, canList
 
 	info, err := hello(conn)
 	if err != nil {
-		return endFailed, "", err
+		return nextFailed, "", err
 	}
 	if info.Version != protocol.ApprovalVersion {
-		return endFailed, "", fmt.Errorf("the daemon speaks approval protocol version %d, this session %d: restart its container", info.Version, protocol.ApprovalVersion)
+		return nextFailed, "", fmt.Errorf("the daemon speaks approval protocol version %d, this session %d: restart its container", info.Version, protocol.ApprovalVersion)
 	}
 	if err := serve(conn, takeOver); err != nil {
 		if err.Error() == protocol.ServedRefusal {
-			return endServed, "", errServed
+			return nextServedElsewhere, "", errServed
 		}
-		return endFailed, "", err
+		return nextFailed, "", err
 	}
 	fmt.Fprintf(t.out, "serving %s (container %s)\nwaiting for requests · %s\n", display(info.Workspace), display(info.ContainerWorkspace), idleCommands)
 
@@ -236,10 +236,10 @@ func (t *term) serveDaemon(ctx context.Context, socket string, takeOver, canList
 	s := &session{term: t, conn: conn, canList: canList, rulesFile: info.RulesFile, rulesDigest: info.RulesDigest, workspace: info.Workspace}
 	s.prompt(idlePrompt)
 	frames := readDaemon(conn, done)
-	end, err := s.loop(ctx, frames)
+	then, err := s.loop(ctx, frames)
 	s.dropAddition()
 	hangUp(conn, frames)
-	return end, s.said, err
+	return then, s.said, err
 }
 
 // hangUpTimeout bounds how long a session that ends waits for the daemon
@@ -353,8 +353,8 @@ type session struct {
 	conn io.Writer
 	// canList lets the human leave the daemon for the list of daemons.
 	canList bool
-	// end is set once the human ends serving the daemon.
-	end end
+	// after is set once the human ends serving the daemon: what is next.
+	after next
 	// said is what the session said of its daemon gone, the prompt of the
 	// wait for the next one (see serveDaemon).
 	said string
@@ -421,50 +421,50 @@ type waiting struct {
 // loop handles the daemon's frames and the human's lines until one of them
 // ends serving the daemon, a write to the daemon fails, or ctx ends it,
 // and returns how. Leaving refuses the requests still waiting.
-func (s *session) loop(ctx context.Context, frames <-chan protocol.Frame) (end, error) {
+func (s *session) loop(ctx context.Context, frames <-chan protocol.Frame) (next, error) {
 	for {
 		if s.failed != nil && ctx.Err() != nil {
 			// Ctrl+C hung up, which is why the write failed.
 			s.leave()
-			return endQuit, nil
+			return nextQuit, nil
 		}
 		if s.failed != nil {
 			s.connectionFailed()
-			return endGone, nil
+			return nextAwait, nil
 		}
 		select {
 		case <-ctx.Done():
 			s.leave()
-			return endQuit, nil
+			return nextQuit, nil
 		case f, ok := <-frames:
 			if !ok && ctx.Err() != nil {
 				// Ctrl+C hung up, and the daemon closed the connection,
 				// before ctx.Done was seen.
 				s.leave()
-				return endQuit, nil
+				return nextQuit, nil
 			}
 			if !ok {
 				s.said = goneSaid
-				return endGone, nil
+				return nextAwait, nil
 			}
 			if f.Type == protocol.FrameTakenOver {
 				fmt.Fprintln(s.out, "\ntaken over by another session")
-				return endTakenOver, nil
+				return nextTakenOver, nil
 			}
 			if err := s.daemonFrame(f); err != nil {
-				return endFailed, err
+				return nextFailed, err
 			}
 		case l, ok := <-s.lines:
 			if !ok {
 				s.leave()
-				return endQuit, nil
+				return nextQuit, nil
 			}
 			if l.n >= s.fresh {
 				s.typed(l.text)
 			}
 			s.handled(l)
-			if s.end != 0 {
-				return s.end, nil
+			if s.after != 0 {
+				return s.after, nil
 			}
 		}
 	}
@@ -503,7 +503,7 @@ func (s *session) daemonFrame(f protocol.Frame) error {
 			fmt.Fprintln(s.out, s.sent)
 		}
 		s.awaiting, s.sent = awaitAnswer, ""
-		s.next()
+		s.advance()
 	case protocol.FrameWithdrawn:
 		var w protocol.Withdrawn
 		if err := protocol.DecodeJSON(f, &w); err != nil {
@@ -670,9 +670,9 @@ func (s *session) command(text string) {
 			s.prompt(idlePrompt)
 			return
 		}
-		s.end = endList
+		s.after = nextList
 	case "quit":
-		s.end = endQuit
+		s.after = nextQuit
 	default:
 		fmt.Fprintf(s.out, "unknown command %q: %s\n", display(text), idleCommands)
 		s.prompt(idlePrompt)
@@ -732,7 +732,7 @@ func (s *session) withdrawn(w protocol.Withdrawn) {
 			s.awaiting = awaitAnswer
 		}
 		s.confirm, s.rereadDigest = "", ""
-		s.next()
+		s.advance()
 	}
 }
 
@@ -777,8 +777,8 @@ func (s *session) sayRefused(n int) {
 	}
 }
 
-// next drops the answered request and shows the one after it, if any.
-func (s *session) next() {
+// advance drops the answered request and shows the one after it, if any.
+func (s *session) advance() {
 	s.queue = s.queue[1:]
 	if len(s.queue) > 0 {
 		s.show()

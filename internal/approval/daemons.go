@@ -248,12 +248,12 @@ func (t *term) askTakeOver(ctx context.Context, prompt string) (yes, more bool) 
 }
 
 // awaitDaemon waits for the next daemon on socket, its runtime directory's,
-// asking for it every pollInterval, and returns endBack once one answers,
-// to be served; endList when the human asks for the list of daemons
-// (canList), and endQuit when they quit or input ends. Anything else typed
+// asking for it every pollInterval, and returns nextServe once one answers,
+// to be served; nextList when the human asks for the list of daemons
+// (canList), and nextQuit when they quit or input ends. Anything else typed
 // gets a reminder of what it takes. said, what the session said of the
 // daemon gone, is the wait's prompt: a line typed once it shows counts.
-func (t *term) awaitDaemon(ctx context.Context, socket string, canList bool, said string) end {
+func (t *term) awaitDaemon(ctx context.Context, socket string, canList bool, said string) next {
 	tick := time.NewTicker(pollInterval)
 	defer tick.Stop()
 	hint := "waiting for the next daemon: q quits"
@@ -264,22 +264,22 @@ func (t *term) awaitDaemon(ctx context.Context, socket string, canList bool, sai
 	for {
 		select {
 		case <-ctx.Done():
-			return endQuit
+			return nextQuit
 		case <-tick.C:
 			if _, err := probe(ctx, socket); err == nil {
-				return endBack
+				return nextServe
 			}
 		case l, more := <-t.lines:
 			if !more {
-				return endQuit
+				return nextQuit
 			}
 			text, fresh := t.take(l)
 			switch {
 			case !fresh:
 			case isQuit(text):
-				return endQuit
+				return nextQuit
 			case text == "daemons" && canList:
-				return endList
+				return nextList
 			default:
 				t.prompt(hint + "\n")
 			}
