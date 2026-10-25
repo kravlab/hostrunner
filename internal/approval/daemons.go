@@ -130,8 +130,7 @@ func holds(workspace, dir string) bool {
 // none, says that it waits for one.
 func (t *term) printList(shown []listed, cwd string) {
 	if len(shown) == 0 {
-		fmt.Fprintln(t.out, "no daemons yet: waiting for one (q quits)")
-		t.prompt("")
+		t.prompt("no daemons yet: waiting for one (q quits)\n")
 		return
 	}
 	width, cwidth := 0, 0
@@ -235,15 +234,16 @@ func isQuit(text string) bool { return text == "q" || text == "quit" }
 // asking for it every pollInterval, and returns endBack once one answers,
 // to be served; endList when the human asks for the list of daemons
 // (canList), and endQuit when they quit or input ends. Anything else typed
-// gets a reminder of what it takes.
-func (t *term) awaitDaemon(ctx context.Context, socket string, canList bool) end {
+// gets a reminder of what it takes. said, what the session said of the
+// daemon gone, is the wait's prompt: a line typed once it shows counts.
+func (t *term) awaitDaemon(ctx context.Context, socket string, canList bool, said string) end {
 	tick := time.NewTicker(pollInterval)
 	defer tick.Stop()
 	hint := "waiting for the next daemon: q quits"
 	if canList {
 		hint += ", daemons lists them"
 	}
-	t.prompt("")
+	t.prompt(said)
 	for {
 		select {
 		case <-ctx.Done():
@@ -264,8 +264,7 @@ func (t *term) awaitDaemon(ctx context.Context, socket string, canList bool) end
 			case text == "daemons" && canList:
 				return endList
 			default:
-				fmt.Fprintln(t.out, hint)
-				t.prompt("")
+				t.prompt(hint + "\n")
 			}
 		}
 	}

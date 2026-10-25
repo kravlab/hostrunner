@@ -116,7 +116,7 @@ func Run(ctx context.Context, cfg Config, in io.Reader, out io.Writer) error {
 				return nil
 			}
 		}
-		end, err := t.serveDaemon(ctx, socket, takeOver, cfg.Root != "")
+		end, said, err := t.serveDaemon(ctx, socket, takeOver, cfg.Root != "")
 		takeOver = false
 		switch {
 		case end == endNoDaemon && first:
@@ -130,7 +130,7 @@ func Run(ctx context.Context, cfg Config, in io.Reader, out io.Writer) error {
 		case end == endList:
 			socket = ""
 		case end == endGone:
-			switch t.awaitDaemon(ctx, socket, cfg.Root != "") {
+			switch t.awaitDaemon(ctx, socket, cfg.Root != "", said) {
 			case endBack: // serve it
 			case endList:
 				socket = ""
@@ -166,11 +166,13 @@ const (
 // lets the human ask for the list of daemons. It returns once the daemon
 // has dropped the session (see hangUp), so a list of daemons asked for
 // right after shows the daemon unserved; an interruption (ctx) hangs up
-// alike.
-func (t *term) serveDaemon(ctx context.Context, socket string, takeOver, canList bool) (end, error) {
+// alike. When the daemon has gone (endGone), it also returns what the
+// session said of that, the prompt of the wait for the next one (see
+// awaitDaemon).
+func (t *term) serveDaemon(ctx context.Context, socket string, takeOver, canList bool) (end, string, error) {
 	conn, err := transport.Unix{Path: socket}.Dial(ctx)
 	if err != nil {
-		return endNoDaemon, err
+		return endNoDaemon, "", err
 	}
 	defer conn.Close()
 	stop := context.AfterFunc(ctx, func() {
@@ -183,13 +185,13 @@ func (t *term) serveDaemon(ctx context.Context, socket string, takeOver, canList
 
 	info, err := hello(conn)
 	if err != nil {
-		return endFailed, err
+		return endFailed, "", err
 	}
 	if info.Version != protocol.ApprovalVersion {
-		return endFailed, fmt.Errorf("the daemon speaks approval protocol version %d, this session %d: restart its container", info.Version, protocol.ApprovalVersion)
+		return endFailed, "", fmt.Errorf("the daemon speaks approval protocol version %d, this session %d: restart its container", info.Version, protocol.ApprovalVersion)
 	}
 	if err := serve(conn, takeOver); err != nil {
-		return endFailed, err
+		return endFailed, "", err
 	}
 	fmt.Fprintf(t.out, "serving %s (container %s)\nwaiting for requests · %s\n", display(info.Workspace), display(info.ContainerWorkspace), idleCommands)
 
@@ -201,7 +203,7 @@ func (t *term) serveDaemon(ctx context.Context, socket string, takeOver, canList
 	end, err := s.loop(ctx, frames)
 	s.dropAddition()
 	hangUp(conn, frames)
-	return end, err
+	return end, s.said, err
 }
 
 // hangUpTimeout bounds how long a session that ends waits for the daemon
@@ -317,6 +319,9 @@ type session struct {
 	canList bool
 	// end is set once the human ends serving the daemon.
 	end end
+	// said is what the session said of its daemon gone, the prompt of the
+	// wait for the next one (see serveDaemon).
+	said string
 
 	queue []waiting
 	// note is set while the human types the note of a refusal.
@@ -364,7 +369,7 @@ func (s *session) loop(ctx context.Context, frames <-chan protocol.Frame) (end, 
 				return endQuit, nil
 			}
 			if !ok {
-				fmt.Fprintln(s.out, "\nthe daemon ended: waiting for the next one")
+				s.said = "\nthe daemon ended: waiting for the next one\n"
 				return endGone, nil
 			}
 			if f.Type == protocol.FrameTakenOver {
