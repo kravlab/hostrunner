@@ -1,4 +1,8 @@
-package rules
+// Package ruleedit edits a rules file as YAML text: it proposes the
+// narrowest edit that lets a command the rules refuse through, a new rule
+// or a widened one, keeping the rest of the file byte for byte, and shows
+// the edit as a diff.
+package ruleedit
 
 import (
 	"bytes"
@@ -9,6 +13,8 @@ import (
 	"strings"
 
 	"go.yaml.in/yaml/v3"
+
+	"github.com/kravlab/hostrunner/internal/rules"
 )
 
 // Proposal is the narrowest edit of a rules file that lets an argv the
@@ -28,8 +34,8 @@ type Proposal struct {
 // widened change; the rest of the file is kept byte for byte, but for a
 // final newline the file lacked, which it gains. A rule holding YAML
 // anchors or aliases is not widened: its lists may be other rules' too.
-// The result parses as Load parses a file and allows argv (see Allows), or
-// Propose fails.
+// The result parses as rules.Load parses a file and allows argv (see
+// Allows), or Propose fails.
 //
 // A new rule's command is the program and the next token unless the rules
 // read it as a flag. Its flags and arguments are read as the rules read
@@ -42,12 +48,12 @@ func Propose(data []byte, name string, argv []string) (*Proposal, error) {
 	if len(argv) == 0 {
 		return nil, errors.New("no command")
 	}
-	policy, err := Parse(data)
+	policy, err := rules.Parse(data)
 	if err != nil {
 		return nil, fmt.Errorf("the rules file does not parse: %w", err)
 	}
 	_, err = policy.Check(argv)
-	d, approvable := ApprovableDenial(err)
+	d, approvable := rules.ApprovableDenial(err)
 	switch {
 	case err == nil:
 		return nil, errors.New("the rules allow it already")
@@ -81,10 +87,10 @@ func Propose(data []byte, name string, argv []string) (*Proposal, error) {
 	return &Proposal{Rule: commandOf(rule), Data: out, Diff: f.diff(name)}, nil
 }
 
-// Allows checks data, the content of a rules file, as Load checks a file,
-// and that its rules allow argv.
+// Allows checks data, the content of a rules file, as rules.Load checks a
+// file, and that its rules allow argv.
 func Allows(data []byte, argv []string) error {
-	policy, err := Parse(data)
+	policy, err := rules.Parse(data)
 	if err != nil {
 		return err
 	}
@@ -96,7 +102,7 @@ func Allows(data []byte, argv []string) error {
 // (see Propose).
 func proposedRule(argv []string) *yaml.Node {
 	command := argv[:1]
-	if len(argv) > 1 && getoptToken(argv[1]) == tokenPositional {
+	if len(argv) > 1 && rules.IsPositional(argv[1]) {
 		command = argv[:2]
 	}
 	rule := mapping()
@@ -106,51 +112,26 @@ func proposedRule(argv []string) *yaml.Node {
 }
 
 // addArgs gives rule lists allowing exactly args, read as the rules read
-// argv with no flag declared to take a value, or `args: none` when there
-// are none.
+// argv with no flag declared to take a value (see rules.ReadArgs), or
+// `args: none` when there are none.
 func addArgs(rule *yaml.Node, args []string) {
 	if len(args) == 0 {
 		setValue(rule, "args", strNode("none"))
 		return
 	}
-	var flags, positional []string
-	var values []string // flags given a value in their token, in order
-	byFlag := map[string][]string{}
-	ended := false
-	for _, tok := range args {
-		kind := getoptToken(tok)
-		switch {
-		case ended || kind == tokenPositional:
-			positional = appendNew(positional, tok)
-		case kind == tokenEnd:
-			ended = true
-		case kind == tokenLong:
-			if name, value, inline := strings.Cut(tok, "="); inline {
-				if _, ok := byFlag[name]; !ok {
-					values = append(values, name)
-				}
-				byFlag[name] = appendNew(byFlag[name], value)
-			} else {
-				flags = appendNew(flags, tok)
-			}
-		default: // a cluster of short flags
-			for _, c := range tok[1:] {
-				flags = appendNew(flags, "-"+string(c))
-			}
-		}
-	}
+	a := rules.ReadArgs(args)
 	fl := mapping()
-	setValue(fl, "allow", sequence(flags))
-	if len(values) > 0 {
+	setValue(fl, "allow", sequence(a.Flags))
+	if len(a.Valued) > 0 {
 		vs := mapping()
-		for _, name := range values {
-			setValue(vs, name, valueList(byFlag[name]))
+		for _, name := range a.Valued {
+			setValue(vs, name, valueList(a.Values[name]))
 		}
 		setValue(fl, "values", vs)
 	}
 	setValue(rule, "flags", fl)
 	pos := mapping()
-	setList(pos, positional)
+	setList(pos, a.Positional)
 	setValue(rule, "positional", pos)
 }
 
@@ -176,7 +157,7 @@ func setList(list *yaml.Node, items []string) {
 // widen widens the rule d refused argv by, in doc, to allow what its allow
 // lists refused, and returns its node. An `args: none` rule gets lists
 // allowing exactly the arguments given instead.
-func widen(doc *yaml.Node, d *Denial, argv []string) (*yaml.Node, error) {
+func widen(doc *yaml.Node, d *rules.Denial, argv []string) (*yaml.Node, error) {
 	rule := findRule(doc, d.Rule)
 	if rule == nil {
 		return nil, fmt.Errorf("rule %q is not in the rules file", d.Rule)
@@ -186,10 +167,10 @@ func widen(doc *yaml.Node, d *Denial, argv []string) (*yaml.Node, error) {
 	}
 	for _, r := range d.Reasons {
 		switch r.Kind {
-		case ReasonArgsNone:
+		case rules.ReasonArgsNone:
 			deleteKey(rule, "args")
 			addArgs(rule, argv[len(strings.Fields(d.Rule)):])
-		case ReasonNotAllowed:
+		case rules.ReasonNotAllowed:
 			if err := allowRefused(rule, r.Refused); err != nil {
 				return nil, err
 			}
@@ -210,10 +191,10 @@ func sharesNodes(n *yaml.Node) bool {
 }
 
 // allowRefused adds r to the allow list of rule that refused it.
-func allowRefused(rule *yaml.Node, r Refused) error {
+func allowRefused(rule *yaml.Node, r rules.Refused) error {
 	flags := mapValue(rule, "flags")
 	switch {
-	case r.Kind == RefusedFlag && r.Inline:
+	case r.Kind == rules.RefusedFlag && r.Inline:
 		// The flag takes the value given in its token: declared so, it
 		// allows that value.
 		values := mapValue(flags, "values")
@@ -226,14 +207,14 @@ func allowRefused(rule *yaml.Node, r Refused) error {
 		}
 		setValue(values, r.Flag, valueList([]string{r.Text}))
 		return nil
-	case r.Kind == RefusedFlag:
+	case r.Kind == rules.RefusedFlag:
 		return appendTo(mapValue(flags, "allow"), r.Flag)
-	case r.Kind == RefusedValue:
+	case r.Kind == rules.RefusedValue:
 		if list := valuesOf(mapValue(flags, "values"), r.Flag); list != nil {
 			return allowIn(list, r.Text)
 		}
 		return fmt.Errorf("flag %s has no value list in the rules file", r.Flag)
-	case r.Kind == RefusedArg:
+	case r.Kind == rules.RefusedArg:
 		return allowIn(mapValue(rule, "positional"), r.Text)
 	}
 	return errors.New("the rules did not say what they refused")
@@ -244,7 +225,7 @@ func allowRefused(rule *yaml.Node, r Refused) error {
 // which getopt names match too.
 func valuesOf(values *yaml.Node, flag string) *yaml.Node {
 	for i := 0; values != nil && i+1 < len(values.Content); i += 2 {
-		if flagKey(values.Content[i].Value) == flagKey(flag) {
+		if rules.SameFlag(values.Content[i].Value, flag) {
 			return values.Content[i+1]
 		}
 	}
@@ -278,11 +259,11 @@ func appendTo(seq *yaml.Node, item string) error {
 // findRule returns the rule mapping in doc whose command is command, as
 // the rules read it (its words joined by single spaces), or nil.
 func findRule(doc *yaml.Node, command string) *yaml.Node {
-	rules := rulesSequence(doc)
-	if rules == nil {
+	list := rulesSequence(doc)
+	if list == nil {
 		return nil
 	}
-	for _, r := range rules.Content {
+	for _, r := range list.Content {
 		if commandOf(r) == command {
 			return r
 		}
@@ -314,14 +295,6 @@ func exactRegexes(items []string) []string {
 		out[i] = "^" + regexp.QuoteMeta(s) + "$"
 	}
 	return out
-}
-
-// appendNew appends s to list unless it holds it already.
-func appendNew(list []string, s string) []string {
-	if slices.Contains(list, s) {
-		return list
-	}
-	return append(list, s)
 }
 
 // mapping returns an empty block mapping node.
@@ -409,24 +382,24 @@ func newRulesText(data []byte) *rulesText {
 // add appends rule to the rules of doc: after the last rule, after an
 // empty rules key, or under a new rules key at the end of the file.
 func (f *rulesText) add(doc *yaml.Node, rule *yaml.Node) error {
-	rules := rulesSequence(doc)
+	list := rulesSequence(doc)
 	switch {
-	case rules == nil:
+	case list == nil:
 		f.from, f.to = len(f.lines), len(f.lines)
 		item, err := f.encodeItem(rule, "  ")
 		f.added = append([]string{"rules:" + f.eol}, item...)
 		return err
-	case rules.Kind == yaml.ScalarNode && rules.Tag == "!!null":
-		f.from, f.to = rules.Line, rules.Line // after the line of the key
-	case rules.Kind != yaml.SequenceNode || rules.Style&yaml.FlowStyle != 0 || len(rules.Content) == 0:
+	case list.Kind == yaml.ScalarNode && list.Tag == "!!null":
+		f.from, f.to = list.Line, list.Line // after the line of the key
+	case list.Kind != yaml.SequenceNode || list.Style&yaml.FlowStyle != 0 || len(list.Content) == 0:
 		return errors.New("the rules are not a block list: add the rule by hand")
 	default:
-		_, end := f.span(rules, len(rules.Content)-1)
+		_, end := f.span(list, len(list.Content)-1)
 		f.from, f.to = end, end
 	}
 	indent := "  "
-	if rules.Kind == yaml.SequenceNode {
-		indent = strings.Repeat(" ", max(rules.Content[0].Column-3, 0))
+	if list.Kind == yaml.SequenceNode {
+		indent = strings.Repeat(" ", max(list.Content[0].Column-3, 0))
 	}
 	item, err := f.encodeItem(rule, indent)
 	f.added = item
@@ -436,8 +409,8 @@ func (f *rulesText) add(doc *yaml.Node, rule *yaml.Node) error {
 // replace replaces the lines of rule, one of the rules of doc, with its
 // edited form.
 func (f *rulesText) replace(doc *yaml.Node, rule *yaml.Node) error {
-	rules := rulesSequence(doc)
-	f.from, f.to = f.span(rules, slices.Index(rules.Content, rule))
+	list := rulesSequence(doc)
+	f.from, f.to = f.span(list, slices.Index(list.Content, rule))
 	// The comments before and after the rule stay where they are, outside
 	// its lines, so the edited form must not repeat them.
 	rule.HeadComment = ""
@@ -463,14 +436,14 @@ func clearTrailingComments(n *yaml.Node) {
 	}
 }
 
-// span returns the lines [from, to) of the i-th rule of rules: from its
+// span returns the lines [from, to) of the i-th rule of list: from its
 // first line to its last one that is neither blank, a comment nor a
 // document marker, which belong to what follows.
-func (f *rulesText) span(rules *yaml.Node, i int) (int, int) {
-	from := rules.Content[i].Line - 1
+func (f *rulesText) span(list *yaml.Node, i int) (int, int) {
+	from := list.Content[i].Line - 1
 	to := len(f.lines)
-	if i+1 < len(rules.Content) {
-		to = rules.Content[i+1].Line - 1
+	if i+1 < len(list.Content) {
+		to = list.Content[i+1].Line - 1
 	}
 	for to > from+1 {
 		t := strings.TrimSpace(f.lines[to-1])

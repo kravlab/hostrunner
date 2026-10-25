@@ -142,7 +142,7 @@ type Reason struct {
 	Kind ReasonKind
 	Text string
 	// Refused is what an allow list refused, for ReasonNotAllowed; a rule
-	// widened to allow it lists it (see Propose).
+	// widened to allow it lists it (see ruleedit.Propose).
 	Refused Refused
 }
 
@@ -187,6 +187,58 @@ func getoptToken(tok string) getoptKind {
 		return tokenLong
 	}
 	return tokenCluster
+}
+
+// IsPositional reports whether the rules read tok, a token of argv before
+// "--", as a positional argument.
+func IsPositional(tok string) bool { return getoptToken(tok) == tokenPositional }
+
+// Args is what argv's arguments give, read as the rules read them with no
+// flag declared to take a value; each list holds what it holds once, in
+// the order given.
+type Args struct {
+	Flags      []string            // flags given without a value in their token
+	Valued     []string            // flags given a value in their token (--file=x)
+	Values     map[string][]string // the values each of Valued was given
+	Positional []string            // positional arguments
+}
+
+// ReadArgs reads args, the arguments after a command, as the rules read
+// them with no flag declared to take a value.
+func ReadArgs(args []string) Args {
+	a := Args{Values: map[string][]string{}}
+	ended := false
+	for _, tok := range args {
+		kind := getoptToken(tok)
+		switch {
+		case ended || kind == tokenPositional:
+			a.Positional = appendNew(a.Positional, tok)
+		case kind == tokenEnd:
+			ended = true
+		case kind == tokenLong:
+			if name, value, inline := strings.Cut(tok, "="); inline {
+				if _, ok := a.Values[name]; !ok {
+					a.Valued = append(a.Valued, name)
+				}
+				a.Values[name] = appendNew(a.Values[name], value)
+			} else {
+				a.Flags = appendNew(a.Flags, tok)
+			}
+		default: // a cluster of short flags
+			for _, c := range tok[1:] {
+				a.Flags = appendNew(a.Flags, "-"+string(c))
+			}
+		}
+	}
+	return a
+}
+
+// appendNew appends s to list unless it holds it already.
+func appendNew(list []string, s string) []string {
+	if slices.Contains(list, s) {
+		return list
+	}
+	return append(list, s)
 }
 
 // ReasonKind tells why the rules refuse a command, and so whether

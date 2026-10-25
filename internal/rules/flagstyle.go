@@ -28,6 +28,10 @@ var flagStyles = map[string]flagStyle{"getopt": styleGetopt, "go": styleGo}
 // name without the leading dashes, so -name and --name are one flag.
 func flagKey(name string) string { return strings.TrimLeft(name, "-") }
 
+// SameFlag reports whether a and b name one flag as a go-style rule reads
+// them, which getopt names that are one flag do too.
+func SameFlag(a, b string) bool { return flagKey(a) == flagKey(b) }
+
 // checkGo applies a go-style rule to the arguments after its command, as
 // check does under getopt, adding every reason to found.
 //

@@ -12,6 +12,7 @@ import (
 	"syscall"
 
 	"github.com/kravlab/hostrunner/internal/protocol"
+	"github.com/kravlab/hostrunner/internal/ruleedit"
 	"github.com/kravlab/hostrunner/internal/rules"
 )
 
@@ -128,9 +129,9 @@ func (s *session) proposeRule(r waiting) {
 		s.prompt(rereadPrompt)
 		return
 	}
-	var p *rules.Proposal
+	var p *ruleedit.Proposal
 	if err == nil {
-		p, err = rules.Propose(data, s.rulesName(), r.Argv)
+		p, err = ruleedit.Propose(data, s.rulesName(), r.Argv)
 	}
 	if err != nil {
 		if file != nil {
@@ -226,7 +227,7 @@ func (s *session) editRule(r waiting) {
 		return
 	}
 	a.data, a.edited = data, true
-	if err := rules.Allows(data, r.Argv); err != nil {
+	if err := ruleedit.Allows(data, r.Argv); err != nil {
 		fmt.Fprintf(s.out, "not written: the edited rules do not allow request %d: %s\n", r.ID, display(err.Error()))
 		a.invalid = true
 		s.prompt(editAgainPrompt)
