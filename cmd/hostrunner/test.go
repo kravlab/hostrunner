@@ -48,8 +48,7 @@ func rulesTest(cfg testConfig, stderr io.Writer) error {
 		return fmt.Errorf("rules file: %w", err)
 	}
 	allowed, err := policy.Check(cfg.argv)
-	var d *rules.Denial
-	if errors.As(err, &d) && d.Approvable() {
+	if d, ok := rules.ApprovableDenial(err); ok {
 		err = fmt.Errorf("%s (%s)", d.Explain(), denialClass(d))
 	}
 	if err != nil {

@@ -207,14 +207,14 @@ func (s *session) editRule(r waiting) {
 		defer os.Remove(tmp.Name())
 	}
 	if err == nil {
-		err = EditInEditor(tmp.Name())
+		err = editInEditor(tmp.Name())
 	}
 	var data []byte
 	if err == nil {
 		data, err = os.ReadFile(tmp.Name())
 	}
 	switch {
-	case errors.Is(err, ErrNoEditor):
+	case errors.Is(err, errNoEditor):
 		fmt.Fprintln(s.out, err)
 		s.prompt(s.asking)
 		return

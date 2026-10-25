@@ -173,7 +173,7 @@ func (t *term) printList(shown []listed, cwd string) {
 // (only daemons remove theirs). The sockets are asked at once, so one that
 // hangs holds up the list by probeTimeout at most.
 func listDaemons(ctx context.Context, root string) []listed {
-	sockets, _ := filepath.Glob(filepath.Join(root, "*"+approvalSuffix))
+	sockets, _ := filepath.Glob(filepath.Join(root, "*"+protocol.ApprovalSuffix))
 	slices.Sort(sockets)
 	answers := make([]*protocol.DaemonInfo, len(sockets))
 	var wg sync.WaitGroup

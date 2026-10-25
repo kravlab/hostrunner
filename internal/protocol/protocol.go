@@ -239,6 +239,11 @@ func (a Approved) String() string {
 	return "approved on the host: " + reach
 }
 
+// ApprovalSuffix makes a runtime directory's path into its daemon's
+// approval socket: it lies beside the runtime directory, which the
+// container mounts, not in it.
+const ApprovalSuffix = ".approval.sock"
+
 // ApprovalVersion is the version of the approval socket's protocol, which
 // the session and the daemon exchange in Hello and DaemonInfo. A session
 // serves only a daemon of its own version.

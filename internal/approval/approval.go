@@ -48,16 +48,16 @@ type Config struct {
 	Cwd string
 }
 
-// ErrNoEditor is what EditInEditor returns when neither $VISUAL nor
+// errNoEditor is what editInEditor returns when neither $VISUAL nor
 // $EDITOR names an editor.
-var ErrNoEditor = errors.New("$EDITOR is not set")
+var errNoEditor = errors.New("$EDITOR is not set")
 
-// EditInEditor opens the file at path in $VISUAL, or else $EDITOR, as a
+// editInEditor opens the file at path in $VISUAL, or else $EDITOR, as a
 // shell runs it, on the process's terminal, and waits for it to exit.
-func EditInEditor(path string) error {
+func editInEditor(path string) error {
 	editor := cmp.Or(os.Getenv("VISUAL"), os.Getenv("EDITOR"))
 	if editor == "" {
-		return ErrNoEditor
+		return errNoEditor
 	}
 	cmd := exec.Command("sh", "-c", editor+` "$1"`, "editor", path)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
@@ -135,7 +135,7 @@ func Run(ctx context.Context, cfg Config, in io.Reader, out io.Writer) error {
 		}
 		switch {
 		case end == endNoDaemon && first:
-			return fmt.Errorf("%s has no approvals: no daemon takes them there: %w", strings.TrimSuffix(socket, approvalSuffix), err)
+			return fmt.Errorf("%s has no approvals: no daemon takes them there: %w", strings.TrimSuffix(socket, protocol.ApprovalSuffix), err)
 		case end == endServed && cfg.Root == "":
 			// A session given its daemon asks, as the list does.
 			yes, more := t.askTakeOver(ctx, protocol.ServedRefusal+"\n"+takeOverPrompt)
@@ -173,10 +173,6 @@ func Run(ctx context.Context, cfg Config, in io.Reader, out io.Writer) error {
 		first = false
 	}
 }
-
-// approvalSuffix ends an approval socket's path: it lies beside the
-// runtime directory it is named after (see launch.ApprovalSocket).
-const approvalSuffix = ".approval.sock"
 
 // errServed is why a session does not serve a daemon another session
 // serves, unless it takes it over.

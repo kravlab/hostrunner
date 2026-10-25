@@ -9,7 +9,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"strings"
 	"syscall"
 )
 
@@ -198,7 +197,7 @@ func fileError(name string, err error) error {
 // relative to root. Both arguments must be clean absolute paths.
 func within(root, path string) (string, bool) {
 	rel, err := filepath.Rel(root, path)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+	if err != nil || !filepath.IsLocal(rel) {
 		return "", false
 	}
 	return rel, true

@@ -702,7 +702,7 @@ func (s *Server) ask(ctx context.Context, cancel context.CancelFunc, conn net.Co
 		s.reject(out, protocol.ExitRejected, message, err)
 		return
 	}
-	guarded := len(need.text.guards) > 0
+	guarded := need.text.guarded()
 	s.log.Info("approval requested", "approval_id", id, "argv", req.Argv, "dir", need.hostDir, "reasons", need.text.agentReasons, "guarded", guarded, "timeout", timeout)
 	_ = out.writeJSON(protocol.FrameWaiting, protocol.Waiting{Reasons: need.text.agentReasons, Guarded: guarded})
 
@@ -767,7 +767,7 @@ func (s *Server) ask(ctx context.Context, cancel context.CancelFunc, conn net.Co
 	if scope == protocol.ScopeLifetime {
 		// Granted once the approved command has passed its checks, so a
 		// request refused at its start leaves nothing standing.
-		n := s.approvals.grant(req, len(need.text.guards) > 0, seen)
+		n := s.approvals.grant(req, guarded, seen)
 		s.log.Info("standing approval granted", "standing", n, "argv", req.Argv, "dir", need.hostDir, "approval_id", id)
 	}
 	s.start(ctx, cancel, conn, out, req, p, frames.next, "approved", scope, "approval_id", id)
@@ -806,10 +806,11 @@ func (s *Server) assessApproval(req protocol.Request) (*approvalNeed, *refusal) 
 	}
 	approved, err := s.rules().Check(req.Argv)
 	var d *rules.Denial
-	if err != nil && (!errors.As(err, &d) || !d.Approvable()) {
-		return nil, &refusal{protocol.ExitRejected, err.Error(), err}
-	}
-	if d != nil {
+	if err != nil {
+		var ok bool
+		if d, ok = rules.ApprovableDenial(err); !ok {
+			return nil, &refusal{protocol.ExitRejected, err.Error(), err}
+		}
 		approved = d.Approved
 	}
 	// Starting the command checks all of it again. Every path check may
@@ -848,7 +849,7 @@ func (s *Server) withAskHint(req protocol.Request, r *refusal) *refusal {
 		return r
 	}
 	hint := "ask for an approval: hostrun --ask …"
-	if len(need.text.guards) > 0 {
+	if need.text.guarded() {
 		hint += "; guarded: needs a second confirmation"
 	}
 	return &refusal{r.code, r.message + " (" + hint + ")", r.err}
@@ -863,6 +864,10 @@ type requestText struct {
 	sessionReasons []string
 	guards         []string
 }
+
+// guarded reports whether approving the request needs a warning and a
+// second confirmation: it has a guard.
+func (t requestText) guarded() bool { return len(t.guards) > 0 }
 
 // describeRequest describes a request the rules refused as d says, or,
 // with d nil, one they allowed, and whose arguments failed their path

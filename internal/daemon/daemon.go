@@ -390,8 +390,8 @@ func (s *Server) prepare(req protocol.Request, dryRun bool) (*prepared, *refusal
 	// them.
 	byStanding := false
 	if err != nil {
-		var d *rules.Denial
-		if standing == nil || !errors.As(err, &d) || !d.Approvable() {
+		d, ok := rules.ApprovableDenial(err)
+		if standing == nil || !ok {
 			return nil, &refusal{protocol.ExitRejected, err.Error(), err}
 		}
 		allowed, byStanding = d.Approved, true

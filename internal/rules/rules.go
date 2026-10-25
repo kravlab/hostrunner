@@ -116,6 +116,16 @@ func (d *Denial) Describe(reason string) string {
 // may refuse the command for good.
 func (d *Denial) Approvable() bool { return len(d.Reasons) > 0 }
 
+// ApprovableDenial returns the Denial err holds when the rules leave it
+// for a human to approve (see Denial.Approvable), and whether they do.
+func ApprovableDenial(err error) (*Denial, bool) {
+	var d *Denial
+	if errors.As(err, &d) && d.Approvable() {
+		return d, true
+	}
+	return nil, false
+}
+
 // Guarded reports whether approving the command needs a warning and a
 // second confirmation: a reason is a deny pattern or an argv the rules
 // cannot read, or the matching rule would inject secrets. A failed path

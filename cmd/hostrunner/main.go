@@ -37,7 +37,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
-	"strings"
 	"syscall"
 	"time"
 
@@ -444,7 +443,7 @@ func checkApprovalSocket(workspace, socket string) error {
 	if err != nil {
 		return err
 	}
-	if rel, err := filepath.Rel(ws, dir); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+	if rel, err := filepath.Rel(ws, dir); err == nil && filepath.IsLocal(rel) {
 		return fmt.Errorf("approval socket %s lies inside the workspace %s, which the container mounts", socket, workspace)
 	}
 	return nil

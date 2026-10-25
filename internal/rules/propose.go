@@ -47,11 +47,11 @@ func Propose(data []byte, name string, argv []string) (*Proposal, error) {
 		return nil, fmt.Errorf("the rules file does not parse: %w", err)
 	}
 	_, err = policy.Check(argv)
-	var d *Denial
+	d, approvable := ApprovableDenial(err)
 	switch {
 	case err == nil:
 		return nil, errors.New("the rules allow it already")
-	case !errors.As(err, &d) || !d.Approvable():
+	case !approvable:
 		return nil, err
 	case d.Guarded():
 		return nil, errors.New("a guarded refusal gets no rule")

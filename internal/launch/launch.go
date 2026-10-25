@@ -36,14 +36,10 @@ const (
 	lockName   = "up.lock"         // serializes concurrent `hostrunner up`s
 )
 
-// approvalSuffix makes a runtime directory's path into its daemon's
-// approval socket.
-const approvalSuffix = ".approval.sock"
-
 // ApprovalSocket is the approval socket of the daemon serving the runtime
 // directory dir: beside dir, not in it, since the container mounts dir and
 // must not reach the socket approval sessions answer on.
-func ApprovalSocket(dir string) string { return filepath.Clean(dir) + approvalSuffix }
+func ApprovalSocket(dir string) string { return filepath.Clean(dir) + protocol.ApprovalSuffix }
 
 // armTimeout bounds one arm request, including connecting.
 const armTimeout = 5 * time.Second
