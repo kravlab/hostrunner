@@ -116,11 +116,11 @@ func (s *session) proposeRule(r waiting) {
 		digest string
 		data   []byte
 	)
-	file, err := openRules(s.rulesFile)
+	file, err := openRules(s.daemon.RulesFile)
 	if err == nil {
 		digest, data, err = file.digest()
 	}
-	if err == nil && s.rulesDigest != "" && digest != s.rulesDigest {
+	if err == nil && s.daemon.RulesDigest != "" && digest != s.daemon.RulesDigest {
 		// Changed by hand: once the human agrees, the daemon rereads the
 		// file first, so the proposal is computed against the rules it
 		// then serves (see rereadTyped).
@@ -142,7 +142,7 @@ func (s *session) proposeRule(r waiting) {
 		return
 	}
 	s.printDiff(p.Diff)
-	if file.path != s.rulesFile {
+	if file.path != s.daemon.RulesFile {
 		// A link on the way: the diff names the file the daemon reads.
 		fmt.Fprintf(s.out, "writes %s\n", display(s.shownPath(file.path)))
 	}
@@ -263,7 +263,7 @@ func (s *session) reread(res protocol.RereadResult) {
 			fmt.Fprintf(s.out, " · request %d runs once", a.id)
 		}
 	} else {
-		s.rulesDigest = res.Digest
+		s.daemon.RulesDigest = res.Digest
 		fmt.Fprint(s.out, "rule added; the daemon reloaded the rules")
 		switch {
 		case !waiting:
@@ -312,7 +312,7 @@ func (s *session) rereadThenPropose(res protocol.RereadResult) {
 	id := s.rereadFor
 	s.awaiting, s.rereadFor = awaitAnswer, 0
 	if res.Error == "" {
-		s.rulesDigest = res.Digest
+		s.daemon.RulesDigest = res.Digest
 	}
 	switch {
 	case len(s.queue) == 0:
@@ -337,12 +337,12 @@ func (s *session) printDiff(diff string) {
 }
 
 // rulesName names the rules file as the diff shows it (see shownPath).
-func (s *session) rulesName() string { return s.shownPath(s.rulesFile) }
+func (s *session) rulesName() string { return s.shownPath(s.daemon.RulesFile) }
 
 // shownPath shows path relative to the daemon's host workspace when it
 // lies inside it.
 func (s *session) shownPath(path string) string {
-	if rel, err := filepath.Rel(s.workspace, path); err == nil && filepath.IsLocal(rel) {
+	if rel, err := filepath.Rel(s.daemon.Workspace, path); err == nil && filepath.IsLocal(rel) {
 		return rel
 	}
 	return path

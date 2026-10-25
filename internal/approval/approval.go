@@ -233,7 +233,7 @@ func (t *term) serveDaemon(ctx context.Context, socket string, takeOver, canList
 
 	done := make(chan struct{})
 	defer close(done)
-	s := &session{term: t, conn: conn, canList: canList, rulesFile: info.RulesFile, rulesDigest: info.RulesDigest, workspace: info.Workspace}
+	s := &session{term: t, conn: conn, canList: canList, daemon: info}
 	s.prompt(idlePrompt)
 	frames := readDaemon(conn, done)
 	then, err := s.loop(ctx, frames)
@@ -373,10 +373,11 @@ type session struct {
 	// printed once the daemon has taken it (awaitAnswered).
 	sent string
 
-	// rulesFile is the daemon's rules file, in its host workspace, which
-	// a rule is added to; rulesDigest is the digest of the rules the daemon
+	// daemon is what the daemon said of itself when the session connected
+	// (see hello): a rule is added to its RulesFile, in its host Workspace;
+	// RulesDigest, which a reread updates, is the digest of the rules it
 	// serves, which the file must have for a rule to be proposed.
-	rulesFile, rulesDigest, workspace string
+	daemon protocol.DaemonInfo
 	// adding is the rule being added (awaitAdd, awaitReread).
 	adding *addition
 	// rereadDigest is the digest of a rules file changed by hand, found
