@@ -52,14 +52,14 @@ type Server struct {
 	mapper         *workspace.Mapper
 	log            *slog.Logger
 	requestTimeout time.Duration
-	onArm          func(protocol.Arm) (stepAside bool) // nil: arming changes nothing
-	reload         func() (Policy, string, error)      // nil: the rules are never reread
-	approvals      *approvals                          // nil: no approval socket, so nothing is approved
+	onArm          func(a protocol.Arm, digest string) (stepAside bool) // nil: arming changes nothing
+	reload         func() (Policy, string, error)                       // nil: the rules are never reread
+	approvals      *approvals                                           // nil: no approval socket, so nothing is approved
 
 	mu        sync.Mutex
 	stopServe context.CancelFunc // stops the running Serve; nil when not serving
 	policy    Policy             // the rules served; see rules
-	digest    string             // their digest; see RulesDigest
+	digest    string             // their digest; see rulesDigest
 }
 
 // Policy decides whether a command may run; rules.Policy implements it. A
@@ -90,20 +90,22 @@ func WithReload(digest string, reload func() (Policy, string, error)) Option {
 	return func(s *Server) { s.digest, s.reload = digest, reload }
 }
 
-// RulesDigest returns the digest of the rules the Server serves, as
+// rulesDigest returns the digest of the rules the Server serves, as
 // WithReload gave it or a reread changed it; "" without WithReload.
-func (s *Server) RulesDigest() string {
+func (s *Server) rulesDigest() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.digest
 }
 
 // WithArmHandler sets what the Server does when `hostrunner up` arms it on
-// a devcontainer start (e.g. arm the container watcher). If f returns
-// true, the Server steps aside: it answers so and then stops Serve, so
-// `up` can start a new daemon. f is called from connection
-// goroutines, so it must be safe for concurrent use.
-func WithArmHandler(f func(protocol.Arm) (stepAside bool)) Option {
+// a devcontainer start (e.g. arm the container watcher); f gets the arm
+// and the digest of the rules the Server serves at that moment
+// (WithReload's, or a reread's). If f returns true, the Server steps
+// aside: it answers so and then stops Serve, so `up` can start a new
+// daemon. f is called from connection goroutines, so it must be safe for
+// concurrent use.
+func WithArmHandler(f func(a protocol.Arm, digest string) (stepAside bool)) Option {
 	return func(s *Server) { s.onArm = f }
 }
 
@@ -307,7 +309,7 @@ func (s *Server) arm(out *frameWriter, f protocol.Frame) {
 		s.reject(out, protocol.ExitHostrunError, err.Error(), err)
 		return
 	}
-	stepAside := s.onArm != nil && s.onArm(a)
+	stepAside := s.onArm != nil && s.onArm(a, s.rulesDigest())
 	s.log.Info("armed by hostrunner up", "step_aside", stepAside)
 	_ = out.writeJSON(protocol.FrameArmed, protocol.Armed{Version: protocol.Version, Restart: stepAside})
 	if stepAside {

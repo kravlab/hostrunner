@@ -373,26 +373,26 @@ func TestArmHandlerStepsAsideOnceTheWatchEnded(t *testing.T) {
 		go func() { done <- w.Run(ctx) }()
 		synctest.Wait() // the watch runs, waiting for its next poll
 
-		onArm := armHandler(func() string { return "digest" }, "rules.yaml", w, discard)
-		if onArm(protocol.Arm{ConfigDigest: "digest"}) {
+		onArm := armHandler("rules.yaml", w, discard)
+		if onArm(protocol.Arm{ConfigDigest: "digest"}, "digest") {
 			t.Fatal("stepped aside while the watch runs")
 		}
 		cancel()
 		if err := <-done; !errors.Is(err, context.Canceled) {
 			t.Fatalf("watch ended with %v, want context.Canceled", err)
 		}
-		if !onArm(protocol.Arm{ConfigDigest: "digest"}) {
+		if !onArm(protocol.Arm{ConfigDigest: "digest"}, "digest") {
 			t.Fatal("did not step aside after the watch ended")
 		}
 	})
 }
 
 func TestArmHandlerStepsAsideWhenRulesChanged(t *testing.T) {
-	onArm := armHandler(func() string { return "digest" }, "rules.yaml", nil, slog.New(slog.DiscardHandler))
-	if !onArm(protocol.Arm{ConfigDigest: "other"}) {
+	onArm := armHandler("rules.yaml", nil, slog.New(slog.DiscardHandler))
+	if !onArm(protocol.Arm{ConfigDigest: "other"}, "digest") {
 		t.Fatal("kept running with other rules")
 	}
-	if onArm(protocol.Arm{ConfigDigest: "digest"}) {
+	if onArm(protocol.Arm{ConfigDigest: "digest"}, "digest") {
 		t.Fatal("stepped aside with the same rules and no watch")
 	}
 }

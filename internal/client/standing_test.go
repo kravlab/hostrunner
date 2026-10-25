@@ -96,7 +96,7 @@ func TestStandingApprovalForAGuardedRefusalConfirmsOnce(t *testing.T) {
 // A standing approval lives in the daemon: it works with no session and
 // survives an arm that keeps the daemon.
 func TestStandingApprovalWorksWithoutASessionAndSurvivesAnArm(t *testing.T) {
-	h := startDaemonWith(t, slog.New(slog.DiscardHandler), policy(t, echoOnly), daemon.WithArmHandler(func(protocol.Arm) bool { return false }))
+	h := startDaemonWith(t, slog.New(slog.DiscardHandler), policy(t, echoOnly), daemon.WithArmHandler(func(protocol.Arm, string) bool { return false }))
 	s := h.startSession(t)
 	h.grantStanding(t, s, false, "touch", "marker")
 	s.cancel()
@@ -269,7 +269,7 @@ func TestSessionReprintsThePromptAfterACommandsOutcome(t *testing.T) {
 // A standing approval goes with the daemon: once it steps aside, the next
 // daemon for the devcontainer refuses the command again.
 func TestStandingApprovalIsGoneAfterTheDaemonStepsAside(t *testing.T) {
-	h := startDaemonWith(t, slog.New(slog.DiscardHandler), policy(t, echoOnly), daemon.WithArmHandler(func(protocol.Arm) bool { return true }))
+	h := startDaemonWith(t, slog.New(slog.DiscardHandler), policy(t, echoOnly), daemon.WithArmHandler(func(protocol.Arm, string) bool { return true }))
 	s := h.startSession(t)
 	h.grantStanding(t, s, false, "touch", "marker")
 	if err := os.Remove(filepath.Join(h.hostRoot, "marker")); err != nil {

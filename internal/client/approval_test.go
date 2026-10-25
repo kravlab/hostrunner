@@ -1185,7 +1185,7 @@ func TestASessionInterruptedRefusesWaitingRequests(t *testing.T) {
 // A daemon that steps aside for a new one answers every waiting request
 // before it closes, as a stopping one does.
 func TestADaemonSteppingAsideAnswersWaitingRequests(t *testing.T) {
-	h := startDaemonWith(t, slog.New(slog.DiscardHandler), policy(t, echoOnly), daemon.WithArmHandler(func(protocol.Arm) bool { return true }))
+	h := startDaemonWith(t, slog.New(slog.DiscardHandler), policy(t, echoOnly), daemon.WithArmHandler(func(protocol.Arm, string) bool { return true }))
 	s := h.startSession(t)
 	ch := h.ask(t, "touch", "marker")
 	s.waitFor(t, answerPromptText)

@@ -458,7 +458,7 @@ func (s *Server) handleSession(ctx context.Context, conn net.Conn) {
 	host, container := s.mapper.Roots()
 	_ = out.writeJSON(protocol.FrameDaemonInfo, protocol.DaemonInfo{
 		Version: protocol.ApprovalVersion, Workspace: host, ContainerWorkspace: container,
-		RulesFile: s.approvals.rulesFile, RulesDigest: s.RulesDigest(), Served: s.approvals.served(),
+		RulesFile: s.approvals.rulesFile, RulesDigest: s.rulesDigest(), Served: s.approvals.served(),
 	})
 	defer func() {
 		// The daemon stopping closes the connection too: its requests end

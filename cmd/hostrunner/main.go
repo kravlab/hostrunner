@@ -421,11 +421,7 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 		}
 		return p, p.Digest(), nil
 	}
-	// The arms compare the digest of the rules the daemon serves, which a
-	// reread changes.
-	var srv *daemon.Server
-	onArm := armHandler(func() string { return srv.RulesDigest() }, cfg.config, watcher, log)
-	srv = daemon.New(mapper, policy, log, daemon.WithArmHandler(onArm), daemon.WithApprovals(al, cfg.config), daemon.WithReload(policy.Digest(), reload))
+	srv := daemon.New(mapper, policy, log, daemon.WithArmHandler(armHandler(cfg.config, watcher, log)), daemon.WithApprovals(al, cfg.config), daemon.WithReload(policy.Digest(), reload))
 	return srv.Serve(ctx, l)
 }
 
@@ -450,14 +446,14 @@ func checkApprovalSocket(workspace, socket string) error {
 }
 
 // armHandler answers the arms of `hostrunner up`, which arms the daemon on
-// every container start with the digest of the rules it validated. digest
-// returns the digest of the rules this daemon serves from config. The daemon
-// steps aside for a new one when the digests differ, or when watcher has
-// ended and will not follow the arm; otherwise watcher, if any, waits for
-// the container of this arm.
-func armHandler(digest func() string, config string, watcher *watch.Watcher, log *slog.Logger) func(protocol.Arm) (stepAside bool) {
-	return func(a protocol.Arm) bool {
-		if a.ConfigDigest != digest() {
+// every container start with the digest of the rules it validated; digest
+// is that of the rules the daemon serves from config, which a reread
+// changes. The daemon steps aside for a new one when the digests differ,
+// or when watcher has ended and will not follow the arm; otherwise
+// watcher, if any, waits for the container of this arm.
+func armHandler(config string, watcher *watch.Watcher, log *slog.Logger) func(a protocol.Arm, digest string) (stepAside bool) {
+	return func(a protocol.Arm, digest string) bool {
+		if a.ConfigDigest != digest {
 			log.Info("stepping aside: the rules file changed", "config", config)
 			return true
 		}

@@ -22,8 +22,9 @@ var errNoReread = errors.New("the rules cannot be reread")
 
 // startRulesDaemon starts a daemon serving the rules file content, written
 // into the host workspace (none when content is ""), and rereading it when
-// a session adds a rule; with failReread, every reread fails.
-func startRulesDaemon(t *testing.T, log *slog.Logger, content string, failReread bool) harness {
+// a session adds a rule; with failReread, every reread fails. opts are
+// the Server options besides its reread and approval socket.
+func startRulesDaemon(t *testing.T, log *slog.Logger, content string, failReread bool, opts ...daemon.Option) harness {
 	t.Helper()
 	return startRulesDaemonWith(t, log, failReread, func(rulesFile string) {
 		if content != "" {
@@ -31,12 +32,12 @@ func startRulesDaemon(t *testing.T, log *slog.Logger, content string, failReread
 				t.Fatal(err)
 			}
 		}
-	})
+	}, opts...)
 }
 
 // startRulesDaemonWith is startRulesDaemon with the rules file, in its
 // existing directory, made by prepare.
-func startRulesDaemonWith(t *testing.T, log *slog.Logger, failReread bool, prepare func(rulesFile string)) harness {
+func startRulesDaemonWith(t *testing.T, log *slog.Logger, failReread bool, prepare func(rulesFile string), opts ...daemon.Option) harness {
 	t.Helper()
 	return startHarness(t, log, func(rulesFile string) (daemon.Policy, []daemon.Option) {
 		if err := os.MkdirAll(filepath.Dir(rulesFile), 0o755); err != nil {
@@ -57,7 +58,7 @@ func startRulesDaemonWith(t *testing.T, log *slog.Logger, failReread bool, prepa
 			}
 			return p, p.Digest(), nil
 		}
-		return p, []daemon.Option{daemon.WithReload(p.Digest(), reload)}
+		return p, append([]daemon.Option{daemon.WithReload(p.Digest(), reload)}, opts...)
 	})
 }
 
@@ -118,6 +119,40 @@ func TestAddRuleForACommandNoRuleMatches(t *testing.T) {
 	}
 	if got := h.run(t, containerRoot, "", "touch", "-a", "marker"); got != (result{}) {
 		t.Fatalf("a later run: got %+v, want it to run without asking", got)
+	}
+}
+
+// An arm after a rule is added gets the digest of the rules reread with
+// it, so `hostrunner up` validating the edited file keeps the daemon.
+func TestAddRuleArmGetsTheRereadDigest(t *testing.T) {
+	digests := make(chan string, 1)
+	h := startRulesDaemon(t, slog.New(slog.DiscardHandler), "rules:\n  - command: echo\n    args: any\n", false,
+		daemon.WithArmHandler(func(_ protocol.Arm, digest string) bool {
+			digests <- digest
+			return false
+		}))
+	s := h.startSession(t)
+	ch := h.ask(t, "touch", "marker")
+	s.addRule(t)
+	s.waitFor(t, "rule added; the daemon reloaded the rules · request 1 runs under it\n")
+	awaitResult(t, ch)
+	reread, err := rules.Load(h.rulesFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := h.transport.Dial(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := protocol.WriteJSON(conn, protocol.FrameArm, protocol.Arm{Version: protocol.Version, ConfigDigest: reread.Digest()}); err != nil {
+		t.Fatal(err)
+	}
+	if f, err := protocol.ReadFrame(conn); err != nil || f.Type != protocol.FrameArmed {
+		t.Fatalf("frame %v, err %v; want armed", f.Type, err)
+	}
+	if got := <-digests; got != reread.Digest() {
+		t.Fatalf("the arm got digest %q, want that of the reread rules %q", got, reread.Digest())
 	}
 }
 
