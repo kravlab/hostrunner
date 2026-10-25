@@ -642,21 +642,21 @@ func (s *Server) sessionRefused(out *frameWriter, pid int, err error) {
 // runs out, its session leaves or the daemon stops; but for the first,
 // the client is told why. To tell it the daemon stops, ask closes the
 // connection on ctx's end itself, once nothing waits (handle does not).
-func (s *Server) ask(ctx context.Context, cancel context.CancelFunc, conn net.Conn, out *frameWriter, f protocol.Frame) {
+func (s *Server) ask(ctx context.Context, x exchange, f protocol.Frame) {
 	// The connection closes when the daemon stops, as handle closes it for
 	// other requests, but while a request waits: ask then tells its client
 	// that the daemon stops first.
-	closeOnStop := context.AfterFunc(ctx, func() { conn.Close() })
+	closeOnStop := context.AfterFunc(ctx, func() { x.conn.Close() })
 	defer func() { closeOnStop() }()
 	var ask protocol.Ask
 	if err := protocol.DecodeJSON(f, &ask); err != nil {
-		s.reject(out, protocol.ExitHostrunError, err.Error(), err)
+		s.reject(x.out, protocol.ExitHostrunError, err.Error(), err)
 		return
 	}
 	req := ask.Request
 	if len(req.Argv) == 0 {
 		err := errors.New("empty command")
-		s.reject(out, protocol.ExitHostrunError, err.Error(), err)
+		s.reject(x.out, protocol.ExitHostrunError, err.Error(), err)
 		return
 	}
 	timeout := defaultAskTimeout
@@ -665,12 +665,12 @@ func (s *Server) ask(ctx context.Context, cancel context.CancelFunc, conn net.Co
 	}
 	if timeout > maxAskTimeout {
 		err := fmt.Errorf("--ask limit %s exceeds %s", timeout, maxAskTimeout)
-		s.reject(out, protocol.ExitHostrunError, err.Error(), err)
+		s.reject(x.out, protocol.ExitHostrunError, err.Error(), err)
 		return
 	}
 	need, r := s.assessApproval(req)
 	if r != nil {
-		s.reject(out, r.code, r.message, r.err)
+		s.reject(x.out, r.code, r.message, r.err)
 		return
 	}
 	if need == nil {
@@ -678,10 +678,10 @@ func (s *Server) ask(ctx context.Context, cancel context.CancelFunc, conn net.Co
 		// since the assessment) does not hint at --ask: it was asked with it.
 		p, r := s.prepare(req, false)
 		if r != nil {
-			s.reject(out, r.code, r.message, r.err)
+			s.reject(x.out, r.code, r.message, r.err)
 			return
 		}
-		s.start(ctx, cancel, conn, out, req, p, func() (protocol.Frame, error) { return protocol.ReadFrame(conn) })
+		s.start(ctx, x, req, p, func() (protocol.Frame, error) { return protocol.ReadFrame(x.conn) })
 		return
 	}
 	// From here on the daemon stopping does not close the connection: a
@@ -706,14 +706,14 @@ func (s *Server) ask(ctx context.Context, cancel context.CancelFunc, conn net.Co
 			reason, message = "too large", tooLargeMessage
 		}
 		s.log.Info("approval not answered", "reason", reason, "argv", req.Argv, "dir", need.hostDir)
-		s.reject(out, protocol.ExitRejected, message, err)
+		s.reject(x.out, protocol.ExitRejected, message, err)
 		return
 	}
 	guarded := need.text.guarded()
 	s.log.Info("approval requested", "approval_id", id, "argv", req.Argv, "dir", need.hostDir, "reasons", need.text.agentReasons, "guarded", guarded, "timeout", timeout)
-	_ = out.writeJSON(protocol.FrameWaiting, protocol.Waiting{Reasons: need.text.agentReasons, Guarded: guarded})
+	_ = x.out.writeJSON(protocol.FrameWaiting, protocol.Waiting{Reasons: need.text.agentReasons, Guarded: guarded})
 
-	frames := readFrames(ctx, conn)
+	frames := readFrames(ctx, x.conn)
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	var o outcome
@@ -730,11 +730,11 @@ func (s *Server) ask(ctx context.Context, cancel context.CancelFunc, conn net.Co
 	if o.ended != "" {
 		s.log.Info("approval not answered", "approval_id", id, "reason", string(o.ended))
 		if r := o.ended.refusal(); r != nil {
-			s.reject(out, r.code, r.message, r.err)
+			s.reject(x.out, r.code, r.message, r.err)
 		}
 		return
 	}
-	closeOnStop = context.AfterFunc(ctx, func() { conn.Close() })
+	closeOnStop = context.AfterFunc(ctx, func() { x.conn.Close() })
 	ans := o.answer
 	if ans.Scope == "" {
 		s.log.Info("approval answered", "approval_id", id, "scope", "refused", "note", ans.Note)
@@ -742,7 +742,7 @@ func (s *Server) ask(ctx context.Context, cancel context.CancelFunc, conn net.Co
 		if ans.Note != "" {
 			message += ": " + ans.Note
 		}
-		s.reject(out, protocol.ExitRejected, message, errRefused)
+		s.reject(x.out, protocol.ExitRejected, message, errRefused)
 		return
 	}
 	scope := ans.Scope
@@ -759,7 +759,7 @@ func (s *Server) ask(ctx context.Context, cancel context.CancelFunc, conn net.Co
 		}
 	}
 	s.log.Info("approval answered", "approval_id", id, "scope", scope)
-	_ = out.writeJSON(protocol.FrameApproved, protocol.Approved{Scope: scope})
+	_ = x.out.writeJSON(protocol.FrameApproved, protocol.Approved{Scope: scope})
 	// Only the path failures the human saw are passed as given, for the
 	// reason they saw: one that fails its check only now, or otherwise (a
 	// file swapped for a symlink meanwhile), refuses the command.
@@ -767,7 +767,7 @@ func (s *Server) ask(ctx context.Context, cancel context.CancelFunc, conn net.Co
 	if p == nil {
 		var r *refusal
 		if p, r = s.prepareAllowed(req, need.approved, false, seen); r != nil {
-			s.reject(out, r.code, r.message, r.err)
+			s.reject(x.out, r.code, r.message, r.err)
 			return
 		}
 	}
@@ -777,7 +777,7 @@ func (s *Server) ask(ctx context.Context, cancel context.CancelFunc, conn net.Co
 		n := s.approvals.grant(req, guarded, seen)
 		s.log.Info("standing approval granted", "standing", n, "argv", req.Argv, "dir", need.hostDir, "approval_id", id)
 	}
-	s.start(ctx, cancel, conn, out, req, p, frames.next, "approved", scope, "approval_id", id)
+	s.start(ctx, x, req, p, frames.next, "approved", scope, "approval_id", id)
 }
 
 // approvalNeed is what --ask would ask a human about a request: what the

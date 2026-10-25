@@ -233,6 +233,7 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 	defer stop()
 
 	out := &frameWriter{conn: conn}
+	x := exchange{cancel: cancel, conn: conn, out: out}
 	// logArgs mark in the log every refusal of this connection's request,
 	// once its kind is known (a dry run).
 	var logArgs []any
@@ -258,7 +259,7 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 		// A request waiting for an answer is told that the daemon stops
 		// before its connection closes: ask closes it itself.
 		stop()
-		s.ask(ctx, cancel, conn, out, f)
+		s.ask(ctx, x, f)
 		return
 	}
 	if f.Type == protocol.FrameDryRun {
@@ -273,7 +274,7 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 		s.dryRun(out, req)
 		return
 	}
-	s.run(ctx, cancel, conn, out, req)
+	s.run(ctx, x, req)
 }
 
 // dryRunLogArgs mark a dry run's lines in the daemon log.
@@ -457,43 +458,50 @@ func (s *Server) prepareAllowed(req protocol.Request, allowed rules.Allowed, dry
 	return p, nil
 }
 
-// run executes req on the connection if it passes prepare; cancel stops it
-// early.
-func (s *Server) run(ctx context.Context, cancel context.CancelFunc, conn net.Conn, out *frameWriter, req protocol.Request) {
+// exchange is the connection a request is served on: conn, out, where
+// its frames go, and cancel, which ends the request early.
+type exchange struct {
+	cancel context.CancelFunc
+	conn   net.Conn
+	out    *frameWriter
+}
+
+// run executes req on x if it passes prepare; x.cancel stops it early.
+func (s *Server) run(ctx context.Context, x exchange, req protocol.Request) {
 	p, r := s.prepare(req, false)
 	if r != nil {
 		r = s.withAskHint(req, r)
-		s.reject(out, r.code, r.message, r.err)
+		s.reject(x.out, r.code, r.message, r.err)
 		return
 	}
-	s.start(ctx, cancel, conn, out, req, p, func() (protocol.Frame, error) { return protocol.ReadFrame(conn) })
+	s.start(ctx, x, req, p, func() (protocol.Frame, error) { return protocol.ReadFrame(x.conn) })
 }
 
 // frameSource returns the client's next frame, or an error once the
 // connection ends.
 type frameSource func() (protocol.Frame, error)
 
-// start runs p, the prepared command of req, on the connection: it streams
-// stdio, reading the client's frames from next, and reports the exit code;
-// cancel stops it early. logArgs (slog key-value pairs) go to its log
+// start runs p, the prepared command of req, on x: it streams stdio,
+// reading the client's frames from next, and reports the exit code;
+// x.cancel stops it early. logArgs (slog key-value pairs) go to its log
 // lines.
-func (s *Server) start(ctx context.Context, cancel context.CancelFunc, conn net.Conn, out *frameWriter, req protocol.Request, p *prepared, next frameSource, logArgs ...any) {
+func (s *Server) start(ctx context.Context, x exchange, req protocol.Request, p *prepared, next frameSource, logArgs ...any) {
 	// The command inherits the files; the daemon's copies go once it has
 	// started (p.files is cleared then), or with the request on failure.
 	defer p.close()
 
-	cmd := newCommand(ctx, p.argv, p.dir, p.hostPath, p.env, out)
+	cmd := newCommand(ctx, p.argv, p.dir, p.hostPath, p.env, x.out)
 	stdout, stderr := newMaskWriter(cmd.Stdout, p.masked), newMaskWriter(cmd.Stderr, p.masked)
 	cmd.Stdout, cmd.Stderr = stdout, stderr
 	cmd.ExtraFiles = p.files
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		s.reject(out, protocol.ExitHostrunError, "cannot start the command", err)
+		s.reject(x.out, protocol.ExitHostrunError, "cannot start the command", err)
 		return
 	}
 	if err := cmd.Start(); err != nil {
 		code, message := startFailure(req.Argv[0], err)
-		s.reject(out, code, message, err)
+		s.reject(x.out, code, message, err)
 		return
 	}
 	closeAll(p.files)
@@ -503,14 +511,14 @@ func (s *Server) start(ctx context.Context, cancel context.CancelFunc, conn net.
 	var streams sync.WaitGroup
 	streams.Go(func() {
 		if err := readClient(next, queue); err != nil {
-			s.reject(out, protocol.ExitHostrunError, err.Error(), err)
+			s.reject(x.out, protocol.ExitHostrunError, err.Error(), err)
 		}
 		// The client is gone or broke the protocol: nobody is left to
 		// receive the result, so stop the command.
-		cancel()
+		x.cancel()
 	})
-	streams.Go(func() { feedStdin(queue, stdin, out) })
-	_ = out.writeJSON(protocol.FrameStdinCredit, protocol.Credit{Bytes: protocol.StdinWindow})
+	streams.Go(func() { feedStdin(queue, stdin, x.out) })
+	_ = x.out.writeJSON(protocol.FrameStdinCredit, protocol.Credit{Bytes: protocol.StdinWindow})
 
 	waitErr := cmd.Wait()
 	// The output is complete: what a mask held back can go now.
@@ -519,11 +527,11 @@ func (s *Server) start(ctx context.Context, cancel context.CancelFunc, conn net.
 	if ctx.Err() == nil {
 		code := exitCode(cmd.ProcessState)
 		s.log.Info("command finished", append(append(p.logArgs(req), logArgs...), "code", code, "wait_error", waitErr)...)
-		_ = out.writeJSON(protocol.FrameExit, protocol.Exit{Code: code})
+		_ = x.out.writeJSON(protocol.FrameExit, protocol.Exit{Code: code})
 	} else {
 		s.log.Info("command cancelled", append(p.logArgs(req), logArgs...)...)
 	}
-	conn.Close()
+	x.conn.Close()
 	streams.Wait()
 }
 
