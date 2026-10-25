@@ -362,30 +362,51 @@ type session struct {
 	failed error
 
 	queue []waiting
-	// note is set while the human types the note of a refusal.
-	note bool
+	// awaiting is what the session takes next (see awaiting); confirm,
+	// sent, adding, rereadDigest and rereadFor carry what the states that
+	// need them hold.
+	awaiting awaiting
 	// confirm is the scope the human confirms approving a guarded request
-	// for; "" while no confirmation is asked.
+	// for (awaitConfirm).
 	confirm protocol.Scope
 	// sent is the outcome of the answer sent for the first request,
-	// printed once the daemon has taken it; "" while none is sent.
+	// printed once the daemon has taken it (awaitAnswered).
 	sent string
 
 	// rulesFile is the daemon's rules file, in its host workspace, which
 	// a rule is added to; rulesDigest is the digest of the rules the daemon
 	// serves, which the file must have for a rule to be proposed.
 	rulesFile, rulesDigest, workspace string
-	// adding is the rule being added, while the human writes, edits or
-	// cancels it; rereading is set while the daemon rereads the rules.
-	adding    *addition
-	rereading bool
-	// rereadAsked is the request a rule is to be proposed for while the
-	// session asks whether the daemon rereads a rules file changed by hand,
-	// found with rereadDigest (see proposeRule); rereadFor is that request
-	// once the daemon rereads it. Each is 0 while none.
-	rereadAsked  uint64
+	// adding is the rule being added (awaitAdd, awaitReread).
+	adding *addition
+	// rereadDigest is the digest of a rules file changed by hand, found
+	// as a rule is proposed (awaitRereadChoice); rereadFor is the request
+	// the rule is then proposed for, once the daemon rereads the file
+	// (awaitProposeReread).
 	rereadDigest string
 	rereadFor    uint64
+}
+
+// awaiting is what a session takes next: while a request is shown, a
+// line the human types, or first a frame of the daemon's, nothing typed
+// being taken meanwhile (see waitsForDaemon). A frame awaited outlasts the
+// request it is for, the queue emptied meanwhile.
+type awaiting int
+
+const (
+	awaitAnswer        awaiting = iota // the answer to the shown request
+	awaitNote                          // the note of a refusal
+	awaitConfirm                       // "yes" to approving a guarded request
+	awaitAdd                           // write, edit or cancel the rule being added
+	awaitRereadChoice                  // whether the daemon rereads a hand-edited rules file
+	awaitAnswered                      // the daemon taking the answer sent (Answered)
+	awaitReread                        // the daemon rereading the rule written (RereadResult)
+	awaitProposeReread                 // the daemon rereading before a proposal (RereadResult)
+)
+
+// waitsForDaemon reports whether a waits for a frame of the daemon's.
+func (a awaiting) waitsForDaemon() bool {
+	return a == awaitAnswered || a == awaitReread || a == awaitProposeReread
 }
 
 // waiting is an approval request and when its time runs out. ended is why
@@ -467,7 +488,7 @@ func (s *session) daemonFrame(f protocol.Frame) error {
 		if err := protocol.DecodeJSON(f, &a); err != nil {
 			return err
 		}
-		if s.sent == "" || len(s.queue) == 0 || s.queue[0].ID != a.ID {
+		if s.awaiting != awaitAnswered || len(s.queue) == 0 || s.queue[0].ID != a.ID {
 			return fmt.Errorf("the daemon confirmed request %d, which was not answered", a.ID)
 		}
 		// The request may have ended as the answer came: the daemon says so
@@ -481,7 +502,7 @@ func (s *session) daemonFrame(f protocol.Frame) error {
 		default:
 			fmt.Fprintln(s.out, s.sent)
 		}
-		s.sent = ""
+		s.awaiting, s.sent = awaitAnswer, ""
 		s.next()
 	case protocol.FrameWithdrawn:
 		var w protocol.Withdrawn
@@ -514,6 +535,9 @@ func (s *session) daemonFrame(f protocol.Frame) error {
 		if err := protocol.DecodeJSON(f, &r); err != nil {
 			return err
 		}
+		if s.awaiting != awaitReread && s.awaiting != awaitProposeReread {
+			return errors.New("the daemon reread the rules, which the session did not ask for")
+		}
 		s.reread(r)
 	case protocol.FrameRevoked:
 		var r protocol.Revoked
@@ -540,52 +564,52 @@ func (s *session) idle() {
 	switch {
 	case len(s.queue) == 0:
 		s.prompt(idlePrompt)
-	case s.sent == "":
+	case s.awaiting != awaitAnswered:
 		s.prompt(s.asking)
 	}
 }
 
-// typed handles a line the human typed after the current prompt: an
-// answer while a request is shown, a command while none is. Nothing is
-// asked while an answer waits for the daemon.
+// typed handles a line the human typed after the current prompt: what the
+// session awaits while a request is shown, a command while none is.
+// Nothing is taken while it awaits the daemon.
 func (s *session) typed(text string) {
 	text = strings.TrimSpace(text)
 	if len(s.queue) == 0 {
 		s.command(text)
 		return
 	}
-	if s.sent != "" || s.rereading || s.rereadFor != 0 {
-		return
-	}
 	r := s.queue[0]
-	if s.rereadAsked != 0 {
+	switch s.awaiting {
+	case awaitAnswered, awaitReread, awaitProposeReread:
+	case awaitRereadChoice:
 		s.rereadTyped(text)
-		return
-	}
-	if s.adding != nil {
+	case awaitAdd:
 		s.addTyped(r, text)
-		return
-	}
-	if s.note {
+	case awaitNote:
 		note := display(text)
 		if len(note) > maxNoteBytes {
 			fmt.Fprintf(s.out, "note too long: at most %d bytes\n", maxNoteBytes)
 			s.prompt(notePrompt)
 			return
 		}
-		s.note = false
 		s.send(protocol.Answer{ID: r.ID, Note: note}, "refused")
-		return
-	}
-	if scope := s.confirm; scope != "" {
-		s.confirm = ""
+	case awaitConfirm:
+		scope := s.confirm
+		s.awaiting, s.confirm = awaitAnswer, ""
 		if text == "yes" {
 			s.approve(r.ID, scope)
 		} else {
 			s.askAnswer()
 		}
-		return
+	default:
+		s.answerTyped(r, text)
 	}
+}
+
+// answerTyped handles text typed as the answer to r: r refuses it, asking
+// for a note; o and l approve it, once a guarded one is confirmed; a adds
+// a rule; ? shows all of its argv. Anything else asks again.
+func (s *session) answerTyped(r waiting, text string) {
 	switch text {
 	case "o", "l":
 		scope := protocol.ScopeOnce
@@ -602,7 +626,7 @@ func (s *session) typed(text string) {
 		for _, guard := range r.Guards {
 			fmt.Fprintf(s.out, "⚠ %s\n", display(guard))
 		}
-		s.confirm = scope
+		s.awaiting, s.confirm = awaitConfirm, scope
 		s.prompt(scopeTexts[scope].confirm)
 	case "a":
 		if r.guarded() {
@@ -614,7 +638,7 @@ func (s *session) typed(text string) {
 		s.showAll(r)
 		s.askAnswer()
 	case "r":
-		s.note = true
+		s.awaiting = awaitNote
 		s.prompt(notePrompt)
 	default:
 		s.askAnswer()
@@ -663,7 +687,7 @@ func (s *session) approve(id uint64, scope protocol.Scope) {
 // send sends ans to the daemon; outcome is printed once the daemon has
 // taken it.
 func (s *session) send(ans protocol.Answer, outcome string) {
-	s.sent = outcome
+	s.awaiting, s.sent = awaitAnswered, outcome
 	s.write(protocol.FrameAnswer, ans)
 }
 
@@ -693,15 +717,21 @@ func (s *session) withdrawn(w protocol.Withdrawn) {
 	case i < 0: // answered meanwhile, or its end came with the answer
 	case i > 0:
 		s.queue = slices.Delete(s.queue, i, i+1)
-	case s.sent != "":
+	case s.awaiting == awaitAnswered:
 		s.queue[0].ended = w.Reason
 	default:
 		fmt.Fprintf(s.out, "\nrequest %d %s\n", w.ID, w.Reason)
-		s.note, s.confirm = false, ""
-		s.rereadAsked, s.rereadDigest = 0, ""
-		if !s.rereading {
+		// What was asked of it goes with it. A reread of the daemon's is
+		// still awaited, nothing typed being taken till it comes: of the
+		// rule written (its addition kept for the result), or of a file
+		// changed by hand, before a proposal no longer due.
+		if s.awaiting != awaitReread {
 			s.dropAddition()
 		}
+		if !s.awaiting.waitsForDaemon() {
+			s.awaiting = awaitAnswer
+		}
+		s.confirm, s.rereadDigest = "", ""
 		s.next()
 	}
 }
@@ -713,7 +743,7 @@ func (s *session) withdrawn(w protocol.Withdrawn) {
 // not in it.
 func (s *session) leave() {
 	n := len(s.queue)
-	if s.sent != "" {
+	if s.awaiting == awaitAnswered {
 		n--
 	}
 	if n > 0 {
@@ -730,7 +760,7 @@ func (s *session) leave() {
 // its socket.
 func (s *session) connectionFailed() {
 	fmt.Fprintf(s.out, "\nthe connection to the daemon failed: %s\n", display(s.failed.Error()))
-	if s.rereading {
+	if s.awaiting == awaitReread {
 		fmt.Fprintln(s.out, "rule written, but the daemon did not reread it: it takes effect at the next container start")
 	}
 	s.sayRefused(len(s.queue))

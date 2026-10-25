@@ -124,7 +124,7 @@ func (s *session) proposeRule(r waiting) {
 		// file first, so the proposal is computed against the rules it
 		// then serves (see rereadTyped).
 		file.close()
-		s.rereadAsked, s.rereadDigest = r.ID, digest
+		s.awaiting, s.rereadDigest = awaitRereadChoice, digest
 		s.prompt(rereadPrompt)
 		return
 	}
@@ -145,7 +145,7 @@ func (s *session) proposeRule(r waiting) {
 		// A link on the way: the diff names the file the daemon reads.
 		fmt.Fprintf(s.out, "writes %s\n", display(s.shownPath(file.path)))
 	}
-	s.adding = &addition{id: r.ID, rule: p.Rule, data: p.Data, base: digest, file: file}
+	s.awaiting, s.adding = awaitAdd, &addition{id: r.ID, rule: p.Rule, data: p.Data, base: digest, file: file}
 	s.prompt(addPrompt)
 }
 
@@ -163,6 +163,7 @@ func (s *session) addTyped(r waiting, text string) {
 		s.editRule(r)
 	case "c":
 		s.dropAddition()
+		s.awaiting = awaitAnswer
 		s.askAnswer()
 	default:
 		s.prompt(s.asking)
@@ -186,10 +187,11 @@ func (s *session) writeRule() {
 	if err != nil {
 		fmt.Fprintf(s.out, "nothing written: %s\n", display(err.Error()))
 		s.dropAddition()
+		s.awaiting = awaitAnswer
 		s.askAnswer()
 		return
 	}
-	s.rereading = true
+	s.awaiting = awaitReread
 	s.write(protocol.FrameReread, protocol.Reread{Rule: a.rule, Edited: a.edited, Digest: rules.ContentDigest(a.data), ID: a.id})
 }
 
@@ -241,13 +243,13 @@ func (s *session) editRule(r waiting) {
 // answer. A reread of a file changed by hand, before a proposal, goes to
 // rereadThenPropose.
 func (s *session) reread(res protocol.RereadResult) {
-	if s.rereadFor != 0 {
+	if s.awaiting == awaitProposeReread {
 		s.rereadThenPropose(res)
 		return
 	}
 	a := s.adding
 	s.dropAddition()
-	s.rereading = false
+	s.awaiting = awaitAnswer
 	if a == nil {
 		return
 	}
@@ -286,16 +288,17 @@ func (s *session) reread(res protocol.RereadResult) {
 func (s *session) rereadTyped(text string) {
 	switch text {
 	case "r":
-		s.rereadFor = s.rereadAsked
+		s.awaiting, s.rereadFor = awaitProposeReread, s.queue[0].ID
 		s.write(protocol.FrameReread, protocol.Reread{Digest: s.rereadDigest})
 	case "c":
 		fmt.Fprintln(s.out, "cannot add a rule: the rules file changed since the daemon loaded it; the change takes effect at the next container start")
+		s.awaiting = awaitAnswer
 		s.askAnswer()
 	default:
 		s.prompt(s.asking)
 		return
 	}
-	s.rereadAsked, s.rereadDigest = 0, ""
+	s.rereadDigest = ""
 }
 
 // rereadThenPropose takes the daemon's reread of a rules file changed by
@@ -306,7 +309,7 @@ func (s *session) rereadTyped(text string) {
 // not taken.
 func (s *session) rereadThenPropose(res protocol.RereadResult) {
 	id := s.rereadFor
-	s.rereadFor = 0
+	s.awaiting, s.rereadFor = awaitAnswer, 0
 	if res.Error == "" {
 		s.rulesDigest = res.Digest
 	}

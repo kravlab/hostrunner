@@ -1488,3 +1488,19 @@ func TestAnAnswerOfAnUnknownScopeIsRefused(t *testing.T) {
 		t.Fatalf("got %+v, want the request approved by the next answer", got)
 	}
 }
+
+// A reread result the session did not ask for breaks the protocol: the
+// session stops serving the daemon and says why.
+func TestSessionRefusesARereadResultItDidNotAskFor(t *testing.T) {
+	socket, served := fakeDaemon(t)
+	s := startSessionOn(t, socket)
+	conn := <-served
+	s.waitFor(t, answerPromptText)
+	if err := protocol.WriteJSON(conn, protocol.FrameRereadResult, protocol.RereadResult{Digest: "x"}); err != nil {
+		t.Fatal(err)
+	}
+	waitEnded(t, s)
+	if s.err == nil || !strings.Contains(s.err.Error(), "did not ask for") {
+		t.Fatalf("got %v, want the session to refuse the reread result", s.err)
+	}
+}
