@@ -1414,3 +1414,49 @@ func TestRunLeavesItsInputOnceItReturns(t *testing.T) {
 		t.Fatal("the line typed after Run returned was taken")
 	}
 }
+
+// An approved command that injects a secret leaves its value out of the
+// daemon log: the request and the run are logged by the argv the
+// container sent, and the secret is shown injected, masked, on stdout.
+func TestAskLogsNoSecretValue(t *testing.T) {
+	t.Setenv("TOKEN", testToken)
+	var log lockedBuffer
+	h := startLoggingDaemon(t, slog.New(slog.NewTextHandler(&log, nil)), policy(t, `
+rules:
+  - command: printf
+    secrets:
+      token: {env: TOKEN}
+    inject:
+      trailing_args: ["${token}"]
+    flags:
+      allow: []
+    positional:
+      allow: ["ok"]
+`))
+	s := h.startSession(t)
+	ch := h.ask(t, "printf", "%s")
+	s.approveYes(t)
+	if got := awaitResult(t, ch); got.code != 0 || got.stdout != "***" {
+		t.Fatalf("got %+v, want the injected secret printed masked", got)
+	}
+	waitForLog(t, &log, `msg="command finished"`)
+	if strings.Contains(log.String(), testToken) {
+		t.Fatalf("the log holds the secret's value:\n%s", log.String())
+	}
+	waitForLog(t, &log, `secrets=[token]`)
+}
+
+// An approved command of a rule with dir: inherit runs in the directory
+// it inherits, as an allowed one does.
+func TestAskRunsAnApprovedCommandInAnInheritedDirectory(t *testing.T) {
+	dir := fixedDir(t)
+	h := startDaemon(t, policy(t, fmt.Sprintf("rules:\n  - command: sh\n    dir: %s\n    args: none\n  - command: sh -c\n    dir: inherit\n    positional:\n      allow: [\"true\"]\n", dir)))
+	s := h.startSession(t)
+	ch := make(chan result, 1)
+	go func() { ch <- h.run(t, containerRoot+"/sub", "", "--ask", "sh", "-c", "pwd -P") }()
+	s.waitFor(t, answerPromptText)
+	s.answer(t, "o")
+	if got := awaitResult(t, ch); got.code != 0 || got.stdout != dir+"\n" {
+		t.Fatalf("got %+v, want it run in %s", got, dir)
+	}
+}

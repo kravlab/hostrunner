@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kravlab/hostrunner/internal/approval"
 	"github.com/kravlab/hostrunner/internal/daemon"
 	"github.com/kravlab/hostrunner/internal/protocol"
 )
@@ -263,4 +264,52 @@ func TestSessionReprintsThePromptAfterACommandsOutcome(t *testing.T) {
 	if f, err := protocol.ReadFrame(conn); err != nil || f.Type != protocol.FrameAnswer {
 		t.Fatalf("frame %v, err %v; want the answer", f.Type, err)
 	}
+}
+
+// A standing approval goes with the daemon: once it steps aside, the next
+// daemon for the devcontainer refuses the command again.
+func TestStandingApprovalIsGoneAfterTheDaemonStepsAside(t *testing.T) {
+	h := startDaemonWith(t, slog.New(slog.DiscardHandler), policy(t, echoOnly), daemon.WithArmHandler(func(protocol.Arm) bool { return true }))
+	s := h.startSession(t)
+	h.grantStanding(t, s, false, "touch", "marker")
+	if err := os.Remove(filepath.Join(h.hostRoot, "marker")); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := h.transport.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := protocol.WriteJSON(conn, protocol.FrameArm, protocol.Arm{Version: protocol.Version}); err != nil {
+		t.Fatal(err)
+	}
+	f, err := protocol.ReadFrame(conn)
+	var armed protocol.Armed
+	if err != nil || f.Type != protocol.FrameArmed || protocol.DecodeJSON(f, &armed) != nil || !armed.Restart {
+		t.Fatalf("frame %v %+v, err %v; want the daemon to step aside", f.Type, armed, err)
+	}
+	// Stepping aside, the daemon stops; stop waits for it.
+	h.stop()
+	next := startHarnessAt(t, slog.New(slog.DiscardHandler), h.runtimeDir, func(string) (daemon.Policy, []daemon.Option) {
+		return policy(t, echoOnly), nil
+	})
+	if got, want := next.run(t, containerRoot, "", "touch", "marker"), (result{code: protocol.ExitRejected, stderr: "hostrun: no rule allows \"touch marker\"\n"}); got != want {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+	assertNotRun(t, next, "marker")
+}
+
+// A session that takes the daemon over sees the standing approvals the
+// one before it granted: they live in the daemon.
+func TestStandingApprovalsAreListedAfterATakeOver(t *testing.T) {
+	h := startDaemon(t, policy(t, echoOnly))
+	first := h.startSession(t)
+	h.grantStanding(t, first, false, "touch", "marker")
+	second := launchSession(t, approval.Config{Socket: h.approvalSocket})
+	second.waitFor(t, takeOverPromptText)
+	second.answer(t, "y")
+	first.waitFor(t, "taken over by another session\n")
+	second.waitFor(t, "> ")
+	second.answer(t, "standing")
+	second.waitFor(t, `  1  "touch" "marker"   in `+containerRoot+"\n")
 }
