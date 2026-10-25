@@ -886,7 +886,7 @@ func describeRequest(d *rules.Denial, approved rules.Allowed, pathFailures []pat
 		for i, reason := range d.Reasons {
 			agent := reason.Text
 			if i == 0 {
-				agent = d.Describe(agent)
+				agent = d.WithRule(agent)
 			}
 			session := agent
 			if reason.Kind == rules.ReasonDenied {

@@ -88,7 +88,7 @@ type Denial struct {
 
 // Error describes the denial with its first reason, as a refusal reports
 // it.
-func (d *Denial) Error() string { return d.Describe(d.Reason) }
+func (d *Denial) Error() string { return d.WithRule(d.Reason) }
 
 // Explain describes the denial with every reason, joined by "; ", as
 // Error describes it with the first.
@@ -97,12 +97,12 @@ func (d *Denial) Explain() string {
 	for i, r := range d.Reasons {
 		texts[i] = r.Text
 	}
-	return d.Describe(strings.Join(texts, "; "))
+	return d.WithRule(strings.Join(texts, "; "))
 }
 
-// Describe prefixes reason, one of the denial's, with the rule that gave
-// it, if any, as a refusal reports it.
-func (d *Denial) Describe(reason string) string {
+// WithRule returns reason, text of the denial's reasons, prefixed with the
+// rule that gave the denial, if any: denied by rule "<rule>": <reason>.
+func (d *Denial) WithRule(reason string) string {
 	if d.Rule == "" {
 		return reason
 	}
