@@ -51,6 +51,17 @@ func startSessionOn(t *testing.T, socket string) *session {
 // it returns at once, the session listing the daemons.
 func startSessionWith(t *testing.T, cfg approval.Config) *session {
 	t.Helper()
+	s := launchSession(t, cfg)
+	if cfg.Socket != "" {
+		s.waitFor(t, "waiting for requests")
+	}
+	return s
+}
+
+// launchSession starts an approval session as cfg configures it and
+// returns at once. It ends when the test does.
+func launchSession(t *testing.T, cfg approval.Config) *session {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	pr, pw := io.Pipe()
 	s := &session{in: pw, out: &lockedBuffer{}, ended: make(chan struct{}), cancel: cancel}
@@ -67,9 +78,6 @@ func startSessionWith(t *testing.T, cfg approval.Config) *session {
 			t.Error("the approval session did not end")
 		}
 	})
-	if cfg.Socket != "" {
-		s.waitFor(t, "waiting for requests")
-	}
 	return s
 }
 
@@ -514,14 +522,113 @@ func TestAskSessionShowsTerminalEscapesEscaped(t *testing.T) {
 	awaitResult(t, ch)
 }
 
-// A second session cannot take a served daemon from under the first.
-func TestASecondSessionIsRefused(t *testing.T) {
+// takeOverPromptText is what a session given a served daemon asks.
+const takeOverPromptText = "another approval session serves this daemon\nTake over? [y/N] "
+
+// A second session given a served daemon asks whether to take it over:
+// "y" or "yes" takes it over; anything else, input ending or Ctrl+C
+// leaves the first serving it and ends the second.
+func TestASecondSessionAsksToTakeOver(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		typed      string
+		closeInput bool // input ends instead
+		interrupt  bool // Ctrl+C instead
+		takesOver  bool
+	}{
+		{name: "y", typed: "y", takesOver: true},
+		{name: "yes", typed: "yes", takesOver: true},
+		{name: "n", typed: "n"},
+		{name: "Enter", typed: ""},
+		{name: "input ends", closeInput: true},
+		{name: "Ctrl+C", interrupt: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h := startDaemon(t, policy(t, echoOnly))
+			first := h.startSession(t)
+			second := launchSession(t, approval.Config{Socket: h.approvalSocket})
+			second.waitFor(t, takeOverPromptText)
+			switch {
+			case tt.closeInput:
+				second.in.Close()
+			case tt.interrupt:
+				second.cancel()
+			default:
+				second.answer(t, tt.typed)
+			}
+			if tt.takesOver {
+				first.waitFor(t, "taken over by another session\n")
+				second.waitFor(t, "serving "+h.hostRoot)
+				return
+			}
+			waitEnded(t, second)
+			if second.err == nil || second.err.Error() != "another approval session serves this daemon" {
+				t.Fatalf("got %v, want the second session refused", second.err)
+			}
+			if out := first.out.String(); strings.Contains(out, "taken over") {
+				t.Fatalf("the first session was taken over: %q", out)
+			}
+		})
+	}
+}
+
+// A session given a served daemon that takes it over gets the requests
+// waiting, each with the rest of its limit.
+func TestADirSessionTakingOverPassesTheRequestsOn(t *testing.T) {
+	h := startDaemon(t, policy(t, echoOnly))
+	first := h.startSession(t)
+	ch := h.askFor(t, "10m", "touch", "marker")
+	first.waitFor(t, answerPromptText)
+	// Past a second, the rest of the limit shows under 10:00.
+	time.Sleep(1100 * time.Millisecond)
+	second := launchSession(t, approval.Config{Socket: h.approvalSocket})
+	second.waitFor(t, takeOverPromptText)
+	second.answer(t, "y")
+	if block := second.waitFor(t, answerPromptText); !strings.Contains(block, "── request 1 ── 9:5") {
+		t.Fatalf("the moved request %q, want it with the rest of its limit", block)
+	}
+	second.answer(t, "o")
+	if got := awaitResult(t, ch); got.code != 0 {
+		t.Fatalf("got %+v, want it approved by the new session", got)
+	}
+}
+
+// A daemon that ends while the session asks whether to take it over is
+// waited for, as one that ends while served: "y" finds no daemon.
+func TestADirSessionWaitsWhenTheDaemonEndsAtTheQuestion(t *testing.T) {
 	h := startDaemon(t, policy(t, echoOnly))
 	h.startSession(t)
-	err := approval.Run(context.Background(), approval.Config{Socket: h.approvalSocket}, strings.NewReader(""), io.Discard)
-	if err == nil || err.Error() != "another approval session serves this daemon" {
-		t.Fatalf("got %v, want the second session refused", err)
-	}
+	second := launchSession(t, approval.Config{Socket: h.approvalSocket})
+	second.waitFor(t, takeOverPromptText)
+	h.stop()
+	second.answer(t, "y")
+	second.waitFor(t, "the daemon ended: waiting for the next one\n")
+}
+
+// A daemon the other session left while the session asked is served
+// even on "no": there is nothing to take over.
+func TestADirSessionServesADaemonLeftWhileAsking(t *testing.T) {
+	h := startDaemon(t, policy(t, echoOnly))
+	first := h.startSession(t)
+	second := launchSession(t, approval.Config{Socket: h.approvalSocket})
+	second.waitFor(t, takeOverPromptText)
+	first.answer(t, "quit")
+	waitEnded(t, first)
+	second.answer(t, "n")
+	second.waitFor(t, "serving "+h.hostRoot)
+}
+
+// A session given its daemon that waits for the next one asks again when
+// another session serves the daemon that comes.
+func TestADirSessionAsksAgainWhenItsNextDaemonIsServed(t *testing.T) {
+	base, _ := newBase(t)
+	h := startEchoDaemon(t, slog.New(slog.DiscardHandler), base)
+	s := startSessionOn(t, h.approvalSocket)
+	h.stop()
+	s.waitFor(t, "the daemon ended: waiting for the next one\n")
+	next := startEchoDaemon(t, slog.New(slog.DiscardHandler), base)
+	startSessionOn(t, next.approvalSocket)
+	s.waitForWithin(t, takeOverPromptText, listWait)
 }
 
 // The daemon honours the client's limit on the wait.

@@ -251,6 +251,10 @@ type Serve struct {
 	TakeOver bool `json:"take_over,omitempty"`
 }
 
+// ServedRefusal is the message of the error a daemon refuses Serve with
+// when another session serves it and Serve does not take it over.
+const ServedRefusal = "another approval session serves this daemon"
+
 // Hello opens a session's connection to an approval socket.
 type Hello struct {
 	Version int `json:"version"`

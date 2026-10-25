@@ -39,7 +39,6 @@ func (t *term) choose(ctx context.Context, cfg Config) (socket string, takeOver,
 	tick := time.NewTicker(pollInterval)
 	defer tick.Stop()
 	var shown []listed
-	var confirming *listed // the served daemon whose take-over is asked
 	show := func(force bool) {
 		found := listDaemons(ctx, cfg.Root)
 		if !force && slices.EqualFunc(found, shown, sameListing) {
@@ -54,24 +53,13 @@ func (t *term) choose(ctx context.Context, cfg Config) (socket string, takeOver,
 		case <-ctx.Done():
 			return "", false, false
 		case <-tick.C:
-			if confirming == nil {
-				show(false)
-			}
+			show(false)
 		case l, more := <-t.lines:
 			if !more {
 				return "", false, false
 			}
 			text, fresh := t.take(l)
 			if !fresh {
-				continue
-			}
-			if confirming != nil {
-				d := confirming
-				confirming = nil
-				if text == "y" || text == "yes" {
-					return d.socket, true, true
-				}
-				show(true)
 				continue
 			}
 			if isQuit(text) {
@@ -85,8 +73,14 @@ func (t *term) choose(ctx context.Context, cfg Config) (socket string, takeOver,
 				fmt.Fprintf(t.out, "daemon %d speaks another approval protocol version: restart its container\n", i+1)
 				show(true)
 			case shown[i].info.Served:
-				confirming = &shown[i]
-				t.prompt("Take over? [y/N] ")
+				yes, more := t.askTakeOver(ctx, takeOverPrompt)
+				if !more {
+					return "", false, false
+				}
+				if yes {
+					return shown[i].socket, true, true
+				}
+				show(true)
 			default:
 				return shown[i].socket, false, true
 			}
@@ -229,6 +223,29 @@ func (t *term) take(l line) (string, bool) {
 
 // isQuit reports whether text asks to quit.
 func isQuit(text string) bool { return text == "q" || text == "quit" }
+
+// isYes reports whether text says yes to taking a daemon over.
+func isYes(text string) bool { return text == "y" || text == "yes" }
+
+// askTakeOver asks, with prompt, whether to take over a daemon another
+// session serves, and reports whether the human said yes, and more,
+// whether they answered at all: input or ctx ending is no answer.
+func (t *term) askTakeOver(ctx context.Context, prompt string) (yes, more bool) {
+	t.prompt(prompt)
+	for {
+		select {
+		case <-ctx.Done():
+			return false, false
+		case l, ok := <-t.lines:
+			if !ok {
+				return false, false
+			}
+			if text, fresh := t.take(l); fresh {
+				return isYes(text), true
+			}
+		}
+	}
+}
 
 // awaitDaemon waits for the next daemon on socket, its runtime directory's,
 // asking for it every pollInterval, and returns endBack once one answers,

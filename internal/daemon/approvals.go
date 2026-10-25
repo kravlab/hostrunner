@@ -252,7 +252,7 @@ func (a *approvals) serve(c *sessionConn, takeOver bool) (string, *sessionConn, 
 		return "", nil, nil
 	}
 	if old != nil && !takeOver {
-		return "another approval session serves this daemon", nil, nil
+		return protocol.ServedRefusal, nil, nil
 	}
 	a.serving = c
 	var moved []*approvalRequest

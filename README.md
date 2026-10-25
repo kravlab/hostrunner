@@ -178,7 +178,8 @@ session says it was taken over and ends, and the requests waiting pass to
 this one with the rest of their limit. `--dir` serves the daemon of that
 runtime directory, the `--dir` its `initializeCommand` gives
 `hostrunner up`; a directory without an approval socket has no
-approvals; a session given `--dir` serves that daemon alone. When its
+approvals; a session given `--dir` serves that daemon alone, asking first
+whether to take it over from another session serving it. When its
 daemon ends, or its connection to it fails, the session waits for the
 next one in the same runtime directory. At the idle `>` prompt, `daemons` leaves the daemon for the
 list (without `--dir`) and `quit` ends the session.

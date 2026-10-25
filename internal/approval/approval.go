@@ -74,6 +74,8 @@ const (
 	notePrompt          = "note for the agent (Enter for none): "
 	idlePrompt          = "> "
 	idleCommands        = "commands: standing, revoke <n>, daemons, quit"
+	takeOverPrompt      = "Take over? [y/N] "
+	goneSaid            = "\nthe daemon ended: waiting for the next one\n"
 )
 
 // maxNoteBytes bounds a refusal's note, as sent: one of any length could
@@ -102,10 +104,13 @@ var scopeTexts = map[protocol.Scope]struct{ outcome, confirm string }{
 //
 // Without cfg.Socket it lists the daemons under cfg.Root to choose from
 // (see choose), and a daemon another session serves can be taken over:
-// the session taken over says so and ends. When its daemon ends, the
-// session waits for the next one in the same runtime directory. It returns
-// an error when it cannot serve the daemon cfg.Socket names: one without
-// an approval socket has no approvals.
+// the session taken over says so and ends. With cfg.Socket, a daemon
+// another session serves is taken over once the human confirms (see
+// askTakeOver). When its daemon ends, the session waits for the next one
+// in the same runtime directory. It returns an error when it cannot serve
+// the daemon cfg.Socket names: one without an approval socket has no
+// approvals, and one another session serves is left to it unless taken
+// over.
 func Run(ctx context.Context, cfg Config, in io.Reader, out io.Writer) error {
 	done := make(chan struct{})
 	defer close(done)
@@ -123,10 +128,30 @@ func Run(ctx context.Context, cfg Config, in io.Reader, out io.Writer) error {
 		}
 		end, said, err := t.serveDaemon(ctx, socket, takeOver, cfg.Root != "")
 		takeOver = false
+		if end == endNoDaemon && !first && cfg.Root == "" {
+			// Its daemon went away between waits or at the question: the
+			// session waits for the next one, as when it ends while served.
+			end, said = endGone, goneSaid
+		}
 		switch {
 		case end == endNoDaemon && first:
 			return fmt.Errorf("%s has no approvals: no daemon takes them there: %w", strings.TrimSuffix(socket, approvalSuffix), err)
-		case end == endFailed || end == endNoDaemon:
+		case end == endServed && cfg.Root == "":
+			// A session given its daemon asks, as the list does.
+			yes, more := t.askTakeOver(ctx, protocol.ServedRefusal+"\n"+takeOverPrompt)
+			if !more {
+				return err
+			}
+			if !yes {
+				// Unless the other session left meanwhile: there is
+				// nothing to take over then.
+				if info, perr := probe(ctx, socket); perr == nil && info.Served {
+					return err
+				}
+			}
+			takeOver, first = yes, false
+			continue
+		case end == endFailed || end == endNoDaemon || end == endServed:
 			if cfg.Root == "" {
 				return err
 			}
@@ -153,6 +178,10 @@ func Run(ctx context.Context, cfg Config, in io.Reader, out io.Writer) error {
 // runtime directory it is named after (see launch.ApprovalSocket).
 const approvalSuffix = ".approval.sock"
 
+// errServed is why a session does not serve a daemon another session
+// serves, unless it takes it over.
+var errServed = errors.New(protocol.ServedRefusal)
+
 // end is how serving a daemon ended.
 type end int
 
@@ -163,7 +192,8 @@ const (
 	endGone                     // the daemon ended
 	endBack                     // a daemon answers on the socket again
 	endNoDaemon                 // no daemon answered on the socket
-	endFailed                   // the daemon would not be served
+	endFailed                   // the daemon would not be served, for another reason
+	endServed                   // another session serves the daemon, not taken over
 )
 
 // serveDaemon serves the daemon on socket, taking it over from the session
@@ -174,6 +204,8 @@ const (
 // alike. When the daemon has gone (endGone), it also returns what the
 // session said of that, the prompt of the wait for the next one (see
 // awaitDaemon).
+// Without takeOver, a daemon another session serves is not served
+// (endServed, errServed).
 func (t *term) serveDaemon(ctx context.Context, socket string, takeOver, canList bool) (end, string, error) {
 	conn, err := transport.Unix{Path: socket}.Dial(ctx)
 	if err != nil {
@@ -196,6 +228,9 @@ func (t *term) serveDaemon(ctx context.Context, socket string, takeOver, canList
 		return endFailed, "", fmt.Errorf("the daemon speaks approval protocol version %d, this session %d: restart its container", info.Version, protocol.ApprovalVersion)
 	}
 	if err := serve(conn, takeOver); err != nil {
+		if err.Error() == protocol.ServedRefusal {
+			return endServed, "", errServed
+		}
 		return endFailed, "", err
 	}
 	fmt.Fprintf(t.out, "serving %s (container %s)\nwaiting for requests · %s\n", display(info.Workspace), display(info.ContainerWorkspace), idleCommands)
@@ -392,7 +427,7 @@ func (s *session) loop(ctx context.Context, frames <-chan protocol.Frame) (end, 
 				return endQuit, nil
 			}
 			if !ok {
-				s.said = "\nthe daemon ended: waiting for the next one\n"
+				s.said = goneSaid
 				return endGone, nil
 			}
 			if f.Type == protocol.FrameTakenOver {

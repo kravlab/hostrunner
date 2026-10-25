@@ -358,7 +358,14 @@ revoked 1
   is marked and cannot be chosen; an empty list waits; dead sockets are
   skipped and only daemons remove them. `--dir X` goes straight to
   `X.approval.sock`; a daemon without one has no approvals, and the
-  session says so and ends; it serves that daemon alone, with no list.
+  session says so and ends; it serves that daemon alone, with no list. A
+  daemon another session serves asks `another approval session serves
+  this daemon` and `Take over? [y/N]`, as the list does: `y` or `yes`
+  takes it over; anything else, input ending or Ctrl+C ends the session
+  with that refusal, unless the other session has left meanwhile, when
+  the daemon is served. A daemon gone by then is waited for, as one that
+  ends while served; one served by another session when it comes asks
+  again.
   Without `--dir`, `$XDG_RUNTIME_DIR` must be set.
 - Choosing a served daemon asks `Take over? [y/N]`; no returns to the
   list. A session that is taken over prints `taken over by another
