@@ -70,6 +70,7 @@ const (
 	guardedAnswerPrompt = "answer [r]efuse [o]nce [l]ifetime [?]more ? " // no rule for a guarded refusal
 	addPrompt           = "[w]rite [e]dit in $EDITOR [c]ancel ? "
 	editAgainPrompt     = "[e]dit again [c]ancel ? "
+	rereadPrompt        = "the rules file changed since the daemon loaded it; reread it, making that change live now? [r]eread [c]ancel ? "
 	notePrompt          = "note for the agent (Enter for none): "
 	idlePrompt          = "> "
 	idleCommands        = "commands: standing, revoke <n>, daemons, quit"
@@ -347,6 +348,13 @@ type session struct {
 	// cancels it; rereading is set while the daemon rereads the rules.
 	adding    *addition
 	rereading bool
+	// rereadAsked is the request a rule is to be proposed for while the
+	// session asks whether the daemon rereads a rules file changed by hand,
+	// found with rereadDigest (see proposeRule); rereadFor is that request
+	// once the daemon rereads it. Each is 0 while none.
+	rereadAsked  uint64
+	rereadDigest string
+	rereadFor    uint64
 }
 
 // waiting is an approval request and when its time runs out. ended is why
@@ -515,10 +523,14 @@ func (s *session) typed(text string) {
 		s.command(text)
 		return
 	}
-	if s.sent != "" || s.rereading {
+	if s.sent != "" || s.rereading || s.rereadFor != 0 {
 		return
 	}
 	r := s.queue[0]
+	if s.rereadAsked != 0 {
+		s.rereadTyped(text)
+		return
+	}
 	if s.adding != nil {
 		s.addTyped(r, text)
 		return
@@ -655,6 +667,7 @@ func (s *session) withdrawn(w protocol.Withdrawn) {
 	default:
 		fmt.Fprintf(s.out, "\nrequest %d %s\n", w.ID, w.Reason)
 		s.note, s.confirm = false, ""
+		s.rereadAsked, s.rereadDigest = 0, ""
 		if !s.rereading {
 			s.dropAddition()
 		}

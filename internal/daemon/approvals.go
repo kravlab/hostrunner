@@ -523,13 +523,19 @@ func (s *Server) handleSession(ctx context.Context, conn net.Conn) {
 }
 
 // reread rereads the rules file for session c, which wrote rr.Rule into
-// it, and logs both; a failed reread keeps the old rules and is logged as
-// a warning.
+// it, or, with no rule, found it changed by hand before proposing one,
+// and logs both; a failed reread keeps the old rules and is logged as a
+// warning.
 func (s *Server) reread(c *sessionConn, rr protocol.Reread) protocol.RereadResult {
 	if why := s.approvals.heard(c); why != "" {
 		return protocol.RereadResult{Error: why}
 	}
-	s.log.Info("rule added", "file", s.approvals.rulesFile, "rule", rr.Rule, "edited", rr.Edited, "pid", c.pid)
+	if rr.Rule != "" {
+		s.log.Info("rule added", "file", s.approvals.rulesFile, "rule", rr.Rule, "edited", rr.Edited, "pid", c.pid)
+	} else {
+		// A file changed by hand, reread before a rule is proposed.
+		s.log.Info("hand-edited rules reread", "file", s.approvals.rulesFile, "pid", c.pid)
+	}
 	digest, err := s.rereadRules(rr.Digest)
 	if err != nil {
 		s.log.Warn("rules reread failed: the old rules stay", "file", s.approvals.rulesFile, "error", err)

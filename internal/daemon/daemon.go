@@ -128,7 +128,7 @@ func (s *Server) rereadRules(want string) (string, error) {
 		return "", err
 	}
 	if digest != want {
-		return "", errors.New("the rules file changed since the session wrote it")
+		return "", errors.New("the rules file changed meanwhile")
 	}
 	s.mu.Lock()
 	s.policy, s.digest = p, digest

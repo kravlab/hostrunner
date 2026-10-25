@@ -333,12 +333,14 @@ type Revoked struct {
 
 // Reread asks the daemon to reread its rules file, into which the session
 // has written Rule, the command of a rule it added or widened (Edited: by
-// the human, in an editor), leaving the file with Digest. The daemon keeps
-// its rules when the file it rereads has another digest: an edit nobody
-// reviewed waits for the next start. ID is the request the rule was added
-// for.
+// the human, in an editor), leaving the file with Digest; ID is the
+// request the rule was added for. Without Rule, the file was changed by
+// hand, and the human agreed to have it reread before a rule is proposed;
+// Digest is that of the file the session read. The daemon keeps its rules
+// when the file it rereads has another digest: an edit nobody reviewed
+// waits for the next start.
 type Reread struct {
-	Rule   string `json:"rule"`
+	Rule   string `json:"rule,omitempty"`
 	Edited bool   `json:"edited,omitempty"`
 	Digest string `json:"digest"`
 	ID     uint64 `json:"id,omitempty"`

@@ -214,9 +214,16 @@ from `protocol.Version` of the container's socket.
 - The session shows the unified diff, then `[w]rite [e]dit in $EDITOR
   [c]ancel`.
 - It writes the file the daemon loaded, computed against the file on disk,
-  which must be the one the daemon serves (`DaemonInfo.rules_digest`): a
-  file edited by hand since is refused, so its change waits for the next
-  start rather than going live unreviewed with the rule. A rule holding
+  which must be the one the daemon serves (`DaemonInfo.rules_digest`).
+  For a file edited by hand since, the session asks first (`the rules file
+  changed since the daemon loaded it; reread it, making that change live
+  now? [r]eread [c]ancel`): `r` has the daemon reread it, so the hand
+  edit goes live and the human sees the diff against the rules the daemon
+  then serves; `c` keeps the hand edit out until the next container start
+  and gives no rule (`cannot add a rule: … takes effect at the next
+  container start`); one the daemon cannot reread gives no rule either
+  (`cannot add a rule: … cannot reread it: …`), the old rules staying. A
+  rule holding
   YAML anchors or aliases is not widened, as its lists may be other
   rules' too. A missing file is created with `rules:` and the rule; without
   its directory no rule is proposed. Only the touched
@@ -233,8 +240,8 @@ from `protocol.Version` of the container's socket.
   next arm does not step aside and standing approvals stay; running
   commands are untouched; the approved request runs under the new rule. A
   failed reread keeps the old rules and runs the request once, and the
-  session says so. A manual edit still takes effect at the next container
-  start.
+  session says so. A manual edit takes effect at the next container start,
+  or before, when the human agrees to its reread to add a rule.
 - A flag given its value in its token (`--file=x`) is declared in a new
   rule's `flags.values`, allowing that value; given apart (`--file x`) it
   is a flag and an argument, as the rules read it. An argument holding `*`
@@ -250,7 +257,9 @@ from `protocol.Version` of the container's socket.
   reported and `[e]dit again [c]ancel` asked. The session reads nothing
   from the terminal while the editor runs.
 - Session frames: `Reread{rule, edited, digest, id}`, `digest` that of
-  the file written, `id` the request the rule is for, answered by
+  the file written, `id` the request the rule is for (no `rule`: a file
+  changed by hand, reread before a proposal, `digest` that of the file
+  the session read), answered by
   `RereadResult{digest, error, runs_once}`; the daemon keeps its rules
   when the file it rereads has another digest, and `runs_once` says why
   its checks still refuse request `id` under the new rules. The answer
@@ -394,7 +403,8 @@ revoked 1
   `refused`, `note`); `approval not answered` (`approval_id`, `reason`:
   `withdrawn`, `expired`, `no session`, `session left`, `daemon
   stopping`); `standing approval granted` and `revoked`; `rule added`
-  (file, rule) and `rules reread` (digest); `approval session serving`,
+  (file, rule), `hand-edited rules reread` (file) and
+  `rules reread` (digest); `approval session serving`,
   `taken over`, `left` (pid).
 - Runs an approval let through: `command finished` and `command
   cancelled` gain `approved` (`once`, `lifetime`, `rule` for the answer
@@ -422,6 +432,10 @@ revoked 1
   was taken over.
 - The daemon steps aside or exits while requests wait: they get 126 before
   the connection closes; standing approvals are gone.
+- The rules file changed by hand before "add a rule": the session asks
+  whether the daemon rereads it; `c` keeps it out, `r` makes it live (or,
+  when it does not load, keeps the old rules), and a request that ends
+  meanwhile drops the question.
 - The rules file changes between the proposal and the write: nothing is
   written, and the session asks for the answer again.
 - The rules file or its directory swapped for a symlink between the
@@ -477,4 +491,5 @@ notification actions as the answer channel; backward compatibility with
 other approval protocol versions; a switch to turn approvals on or off in
 the rules file, a `hostrunner up` flag or the environment, and any opt-out
 for a workspace; persisting standing approvals across daemons; rereading
-manually edited rules without a container start.
+manually edited rules without a container start, but to add a rule with
+the human's consent.

@@ -31,7 +31,9 @@ while a session serves the daemon.
 - **Waiting for the next container start after "add a rule"**: every
   repeat would ask again until a restart, which also drops standing
   approvals. Rejected: the daemon rereads the rules the session wrote;
-  a manual edit still waits for the next start.
+  a manual edit still waits for the next start, unless the human, adding
+  a rule, agrees to have it reread first, so the rule is proposed against
+  the rules the daemon serves.
 - **Desktop dialogs or notification actions as the answer channel**: they
   need a display or a session bus the detached daemon may lack, and do not
   work on headless or SSH hosts. Rejected for a terminal session; a

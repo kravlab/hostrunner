@@ -231,10 +231,12 @@ request runs under the new rule; later runs need no approval, and the
 next container start keeps the daemon. If the reread fails, the old
 rules stay and the request runs once. It also runs once, and the session
 and the agent are told so, when a rule edited by hand still fails a
-later check (a fixed directory missing). A rule is added only while the file
-on disk is the one the daemon serves, and written only when it has not
-changed since the proposal: an edit of the file by hand never goes live
-with a rule, but at the next container start. A rule sharing YAML
+later check (a fixed directory missing). For a rules file edited by hand
+since the daemon loaded it, the session asks first whether the daemon
+rereads it, making that edit live now (`[r]eread [c]ancel`): with `r` the
+diff is against the rules the daemon then serves, with `c` the edit waits
+for the next container start and no rule is added. A rule is written only
+when the file has not changed since the proposal. A rule sharing YAML
 anchors or aliases is not widened. A missing rules file is created, but
 not its directory.
 
@@ -346,7 +348,9 @@ rules:
   fail, and with it `devcontainer up`.
 - Changes apply on the next container start (reopen, restart or rebuild):
   `hostrunner up` notices that the file differs from what the running
-  daemon loaded and replaces the daemon. The file lives in `.devcontainer/`,
+  daemon loaded and replaces the daemon; a rule added from the approval
+  session, and a hand edit the human agrees to have reread then, apply at
+  once. The file lives in `.devcontainer/`,
   which is read-only inside the container, so the agent can read but not
   change its rules.
 - Matching is literal on argv: `/usr/bin/git push` and `git -C dir push` do

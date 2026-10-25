@@ -411,9 +411,8 @@ func TestAddRuleCancelledAfterAnInvalidEdit(t *testing.T) {
 }
 
 // When no edit lets the request through, the session says why and asks
-// for the answer again: a rules file changed since the daemon loaded it
-// (its change waits for the next start), a rule sharing YAML anchors, an
-// argument a glob list cannot match exactly.
+// for the answer again: a rule sharing YAML anchors, an argument a glob
+// list cannot match exactly.
 func TestAddRuleSaysWhyItCannot(t *testing.T) {
 	const loaded = "rules:\n  - command: touch\n    flags:\n      allow: [-a]\n    positional:\n      allow: [marker]\n"
 	tests := []struct {
@@ -423,7 +422,6 @@ func TestAddRuleSaysWhyItCannot(t *testing.T) {
 		argv    []string
 		why     string
 	}{
-		{"changed since loaded", loaded, loaded + "  - command: date\n    args: any\n", []string{"touch", "-m", "marker"}, "the rules file changed since the daemon loaded it"},
 		{"anchors", "rules:\n  - command: touch\n    flags:\n      allow: &common [-a]\n    positional:\n      allow: [marker]\n  - command: date\n    flags:\n      allow: *common\n    positional:\n      allow: []\n", "", []string{"touch", "-m", "marker"}, `rule "touch" uses YAML anchors or aliases`},
 		{"a glob argument", loaded, "", []string{"touch", "-a", "m*"}, `"m*" holds a glob character`},
 	}
@@ -444,6 +442,112 @@ func TestAddRuleSaysWhyItCannot(t *testing.T) {
 			s.answer(t, "o")
 			awaitResult(t, ch)
 		})
+	}
+}
+
+// rereadPromptText is what the session asks before the daemon rereads a
+// rules file changed by hand since it loaded it.
+const rereadPromptText = "the rules file changed since the daemon loaded it; reread it, making that change live now? [r]eread [c]ancel ? "
+
+// handEditedRules starts a daemon serving loaded rules, then changes the
+// rules file by hand to changed, and asks for argv with a session
+// serving the daemon; it returns once the session asks to reread the file
+// for "add a rule".
+func handEditedRules(t *testing.T, log *slog.Logger, loaded, changed string, argv ...string) (harness, *session, <-chan result) {
+	t.Helper()
+	h := startRulesDaemon(t, log, loaded, false)
+	if err := os.WriteFile(h.rulesFile, []byte(changed), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := h.startSession(t)
+	ch := h.ask(t, argv...)
+	s.waitFor(t, answerPromptText)
+	s.answer(t, "a")
+	s.waitFor(t, rereadPromptText)
+	return h, s, ch
+}
+
+const (
+	loadedTouch = "rules:\n  - command: touch\n    flags:\n      allow: [-a]\n    positional:\n      allow: [marker]\n"
+	handDate    = loadedTouch + "  - command: date\n    args: any\n"
+)
+
+// A rules file changed by hand since the daemon loaded it is reread, once
+// the human agrees, before a rule is proposed: the proposal is computed
+// against the rules the daemon then serves, and the hand edit goes live.
+func TestAddRuleRereadsAFileChangedSinceLoaded(t *testing.T) {
+	var log lockedBuffer
+	h, s, ch := handEditedRules(t, slog.New(slog.NewTextHandler(&log, nil)), loadedTouch, handDate, "touch", "-m", "marker")
+	s.answer(t, "r")
+	if block := s.waitFor(t, addPromptText); !strings.Contains(block, "+      allow: [-a, -m]\n") {
+		t.Errorf("the proposal %q does not widen the rule", block)
+	}
+	waitForLog(t, &log, `msg="hand-edited rules reread"`)
+	waitForLog(t, &log, `msg="rules reread"`)
+	s.answer(t, "w")
+	s.waitFor(t, "rule added; the daemon reloaded the rules · request 1 runs under it\n")
+	if got := awaitResult(t, ch); got.code != 0 {
+		t.Fatalf("got %+v, want it to run under the rule", got)
+	}
+	if file := readFile(t, h.rulesFile); !strings.Contains(file, "  - command: date\n") || !strings.Contains(file, "allow: [-a, -m]") {
+		t.Fatalf("the rules file lacks the hand edit or the rule:\n%s", file)
+	}
+	if got := h.run(t, containerRoot, "", "date"); got.code != 0 {
+		t.Fatalf("a command of the hand edit: got %+v, want it to run", got)
+	}
+}
+
+// Cancelling the reread of a rules file changed by hand keeps the hand
+// edit out until the next start: no rule is proposed, and the session
+// asks for the answer again.
+func TestAddRuleRereadCancelledKeepsTheHandEditOut(t *testing.T) {
+	h, s, ch := handEditedRules(t, slog.New(slog.DiscardHandler), loadedTouch, handDate, "touch", "-m", "marker")
+	s.answer(t, "c")
+	s.waitFor(t, "cannot add a rule: the rules file changed since the daemon loaded it; the change takes effect at the next container start\n")
+	s.waitFor(t, answerPromptText)
+	s.answer(t, "o")
+	if got := awaitResult(t, ch); got.code != 0 {
+		t.Fatalf("got %+v, want it approved once", got)
+	}
+	if got := h.run(t, containerRoot, "", "date"); got.code != protocol.ExitRejected {
+		t.Fatalf("a command of the hand edit: got %+v, want it refused", got)
+	}
+}
+
+// A rules file changed by hand that the daemon cannot reread gets no
+// rule: the session says why, asks for the answer again, and the old
+// rules stay.
+func TestAddRuleWithAChangedFileThatDoesNotLoad(t *testing.T) {
+	h, s, ch := handEditedRules(t, slog.New(slog.DiscardHandler), loadedTouch, "rules: [", "touch", "-m", "marker")
+	s.answer(t, "r")
+	s.waitFor(t, "cannot add a rule: the rules file changed since the daemon loaded it, and the daemon cannot reread it: ")
+	s.waitFor(t, answerPromptText)
+	s.answer(t, "o")
+	if got := awaitResult(t, ch); got.code != 0 {
+		t.Fatalf("got %+v, want it approved once", got)
+	}
+	if got := h.run(t, containerRoot, "", "touch", "-a", "marker"); got.code != 0 {
+		t.Fatalf("a command of the old rules: got %+v, want it to run", got)
+	}
+}
+
+// A request that ends while the session asks to reread the rules file is
+// dropped with the question: the file is not reread.
+func TestAddRuleRereadQuestionEndsWithItsRequest(t *testing.T) {
+	h := startRulesDaemon(t, slog.New(slog.DiscardHandler), loadedTouch, false)
+	if err := os.WriteFile(h.rulesFile, []byte(handDate), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := h.startSession(t)
+	ch := h.askFor(t, "2s", "touch", "-m", "marker")
+	s.waitFor(t, answerPromptText)
+	s.answer(t, "a")
+	s.waitFor(t, rereadPromptText)
+	s.waitFor(t, "request 1 expired\n")
+	awaitResult(t, ch)
+	s.answer(t, "r")
+	if got := h.run(t, containerRoot, "", "date"); got.code != protocol.ExitRejected {
+		t.Fatalf("a command of the hand edit: got %+v, want it refused", got)
 	}
 }
 
@@ -578,7 +682,7 @@ func TestAddRuleWritesNothingThroughADirectorySwappedForALink(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.answer(t, "w")
-	s.waitFor(t, "rule added, but the daemon kept its old rules: the rules file changed since the session wrote it · request 1 runs once\n")
+	s.waitFor(t, "rule added, but the daemon kept its old rules: the rules file changed meanwhile · request 1 runs once\n")
 	if got := awaitResult(t, ch); !strings.HasSuffix(got.stderr, "hostrun: approved on the host: this request only\n") || got.code != 0 {
 		t.Fatalf("got %+v, want it approved once", got)
 	}
