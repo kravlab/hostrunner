@@ -7,6 +7,8 @@ import (
 	"io/fs"
 	"net"
 	"os"
+	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -33,18 +35,69 @@ var _ Transport = Unix{}
 // daemon still answers on Path; any other kind of file at Path is left
 // untouched and reported as an error.
 //
-// The socket is created under umask 0177 so it is never reachable with
-// looser permissions, not even briefly. The umask is process-wide, so Listen
-// must run before the process starts goroutines that create files.
+// The socket is never reachable with permissions looser than the owner's,
+// not even briefly: it is bound in a new directory only the owner can
+// enter, beside Path, made owner-only there and then linked to Path,
+// already listening. The link never replaces what is at Path: of two
+// Listens at once, the second gets ErrAlreadyListening. The process's
+// umask, which is process-wide, is left alone, so Listen may run while
+// other goroutines create files. Closing the listener removes the socket.
 func (u Unix) Listen() (net.Listener, error) {
 	if err := removeStaleSocket(u.Path); err != nil {
 		return nil, err
 	}
-	old := syscall.Umask(0o177)
-	l, err := net.Listen("unix", u.Path)
-	syscall.Umask(old)
-	return l, err
+	dir, err := os.MkdirTemp(filepath.Dir(u.Path), ".hr")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(dir)
+	tmp := filepath.Join(dir, "s")
+	l, err := net.ListenUnix("unix", &net.UnixAddr{Name: tmp, Net: "unix"})
+	if err != nil {
+		return nil, err
+	}
+	// The socket leaves tmp, which goes with dir: Close removes it at Path.
+	l.SetUnlinkOnClose(false)
+	if err = os.Chmod(tmp, 0o600); err == nil {
+		err = os.Link(tmp, u.Path)
+	}
+	if errors.Is(err, fs.ErrExist) {
+		if info, lerr := os.Lstat(u.Path); lerr == nil && info.Mode().Type() == fs.ModeSocket {
+			err = fmt.Errorf("%w: %s", ErrAlreadyListening, u.Path)
+		}
+	}
+	if err != nil {
+		l.Close()
+		return nil, err
+	}
+	return &unixListener{UnixListener: l, path: u.Path}, nil
 }
+
+// unixListener is a listener on the Unix socket at path, which Close
+// removes, once.
+type unixListener struct {
+	*net.UnixListener
+	path   string
+	remove sync.Once
+}
+
+// Close removes the socket and stops listening, in that order, as
+// net.UnixListener does: once Accept returns, the socket is gone.
+func (l *unixListener) Close() error {
+	var err error
+	l.remove.Do(func() {
+		if rerr := os.Remove(l.path); !errors.Is(rerr, fs.ErrNotExist) {
+			err = rerr
+		}
+	})
+	if cerr := l.UnixListener.Close(); err == nil {
+		err = cerr
+	}
+	return err
+}
+
+// Addr returns the socket's address, at its path.
+func (l *unixListener) Addr() net.Addr { return &net.UnixAddr{Name: l.path, Net: "unix"} }
 
 // Dial connects to the socket.
 func (u Unix) Dial(ctx context.Context) (net.Conn, error) {

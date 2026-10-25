@@ -189,25 +189,41 @@ func watchConfig(t *testing.T) serveConfig {
 }
 
 // startServe runs serve in the background and returns its result channel
-// once the socket accepts connections.
+// once its socket and its approval socket accept connections. A serve
+// still running when the test ends is stopped then.
 func startServe(t *testing.T, cfg serveConfig, runtimes ...*watchtest.Runtime) <-chan error {
 	t.Helper()
 	rts := make([]watch.Runtime, len(runtimes))
 	for i, rt := range runtimes {
 		rts[i] = rt
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- serve(context.Background(), cfg, slog.New(slog.DiscardHandler), rts) }()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		if c, err := net.Dial("unix", cfg.socket); err == nil {
+	exited := make(chan struct{})
+	go func() {
+		done <- serve(ctx, cfg, slog.New(slog.DiscardHandler), rts)
+		close(exited)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-exited
+	})
+	waitListening(t, cfg.socket)
+	waitListening(t, launch.ApprovalSocket(filepath.Dir(cfg.socket)))
+	return done
+}
+
+// waitListening waits until the Unix socket at path accepts connections.
+func waitListening(t *testing.T, path string) {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		if c, err := net.Dial("unix", path); err == nil {
 			c.Close()
-			return done
+			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("serve did not listen")
+			t.Fatalf("nothing listens on %s", path)
 		}
-		time.Sleep(5 * time.Millisecond)
 	}
 }
 
@@ -303,22 +319,10 @@ func TestServeEnforcesConfig(t *testing.T) {
 	if err := os.WriteFile(cfg.config, []byte("rules:\n  - command: true\n    args: none\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- serve(ctx, cfg, slog.New(slog.DiscardHandler), nil) }()
-	defer func() { cancel(); <-done }()
+	startServe(t, cfg)
 	tr := transport.Unix{Path: cfg.socket}
-	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(5 * time.Millisecond) {
-		if c, err := tr.Dial(ctx); err == nil {
-			c.Close()
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("serve did not listen")
-		}
-	}
 	run := func(argv ...string) int {
-		return client.Run(ctx, tr, argv, cfg.containerWorkspace, strings.NewReader(""), io.Discard, io.Discard)
+		return client.Run(context.Background(), tr, argv, cfg.containerWorkspace, strings.NewReader(""), io.Discard, io.Discard)
 	}
 	if code := run("true"); code != 0 {
 		t.Errorf("allowed command exited %d", code)
@@ -507,15 +511,12 @@ func TestServeListensOnTheApprovalSocket(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- serve(ctx, cfg, slog.New(slog.DiscardHandler), nil) }()
-	var c net.Conn
-	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(5 * time.Millisecond) {
-		var err error
-		if c, err = net.Dial("unix", approvalSocket); err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("serve did not listen on the approval socket")
-		}
+	// Stopped here as the test ends, should it fail before it stops serve.
+	t.Cleanup(cancel)
+	waitListening(t, approvalSocket)
+	c, err := net.Dial("unix", approvalSocket)
+	if err != nil {
+		t.Fatal(err)
 	}
 	defer c.Close()
 	info, err := os.Stat(approvalSocket)
