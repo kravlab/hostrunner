@@ -9,6 +9,7 @@
 //	hostrunner test [--config <path>] [--] <command> [args...]
 //	hostrunner approve [--dir <runtime-dir>]
 //	hostrunner update [--check]
+//	hostrunner instructions [--append [<path>]]
 //	hostrunner version
 //
 // `up` is meant for devcontainer's initializeCommand: it installs the client
@@ -22,7 +23,9 @@
 // buildVersion). `approve` runs an approval session in a host terminal: it
 // serves the daemon of the runtime directory, or one chosen from the list
 // of daemons, showing each approval request and sending the human's
-// answer (see internal/approval).
+// answer (see internal/approval). `instructions` prints the instructions
+// for agents working with hostrun, or with --append adds them to a file,
+// AGENTS.md by default (see internal/instructions).
 package main
 
 import (
@@ -40,8 +43,11 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/kravlab/hostrunner/internal/approval"
 	"github.com/kravlab/hostrunner/internal/daemon"
+	"github.com/kravlab/hostrunner/internal/instructions"
 	"github.com/kravlab/hostrunner/internal/launch"
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
@@ -52,12 +58,13 @@ import (
 )
 
 const (
-	usage        = "usage: hostrunner up|serve|test|approve|update|version [flags]; see `hostrunner <command> -h`"
-	upUsage      = "usage: hostrunner up --dir <runtime-dir> --workspace <host-path> --container-workspace <path>"
-	serveUsage   = "usage: hostrunner serve --socket <path> --workspace <host-path> --container-workspace <path> [--config <path>] [--watch]"
-	approveUsage = "usage: hostrunner approve [--dir <runtime-dir>]"
-	updateUsage  = "usage: hostrunner update [--check]"
-	versionUsage = "usage: hostrunner version"
+	usage             = "usage: hostrunner up|serve|test|approve|update|instructions|version [flags]; see `hostrunner <command> -h`"
+	upUsage           = "usage: hostrunner up --dir <runtime-dir> --workspace <host-path> --container-workspace <path>"
+	serveUsage        = "usage: hostrunner serve --socket <path> --workspace <host-path> --container-workspace <path> [--config <path>] [--watch]"
+	approveUsage      = "usage: hostrunner approve [--dir <runtime-dir>]"
+	updateUsage       = "usage: hostrunner update [--check]"
+	instructionsUsage = "usage: hostrunner instructions [--append [<path>]]"
+	versionUsage      = "usage: hostrunner version"
 )
 
 // Defaults for following the container; see internal/watch.
@@ -99,10 +106,11 @@ func exitCode(err error) int {
 	return 1
 }
 
-// run dispatches the subcommand in args; stdout receives `version`'s and
-// `update`'s output and the approval session, which reads the human's
-// answers from stdin; stderr flag help, the daemon's log and the Rules
-// test's verdict.
+// run dispatches the subcommand in args; stdout receives `version`'s,
+// `update`'s and `instructions`' output and the approval session, which
+// reads the human's answers from stdin; stderr flag help, the daemon's
+// log, the Rules test's verdict and the questions of `instructions
+// --append`, answered on stdin.
 // The caller prints a returned error; see exitCode for the exit code.
 func run(args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
@@ -151,6 +159,12 @@ func run(args []string, stdout, stderr io.Writer) error {
 			return err
 		}
 		return runUpdate(ctx, check, buildVersion(debug.ReadBuildInfo()), stdout)
+	case "instructions":
+		cfg, err := parseInstructions(args[1:], stderr)
+		if err != nil {
+			return err
+		}
+		return runInstructions(cfg, os.Stdin, isTerminal(os.Stdin), stdout, stderr)
 	case "version":
 		if err := parseVersion(args[1:], stderr); err != nil {
 			return err
@@ -358,6 +372,94 @@ func updateMessage(res update.Result) string {
 	default:
 		return fmt.Sprintf("hostrunner: already up to date (%s)", res.Current)
 	}
+}
+
+// defaultInstructionsFile is the file `instructions --append` writes when
+// given no path, relative to the current directory.
+const defaultInstructionsFile = "AGENTS.md"
+
+// instructionsConfig holds the settings of `hostrunner instructions`.
+type instructionsConfig struct {
+	append bool   // add the block to path instead of printing it
+	path   string // with append: the file to add it to
+}
+
+// parseInstructions parses the arguments of `hostrunner instructions`:
+// --append and, after it, at most one path, defaultInstructionsFile when
+// none is given. A path without --append is an error.
+func parseInstructions(args []string, output io.Writer) (instructionsConfig, error) {
+	var cfg instructionsConfig
+	fs := flag.NewFlagSet("instructions", flag.ContinueOnError)
+	fs.SetOutput(output)
+	fs.BoolVar(&cfg.append, "append", false, "add the instructions to the file named after the flags (default "+defaultInstructionsFile+") instead of printing them")
+	if err := fs.Parse(args); err != nil {
+		return cfg, err
+	}
+	paths := 0
+	if cfg.append {
+		paths = 1
+	}
+	if fs.NArg() > paths {
+		return cfg, fmt.Errorf("unexpected argument %q; %s", fs.Arg(paths), instructionsUsage)
+	}
+	if cfg.append {
+		cfg.path = defaultInstructionsFile
+		if fs.NArg() == 1 {
+			cfg.path = fs.Arg(0)
+		}
+		if cfg.path == "" {
+			return cfg, errors.New("empty path; " + instructionsUsage)
+		}
+	}
+	return cfg, nil
+}
+
+// runInstructions prints the instructions block to stdout or, with
+// cfg.append, adds it to cfg.path, asking on stderr and reading the
+// answers from stdin when terminal says stdin is one, then prints the
+// outcome to stdout.
+func runInstructions(cfg instructionsConfig, stdin io.Reader, terminal bool, stdout, stderr io.Writer) error {
+	if !cfg.append {
+		_, err := io.WriteString(stdout, instructions.Block())
+		return err
+	}
+	outcome, err := instructions.AppendFile(cfg.path, instructions.Prompt{In: stdin, Out: stderr, Terminal: terminal})
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintln(stdout, instructionsMessage(outcome, cfg.path))
+	return err
+}
+
+// instructionsMessage is the line `instructions --append` prints after
+// writing path with outcome.
+func instructionsMessage(outcome instructions.Outcome, path string) string {
+	switch outcome {
+	case instructions.Created:
+		return "hostrunner: created " + path
+	case instructions.Appended:
+		return "hostrunner: appended instructions to " + path
+	case instructions.Replaced:
+		return "hostrunner: replaced instructions in " + path
+	default:
+		return "hostrunner: " + path + " left unchanged"
+	}
+}
+
+// isTerminal reports whether f is a terminal, so a human can answer
+// questions read from it. The descriptor is reached through SyscallConn,
+// not Fd, which would put a pipe into blocking mode.
+func isTerminal(f *os.File) bool {
+	raw, err := f.SyscallConn()
+	if err != nil {
+		return false
+	}
+	terminal := false
+	_ = raw.Control(func(fd uintptr) {
+		_, err := unix.IoctlGetTermios(int(fd), unix.TCGETS)
+		terminal = err == nil
+	})
+	return terminal
 }
 
 // serve runs the daemon until ctx is cancelled or, with watch, until the
