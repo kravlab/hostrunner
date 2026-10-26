@@ -678,7 +678,9 @@ func pathMessage(name string, err error) string {
 // socket (FrameRequest, FrameDryRun, FrameAsk or FrameArm) and checks its
 // protocol version before anything else, so a frame shaped by a newer
 // protocol is reported as a version mismatch rather than a decoding error.
-// Every other frame, the approval socket's included, is refused.
+// A request whose JSON would decode with U+FFFD in place of what its
+// client wrote is refused next (errNotUTF8). Every other frame, the
+// approval socket's included, is refused.
 func readOpening(conn net.Conn) (protocol.Frame, error) {
 	f, err := protocol.ReadFrame(conn)
 	if err != nil {
@@ -698,8 +700,15 @@ func readOpening(conn net.Conn) (protocol.Frame, error) {
 	if header.Version != protocol.Version {
 		return f, fmt.Errorf("protocol version mismatch: client %d, daemon %d", header.Version, protocol.Version)
 	}
+	if f.Type != protocol.FrameArm && !protocol.DecodesLosslessly(f.Payload) {
+		return f, errNotUTF8
+	}
 	return f, nil
 }
+
+// errNotUTF8 refuses a request that would decode to another argv or
+// current directory than its client wrote (see protocol.DecodesLosslessly).
+var errNotUTF8 = errors.New("the request is not valid UTF-8: arguments and the current directory must be valid UTF-8")
 
 // decodeRequest decodes and validates a FrameRequest or FrameDryRun.
 func decodeRequest(f protocol.Frame) (protocol.Request, error) {

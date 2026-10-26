@@ -46,7 +46,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
+	"unicode/utf16"
+	"unicode/utf8"
 )
 
 // Version is the protocol version the client sends in Request. The daemon
@@ -464,6 +467,54 @@ func WriteJSON(w io.Writer, t FrameType, v any) error {
 		return fmt.Errorf("protocol: encode %T: %w", v, err)
 	}
 	return WriteFrame(w, Frame{Type: t, Payload: payload})
+}
+
+// DecodesLosslessly reports whether the JSON payload decodes without loss:
+// encoding/json replaces bytes that are not valid UTF-8, and \u escapes
+// of UTF-16 surrogates that are not a high-low pair, with U+FFFD rather
+// than failing, so a request holding either would decode to other
+// strings than its sender wrote.
+func DecodesLosslessly(payload []byte) bool {
+	if !utf8.Valid(payload) {
+		return false
+	}
+	// A backslash appears in JSON only inside a string, where it starts an
+	// escape; every escape but \uXXXX is two bytes long.
+	for i := 0; i < len(payload); i++ {
+		if payload[i] != '\\' {
+			continue
+		}
+		r, ok := uEscape(payload[i:])
+		if !ok {
+			i++ // the escaped character, '\\' included
+			continue
+		}
+		i += 5 // the rest of the escape
+		switch {
+		case utf16.IsSurrogate(r) && r < 0xdc00: // high: a low one must follow
+			low, ok := uEscape(payload[i+1:])
+			if !ok || utf16.DecodeRune(r, low) == utf8.RuneError {
+				return false
+			}
+			i += 6
+		case utf16.IsSurrogate(r): // low, with no high one before it
+			return false
+		}
+	}
+	return true
+}
+
+// uEscape returns the code unit of the \uXXXX escape b starts with, if it
+// starts with one.
+func uEscape(b []byte) (rune, bool) {
+	if len(b) < 6 || b[0] != '\\' || b[1] != 'u' {
+		return 0, false
+	}
+	n, err := strconv.ParseUint(string(b[2:6]), 16, 16)
+	if err != nil {
+		return 0, false
+	}
+	return rune(n), true
 }
 
 // DecodeJSON unmarshals f's payload into v.
