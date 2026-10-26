@@ -14,10 +14,20 @@ import (
 	"github.com/kravlab/hostrunner/internal/protocol"
 )
 
-// grantStanding asks for argv with --ask and answers "for the daemon's
-// lifetime", typing "yes" when the request is guarded; it returns what
-// hostrun printed.
-func (h harness) grantStanding(t *testing.T, s *session, guarded bool, argv ...string) result {
+// grantAnswer is an answer that grants an approval held for later runs:
+// the key typed, the guarded confirmation the session asks, and the
+// outcome it says.
+type grantAnswer struct{ key, confirm, outcome string }
+
+// The answers granting a standing approval and a session approval.
+var (
+	standingAnswer = grantAnswer{"d", `Type "yes" to approve it as standing (until the daemon stops): `, "approved as standing (until the daemon stops)\n"}
+	sessionAnswer  = grantAnswer{"s", `Type "yes" to approve it for this session: `, "approved for this session (until it ends)\n"}
+)
+
+// grantAs asks for argv with --ask and gives answer a, typing "yes" when
+// the request is guarded; it returns what hostrun printed.
+func (h harness) grantAs(t *testing.T, s *session, a grantAnswer, guarded bool, argv ...string) result {
 	t.Helper()
 	ch := h.ask(t, argv...)
 	prompt := answerPromptText
@@ -25,14 +35,20 @@ func (h harness) grantStanding(t *testing.T, s *session, guarded bool, argv ...s
 		prompt = guardedPromptText
 	}
 	s.waitFor(t, prompt)
-	s.answer(t, "l")
+	s.answer(t, a.key)
 	if guarded {
-		s.waitFor(t, `Type "yes" to approve it for the daemon's lifetime: `)
+		s.waitFor(t, a.confirm)
 		s.answer(t, "yes")
 	}
 	got := awaitResult(t, ch)
-	s.waitFor(t, "approved for the daemon's lifetime\n")
+	s.waitFor(t, a.outcome)
 	return got
+}
+
+// grantStanding grants argv a standing approval (see grantAs).
+func (h harness) grantStanding(t *testing.T, s *session, guarded bool, argv ...string) result {
+	t.Helper()
+	return h.grantAs(t, s, standingAnswer, guarded, argv...)
 }
 
 // A standing approval lets the same argv from the same container
@@ -43,11 +59,11 @@ func TestStandingApprovalLetsTheSameCommandThrough(t *testing.T) {
 	h := startLoggingDaemon(t, slog.New(slog.NewTextHandler(&log, nil)), policy(t, echoOnly))
 	s := h.startSession(t)
 	got := h.grantStanding(t, s, false, "touch", "marker")
-	if want := (result{stderr: waitingNoRule + "hostrun: approved on the host: for the daemon's lifetime\n"}); got != want {
+	if want := (result{stderr: waitingNoRule + "hostrun: approved on the host: standing (until the daemon stops)\n"}); got != want {
 		t.Fatalf("got %+v, want %+v", got, want)
 	}
-	waitForLog(t, &log, `msg="standing approval granted" standing=1 argv="[touch marker]"`)
-	waitForLog(t, &log, `approved=lifetime`)
+	waitForLog(t, &log, `msg="standing approval granted" approval=1 argv="[touch marker]"`)
+	waitForLog(t, &log, `approved=standing approval_id=1`)
 	marker := filepath.Join(h.hostRoot, "marker")
 	for _, argv := range [][]string{{"touch", "marker"}, {"--ask", "touch", "marker"}} {
 		if err := os.Remove(marker); err != nil {
@@ -60,7 +76,7 @@ func TestStandingApprovalLetsTheSameCommandThrough(t *testing.T) {
 			t.Fatalf("%v did not run: %v", argv, err)
 		}
 	}
-	waitForLog(t, &log, `approved=standing`)
+	waitForLog(t, &log, `approved=standing code=0`)
 	for _, tt := range []struct {
 		cwd  string
 		argv []string
@@ -129,17 +145,17 @@ func TestStandingApprovalsAreListedAndRevoked(t *testing.T) {
 	h.grantStanding(t, s, true, "touch", "+marker")
 	s.waitFor(t, "> ")
 	s.answer(t, "standing")
-	s.waitFor(t, `  1  "touch" "+marker"   in `+containerRoot+"   guarded\n")
+	s.waitFor(t, `  1  touch +marker   in `+containerRoot+"   guarded\n")
 	s.waitFor(t, "> ")
 	s.answer(t, "revoke 2")
-	s.waitFor(t, "revoke 2: no standing approval 2\n")
+	s.waitFor(t, "revoke 2: no approval 2\n")
 	s.waitFor(t, "> ")
 	s.answer(t, "revoke 1")
 	s.waitFor(t, "revoked 1\n")
-	waitForLog(t, &log, `msg="standing approval revoked" standing=1`)
+	waitForLog(t, &log, `msg="standing approval revoked" approval=1`)
 	s.waitFor(t, "> ")
 	s.answer(t, "standing")
-	s.waitFor(t, "no standing approvals\n")
+	s.waitFor(t, "no approvals\n")
 	if got := h.run(t, containerRoot, "", "touch", "+marker"); got.code != protocol.ExitRejected {
 		t.Fatalf("got %+v, want it refused once revoked", got)
 	}
@@ -218,15 +234,15 @@ func TestStandingApprovalIsGrantedOnce(t *testing.T) {
 	s.waitFor(t, answerPromptText)
 	second := h.ask(t, "touch", "marker")
 	s.waitFor(t, "\a")
-	s.answer(t, "l")
+	s.answer(t, "d")
 	awaitResult(t, first)
 	s.waitFor(t, answerPromptText)
-	s.answer(t, "l")
+	s.answer(t, "d")
 	awaitResult(t, second)
 	s.waitFor(t, "> ")
 	s.answer(t, "standing")
 	list := s.waitFor(t, "> ")
-	if !strings.Contains(list, `  1  "touch" "marker"`) || strings.Contains(list, "  2  ") {
+	if !strings.Contains(list, `  1  touch marker`) || strings.Contains(list, "  2  ") {
 		t.Fatalf("the list %q, want approval 1 alone", list)
 	}
 }
@@ -257,7 +273,7 @@ func TestSessionReprintsThePromptAfterACommandsOutcome(t *testing.T) {
 	conn := <-served
 	s.waitFor(t, answerPromptText)
 	_ = protocol.WriteJSON(conn, protocol.FrameStandingList, protocol.StandingList{Approvals: []protocol.Standing{{N: 3, Argv: []string{"touch", "x"}, Cwd: containerRoot}}})
-	s.waitFor(t, `  3  "touch" "x"   in `+containerRoot+"\n"+answerPromptText)
+	s.waitFor(t, "  3  touch x   in "+containerRoot+"\n"+answerPromptText)
 	_ = protocol.WriteJSON(conn, protocol.FrameStandingList, protocol.StandingList{Error: "not now"})
 	s.waitFor(t, "standing: not now\n"+answerPromptText)
 	s.answer(t, "o")
@@ -311,5 +327,5 @@ func TestStandingApprovalsAreListedAfterATakeOver(t *testing.T) {
 	first.waitFor(t, "taken over by another session\n")
 	second.waitFor(t, "> ")
 	second.answer(t, "standing")
-	second.waitFor(t, `  1  "touch" "marker"   in `+containerRoot+"\n")
+	second.waitFor(t, `  1  touch marker   in `+containerRoot+"\n")
 }
