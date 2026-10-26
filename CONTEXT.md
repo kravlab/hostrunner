@@ -189,6 +189,12 @@ An approval of one argv from one container directory that lets
 it through until its daemon ends or the human revokes it.
 _Avoid_: lifetime approval, grant
 
+**Session approval**:
+An approval of one argv from one container directory that lets
+it through until the approval session that granted it stops
+serving its daemon, or the human revokes it.
+_Avoid_: temporary approval
+
 **Approval socket**:
 The daemon's socket for approval sessions, beside its runtime
 directory and outside the container's reach.

@@ -108,6 +108,14 @@ func (s *session) answer(t *testing.T, line string) {
 	}
 }
 
+// refuse refuses the request shown, with no note for the agent.
+func (s *session) refuse(t *testing.T) {
+	t.Helper()
+	s.answer(t, "r")
+	s.waitFor(t, notePromptText)
+	s.answer(t, "")
+}
+
 // ask runs hostrun --ask argv in the background; the result arrives on the
 // channel.
 func (h harness) ask(t *testing.T, argv ...string) <-chan result {
@@ -136,7 +144,7 @@ func TestAskRunsACommandApprovedOnce(t *testing.T) {
 	s := h.startSession(t)
 	ch := h.ask(t, "touch", "marker")
 	block := s.waitFor(t, answerPromptText)
-	for _, want := range []string{"\a", "── request 1 ──", "dir   " + containerRoot + "\n", `argv  "touch" "marker"`, `why   no rule allows "touch marker"`} {
+	for _, want := range []string{"\a", "── request 1 ──", "dir   " + containerRoot + "\n", `cmd   touch marker`, `why   no rule allows "touch marker"`} {
 		if !strings.Contains(block, want) {
 			t.Errorf("the request block %q lacks %q", block, want)
 		}
@@ -493,8 +501,8 @@ func TestAskSessionDiscardsInputTypedBeforeThePrompt(t *testing.T) {
 // The prompts the session asks for an answer, to a request and to a
 // guarded one, and for a refusal's note with.
 const (
-	answerPromptText  = "answer [r]efuse [o]nce [l]ifetime [a]dd rule [?]more ? "
-	guardedPromptText = "answer [r]efuse [o]nce [l]ifetime [?]more ? " // a guarded request gets no rule
+	answerPromptText  = "answer [r]efuse [o]nce [s]ession stan[d]ing [a]dd rule [c]md [h]elp ? "
+	guardedPromptText = "answer [r]efuse [o]nce [s]ession stan[d]ing [c]md [h]elp ? " // a guarded request gets no rule
 	notePromptText    = "note for the agent (Enter for none): "
 )
 
@@ -509,7 +517,7 @@ func TestAskSessionShowsTerminalEscapesEscaped(t *testing.T) {
 	ch := make(chan result, 1)
 	go func() { ch <- h.run(t, containerRoot+"/d\x1b[2J", "", "--ask", "touch", "\x1b]0;owned\a") }()
 	block := s.waitFor(t, answerPromptText)
-	for _, want := range []string{`dir   "/workspaces/app/d\x1b[2J"`, `argv  "touch" "\x1b]0;owned\a"`} {
+	for _, want := range []string{`dir   "/workspaces/app/d\x1b[2J"`, `cmd   touch $'\x1b]0;owned\x07'`} {
 		if !strings.Contains(block, want) {
 			t.Errorf("the block %q lacks %q", block, want)
 		}
@@ -1075,7 +1083,7 @@ func TestAskSessionShowsRequestsInTurn(t *testing.T) {
 		t.Fatalf("first: got %+v", got)
 	}
 	block = s.waitFor(t, answerPromptText)
-	for _, want := range []string{"── request 2 ──", `"touch" "second"`, "  (1 more waiting)\n"} {
+	for _, want := range []string{"── request 2 ──", "cmd   touch second\n", "  (1 more waiting)\n"} {
 		if !strings.Contains(block, want) {
 			t.Errorf("the second block %q lacks %q", block, want)
 		}
@@ -1083,7 +1091,7 @@ func TestAskSessionShowsRequestsInTurn(t *testing.T) {
 	s.answer(t, "o")
 	awaitResult(t, second)
 	block = s.waitFor(t, answerPromptText)
-	if !strings.Contains(block, `"touch" "third"`) || strings.Contains(block, "more waiting") {
+	if !strings.Contains(block, "cmd   touch third\n") || strings.Contains(block, "more waiting") {
 		t.Errorf("the third block %q", block)
 	}
 	s.answer(t, "o")

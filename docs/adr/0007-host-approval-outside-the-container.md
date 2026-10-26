@@ -47,6 +47,8 @@ while a session serves the daemon.
 - Guarded refusals (deny patterns, failed path checks, an argv the rules
   cannot read, rules with secrets) need a second confirmation and get no
   "add a rule" answer.
-- Standing approvals live in the daemon's memory and end with it.
+- Standing approvals live in the daemon's memory and end with it;
+  session approvals end sooner, when the session that granted them stops
+  serving the daemon.
 - The daemon log, which the container can read, records approvals but
   never secrets' values or the session's environment.

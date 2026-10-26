@@ -297,7 +297,7 @@ func (s *Server) dryRun(out *frameWriter, req protocol.Request) {
 	}
 	p.close()
 	s.log.Info("dry run allowed", append(append(p.logArgs(req), "rule", p.rule), dryRunLogArgs...)...)
-	_ = out.writeJSON(protocol.FrameAllowed, protocol.Allowed{Rule: p.rule, Dir: p.fixedDir, Secrets: p.secrets, Standing: p.standing})
+	_ = out.writeJSON(protocol.FrameAllowed, protocol.Allowed{Rule: p.rule, Dir: p.fixedDir, Secrets: p.secrets, Approval: p.approval})
 }
 
 // arm handles FrameArm from `hostrunner up`. When the handler steps aside,
@@ -338,8 +338,9 @@ type prepared struct {
 	// pathFailures are the arguments that failed their path checks and are
 	// passed as given, as the passes allowed (see prepareAllowed).
 	pathFailures []pathFailure
-	// standing is set when a standing approval lets the command through.
-	standing bool
+	// approval is the kind of approval that lets the command through,
+	// ScopeStanding or ScopeSession; "" when the rules do.
+	approval protocol.Scope
 }
 
 // close releases the daemon's copies of the directory and of the files
@@ -357,8 +358,8 @@ func (p *prepared) logArgs(req protocol.Request) []any {
 	if len(p.secrets) > 0 {
 		args = append(args, "secrets", p.secrets)
 	}
-	if p.standing {
-		args = append(args, "approved", "standing")
+	if p.approval != "" {
+		args = append(args, "approved", string(p.approval))
 	}
 	return args
 }
@@ -383,29 +384,28 @@ type refusal struct {
 // only checked (see checkSources), and the argv is the container's. On
 // refusal nothing is left open.
 //
-// A standing approval for req lets it through what the rules refuse, as
-// the rule that refused it would run it, and passes as given the path
-// failures the human saw when granting it.
+// A standing or session approval for req lets it through what the rules
+// refuse, as the rule that refused it would run it, and passes as given
+// the path failures the human saw when granting it.
 func (s *Server) prepare(req protocol.Request, dryRun bool) (*prepared, *refusal) {
 	allowed, err := s.rules().Check(req.Argv)
-	standing := s.approvals.standingFor(req)
-	// byStanding: the rules refuse req, and its standing approval overrides
-	// them.
-	byStanding := false
+	held := s.approvals.approvalFor(req)
+	// byApproval: the rules refuse req, and its approval overrides them.
+	byApproval := false
 	if err != nil {
 		d, ok := rules.ApprovableDenial(err)
-		if standing == nil || !ok {
+		if held == nil || !ok {
 			return nil, &refusal{protocol.ExitRejected, err.Error(), err}
 		}
-		allowed, byStanding = d.Approved, true
+		allowed, byApproval = d.Approved, true
 	}
 	var passes pathPasses
-	if standing != nil {
-		passes = standing.passes
+	if held != nil {
+		passes = held.passes
 	}
 	p, r := s.prepareAllowed(req, allowed, dryRun, passes)
-	if p != nil {
-		p.standing = byStanding || len(p.pathFailures) > 0
+	if p != nil && held != nil && (byApproval || len(p.pathFailures) > 0) {
+		p.approval = held.kind()
 	}
 	return p, r
 }

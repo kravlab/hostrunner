@@ -7,8 +7,8 @@
 // approval request, and it sends back the human's answer. It is a
 // line-oriented log, without an alternate screen: requests are shown one
 // at a time, first in, first out, each as a block, and answered with a
-// letter and Enter. What came from the container is shown quoted, so that
-// it cannot steer the terminal.
+// letter and Enter. What came from the container is shown quoted or
+// escaped as needed, so that it cannot steer the terminal.
 package approval
 
 import (
@@ -66,8 +66,8 @@ func editInEditor(path string) error {
 
 // Prompts and lines the session prints.
 const (
-	answerPrompt        = "answer [r]efuse [o]nce [l]ifetime [a]dd rule [?]more ? "
-	guardedAnswerPrompt = "answer [r]efuse [o]nce [l]ifetime [?]more ? " // no rule for a guarded refusal
+	answerPrompt        = "answer [r]efuse [o]nce [s]ession stan[d]ing [a]dd rule [c]md [h]elp ? "
+	guardedAnswerPrompt = "answer [r]efuse [o]nce [s]ession stan[d]ing [c]md [h]elp ? " // no rule for a guarded refusal
 	addPrompt           = "[w]rite [e]dit in $EDITOR [c]ancel ? "
 	editAgainPrompt     = "[e]dit again [c]ancel ? "
 	rereadPrompt        = "the rules file changed since the daemon loaded it; reread it, making that change live now? [r]eread [c]ancel ? "
@@ -78,6 +78,40 @@ const (
 	goneSaid            = "\nthe daemon ended: waiting for the next one\n"
 )
 
+// approvingKeys are the answers that approve a request, by the scope of
+// the approval each gives.
+var approvingKeys = map[string]protocol.Scope{
+	"o": protocol.ScopeOnce,
+	"s": protocol.ScopeSession,
+	"d": protocol.ScopeStanding,
+}
+
+// helpEntry is one answer the help (h) describes: its key, what it does,
+// whether a guarded request asks for "yes" before it, and whether a
+// guarded request is offered it at all.
+type helpEntry struct {
+	key, does          string
+	confirms, addsRule bool
+}
+
+// helpEntries are the answers h describes, in the prompt's order.
+var helpEntries = []helpEntry{
+	{key: "r", does: "refuse it; then an optional note for the agent"},
+	{key: "o", does: "run this request only", confirms: true},
+	{key: "s", does: "session: run this command from this directory now and whenever asked again, until this session ends", confirms: true},
+	{key: "d", does: "standing: run this command from this directory now and whenever asked again, until the daemon stops", confirms: true},
+	{key: "a", does: "add a rule to the rules file that allows it, then run it", addsRule: true},
+	{key: "c", does: "show every argument of the command whole"},
+	{key: "h", does: "this help"},
+}
+
+// helpConfirms ends the line of an answer a guarded request confirms.
+const helpConfirms = "; after a warning, asks you to type yes"
+
+// helpWidth is how wide h wraps its lines, continuation lines indented
+// under the text.
+const helpWidth = 65
+
 // maxNoteBytes bounds a refusal's note, as sent: one of any length could
 // not fit a frame.
 const maxNoteBytes = 4096
@@ -87,7 +121,8 @@ const maxNoteBytes = 4096
 // a guarded request.
 var scopeTexts = map[protocol.Scope]struct{ outcome, confirm string }{
 	protocol.ScopeOnce:     {"approved once", `Type "yes" to run it once: `},
-	protocol.ScopeLifetime: {"approved for the daemon's lifetime", `Type "yes" to approve it for the daemon's lifetime: `},
+	protocol.ScopeSession:  {"approved for this session (until it ends)", `Type "yes" to approve it for this session: `},
+	protocol.ScopeStanding: {"approved as standing (until the daemon stops)", `Type "yes" to approve it as standing (until the daemon stops): `},
 	protocol.ScopeRule:     {"approved under the new rule", ""},
 }
 
@@ -99,8 +134,9 @@ var scopeTexts = map[protocol.Scope]struct{ outcome, confirm string }{
 // Run says how many. The answer "add a rule" edits the daemon's rules file
 // (see proposeRule), opening it in $VISUAL or $EDITOR when the human
 // asks. While no request is shown, the idle prompt takes commands:
-// standing lists the daemon's standing approvals, revoke <n> revokes one,
-// daemons leaves the daemon for the list, quit ends the session.
+// standing lists the daemon's standing and session approvals, revoke <n>
+// revokes one, daemons leaves the daemon for the list, quit ends the
+// session.
 //
 // Without cfg.Socket it lists the daemons under cfg.Root to choose from
 // (see choose), and a daemon another session serves can be taken over:
@@ -520,12 +556,15 @@ func (s *session) daemonFrame(f protocol.Frame) error {
 		case l.Error != "":
 			fmt.Fprintf(s.out, "standing: %s\n", l.Error)
 		case len(l.Approvals) == 0:
-			fmt.Fprintln(s.out, "no standing approvals")
+			fmt.Fprintln(s.out, "no approvals")
 		}
 		for _, a := range l.Approvals {
 			line := fmt.Sprintf("  %d  %s   in %s", a.N, argvLine(a.Argv), display(a.Cwd))
 			if a.Guarded {
 				line += "   guarded"
+			}
+			if a.Session {
+				line += "   session"
 			}
 			fmt.Fprintln(s.out, line)
 			s.printMarks(a.Argv)
@@ -608,35 +647,38 @@ func (s *session) typed(text string) {
 }
 
 // answerTyped handles text typed as the answer to r: r refuses it, asking
-// for a note; o and l approve it, once a guarded one is confirmed; a adds
-// a rule; ? shows all of its argv. Anything else asks again.
+// for a note; o, s and d approve it (this request only, for this session,
+// standing), once a guarded one is confirmed; a adds a rule; c shows all
+// of its argv; h prints what each answer offered for it does. Anything
+// else asks again.
 func (s *session) answerTyped(r waiting, text string) {
-	switch text {
-	case "o", "l":
-		scope := protocol.ScopeOnce
-		if text == "l" {
-			scope = protocol.ScopeLifetime
-		}
+	if scope, ok := approvingKeys[text]; ok {
 		if !r.guarded() {
 			s.approve(r.ID, scope)
 			return
 		}
 		// A guarded request is approved only once the human has read its
 		// guards again and typed "yes"; anything else asks for the answer
-		// again. A standing approval is confirmed so once, here.
+		// again. A standing or session approval is confirmed so once, here.
 		for _, guard := range r.Guards {
 			fmt.Fprintf(s.out, "⚠ %s\n", display(guard))
 		}
 		s.awaiting, s.confirm = awaitConfirm, scope
 		s.prompt(scopeTexts[scope].confirm)
+		return
+	}
+	switch text {
 	case "a":
 		if r.guarded() {
 			s.askAnswer()
 			return
 		}
 		s.proposeRule(r)
-	case "?":
+	case "c":
 		s.showAll(r)
+		s.askAnswer()
+	case "h":
+		s.showHelp(r)
 		s.askAnswer()
 	case "r":
 		s.awaiting = awaitNote
@@ -647,9 +689,9 @@ func (s *session) answerTyped(r waiting, text string) {
 }
 
 // command runs a command typed at the idle prompt: standing lists the
-// standing approvals, revoke <n> revokes one, the daemon's answer printing
-// the outcome; daemons leaves the daemon for the list of daemons, quit
-// ends the session.
+// standing and session approvals, revoke <n> revokes one, the daemon's
+// answer printing the outcome; daemons leaves the daemon for the list of
+// daemons, quit ends the session.
 func (s *session) command(text string) {
 	name, arg, _ := strings.Cut(text, " ")
 	switch name {
@@ -796,10 +838,10 @@ func (s *session) show() {
 	head := fmt.Sprintf("── request %d ── %d:%02d left ", r.ID, int(left.Minutes()), int(left.Seconds())%60)
 	fmt.Fprintf(s.out, "\n%s%s\n", head, strings.Repeat("─", max(0, 58-len([]rune(head)))))
 	fmt.Fprintf(s.out, "  dir   %s\n", display(r.Cwd))
-	fmt.Fprintf(s.out, "  argv  %s\n", argvLine(r.Argv))
+	fmt.Fprintf(s.out, "  cmd   %s\n", argvLine(r.Argv))
 	s.printMarks(r.Argv)
 	if len(r.Argv) > maxShownArgs || slices.ContainsFunc(shownArgs(r.Argv), isLong) {
-		fmt.Fprintln(s.out, "  argv truncated: ? shows all")
+		fmt.Fprintln(s.out, "  cmd truncated: c shows all")
 	}
 	for i, reason := range r.Reasons {
 		label := "why "
@@ -828,8 +870,8 @@ func (t *term) prompt(p string) {
 	fmt.Fprint(t.out, p)
 }
 
-// How much of an argv a request's block, and the list of standing
-// approvals, show; `?` shows all of a request's.
+// How much of an argv a request's block, and the list of standing and
+// session approvals, show; `c` shows all of a request's.
 const (
 	maxShownArgs  = 20  // arguments; more are counted, not shown
 	maxShownRunes = 200 // characters of one argument; more are counted
@@ -842,13 +884,13 @@ func isLong(arg string) bool { return utf8.RuneCountInString(arg) > maxShownRune
 func shownArgs(argv []string) []string { return argv[:min(len(argv), maxShownArgs)] }
 
 // argvLine shows argv as a block does: the arguments shownArgs returns,
-// each Go-quoted, so none can steer the terminal or hide where it ends,
-// and cut (see quoteCut), the arguments left out counted.
+// each quoted as bashQuote does, so none can steer the terminal or hide
+// where it ends, and cut (see quoteCut), the arguments left out counted.
 func argvLine(argv []string) string {
 	shown := shownArgs(argv)
 	cut := make([]string, len(shown))
 	for i, arg := range shown {
-		cut[i] = quoteCut(arg, strconv.Quote)
+		cut[i] = quoteCut(arg, bashQuote)
 	}
 	line := strings.Join(cut, " ")
 	if more := len(argv) - len(shown); more > 0 {
@@ -863,9 +905,79 @@ func argvLine(argv []string) string {
 func (t *term) printMarks(argv []string) {
 	for i, arg := range shownArgs(argv) {
 		if holdsNonASCII(arg) {
-			fmt.Fprintf(t.out, "  ⚠ non-ASCII: argument %d %s is %s\n", i+1, quoteCut(arg, strconv.Quote), quoteCut(arg, strconv.QuoteToASCII))
+			fmt.Fprintf(t.out, "  ⚠ non-ASCII: argument %d %s is %s\n", i+1, quoteCut(arg, bashQuote), quoteCut(arg, asciiQuote))
 		}
 	}
+}
+
+// bashQuote returns arg quoted so that bash reads it back as it is: as it
+// is when every character in it is safe (see bashSafe), in single quotes
+// when every character in it is printable and none is ' or a combining
+// mark, in ANSI-C quotes otherwise (see ansiCQuote). An empty argument
+// shows as two single quotes.
+func bashQuote(arg string) string {
+	needsQuotes := func(r rune) bool { return !bashSafe(r) }
+	switch {
+	case arg == "":
+		return "''"
+	case strings.IndexFunc(arg, needsQuotes) < 0:
+		return arg
+	case printable(arg) && !strings.ContainsRune(arg, '\'') && strings.IndexFunc(arg, isMark) < 0:
+		return "'" + arg + "'"
+	}
+	return ansiCQuote(arg, false)
+}
+
+// asciiQuote returns arg's ASCII form: arg in ANSI-C quotes with every
+// character outside ASCII escaped, so a look-alike letter shows its code.
+func asciiQuote(arg string) string { return ansiCQuote(arg, true) }
+
+// bashSafe reports whether r stands for itself in a bash word, unquoted:
+// an ASCII letter or digit, or one of _@%+=:,./-. A first word holding =
+// still reads as an assignment, which the cmd line leaves as it is.
+func bashSafe(r rune) bool {
+	return r <= unicode.MaxASCII && (unicode.IsLetter(r) || unicode.IsDigit(r) || strings.ContainsRune("_@%+=:,./-", r))
+}
+
+// isMark reports whether r is a combining mark (Unicode Mn, Me), which a
+// terminal draws over the character before it, a quote included.
+func isMark(r rune) bool { return unicode.In(r, unicode.Mn, unicode.Me) }
+
+// ansiCQuote returns arg in bash's ANSI-C quotes, $'…': ' and \ escaped
+// with \, newline and tab as \n and \t, any other ASCII control character,
+// DEL and a byte of invalid UTF-8 as \xHH, a combining mark and a
+// character outside ASCII that is not printable, or any when ascii is set,
+// as \uHHHH, or \UHHHHHHHH above U+FFFF, and every other character as it
+// is.
+func ansiCQuote(arg string, ascii bool) string {
+	var b strings.Builder
+	b.WriteString("$'")
+	for i := 0; i < len(arg); {
+		r, size := utf8.DecodeRuneInString(arg[i:])
+		escape := r > unicode.MaxASCII && (ascii || isMark(r) || !strconv.IsPrint(r))
+		switch {
+		case r == utf8.RuneError && size == 1:
+			fmt.Fprintf(&b, `\x%02x`, arg[i])
+		case r == '\'' || r == '\\':
+			b.WriteByte('\\')
+			b.WriteRune(r)
+		case r == '\n':
+			b.WriteString(`\n`)
+		case r == '\t':
+			b.WriteString(`\t`)
+		case r <= unicode.MaxASCII && !strconv.IsPrint(r):
+			fmt.Fprintf(&b, `\x%02x`, r)
+		case escape && r > 0xFFFF: // past the four digits \u takes
+			fmt.Fprintf(&b, `\U%08x`, r)
+		case escape:
+			fmt.Fprintf(&b, `\u%04x`, r)
+		default:
+			b.WriteRune(r)
+		}
+		i += size
+	}
+	b.WriteByte('\'')
+	return b.String()
 }
 
 // quoteCut shows arg quoted by quote, cut after maxShownRunes
@@ -887,13 +999,39 @@ func holdsNonASCII(arg string) bool {
 	return strings.IndexFunc(arg, func(r rune) bool { return r > unicode.MaxASCII }) >= 0
 }
 
+// showHelp prints what each answer offered for r does, one per answer,
+// wrapped at helpWidth: a guarded request is offered no rule, and its o, s
+// and d ask for yes.
+func (s *session) showHelp(r waiting) {
+	for _, e := range helpEntries {
+		does := e.does
+		if r.guarded() {
+			if e.addsRule {
+				continue
+			}
+			if e.confirms {
+				does += helpConfirms
+			}
+		}
+		line := "  " + e.key + " "
+		for _, word := range strings.Fields(does) {
+			if len([]rune(line))+1+len([]rune(word)) > helpWidth {
+				fmt.Fprintln(s.out, line)
+				line = "    "
+			}
+			line += " " + word
+		}
+		fmt.Fprintln(s.out, line)
+	}
+}
+
 // showAll prints every argument of r whole, one numbered per line, an
 // argument holding non-ASCII with its ASCII form.
 func (s *session) showAll(r waiting) {
 	for i, arg := range r.Argv {
-		line := fmt.Sprintf("  %d  %s", i+1, strconv.Quote(arg))
+		line := fmt.Sprintf("  %d  %s", i+1, bashQuote(arg))
 		if holdsNonASCII(arg) {
-			line += "   ⚠ non-ASCII: " + strconv.QuoteToASCII(arg)
+			line += "   ⚠ non-ASCII: " + asciiQuote(arg)
 		}
 		fmt.Fprintln(s.out, line)
 	}
@@ -903,10 +1041,16 @@ func (s *session) showAll(r waiting) {
 // every character in it is printable, Go-quoted otherwise, so control
 // characters and terminal escapes appear escaped.
 func display(text string) string {
-	if !utf8.ValidString(text) || strings.IndexFunc(text, func(r rune) bool { return !strconv.IsPrint(r) }) >= 0 {
+	if !printable(text) {
 		return strconv.Quote(text)
 	}
 	return text
+}
+
+// printable reports whether text is valid UTF-8 and every character in it
+// is printable.
+func printable(text string) bool {
+	return utf8.ValidString(text) && strings.IndexFunc(text, func(r rune) bool { return !strconv.IsPrint(r) }) < 0
 }
 
 // line is a line the human typed, its number, counting from 1, and

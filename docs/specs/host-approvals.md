@@ -16,8 +16,9 @@ A command the rules do not let through is refused with 126, and the agent
 can only stop and ask in chat; the human then edits the rules file and
 restarts the container, or runs the command by hand. Now the agent can
 ask, with `hostrun --ask`, and a human answers on the host in an approval
-session: refuse, this request only, for the daemon's lifetime, or add a
-rule. The container cannot reach the channel the human answers on.
+session: refuse, this request only, for this session (until the approval
+session ends), standing (until the daemon stops), or add a rule. The
+container cannot reach the channel the human answers on.
 
 In this spec, a **plain refusal** is what `hostrun` without `--ask` gets
 for a command the rules refuse; the **container directory** is the
@@ -73,15 +74,16 @@ from `protocol.Version` of the container's socket.
   1h0m1s exceeds 1h0m0s`).
 - `--dry-run` and `--ask` together, in either order as the first two
   arguments: 125, `--dry-run and --ask cannot be combined`.
-- A command the rules or a standing approval allow runs at once, printing
-  nothing of hostrun's own.
+- A command the rules, a session approval or a standing approval allow
+  runs at once, printing nothing of hostrun's own.
 - While the request waits: one stderr line, `hostrun: waiting for approval
   on the host: <reasons joined by "; ">`, the first naming the rule that
   refused it as a refusal does (`denied by rule "git push": …`), with
   ` (guarded)` after `host` for a guarded refusal.
-- Approved: `hostrun: approved on the host: this request only` (`for the
-  daemon's lifetime`, `rule added`), then the command's output and exit
-  code as for an allowed command.
+- Approved: `hostrun: approved on the host: this request only` (`session
+  (until the approval session ends)`, `standing (until the daemon
+  stops)`, `rule added`), then the command's output and exit code as for
+  an allowed command.
 - Not approved, all 126:
   - `hostrun: refused on the host`, followed by `: <note>` when the human
     gave one;
@@ -103,13 +105,14 @@ from `protocol.Version` of the container's socket.
 - `FrameAsk` (client → daemon), JSON `Ask{version, argv, cwd,
   timeout_ms}`; `timeout_ms` 0 is the daemon's default.
 - `FrameWaiting` (daemon → client), JSON `{reasons, guarded}`;
-  `FrameApproved`, JSON `{scope}` with `once`, `lifetime` or `rule` (the
-  answer given, not a request let through by a standing approval, which
-  gets no approval frames); then the ordinary run stream (stdin credit
-  once the command has started, stdout, stderr, exit). Every refusal is
-  `FrameError` with 126.
-- `Allowed` gains optional `standing`, so a dry run can report that a
-  standing approval lets the command through.
+  `FrameApproved`, JSON `{scope}` with `once`, `session`, `standing` or
+  `rule` (the answer given, not a request let through by a session or
+  standing approval, which gets no approval frames); then the ordinary
+  run stream (stdin credit once the command has started, stdout, stderr,
+  exit). Every refusal is `FrameError` with 126.
+- `Allowed` gains optional `approval`, `standing` or `session`, so a dry
+  run can report that a standing or session approval lets the command
+  through.
 - `protocol.Version` stays 1. A daemon that predates `FrameAsk` rejects
   the frame type with 125 and runs nothing; an older client never sends
   it. `hostrunner up` installs the client with the daemon, so both
@@ -143,15 +146,16 @@ from `protocol.Version` of the container's socket.
 - Each approval request has an id (a counter in the daemon), sent with its
   content. The session answers by id; only the serving session is heard;
   an answer for an unknown, answered, withdrawn or expired request, or of
-  a scope other than `once`, `lifetime` or `rule`, is refused, and the
-  session says so. The daemon tells the serving session
+  a scope other than `once`, `session`, `standing` or `rule`, is refused,
+  and the session says so. The daemon tells the serving session
   of a request withdrawn or expired (`Withdrawn{id, reason}`), so it
   drops it; an answer that crosses it is refused with that reason
   (`Answered{id, error, ended}`), so the session reports the end
   (`request N expired`) whichever frame comes first.
 - Take-overs are handled one at a time; the last wins. Waiting requests,
   with the rest of their limit, and the standing approvals pass to the new
-  session.
+  session; the session approvals of the session taken over end (see
+  Session approvals).
 
 ## Unanswered requests
 
@@ -184,7 +188,7 @@ from `protocol.Version` of the container's socket.
 
 ## Standing approvals
 
-- Granted by the answer "for the daemon's lifetime".
+- Granted by the answer `d`, standing.
 - The same argv, byte for byte, from the same container directory; let
   through with or without `--ask`, printing nothing of hostrun's own.
 - Guarded refusals can get one; the second confirmation comes once, when
@@ -207,9 +211,40 @@ from `protocol.Version` of the container's socket.
 - A one-off approval likewise passes a path failure as given only for
   the reason the human saw.
 - Session frames: `Standing` (no payload) answered by `StandingList{
-  approvals: [{n, argv, cwd, guarded}]}`; `Revoke{n}` answered by
-  `Revoked{n, error}`. The guarded confirmation for `l` reads `Type "yes"
-  to approve it for the daemon's lifetime: `.
+  approvals: [{n, argv, cwd, guarded, session}]}`, session approvals
+  included and marked; `Revoke{n}` answered by `Revoked{n, error}`, for
+  either kind. The guarded confirmation for `d` reads `Type "yes" to
+  approve it as standing (until the daemon stops): `. A standing approval
+  granted, the session says `approved as standing (until the daemon
+  stops)`.
+
+## Session approvals
+
+- Granted by the answer `s`, for this session.
+- A standing approval in every other respect (the same argv and
+  directory, with or without `--ask`, the second confirmation once, how
+  it runs and is taken out by a new path failure, the log's
+  `approval_id` on the run the answer started), but held only while the
+  session that granted it serves the daemon. They end, every one that
+  session granted, when it stops serving: it leaves (`quit`, Ctrl+C, end
+  of input, `daemons`, its connection failing), is dropped (a write not
+  taken within 2 seconds) or is taken over; and with the daemon. A
+  command one let through keeps running.
+- Session approvals and standing approvals share one numbering and one
+  list: `standing` shows both, a session approval marked `session`, and
+  `revoke <n>` revokes either (`no approval N` for a number it does not
+  hold; `no approvals` for an empty list). Granting either kind for an
+  argv and directory the daemon holds an approval for keeps its number
+  and takes the new kind and terms.
+- The answer `s` is given, but the session stops serving before the
+  approved command has passed its checks: the command runs as approved
+  (the agent was told `session (until the approval session ends)`
+  already), and no session approval is granted; the log says `session
+  approval not granted` (`approval_id`, `reason` `session left`).
+- The log marks the runs `approved=session`.
+- The guarded confirmation for `s` reads `Type "yes" to approve it for
+  this session: `. A session approval granted, the session says
+  `approved for this session (until it ends)`.
 
 ## Add a rule
 
@@ -296,20 +331,20 @@ waiting for requests · commands: standing, revoke <n>, daemons, quit
 
 ── request 7 ── 10:00 left ──────────────────────────────
   dir   /workspaces/app/svc
-  argv  "git" "push" "--force" "origin" "main"
+  cmd   git push --force origin main
   why   denied by rule "git push": flag --force is not allowed (deny list)
   ⚠ guarded: explicitly denied: flag --force is not allowed
   (1 more waiting)
-answer [r]efuse [o]nce [l]ifetime [?]more ? o
+answer [r]efuse [o]nce [s]ession stan[d]ing [c]md [h]elp ? o
 ⚠ explicitly denied: flag --force is not allowed
 Type "yes" to run it once: yes
 approved once
 
 ── request 9 ── 10:00 left ──────────────────────────────
   dir   /workspaces/app
-  argv  "git" "rebase" "-i" "main"
+  cmd   git rebase -i main
   why   no rule allows "git rebase"
-answer [r]efuse [o]nce [l]ifetime [a]dd rule [?]more ? a
+answer [r]efuse [o]nce [s]ession stan[d]ing [a]dd rule [c]md [h]elp ? a
 --- .devcontainer/hostrun.yaml
 +++ .devcontainer/hostrun.yaml
 +  - command: git rebase
@@ -322,46 +357,91 @@ rule added; the daemon reloaded the rules · request 9 runs under it
 
 ── request 10 ── 10:00 left ─────────────────────────────
   dir   /workspaces/app
-  argv  "curl" "https://other.example/"
+  cmd   curl https://other.example/
   why   denied by rule "curl": argument "https://other.example/" is not allowed
   ⚠ guarded: injects secrets: token
-answer [r]efuse [o]nce [l]ifetime [?]more ? r
+answer [r]efuse [o]nce [s]ession stan[d]ing [c]md [h]elp ? r
 note for the agent (Enter for none): only api.example.com is allowed
 refused
 
 > standing
-  1  "git" "push" "--force" "origin" "main"   in /workspaces/app/svc   guarded
+  1  git push --force origin main   in /workspaces/app/svc   guarded
+  2  make test   in /workspaces/app   session
 > revoke 1
 revoked 1
 ```
 
 - Answers are a letter and Enter: `r` refuse (then an optional note for
-  the agent), `o` this request only, `l` for the daemon's lifetime, `a`
-  add a rule, `?` the whole argv. Input typed before the prompt is
-  discarded; an invalid line asks again.
+  the agent), `o` this request only, `s` for this session (until it
+  ends), `d` standing (until the daemon stops), `a` add a rule, `c` the
+  whole command, `h` help. Input typed before the prompt is discarded; an
+  invalid line asks again.
+- `h` prints what each answer offered for the request does, one per
+  line, then asks again:
+
+  ```
+    r  refuse it; then an optional note for the agent
+    o  run this request only
+    s  session: run this command from this directory now and
+       whenever asked again, until this session ends
+    d  standing: run this command from this directory now and
+       whenever asked again, until the daemon stops
+    a  add a rule to the rules file that allows it, then run it
+    c  show every argument of the command whole
+    h  this help
+  ```
+
+  For a guarded request the `a` line is left out, and the `o`, `s` and
+  `d` lines end `; after a warning, asks you to type yes`, wrapped to
+  fit (`o  run this request only; after a warning, asks you to type
+  yes`).
 - Guarded: the block lists every guarded reason, `⚠ guarded: <reason>`
-  each, sent with the request; after `o` or `l`, a warning repeats them,
-  `⚠ <reason>` each, then `yes` to type; anything else returns to the
-  answer prompt. The `why` line names the list kind that refused
+  each, sent with the request; after `o`, `s` or `d`, a warning repeats
+  them, `⚠ <reason>` each, then `yes` to type; anything else returns to
+  the answer prompt. The `why` line names the list kind that refused
   (`(deny list)`), which the rules' own message does not.
-- What came from the container is shown in Go quotes: control characters
-  and terminal escapes appear escaped. Printable Unicode is shown as is,
-  and an argument holding non-ASCII gets `⚠ non-ASCII` and its ASCII form.
-  An argument over 200 characters is cut with `…(+N bytes)`, an argv over
-  20 arguments with `…(+N args)`, and `argv truncated: ? shows all` is
-  printed; `?` prints every argument, one numbered per line, and asks
+- The command from the container is shown on the `cmd` line quoted so
+  that bash reads each argument back as it is, its arguments separated
+  by spaces, so that none can steer the terminal or hide where it ends:
+  - an argument made only of ASCII letters, digits and `_@%+=:,./-` as
+    is (`git push origin --delete feat/x`);
+  - an empty one as `''`;
+  - one holding any other printable character, `'` and combining marks
+    (Unicode Mn, Me) excepted, in single quotes (`git commit -m 'fix: a
+    b'`);
+  - one holding `'`, a control character, a combining mark, a character
+    that is not printable or invalid UTF-8 in ANSI-C quotes, `$'…'`
+    (`echo $'\x1b[2J'`): `'` and `\` as `\'` and `\\`, newline and tab
+    as `\n` and `\t`, any other ASCII control character, DEL and a byte
+    of invalid UTF-8 as `\xHH`, a combining mark and any other character
+    that is not printable as `\uHHHH`, or `\UHHHHHHHH` above U+FFFF, and
+    every other character as it is. Invalid UTF-8 reaches the session
+    only once [#101](https://github.com/kravlab/hostrunner/issues/101) is
+    fixed;
+    until then such bytes arrive as U+FFFD.
+
+  The directory, reasons and guards are shown as they are when every
+  character is printable, Go-quoted otherwise. An argument holding
+  non-ASCII gets `⚠ non-ASCII` and its ASCII form. An argument over 200
+  characters is cut, its first 200 shown as above and followed by
+  `…(+N bytes)`, a command over 20 arguments with `…(+N args)`, and
+  `cmd truncated: c shows all` is printed; `c` prints every argument
+  whole, one numbered per line, shown as above, one holding non-ASCII
+  followed by `   ⚠ non-ASCII: <ASCII form>`, whole too, and asks
   again. A non-ASCII argument gets a line of its own, `⚠ non-ASCII:
-  argument N "<as is>" is "<ASCII form>"`, the ASCII form Go-quoted with
-  every character outside ASCII escaped, both cut alike. `standing` shows
-  an argv as the block does, cut and marked. A note for the agent holding
-  control characters is sent Go-quoted.
+  argument N <as shown> is <ASCII form>`, the ASCII form in `$'…'` with
+  every character outside ASCII escaped (`\uHHHH`, or `\UHHHHHHHH`
+  above U+FFFF), both cut alike. `standing` shows a command as the
+  block does, cut and marked. A note for the agent holding control
+  characters is sent Go-quoted.
 - Requests come one at a time, first in, first out. A new one rings the
   bell (BEL) and counts in `(N more waiting)` at the next block; nothing
   is printed in the middle of a prompt. A current request that is
   withdrawn or expires is announced (`request N withdrawn`, `… expired`),
   typed input is discarded, and the next is shown; queued ones that expire
   drop out silently.
-- The idle prompt `>` takes `standing`, `revoke <n>`, `daemons`, `quit`.
+- The idle prompt `>` takes `standing` (the standing and session
+  approvals), `revoke <n>`, `daemons`, `quit`.
 - Without `--dir`, the session globs
   `$XDG_RUNTIME_DIR/hostrunner/*.approval.sock` and sends hellos, every 2
   seconds while it lists or waits. The daemon whose host workspace holds
@@ -397,7 +477,9 @@ revoked 1
   that prompt) and shows the list; choosing it again serves it again. One
   session serves one daemon. A session that ends, by `daemons`, `quit` or
   Ctrl+C, waits (up to 1 s) for the daemon to drop it, so a list shown
-  right after shows the daemon unserved.
+  right after shows the daemon unserved. Leaving a daemon, by any of
+  these, ends the session approvals the session granted it; serving it
+  again starts with none.
 - Session frames: `Serve{take_over}` (an empty `Serve` serves a daemon
   nobody serves), answered by `FrameServing` and the requests passed on;
   the session replaced gets `FrameTakenOver`.
@@ -407,11 +489,12 @@ revoked 1
 - Dry run: what a run would get. A refused command: 126 and the plain
   refusal's message and hint, guarded marked; not approvable as today; a
   standing approval: 0 and `hostrun: dry run: allowed by a standing
-  approval`, with `dir` and secrets' names.
+  approval`, with `dir` and secrets' names; a session approval likewise,
+  `allowed by a session approval`.
 - Rules test: a refused command exits 126; its line lists every reason,
   joined by `; `, and ends with `(approvable)` or `(guarded: approvable
   after a second confirmation)`, judged from the file alone. It still
-  does no path checks and knows nothing of sessions or standing
+  does no path checks and knows nothing of sessions, session or standing
   approvals. Allowed commands, and a missing or invalid file, are
   unchanged.
 
@@ -423,14 +506,20 @@ revoked 1
   `withdrawn`, `expired`, `session left`, `daemon stopping`, or, for a
   request no session received, `no session` (none serves, or the serving
   one did not take it) or `too large`, logged without `approval_id` but
-  with `argv` and `dir`); `standing approval granted` and `revoked`;
+  with `argv` and `dir`); `standing approval granted` and `revoked`,
+  `session approval granted`, `revoked` and `not granted`, each with the
+  approval's number (`approval`); `session approvals ended` (`count`,
+  `reason`: `session left` or `taken over`, `pid` of the session), when
+  a session stops serving and had granted some, but not when the daemon
+  stops, which every approval goes with;
   `rule added` (file, rule), `hand-edited rules reread` (file) and
   `rules reread` (digest); `approval session serving`, `taken over`,
   `left` (pid).
 - Runs an approval let through: `command finished` and `command
-  cancelled` gain `approved` (`once`, `lifetime`, `rule` for the answer
-  that started them, `standing` for a later run a standing approval let
-  through) and, with a request, `approval_id`.
+  cancelled` gain `approved` (`once`, `session`, `standing`, `rule` for
+  the answer that started them, `session` or `standing` too for a later
+  run a session or standing approval let through) and, with a request,
+  `approval_id`: the run the answer started has one, a later run none.
 - Warn: a failed reread; a refused approval-socket connection (another
   uid, a frame that does not belong there).
 - Kept out: secrets' values; anything from the session's environment.
@@ -452,7 +541,12 @@ revoked 1
 - Two sessions taking over at once: the last wins; the other is told it
   was taken over.
 - The daemon steps aside or exits while requests wait: they get 126 before
-  the connection closes; standing approvals are gone.
+  the connection closes; standing and session approvals are gone.
+- A session that quits, goes to `daemons`, is dropped, loses its
+  connection or is taken over: the session approvals it granted end, a
+  command one let through keeps running, and the next run of such a
+  command is refused with the hint, so `--ask` asks again; standing
+  approvals stay.
 - The rules file changed by hand before "add a rule": the session asks
   whether the daemon rereads it; `c` keeps it out, `r` makes it live (or,
   when it does not load, keeps the old rules), and a request that ends
@@ -475,7 +569,7 @@ revoked 1
   so and why (`request 9 runs once: fixed directory … does not exist`),
   and the agent and the log get `once`, not `rule`.
 - An argv holding terminal escapes, look-alike letters, or long
-  arguments: shown escaped, marked and cut; `?` shows all.
+  arguments: shown escaped, marked and cut; `c` shows all.
 - An approval request whose content for the session (argv, directory,
   reasons and guards) exceeds a frame (1 MiB), though its `FrameAsk` fit
   one, is refused at once while a session serves, before anyone is
@@ -486,9 +580,11 @@ revoked 1
 
 README: usage of `--ask` and `hostrunner approve`, exit codes, dry run
 and Rules test, the daemon log being readable in the container, what an
-older daemon does with `--ask`. The agent instructions' "Host commands
-(hostrun)": on a refusal hinting at `--ask`, re-run with
-`--ask=<duration>` within the tool timeout; on a refusal by the human or
+older daemon does with `--ask`; its approval session part names the
+answers `s`, for this session (until it ends), `d`, standing (until the
+daemon stops), `c` and `h`, and shows a command as the `cmd` line does.
+The agent instructions' "Host commands (hostrun)": on a refusal hinting
+at `--ask`, re-run with `--ask=<duration>` within the tool timeout; on a refusal by the human or
 no answer, report and wait instead of asking again.
 
 ## Tests
