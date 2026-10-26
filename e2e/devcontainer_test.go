@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -132,6 +133,9 @@ type cmdError struct {
 }
 
 func (c *cmdError) Error() string { return c.err.Error() + "\n" + lastLines(c.stderr, 20) }
+
+// Unwrap gives errors.As the command's *exec.ExitError, for its exit code.
+func (c *cmdError) Unwrap() error { return c.err }
 
 func lastLines(s string, n int) string {
 	lines := strings.Split(strings.TrimSpace(s), "\n")
@@ -308,6 +312,32 @@ func testLifecycle(t *testing.T, e env) {
 		}
 		if _, err := e.exec(t, "hostrun", "rm", "-rf", "."); err == nil || !strings.Contains(err.Error(), `no rule allows "rm -rf"`) {
 			t.Fatalf("got %v, want an unlisted command denied", err)
+		}
+	})
+
+	t.Run("the approval socket is out of the container's reach", func(t *testing.T) {
+		approvalSocket := runtimeDir + ".approval.sock"
+		if info, err := os.Stat(approvalSocket); err != nil || info.Mode().Type() != os.ModeSocket {
+			t.Fatalf("approval socket %s on the host: %v", approvalSocket, err)
+		}
+		// The container mounts the runtime directory alone, at
+		// /run/hostrunner, and the workspace; no approval socket is in either
+		// or beside the runtime directory.
+		got, err := e.exec(t, "sh", "-c", `find /run "$PWD" -name '*.approval.sock'`)
+		if err != nil {
+			t.Fatalf("searching the container: %v", err)
+		}
+		if strings.TrimSpace(got) != "" {
+			t.Fatalf("the container sees an approval socket:\n%s", got)
+		}
+		start := time.Now()
+		_, err = e.exec(t, "hostrun", "--ask", "rm", "-rf", ".")
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 126 || !strings.Contains(err.Error(), "not approved: no approval session serves this devcontainer") {
+			t.Fatalf("got %v, want --ask refused with 126 without a session", err)
+		}
+		if waited := time.Since(start); waited > cliTimeout/10 {
+			t.Fatalf("--ask without a session took %v, want it refused at once", waited)
 		}
 	})
 

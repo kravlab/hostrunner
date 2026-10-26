@@ -185,10 +185,10 @@ func TestServeStopsRunningCommandsOnPermanentAcceptError(t *testing.T) {
 }
 
 func TestServeCallsArmHandlerOnArmRequest(t *testing.T) {
-	armed := make(chan struct{}, 1)
-	srv := newServer(t, daemon.WithArmHandler(func(a protocol.Arm) bool {
+	digests := make(chan string, 1)
+	srv := newServer(t, daemon.WithReload("served", nil), daemon.WithArmHandler(func(a protocol.Arm, digest string) bool {
 		if a.ConfigDigest == "abc" {
-			armed <- struct{}{}
+			digests <- digest
 		}
 		return false
 	}))
@@ -211,14 +211,17 @@ func TestServeCallsArmHandlerOnArmRequest(t *testing.T) {
 		t.Fatalf("reply %+v, err %v; want no step aside", reply, err)
 	}
 	select {
-	case <-armed:
+	case got := <-digests:
+		if got != "served" {
+			t.Fatalf("arm handler got digest %q, want \"served\"", got)
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("arm handler was not called")
 	}
 }
 
 func TestServeRejectsArmWithOtherVersion(t *testing.T) {
-	srv := newServer(t, daemon.WithArmHandler(func(protocol.Arm) bool {
+	srv := newServer(t, daemon.WithArmHandler(func(protocol.Arm, string) bool {
 		t.Error("arm handler called for a bad version")
 		return false
 	}))
@@ -271,7 +274,7 @@ func TestServeSurvivesAPanickingRequest(t *testing.T) {
 }
 
 func TestServeStopsAfterAnsweringArmWithStepAside(t *testing.T) {
-	srv := newServer(t, daemon.WithArmHandler(func(protocol.Arm) bool { return true }))
+	srv := newServer(t, daemon.WithArmHandler(func(protocol.Arm, string) bool { return true }))
 	client, server := net.Pipe()
 	defer client.Close()
 	done := make(chan error, 1)

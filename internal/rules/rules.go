@@ -42,6 +42,11 @@
 // values is the caller's. A rule with secrets takes allow lists only (see
 // checkStrictLists).
 //
+// A refusal carries every reason the matching rule finds, each with its
+// kind (see Denial): a plain refusal reports the first, while an approval
+// request and the Rules test show them all and tell from their kinds
+// whether approving the command is guarded.
+//
 // Rules restrict argv and, with `dir`, the working directory only. A tool
 // that reads configuration or hooks from the workspace can still be
 // steered by whoever can write the workspace.
@@ -66,17 +71,220 @@ import (
 )
 
 // Denial explains why a command is not allowed. Rule is the matched rule's
-// command, or empty when no rule applies.
+// command, or empty when no rule applies. Reason is the first reason, the
+// one a refusal reports (Error); Reasons are all of them, Reasons[0] being
+// Reason, so an approval request and the Rules test can show every one.
+// Reasons is empty for an empty command, which nothing can approve.
+// Approved is what the matching rule would run the command with if a
+// human approved it, as Check reports an allowed command: its fixed
+// directory, secrets, injection and the arguments under lists with a path
+// check, refused ones included; the zero Allowed when no rule matches.
 type Denial struct {
-	Rule   string
-	Reason string
+	Rule     string
+	Reason   string
+	Reasons  []Reason
+	Approved Allowed
 }
 
-func (d *Denial) Error() string {
-	if d.Rule == "" {
-		return d.Reason
+// Error describes the denial with its first reason, as a refusal reports
+// it.
+func (d *Denial) Error() string { return d.WithRule(d.Reason) }
+
+// Explain describes the denial with every reason, joined by "; ", as
+// Error describes it with the first.
+func (d *Denial) Explain() string {
+	texts := make([]string, len(d.Reasons))
+	for i, r := range d.Reasons {
+		texts[i] = r.Text
 	}
-	return fmt.Sprintf("denied by rule %q: %s", d.Rule, d.Reason)
+	return d.WithRule(strings.Join(texts, "; "))
+}
+
+// WithRule returns reason, text of the denial's reasons, prefixed with the
+// rule that gave the denial, if any: denied by rule "<rule>": <reason>.
+func (d *Denial) WithRule(reason string) string {
+	if d.Rule == "" {
+		return reason
+	}
+	return fmt.Sprintf("denied by rule %q: %s", d.Rule, reason)
+}
+
+// Approvable reports whether the rules leave the denial for a human to
+// approve: every refusal by the rules, not an empty command. Whether one
+// can is the caller's to decide: approvals need an approval session, and
+// checks outside the rules (directories, secrets' sources, the program)
+// may refuse the command for good.
+func (d *Denial) Approvable() bool { return len(d.Reasons) > 0 }
+
+// ApprovableDenial returns the Denial err holds when the rules leave it
+// for a human to approve (see Denial.Approvable), and whether they do.
+func ApprovableDenial(err error) (*Denial, bool) {
+	var d *Denial
+	if errors.As(err, &d) && d.Approvable() {
+		return d, true
+	}
+	return nil, false
+}
+
+// Guarded reports whether approving the command needs a warning and a
+// second confirmation: a reason is a deny pattern or an argv the rules
+// cannot read, or the matching rule would inject secrets. A failed path
+// check, the remaining kind of guarded refusal, is the caller's to find.
+func (d *Denial) Guarded() bool {
+	if len(d.Approved.Secrets) > 0 {
+		return true
+	}
+	return slices.ContainsFunc(d.Reasons, func(r Reason) bool { return r.Guard() != "" })
+}
+
+// Reason is one reason the rules refuse a command, and its kind.
+type Reason struct {
+	Kind ReasonKind
+	Text string
+	// Refused is what an allow list refused, for ReasonNotAllowed; a rule
+	// widened to allow it lists it (see ruleedit.Propose).
+	Refused Refused
+}
+
+// RefusedKind tells what part of an argv an allow list refused.
+type RefusedKind int
+
+const (
+	RefusedFlag  RefusedKind = iota + 1 // a flag name: Flag
+	RefusedValue                        // a flag's value: Flag, Text
+	RefusedArg                          // a positional argument: Text
+)
+
+// Refused is the part of an argv an allow list refused: Flag names the
+// flag, as given, and Text is the value or the argument. Inline marks a
+// refused flag given a value in its token (--file=x), Text: a rule
+// declares it to take one to allow it.
+type Refused struct {
+	Kind   RefusedKind
+	Flag   string
+	Text   string
+	Inline bool
+}
+
+// getoptKind is how getopt reads a token of argv before "--".
+type getoptKind int
+
+const (
+	tokenEnd        getoptKind = iota + 1 // "--": the tokens after it are positional
+	tokenPositional                       // "-", or a token without a leading dash
+	tokenLong                             // --name or --name=value
+	tokenCluster                          // -abc: short flags, -ovalue included
+)
+
+// getoptToken tells how getopt reads tok, a token of argv before "--".
+func getoptToken(tok string) getoptKind {
+	switch {
+	case tok == "--":
+		return tokenEnd
+	case tok == "-" || !strings.HasPrefix(tok, "-"):
+		return tokenPositional
+	case strings.HasPrefix(tok, "--"):
+		return tokenLong
+	}
+	return tokenCluster
+}
+
+// IsPositional reports whether the rules read tok, a token of argv before
+// "--", as a positional argument.
+func IsPositional(tok string) bool { return getoptToken(tok) == tokenPositional }
+
+// Args is what argv's arguments give, read as the rules read them with no
+// flag declared to take a value; each list holds what it holds once, in
+// the order given.
+type Args struct {
+	Flags      []string            // flags given without a value in their token
+	Valued     []string            // flags given a value in their token (--file=x)
+	Values     map[string][]string // the values each of Valued was given
+	Positional []string            // positional arguments
+}
+
+// ReadArgs reads args, the arguments after a command, as the rules read
+// them with no flag declared to take a value.
+func ReadArgs(args []string) Args {
+	a := Args{Values: map[string][]string{}}
+	ended := false
+	for _, tok := range args {
+		kind := getoptToken(tok)
+		switch {
+		case ended || kind == tokenPositional:
+			a.Positional = appendNew(a.Positional, tok)
+		case kind == tokenEnd:
+			ended = true
+		case kind == tokenLong:
+			if name, value, inline := strings.Cut(tok, "="); inline {
+				if _, ok := a.Values[name]; !ok {
+					a.Valued = append(a.Valued, name)
+				}
+				a.Values[name] = appendNew(a.Values[name], value)
+			} else {
+				a.Flags = appendNew(a.Flags, tok)
+			}
+		default: // a cluster of short flags
+			for _, c := range tok[1:] {
+				a.Flags = appendNew(a.Flags, "-"+string(c))
+			}
+		}
+	}
+	return a
+}
+
+// appendNew appends s to list unless it holds it already.
+func appendNew(list []string, s string) []string {
+	if slices.Contains(list, s) {
+		return list
+	}
+	return append(list, s)
+}
+
+// ReasonKind tells why the rules refuse a command, and so whether
+// approving it is guarded.
+type ReasonKind int
+
+const (
+	// ReasonNoRule: no rule matches the command.
+	ReasonNoRule ReasonKind = iota + 1
+	// ReasonNoFile: there is no rules file.
+	ReasonNoFile
+	// ReasonNotAllowed: an argument misses an allow list.
+	ReasonNotAllowed
+	// ReasonArgsNone: arguments were given to an `args: none` rule.
+	ReasonArgsNone
+	// ReasonDenied: an argument matches a deny list (explicitly denied).
+	ReasonDenied
+	// ReasonUnreadable: the rules cannot tell how the program reads the
+	// argv (a missing value, an abbreviation they cannot resolve, a value
+	// for a flag that takes none, tokens Go flag parsers read differently).
+	ReasonUnreadable
+)
+
+// Guard describes r as the guarded reason it makes approving the command
+// ("explicitly denied: …", "unreadable argv: …"), or returns "" when it
+// does not make approving it guarded.
+func (r Reason) Guard() string {
+	switch r.Kind {
+	case ReasonDenied:
+		return "explicitly denied: " + r.Text
+	case ReasonUnreadable:
+		return "unreadable argv: " + r.Text
+	}
+	return ""
+}
+
+// findings collects the reasons a rule refuses arguments, in the order a
+// refusal has always reported its first one.
+type findings []Reason
+
+// add records a reason of kind k.
+func (f *findings) add(k ReasonKind, text string) { *f = append(*f, Reason{Kind: k, Text: text}) }
+
+// refuse records that an allow list refused r, for text.
+func (f *findings) refuse(r Refused, text string) {
+	*f = append(*f, Reason{Kind: ReasonNotAllowed, Text: text, Refused: r})
 }
 
 // missingReason is the denial for every command when there is no config.
@@ -179,9 +387,29 @@ func Read(path string) (*Policy, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
-	sum := sha256.Sum256(data)
-	p.digest = hex.EncodeToString(sum[:])
+	p.digest = ContentDigest(data)
 	return p, nil
+}
+
+// ContentDigest returns the digest Load gives a rules file with content
+// data.
+func ContentDigest(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+// FileDigest returns the digest of the rules file name in fsys, the one
+// Load gives the file it loads (see Policy.Digest), and the file's
+// content: no content, with the digest of no file, when it is missing.
+func FileDigest(fsys fs.FS, name string) (string, []byte, error) {
+	data, err := fs.ReadFile(fsys, name)
+	if errors.Is(err, fs.ErrNotExist) {
+		return missingDigest, nil, nil
+	}
+	if err != nil {
+		return "", nil, err
+	}
+	return ContentDigest(data), data, nil
 }
 
 // Raw YAML shapes; Parse validates them into rules.
@@ -551,12 +779,14 @@ type Allowed struct {
 }
 
 // Check returns what allowed argv, or a *Denial when argv is not allowed.
+// The denial carries every reason the matching rule finds, not only the
+// first one it reports.
 func (p *Policy) Check(argv []string) (Allowed, error) {
 	if len(argv) == 0 {
 		return Allowed{}, &Denial{Reason: "empty command"}
 	}
 	if p.missing {
-		return Allowed{}, &Denial{Reason: missingReason}
+		return Allowed{}, denial("", Allowed{}, findings{{Kind: ReasonNoFile, Text: missingReason}})
 	}
 	var best *rule
 	for _, r := range p.rules {
@@ -566,81 +796,106 @@ func (p *Policy) Check(argv []string) (Allowed, error) {
 		}
 	}
 	if best == nil {
-		return Allowed{}, &Denial{Reason: fmt.Sprintf("no rule allows %q", strings.Join(argv[:min(2, len(argv))], " "))}
+		return Allowed{}, denial("", Allowed{}, findings{{Kind: ReasonNoRule, Text: fmt.Sprintf("no rule allows %q", strings.Join(argv[:min(2, len(argv))], " "))}})
 	}
 	var paths []PathArg
-	if reason := best.check(argv[len(best.command):], &paths); reason != "" {
-		return Allowed{}, &Denial{Rule: best.name, Reason: reason}
-	}
+	var found findings
+	best.check(argv[len(best.command):], &paths, &found)
 	// check finds flag values as it goes but positional arguments at the end.
 	slices.SortFunc(paths, func(a, b PathArg) int { return a.Index - b.Index })
 	for i := range paths {
 		paths[i].Index += len(best.command)
 	}
-	return Allowed{Rule: best.name, Paths: paths, Dir: best.dir, Secrets: best.secrets, Inject: best.inject, commandLen: len(best.command)}, nil
+	allowed := Allowed{Rule: best.name, Paths: paths, Dir: best.dir, Secrets: best.secrets, Inject: best.inject, commandLen: len(best.command)}
+	if len(found) > 0 {
+		return Allowed{}, denial(best.name, allowed, found)
+	}
+	return allowed, nil
 }
 
-// check applies the rule to the arguments after its command and returns
-// why they are denied, or "" if they are allowed. It appends to paths the
-// arguments a path check applies to, indexed into args.
-func (r *rule) check(args []string, paths *[]PathArg) string {
+// denial builds the Denial for the reasons found, which must not be empty,
+// by the rule named rule (empty when no rule applies), which would run the
+// command as approved describes.
+func denial(rule string, approved Allowed, found findings) *Denial {
+	return &Denial{Rule: rule, Reason: found[0].Text, Reasons: found, Approved: approved}
+}
+
+// check applies the rule to the arguments after its command and adds to
+// found every reason they are denied; none if they are allowed. It
+// appends to paths the arguments a path check applies to, indexed into
+// args. After a reason it reads on as the program most likely would, so
+// that later reasons are found too; the first one is the one a refusal
+// reports.
+func (r *rule) check(args []string, paths *[]PathArg, found *findings) {
 	switch r.args {
 	case "any":
-		return ""
+		return
 	case "none":
 		if len(args) > 0 {
-			return "arguments are not allowed"
+			found.add(ReasonArgsNone, "arguments are not allowed")
 		}
-		return ""
+		return
 	}
 	if r.style == styleGo {
-		return r.checkGo(args, paths)
+		r.checkGo(args, paths, found)
+		return
 	}
 	var positional []int // indexes into args
 	for i := 0; i < len(args); i++ {
 		tok := args[i]
-		switch {
-		case tok == "--":
+		switch getoptToken(tok) {
+		case tokenEnd:
 			for j := i + 1; j < len(args); j++ {
 				positional = append(positional, j)
 			}
 			i = len(args)
-		case tok == "-" || !strings.HasPrefix(tok, "-"):
+		case tokenPositional:
 			positional = append(positional, i)
-		case strings.HasPrefix(tok, "--"):
+		case tokenLong:
 			name, value, inline := strings.Cut(tok, "=")
 			// A denied flag stays denied even if it also abbreviates a value
 			// flag (--force vs --force-with-lease).
+			// After a refused flag that most likely takes the next token as
+			// its value, that token is skipped rather than read as a
+			// positional argument with a reason of its own.
+			skipValue := func() {
+				if !inline && r.flags.valueFollows(name) {
+					i++
+				}
+			}
 			if reason := r.flags.checkDenied(name); reason != "" {
-				return reason
+				found.add(ReasonDenied, reason)
+				skipValue()
+				continue
 			}
 			flag, reason := r.flags.resolveLong(name)
 			if reason != "" {
-				return reason
+				found.add(ReasonUnreadable, reason)
+				skipValue()
+				continue
 			}
 			if flag != name && !inline {
 				// Whether an abbreviation takes the next token is up to the
 				// program; only the unambiguous form is filtered reliably.
-				return fmt.Sprintf("abbreviated flag %s must be given its value as %s=value", name, name)
+				found.add(ReasonUnreadable, fmt.Sprintf("abbreviated flag %s must be given its value as %s=value", name, name))
+				skipValue()
+				continue
 			}
 			if _, takesValue := r.flags.valuesFor(flag); takesValue {
 				prefix := name + "="
 				if !inline {
 					if i+1 == len(args) {
-						return fmt.Sprintf("flag %s needs a value", flag)
+						found.add(ReasonUnreadable, fmt.Sprintf("flag %s needs a value", flag))
+						continue
 					}
 					i++
 					value, prefix = args[i], ""
 				}
-				if reason := r.flags.checkValue(flag, value); reason != "" {
-					return reason
-				}
+				r.flags.checkValue(flag, value, found)
 				r.flags.addPath(paths, flag, i, prefix)
 				continue
 			}
-			if reason := r.flags.checkName(name, inline); reason != "" {
-				return reason
-			}
+			r.flags.checkName(name, value, inline, found)
 		default: // a cluster of short flags: -abc, -ovalue
 			for j, c := range tok[1:] {
 				flag := "-" + string(c)
@@ -649,59 +904,72 @@ func (r *rule) check(args []string, paths *[]PathArg) string {
 					value := tok[len(prefix):]
 					if value == "" {
 						if i+1 == len(args) {
-							return fmt.Sprintf("flag %s needs a value", flag)
+							found.add(ReasonUnreadable, fmt.Sprintf("flag %s needs a value", flag))
+							break
 						}
 						i++
 						value, prefix = args[i], ""
 					}
-					if reason := r.flags.checkValue(flag, value); reason != "" {
-						return reason
-					}
+					r.flags.checkValue(flag, value, found)
 					r.flags.addPath(paths, flag, i, prefix)
 					break
 				}
-				if reason := r.flags.checkName(flag, false); reason != "" {
-					return reason
-				}
+				r.flags.checkName(flag, "", false, found)
 			}
 		}
 	}
-	return r.checkPositionals(args, positional, paths)
+	r.checkPositionals(args, positional, paths, found)
 }
 
 // checkPositionals applies the positional list to args[i] for each i in
-// positional, and appends those arguments to paths if the list has a path
-// check.
-func (r *rule) checkPositionals(args []string, positional []int, paths *[]PathArg) string {
+// positional, adding to found the reason for each one refused, and
+// appends each to paths if the list has a path check: a refused one too,
+// since an approval runs it, and a failed check makes it guarded.
+func (r *rule) checkPositionals(args []string, positional []int, paths *[]PathArg, found *findings) {
 	for _, i := range positional {
-		if reason := r.checkPositional(args[i]); reason != "" {
-			return reason
-		}
+		r.checkPositional(args[i], found)
 		if r.positional != nil && r.positional.path != PathModeNone {
 			*paths = append(*paths, PathArg{Index: i, Mode: r.positional.path})
 		}
 	}
-	return ""
 }
 
 // checkPositional applies the positional list's patterns to one argument.
-func (r *rule) checkPositional(arg string) string {
+// It reports whether the argument passes, adding to found why it does not.
+func (r *rule) checkPositional(arg string, found *findings) bool {
 	if r.positional == nil {
-		return ""
+		return true
 	}
 	switch m := r.positional.matches(arg); {
 	case r.positional.allow && !m:
-		return fmt.Sprintf("argument %q is not allowed", arg)
+		found.refuse(Refused{Kind: RefusedArg, Text: arg}, fmt.Sprintf("argument %q is not allowed", arg))
+		return false
 	case !r.positional.allow && m:
-		return fmt.Sprintf("argument %q is denied", arg)
+		found.add(ReasonDenied, fmt.Sprintf("argument %q is denied", arg))
+		return false
 	}
-	return ""
+	return true
 }
 
 // strict reports whether flags are restricted by an allow list, in which
 // case nothing is normalized: whatever is not listed is denied.
 func (f *flagFilter) strict() bool {
 	return f != nil && f.names != nil && f.names.allow
+}
+
+// valueFollows reports whether the long flag name, given without an inline
+// value, most likely takes the next token as its value: it is a value flag
+// or, outside strict mode, abbreviates one (see resolveLong).
+func (f *flagFilter) valueFollows(name string) bool {
+	if f == nil {
+		return false
+	}
+	for flag := range f.values {
+		if flag == name || !f.strict() && strings.HasPrefix(flag, "--") && strings.HasPrefix(flag, name) {
+			return true
+		}
+	}
+	return false
 }
 
 // valuesFor returns the value filter of a flag that takes a value.
@@ -740,23 +1008,27 @@ func (f *flagFilter) resolveLong(name string) (string, string) {
 	return "", fmt.Sprintf("flag %s is ambiguous", name)
 }
 
-// checkName checks a flag that takes no value. With an allow list the flag
-// must be listed and must not carry an inline value; with a deny list see
+// checkName checks a flag that takes no value, adding to found why it is
+// refused. With an allow list the flag must be listed and must not carry
+// an inline value (value, when inlineValue); with a deny list see
 // checkDenied.
-func (f *flagFilter) checkName(flag string, inlineValue bool) string {
+func (f *flagFilter) checkName(flag, value string, inlineValue bool, found *findings) {
 	if f == nil || f.names == nil {
-		return ""
+		return
 	}
 	if !f.names.allow {
-		return f.checkDenied(flag)
+		if reason := f.checkDenied(flag); reason != "" {
+			found.add(ReasonDenied, reason)
+		}
+		return
 	}
 	if !slices.Contains(f.names.patterns, flag) {
-		return fmt.Sprintf("flag %s is not allowed", flag)
+		found.refuse(Refused{Kind: RefusedFlag, Flag: flag, Text: value, Inline: inlineValue}, fmt.Sprintf("flag %s is not allowed", flag))
+		return
 	}
 	if inlineValue {
-		return fmt.Sprintf("flag %s does not take a value", flag)
+		found.add(ReasonUnreadable, fmt.Sprintf("flag %s does not take a value", flag))
 	}
-	return ""
 }
 
 // checkDenied applies a deny list: a flag is denied if listed or, for a long
@@ -774,29 +1046,34 @@ func (f *flagFilter) checkDenied(flag string) string {
 	return ""
 }
 
-// checkValue filters the value of a flag that takes one.
-func (f *flagFilter) checkValue(flag, value string) string {
+// checkValue filters the value of a flag that takes one; see
+// checkFlagValue.
+func (f *flagFilter) checkValue(flag, value string, found *findings) {
 	l, _ := f.valuesFor(flag)
-	return checkFlagValue(l, flag, value)
+	checkFlagValue(l, flag, value, found)
 }
 
 // checkFlagValue applies l, the value list of flag, to one value; a nil list
-// allows any value.
-func checkFlagValue(l *list, flag, value string) string {
+// allows any value. It reports whether the value passes, adding to found
+// why it does not.
+func checkFlagValue(l *list, flag, value string, found *findings) bool {
 	if l == nil {
-		return ""
+		return true
 	}
 	switch m := l.matches(value); {
 	case l.allow && !m:
-		return fmt.Sprintf("value %q of flag %s is not allowed", value, flag)
+		found.refuse(Refused{Kind: RefusedValue, Flag: flag, Text: value}, fmt.Sprintf("value %q of flag %s is not allowed", value, flag))
+		return false
 	case !l.allow && m:
-		return fmt.Sprintf("value %q of flag %s is denied", value, flag)
+		found.add(ReasonDenied, fmt.Sprintf("value %q of flag %s is denied", value, flag))
+		return false
 	}
-	return ""
+	return true
 }
 
 // addPath appends to paths the value of flag at args[i], after prefix in its
-// token, if the flag's list has a path check.
+// token, if the flag's list has a path check; whether the list refused the
+// value or not, as for positional arguments (see checkPositionals).
 func (f *flagFilter) addPath(paths *[]PathArg, flag string, i int, prefix string) {
 	if l, _ := f.valuesFor(flag); l != nil && l.path != PathModeNone {
 		*paths = append(*paths, PathArg{Index: i, Prefix: prefix, Mode: l.path})
