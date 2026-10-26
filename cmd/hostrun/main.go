@@ -1,8 +1,9 @@
 // Command hostrun runs a command on the devcontainer's host through the
 // hostrunner daemon: `hostrun git push` runs `git push` on the host in the
 // host directory that mirrors the current one, and exits with its code.
-// `hostrun --dry-run git push` only asks whether it would run (see
-// client.Run).
+// `hostrun --dry-run git push` only asks whether it would run, and
+// `hostrun --ask git push` asks a human on the host to approve it if the
+// rules refuse it (see client.Run).
 package main
 
 import (

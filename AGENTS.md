@@ -52,6 +52,15 @@ in the container.
   rule names a directory), or with the code and message
   the run would get. Nothing runs and stdin is not read. Anywhere after
   the program, `--dry-run` is the command's own.
+- A refusal holding `(ask for an approval: hostrun --ask …` (with
+  `; guarded: needs a second confirmation` or without) can be approved
+  by a human on the host: re-run the same command with
+  `--ask=<duration>` first (`hostrun --ask=3m git rebase -i main`), the
+  duration within your tool's timeout and at most 1 hour (125 otherwise).
+  It waits for the answer, then runs or exits 126. On `refused on the
+  host` (with the human's note, if any), `nobody answered on the host`
+  or `the hostrunner daemon is stopping`, report it to the user and
+  wait; do not ask again.
 - No TTY: supply all input up front, through flags or stdin.
 
 ## Go

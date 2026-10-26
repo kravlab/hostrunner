@@ -7,6 +7,7 @@
 //	hostrunner serve --socket <path> --workspace <host-path> --container-workspace <path>
 //	    [--config <path>] [--watch [--startup-timeout 30m] [--grace 15s]]
 //	hostrunner test [--config <path>] [--] <command> [args...]
+//	hostrunner approve [--dir <runtime-dir>]
 //	hostrunner update [--check]
 //	hostrunner version
 //
@@ -18,7 +19,10 @@
 // does not, and 1 on any error. `update` switches the versioned install
 // of hostrunner and hostrun to the latest release (see internal/update).
 // `version` prints the module version Go stamped into the binary (see
-// buildVersion).
+// buildVersion). `approve` runs an approval session in a host terminal: it
+// serves the daemon of the runtime directory, or one chosen from the list
+// of daemons, showing each approval request and sending the human's
+// answer (see internal/approval).
 package main
 
 import (
@@ -36,6 +40,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/kravlab/hostrunner/internal/approval"
 	"github.com/kravlab/hostrunner/internal/daemon"
 	"github.com/kravlab/hostrunner/internal/launch"
 	"github.com/kravlab/hostrunner/internal/protocol"
@@ -47,9 +52,10 @@ import (
 )
 
 const (
-	usage        = "usage: hostrunner up|serve|test|update|version [flags]; see `hostrunner <command> -h`"
+	usage        = "usage: hostrunner up|serve|test|approve|update|version [flags]; see `hostrunner <command> -h`"
 	upUsage      = "usage: hostrunner up --dir <runtime-dir> --workspace <host-path> --container-workspace <path>"
 	serveUsage   = "usage: hostrunner serve --socket <path> --workspace <host-path> --container-workspace <path> [--config <path>] [--watch]"
+	approveUsage = "usage: hostrunner approve [--dir <runtime-dir>]"
 	updateUsage  = "usage: hostrunner update [--check]"
 	versionUsage = "usage: hostrunner version"
 )
@@ -94,7 +100,8 @@ func exitCode(err error) int {
 }
 
 // run dispatches the subcommand in args; stdout receives `version`'s and
-// `update`'s output, stderr flag help, the daemon's log and the Rules
+// `update`'s output and the approval session, which reads the human's
+// answers from stdin; stderr flag help, the daemon's log and the Rules
 // test's verdict.
 // The caller prints a returned error; see exitCode for the exit code.
 func run(args []string, stdout, stderr io.Writer) error {
@@ -132,6 +139,12 @@ func run(args []string, stdout, stderr io.Writer) error {
 			return err
 		}
 		return rulesTest(cfg, stderr)
+	case "approve":
+		cfg, err := parseApprove(args[1:], stderr)
+		if err != nil {
+			return err
+		}
+		return approval.Run(ctx, cfg, os.Stdin, stdout)
 	case "update":
 		check, err := parseUpdate(args[1:], stderr)
 		if err != nil {
@@ -256,6 +269,34 @@ func parseServe(args []string, output io.Writer) (serveConfig, error) {
 	return cfg, nil
 }
 
+// parseApprove parses the flags of `hostrunner approve`: --dir, the runtime
+// directory of the daemon to serve, whose approval socket is beside it.
+// Without it the session lists the daemons of $XDG_RUNTIME_DIR/hostrunner,
+// where `hostrunner up` puts their runtime directories, and the current
+// directory chooses the default; with it, the session serves that daemon
+// alone.
+func parseApprove(args []string, output io.Writer) (approval.Config, error) {
+	var dir string
+	fs := flag.NewFlagSet("approve", flag.ContinueOnError)
+	fs.SetOutput(output)
+	fs.StringVar(&dir, "dir", "", "runtime directory of the daemon to serve (default: choose from the list)")
+	if err := parseFlags(fs, args, approveUsage); err != nil {
+		return approval.Config{}, err
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return approval.Config{}, err
+	}
+	if dir != "" {
+		return approval.Config{Socket: launch.ApprovalSocket(dir), Cwd: cwd}, nil
+	}
+	xdg := os.Getenv("XDG_RUNTIME_DIR")
+	if xdg == "" {
+		return approval.Config{}, errors.New("XDG_RUNTIME_DIR is not set: give the runtime directory with --dir")
+	}
+	return approval.Config{Root: filepath.Join(xdg, "hostrunner"), Cwd: cwd}, nil
+}
+
 // parseVersion parses the arguments of `hostrunner version`, which takes
 // none; output receives the usage for -h.
 func parseVersion(args []string, output io.Writer) error {
@@ -323,9 +364,11 @@ func updateMessage(res update.Result) string {
 // devcontainer has stopped (as reported by runtimes). An arm request from
 // `hostrunner up` puts the watcher back into waiting for the container.
 //
-// The rules file is read once, here: an invalid file stops the daemon from
+// The rules file is read here: an invalid file stops the daemon from
 // starting (fail closed), a missing one makes it deny every command. Later
-// edits, e.g. by a `git pull` on the host, take effect only in a new daemon.
+// edits, e.g. by a `git pull` on the host, take effect only in a new
+// daemon, except that an approval session which adds a rule makes the
+// daemon reread the file; the digest of the rules reread is the one arms compare.
 func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []watch.Runtime) error {
 	policy, err := rules.Load(cfg.config)
 	if err != nil {
@@ -335,11 +378,23 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 	if err != nil {
 		return err
 	}
+	// The approval socket lies beside the runtime directory, the socket's
+	// directory, which the container mounts: the container must not reach
+	// the channel a human approves on.
+	approvalSocket := launch.ApprovalSocket(filepath.Dir(cfg.socket))
+	if err := checkApprovalSocket(cfg.workspace, approvalSocket); err != nil {
+		return err
+	}
 	l, err := transport.Unix{Path: cfg.socket}.Listen()
 	if err != nil {
 		return err
 	}
-	log.Info("listening", "socket", cfg.socket, "workspace", cfg.workspace, "container_workspace", cfg.containerWorkspace, "config", cfg.config, "rules_digest", policy.Digest(), "watch", cfg.watch)
+	al, err := transport.Unix{Path: approvalSocket}.Listen()
+	if err != nil {
+		l.Close()
+		return err
+	}
+	log.Info("listening", "socket", cfg.socket, "approval_socket", approvalSocket, "workspace", cfg.workspace, "container_workspace", cfg.containerWorkspace, "config", cfg.config, "rules_digest", policy.Digest(), "watch", cfg.watch)
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -359,18 +414,45 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 			}
 		}()
 	}
-	onArm := armHandler(policy.Digest(), cfg.config, watcher, log)
-	return daemon.New(mapper, policy, log, daemon.WithArmHandler(onArm)).Serve(ctx, l)
+	reload := func() (daemon.Policy, string, error) {
+		p, err := rules.Load(cfg.config)
+		if err != nil {
+			return nil, "", err
+		}
+		return p, p.Digest(), nil
+	}
+	srv := daemon.New(mapper, policy, log, daemon.WithArmHandler(armHandler(cfg.config, watcher, log)), daemon.WithApprovals(al, cfg.config), daemon.WithReload(policy.Digest(), reload))
+	return srv.Serve(ctx, l)
+}
+
+// checkApprovalSocket refuses an approval socket inside the workspace,
+// which the container mounts and so could reach to answer its own
+// requests. Other mounts the daemon cannot see: the runtime directory
+// `hostrunner up` uses lies under $XDG_RUNTIME_DIR, which no container
+// mounts whole.
+func checkApprovalSocket(workspace, socket string) error {
+	ws, err := filepath.EvalSymlinks(workspace)
+	if err != nil {
+		return err
+	}
+	dir, err := filepath.EvalSymlinks(filepath.Dir(socket))
+	if err != nil {
+		return err
+	}
+	if rel, err := filepath.Rel(ws, dir); err == nil && filepath.IsLocal(rel) {
+		return fmt.Errorf("approval socket %s lies inside the workspace %s, which the container mounts", socket, workspace)
+	}
+	return nil
 }
 
 // armHandler answers the arms of `hostrunner up`, which arms the daemon on
-// every container start with the digest of the rules it validated. digest
-// is the digest of the rules this daemon loaded from config. The daemon
-// steps aside for a new one when the digests differ, or when watcher has
-// ended and will not follow the arm; otherwise watcher, if any, waits for
-// the container of this arm.
-func armHandler(digest, config string, watcher *watch.Watcher, log *slog.Logger) func(protocol.Arm) (stepAside bool) {
-	return func(a protocol.Arm) bool {
+// every container start with the digest of the rules it validated; digest
+// is that of the rules the daemon serves from config, which a reread
+// changes. The daemon steps aside for a new one when the digests differ,
+// or when watcher has ended and will not follow the arm; otherwise
+// watcher, if any, waits for the container of this arm.
+func armHandler(config string, watcher *watch.Watcher, log *slog.Logger) func(a protocol.Arm, digest string) (stepAside bool) {
+	return func(a protocol.Arm, digest string) bool {
 		if a.ConfigDigest != digest {
 			log.Info("stepping aside: the rules file changed", "config", config)
 			return true

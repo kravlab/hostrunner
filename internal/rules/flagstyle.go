@@ -28,8 +28,12 @@ var flagStyles = map[string]flagStyle{"getopt": styleGetopt, "go": styleGo}
 // name without the leading dashes, so -name and --name are one flag.
 func flagKey(name string) string { return strings.TrimLeft(name, "-") }
 
+// SameFlag reports whether a and b name one flag as a go-style rule reads
+// them, which getopt names that are one flag do too.
+func SameFlag(a, b string) bool { return flagKey(a) == flagKey(b) }
+
 // checkGo applies a go-style rule to the arguments after its command, as
-// check does under getopt.
+// check does under getopt, adding every reason to found.
 //
 // The parsers this style stands for differ. Go's flag package and urfave/cli
 // v1 and v2 stop reading flags at the first positional argument (v1 leaf
@@ -41,29 +45,26 @@ func flagKey(name string) string { return strings.TrimLeft(name, "-") }
 // has to pass every reading: as a positional argument, and as a flag or a
 // flag's value. A path check cannot apply to a token read in more than one
 // way: the daemon would rewrite a token the program may read as something
-// else.
-func (r *rule) checkGo(args []string, paths *[]PathArg) string {
+// else. Such a token can get a reason for each reading it fails (as a
+// positional argument, and as a flag or its value), each true for some
+// parser.
+func (r *rule) checkGo(args []string, paths *[]PathArg, found *findings) {
 	i := 0
 agreed:
 	for ; i < len(args); i++ {
 		tok := args[i]
 		switch {
 		case tok == "--":
-			return r.goPositionals(args, i+1, paths)
+			r.goPositionals(args, i+1, paths, found)
+			return
 		case isGoFlag(tok):
-			consumed, reason := r.goFlag(args, i, false, paths)
-			if reason != "" {
-				return reason
-			}
-			if consumed {
+			if r.goFlag(args, i, false, paths, found) {
 				i++
 			}
 		case tok == "-" || !strings.HasPrefix(tok, "-") && strings.TrimSpace(tok) == tok:
 			// Every parser reads the first positional argument as one; they
 			// disagree on what follows it.
-			if reason := r.goPositional(args, i, false, paths); reason != "" {
-				return reason
-			}
+			r.goPositional(args, i, false, paths, found)
 			i++
 			break agreed
 		default: // -1, or whitespace around the token: read differently already
@@ -76,28 +77,20 @@ agreed:
 		if !value && t == "--" {
 			// urfave/cli v3 ends the flags here; the other parsers read it
 			// and everything after it as positional arguments already.
-			if reason := r.goPositional(args, i, true, paths); reason != "" {
-				return reason
-			}
-			return r.goPositionals(args, i+1, paths)
+			r.goPositional(args, i, true, paths, found)
+			r.goPositionals(args, i+1, paths, found)
+			return
 		}
 		flag := !value && strings.HasPrefix(t, "-") && t != "-"
-		if reason := r.goPositional(args, i, value || flag, paths); reason != "" {
-			return reason
-		}
+		r.goPositional(args, i, value || flag, paths, found)
 		if value {
 			value = false // goFlag has checked it as the value
 			continue
 		}
 		if flag {
-			consumed, reason := r.goFlag(args, i, true, paths)
-			if reason != "" {
-				return reason
-			}
-			value = consumed
+			value = r.goFlag(args, i, true, paths, found)
 		}
 	}
-	return ""
 }
 
 // isGoFlag reports whether every Go parser reads tok as a flag: two dashes,
@@ -115,75 +108,82 @@ func isGoFlag(tok string) bool {
 
 // goPositionals checks args[from:] as positional arguments, which every
 // parser reads them as.
-func (r *rule) goPositionals(args []string, from int, paths *[]PathArg) string {
+func (r *rule) goPositionals(args []string, from int, paths *[]PathArg, found *findings) {
 	for i := from; i < len(args); i++ {
-		if reason := r.goPositional(args, i, false, paths); reason != "" {
-			return reason
-		}
+		r.goPositional(args, i, false, paths, found)
 	}
-	return ""
 }
 
-// goPositional checks args[i] as a positional argument. ambiguous is set
-// when a parser may read it as a flag or a flag's value instead. A token
-// with whitespace around it is checked as given and trimmed, as urfave/cli
-// v3 reads it; like an ambiguous one, it cannot take a path check.
-func (r *rule) goPositional(args []string, i int, ambiguous bool, paths *[]PathArg) string {
+// goPositional checks args[i] as a positional argument, adding to found
+// why it is refused. ambiguous is set when a parser may read it as a flag
+// or a flag's value instead. A token with whitespace around it is checked
+// as given and trimmed, as urfave/cli v3 reads it; like an ambiguous one,
+// it cannot take a path check.
+func (r *rule) goPositional(args []string, i int, ambiguous bool, paths *[]PathArg, found *findings) {
 	tok := args[i]
 	readings := textReadings(tok)
+	// A refused argument is path-checked too (see checkPositionals); its
+	// other readings would only repeat the refusal.
 	for _, arg := range readings {
-		if reason := r.checkPositional(arg); reason != "" {
-			return reason
+		if !r.checkPositional(arg, found) {
+			break
 		}
 	}
 	if r.positional == nil || r.positional.path == PathModeNone {
-		return ""
+		return
 	}
 	if ambiguous || len(readings) > 1 {
-		return fmt.Sprintf("argument %q is read differently by Go flag parsers: a path check cannot apply to it", tok)
+		found.add(ReasonUnreadable, fmt.Sprintf("argument %q is read differently by Go flag parsers: a path check cannot apply to it", tok))
+		return
 	}
 	*paths = append(*paths, PathArg{Index: i, Mode: r.positional.path})
-	return ""
 }
 
 // goFlag checks args[i] as a flag the way the Go parsers read it: one or two
 // dashes, an exact name, a value inline or in the next token, and, for a
 // single-dash name the rule does not know, possibly a cluster of short flags.
-// It reports whether the flag takes the next token as its value. ambiguous
-// is set when a parser may read the token, or the token after it, as
-// something else (see checkGo).
-func (r *rule) goFlag(args []string, i int, ambiguous bool, paths *[]PathArg) (bool, string) {
+// It adds to found why the flag is refused and reports whether the flag
+// takes the next token as its value. ambiguous is set when a parser may read
+// the token, or the token after it, as something else (see checkGo).
+func (r *rule) goFlag(args []string, i int, ambiguous bool, paths *[]PathArg, found *findings) bool {
 	tok := args[i]
 	t := strings.TrimSpace(tok)
-	name, _, inline := strings.Cut(t, "=")
+	name, value, inline := strings.Cut(t, "=")
 	shown := name // the flag as written in argv, for messages
 	if t != tok {
 		given, _, _ := strings.Cut(tok, "=")
 		shown = strconv.Quote(given) // whitespace and all
 	}
 	if strings.HasPrefix(t, "---") {
-		return false, fmt.Sprintf("flag %s has more than two dashes", shown)
+		found.add(ReasonUnreadable, fmt.Sprintf("flag %s has more than two dashes", shown))
+		return false
 	}
 	f := r.flags
 	if f == nil {
-		return false, ""
+		return false
 	}
 	key := flagKey(name)
 	denied := func(key string) bool {
 		return f.names != nil && !f.names.allow && slices.Contains(f.names.patterns, key)
 	}
 	if denied(key) {
-		return false, fmt.Sprintf("flag %s is not allowed", shown)
+		found.add(ReasonDenied, fmt.Sprintf("flag %s is not allowed", shown))
+		// A denied value flag still takes the next token as its value, as
+		// under getopt, so that token gets no reason of its own.
+		_, takesValue := f.values[key]
+		return takesValue && !inline && i+1 < len(args)
 	}
 	if l, ok := f.values[key]; ok {
-		return goValue(args, i, l, shown, ambiguous, paths)
+		return goValue(args, i, l, shown, ambiguous, paths, found)
 	}
 	if f.names != nil && f.names.allow && !slices.Contains(f.names.patterns, key) {
-		return false, fmt.Sprintf("flag %s is not allowed", shown)
+		found.refuse(Refused{Kind: RefusedFlag, Flag: name, Text: value, Inline: inline}, fmt.Sprintf("flag %s is not allowed", shown))
+		return false
 	}
 	if inline {
 		// A boolean flag takes it: --dry-run=false turns the flag off.
-		return false, fmt.Sprintf("flag %s does not take a value", shown)
+		found.add(ReasonUnreadable, fmt.Sprintf("flag %s does not take a value", shown))
+		return false
 	}
 	allowed := f.names != nil && f.names.allow // and listed, or denied above
 	if !allowed && !strings.HasPrefix(name, "--") && utf8.RuneCountInString(key) > 1 {
@@ -195,20 +195,23 @@ func (r *rule) goFlag(args []string, i int, ambiguous bool, paths *[]PathArg) (b
 		for _, c := range key {
 			letter := string(c)
 			if denied(letter) {
-				return false, fmt.Sprintf("flag -%s in %s is not allowed", letter, shown)
+				found.add(ReasonDenied, fmt.Sprintf("flag -%s in %s is not allowed", letter, shown))
+				return false
 			}
 			if _, ok := f.values[letter]; ok {
-				return false, fmt.Sprintf("flag -%s in %s takes a value", letter, shown)
+				found.add(ReasonUnreadable, fmt.Sprintf("flag -%s in %s takes a value", letter, shown))
+				return false
 			}
 		}
 	}
-	return false, ""
+	return false
 }
 
 // goValue checks the value of the value flag at args[i], named name in
-// messages and filtered by l, and appends it to paths if l has a path check.
-// It reports whether the value is the next token.
-func goValue(args []string, i int, l *list, name string, ambiguous bool, paths *[]PathArg) (bool, string) {
+// messages and filtered by l, adds to found why it is refused, and appends
+// it to paths if l has a path check. It reports whether the value is the
+// next token.
+func goValue(args []string, i int, l *list, name string, ambiguous bool, paths *[]PathArg, found *findings) bool {
 	tok := args[i]
 	t := strings.TrimSpace(tok)
 	var values []string // the value's readings
@@ -222,29 +225,34 @@ func goValue(args []string, i int, l *list, name string, ambiguous bool, paths *
 		}
 	} else {
 		if i+1 == len(args) {
-			return false, fmt.Sprintf("flag %s needs a value", name)
+			found.add(ReasonUnreadable, fmt.Sprintf("flag %s needs a value", name))
+			return false
 		}
 		at, prefix = i+1, ""
 		next := args[at]
 		if ambiguous && strings.HasPrefix(strings.TrimSpace(next), "-") {
 			// urfave/cli v1 leaf commands move a known flag in front together
 			// with the next token only if that token is not a flag.
-			return false, fmt.Sprintf("flag %s is followed by %q: Go flag parsers disagree on its value here", name, next)
+			found.add(ReasonUnreadable, fmt.Sprintf("flag %s is followed by %q: Go flag parsers disagree on its value here", name, next))
+			return false
 		}
 		values = textReadings(next)
 	}
+	// A refused value is path-checked too (see checkPositionals); its other
+	// readings would only repeat the refusal.
 	for _, v := range values {
-		if reason := checkFlagValue(l, name, v); reason != "" {
-			return false, reason
+		if !checkFlagValue(l, name, v, found) {
+			break
 		}
 	}
 	if l != nil && l.path != PathModeNone {
 		if ambiguous || t != tok || len(values) > 1 {
-			return false, fmt.Sprintf("value %q of flag %s is read differently by Go flag parsers: a path check cannot apply to it", values[0], name)
+			found.add(ReasonUnreadable, fmt.Sprintf("value %q of flag %s is read differently by Go flag parsers: a path check cannot apply to it", values[0], name))
+			return at != i
 		}
 		*paths = append(*paths, PathArg{Index: at, Prefix: prefix, Mode: l.path})
 	}
-	return at != i, ""
+	return at != i
 }
 
 // textReadings returns the texts a parser may see for a token: as given

@@ -15,6 +15,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/kravlab/hostrunner/internal/approval"
 	"github.com/kravlab/hostrunner/internal/client"
 	"github.com/kravlab/hostrunner/internal/launch"
 	"github.com/kravlab/hostrunner/internal/protocol"
@@ -188,25 +189,41 @@ func watchConfig(t *testing.T) serveConfig {
 }
 
 // startServe runs serve in the background and returns its result channel
-// once the socket accepts connections.
+// once its socket and its approval socket accept connections. A serve
+// still running when the test ends is stopped then.
 func startServe(t *testing.T, cfg serveConfig, runtimes ...*watchtest.Runtime) <-chan error {
 	t.Helper()
 	rts := make([]watch.Runtime, len(runtimes))
 	for i, rt := range runtimes {
 		rts[i] = rt
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- serve(context.Background(), cfg, slog.New(slog.DiscardHandler), rts) }()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		if c, err := net.Dial("unix", cfg.socket); err == nil {
+	exited := make(chan struct{})
+	go func() {
+		done <- serve(ctx, cfg, slog.New(slog.DiscardHandler), rts)
+		close(exited)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-exited
+	})
+	waitListening(t, cfg.socket)
+	waitListening(t, launch.ApprovalSocket(filepath.Dir(cfg.socket)))
+	return done
+}
+
+// waitListening waits until the Unix socket at path accepts connections.
+func waitListening(t *testing.T, path string) {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		if c, err := net.Dial("unix", path); err == nil {
 			c.Close()
-			return done
+			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("serve did not listen")
+			t.Fatalf("nothing listens on %s", path)
 		}
-		time.Sleep(5 * time.Millisecond)
 	}
 }
 
@@ -302,22 +319,10 @@ func TestServeEnforcesConfig(t *testing.T) {
 	if err := os.WriteFile(cfg.config, []byte("rules:\n  - command: true\n    args: none\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- serve(ctx, cfg, slog.New(slog.DiscardHandler), nil) }()
-	defer func() { cancel(); <-done }()
+	startServe(t, cfg)
 	tr := transport.Unix{Path: cfg.socket}
-	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(5 * time.Millisecond) {
-		if c, err := tr.Dial(ctx); err == nil {
-			c.Close()
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("serve did not listen")
-		}
-	}
 	run := func(argv ...string) int {
-		return client.Run(ctx, tr, argv, cfg.containerWorkspace, strings.NewReader(""), io.Discard, io.Discard)
+		return client.Run(context.Background(), tr, argv, cfg.containerWorkspace, strings.NewReader(""), io.Discard, io.Discard)
 	}
 	if code := run("true"); code != 0 {
 		t.Errorf("allowed command exited %d", code)
@@ -368,26 +373,26 @@ func TestArmHandlerStepsAsideOnceTheWatchEnded(t *testing.T) {
 		go func() { done <- w.Run(ctx) }()
 		synctest.Wait() // the watch runs, waiting for its next poll
 
-		onArm := armHandler("digest", "rules.yaml", w, discard)
-		if onArm(protocol.Arm{ConfigDigest: "digest"}) {
+		onArm := armHandler("rules.yaml", w, discard)
+		if onArm(protocol.Arm{ConfigDigest: "digest"}, "digest") {
 			t.Fatal("stepped aside while the watch runs")
 		}
 		cancel()
 		if err := <-done; !errors.Is(err, context.Canceled) {
 			t.Fatalf("watch ended with %v, want context.Canceled", err)
 		}
-		if !onArm(protocol.Arm{ConfigDigest: "digest"}) {
+		if !onArm(protocol.Arm{ConfigDigest: "digest"}, "digest") {
 			t.Fatal("did not step aside after the watch ended")
 		}
 	})
 }
 
 func TestArmHandlerStepsAsideWhenRulesChanged(t *testing.T) {
-	onArm := armHandler("digest", "rules.yaml", nil, slog.New(slog.DiscardHandler))
-	if !onArm(protocol.Arm{ConfigDigest: "other"}) {
+	onArm := armHandler("rules.yaml", nil, slog.New(slog.DiscardHandler))
+	if !onArm(protocol.Arm{ConfigDigest: "other"}, "digest") {
 		t.Fatal("kept running with other rules")
 	}
-	if onArm(protocol.Arm{ConfigDigest: "digest"}) {
+	if onArm(protocol.Arm{ConfigDigest: "digest"}, "digest") {
 		t.Fatal("stepped aside with the same rules and no watch")
 	}
 }
@@ -470,7 +475,7 @@ func TestRunDispatchesUpdate(t *testing.T) {
 
 // TestUsageListsUpdate checks that the top-level usage names update.
 func TestUsageListsUpdate(t *testing.T) {
-	if err := run(nil, io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "up|serve|test|update|version") {
+	if err := run(nil, io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "up|serve|test|approve|update|version") {
 		t.Fatalf("got %v, want the usage listing update", err)
 	}
 }
@@ -491,5 +496,195 @@ func TestUpdateMessage(t *testing.T) {
 				t.Fatalf("got %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+// serve listens for approval sessions beside its socket's directory, the
+// runtime directory, which the container mounts, so the container cannot
+// reach it; it removes the socket when it stops.
+func TestServeListensOnTheApprovalSocket(t *testing.T) {
+	cfg := watchConfig(t)
+	cfg.watch = false
+	cfg.config = filepath.Join(cfg.workspace, "hostrun.yaml")
+	approvalSocket := launch.ApprovalSocket(filepath.Dir(cfg.socket))
+	t.Cleanup(func() { os.Remove(approvalSocket) })
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- serve(ctx, cfg, slog.New(slog.DiscardHandler), nil) }()
+	// Stopped here as the test ends, should it fail before it stops serve.
+	t.Cleanup(cancel)
+	waitListening(t, approvalSocket)
+	c, err := net.Dial("unix", approvalSocket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	info, err := os.Stat(approvalSocket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("approval socket mode %v, want 0600", info.Mode().Perm())
+	}
+	if err := protocol.WriteJSON(c, protocol.FrameHello, protocol.Hello{Version: protocol.ApprovalVersion}); err != nil {
+		t.Fatal(err)
+	}
+	f, err := protocol.ReadFrame(c)
+	var got protocol.DaemonInfo
+	if err != nil || f.Type != protocol.FrameDaemonInfo || protocol.DecodeJSON(f, &got) != nil {
+		t.Fatalf("hello: frame %v, err %v", f.Type, err)
+	}
+	want := protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: cfg.workspace, ContainerWorkspace: cfg.containerWorkspace, RulesFile: cfg.config, RulesDigest: "missing"}
+	if real, err := filepath.EvalSymlinks(cfg.workspace); err == nil {
+		want.Workspace = real
+	}
+	if got != want {
+		t.Fatalf("hello: got %+v, want %+v", got, want)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("serve: %v", err)
+	}
+	if _, err := os.Stat(approvalSocket); !os.IsNotExist(err) {
+		t.Fatalf("approval socket left behind: %v", err)
+	}
+}
+
+func TestParseApproveServesTheRuntimeDirectorysApprovalSocket(t *testing.T) {
+	got, err := parseApprove([]string{"--dir", "/run/user/1000/hostrunner/abc"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "/run/user/1000/hostrunner/abc.approval.sock"; got.Socket != want {
+		t.Fatalf("socket %q, want %q", got.Socket, want)
+	}
+	if got.Root != "" {
+		t.Fatalf("root %q: a session given --dir serves that daemon alone", got.Root)
+	}
+}
+
+// Without --dir, the session lists the daemons of the user's runtime
+// directory, the current directory choosing the default.
+func TestParseApproveListsTheDaemonsWithoutADirectory(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", "/run/user/1000")
+	got, err := parseApprove(nil, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := (approval.Config{Root: "/run/user/1000/hostrunner", Cwd: cwd}); got != want {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	if _, err := parseApprove(nil, io.Discard); err == nil || !strings.Contains(err.Error(), "XDG_RUNTIME_DIR") {
+		t.Fatalf("got %v, want it to need XDG_RUNTIME_DIR", err)
+	}
+	if _, err := parseApprove([]string{"--dir", "/d", "extra"}, io.Discard); err == nil {
+		t.Fatal("expected an error for an unexpected positional argument")
+	}
+}
+
+// An approval socket inside the workspace, which the container mounts,
+// would let the container answer its own requests: serve refuses it.
+func TestServeRefusesAnApprovalSocketInsideTheWorkspace(t *testing.T) {
+	cfg := watchConfig(t)
+	cfg.watch = false
+	runtimeDir := filepath.Join(cfg.workspace, "rt")
+	if err := os.Mkdir(runtimeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfg.socket = filepath.Join(runtimeDir, "h.sock")
+	err := serve(context.Background(), cfg, slog.New(slog.DiscardHandler), nil)
+	if err == nil || !strings.Contains(err.Error(), "inside the workspace") {
+		t.Fatalf("got %v, want the approval socket inside the workspace refused", err)
+	}
+	if _, err := os.Stat(launch.ApprovalSocket(runtimeDir)); !os.IsNotExist(err) {
+		t.Fatalf("approval socket created: %v", err)
+	}
+}
+
+// A daemon stepping aside closes its approval socket before its socket, so
+// once `up` sees the socket closed, the new daemon can take the approval
+// socket.
+func TestServeClosesTheApprovalSocketFirstWhenSteppingAside(t *testing.T) {
+	cfg := watchConfig(t)
+	approvalSocket := launch.ApprovalSocket(filepath.Dir(cfg.socket))
+	t.Cleanup(func() { os.Remove(approvalSocket) })
+	rt := &watchtest.Runtime{}
+	rt.Start("c")
+	done := startServe(t, cfg, rt)
+	if stepAside := armServe(t, cfg, "some other digest"); !stepAside {
+		t.Fatal("serve kept running with stale rules")
+	}
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(time.Millisecond) {
+		c, err := net.Dial("unix", cfg.socket)
+		if err != nil {
+			break
+		}
+		c.Close()
+		if time.Now().After(deadline) {
+			t.Fatal("the socket stayed open")
+		}
+	}
+	if c, err := net.Dial("unix", approvalSocket); err == nil {
+		c.Close()
+		t.Fatal("the approval socket still listens after the socket closed")
+	}
+	expectServeExit(t, done, cfg.socket)
+}
+
+// A session that adds a rule makes serve reread its rules file: the next
+// arm, carrying the new file's digest, does not make the daemon step aside.
+func TestServeRereadsItsRulesOnceARuleIsAdded(t *testing.T) {
+	cfg := watchConfig(t)
+	cfg.watch = false
+	cfg.config = filepath.Join(cfg.workspace, "hostrun.yaml")
+	if err := os.WriteFile(cfg.config, []byte("rules:\n  - command: echo\n    args: any\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	approvalSocket := launch.ApprovalSocket(filepath.Dir(cfg.socket))
+	t.Cleanup(func() { os.Remove(approvalSocket) })
+	startServe(t, cfg)
+	c, err := transport.Unix{Path: approvalSocket}.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if err := protocol.WriteJSON(c, protocol.FrameHello, protocol.Hello{Version: protocol.ApprovalVersion}); err != nil {
+		t.Fatal(err)
+	}
+	if f, err := protocol.ReadFrame(c); err != nil || f.Type != protocol.FrameDaemonInfo {
+		t.Fatalf("hello: frame %v, err %v", f.Type, err)
+	}
+	if err := protocol.WriteFrame(c, protocol.Frame{Type: protocol.FrameServe}); err != nil {
+		t.Fatal(err)
+	}
+	if f, err := protocol.ReadFrame(c); err != nil || f.Type != protocol.FrameServing {
+		t.Fatalf("serve: frame %v, err %v", f.Type, err)
+	}
+	added := []byte("rules:\n  - command: echo\n    args: any\n  - command: date\n    args: none\n")
+	if err := os.WriteFile(cfg.config, added, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := protocol.WriteJSON(c, protocol.FrameReread, protocol.Reread{Rule: "date", Digest: rules.ContentDigest(added)}); err != nil {
+		t.Fatal(err)
+	}
+	f, err := protocol.ReadFrame(c)
+	var res protocol.RereadResult
+	if err != nil || f.Type != protocol.FrameRereadResult || protocol.DecodeJSON(f, &res) != nil {
+		t.Fatalf("reread: frame %v, err %v", f.Type, err)
+	}
+	p, err := rules.Load(cfg.config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Error != "" || res.Digest != p.Digest() {
+		t.Fatalf("reread: got %+v, want the new file's digest %s", res, p.Digest())
+	}
+	if stepAside := armServe(t, cfg, p.Digest()); stepAside {
+		t.Fatal("stepped aside for the rules it reread")
 	}
 }

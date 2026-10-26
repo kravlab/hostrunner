@@ -41,6 +41,10 @@ func open(t *testing.T, m *Mapper, cwd string) (string, error) {
 
 func TestOpenMirrorsCwdInsideWorkspace(t *testing.T) {
 	root, _ := newHostWorkspace(t)
+	// A name beginning with ".." is inside, not a way out.
+	if err := os.Mkdir(filepath.Join(root, "..dots"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	m, err := NewMapper(root, containerRoot)
 	if err != nil {
 		t.Fatal(err)
@@ -49,6 +53,7 @@ func TestOpenMirrorsCwdInsideWorkspace(t *testing.T) {
 		"/workspaces/app":            root,
 		"/workspaces/app/sub":        filepath.Join(root, "sub"),
 		"/workspaces/app/sub/../sub": filepath.Join(root, "sub"),
+		"/workspaces/app/..dots":     filepath.Join(root, "..dots"),
 	}
 	for cwd, want := range cases {
 		got, err := open(t, m, cwd)

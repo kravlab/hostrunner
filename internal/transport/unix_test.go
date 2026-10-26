@@ -7,6 +7,9 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -54,6 +57,105 @@ func TestUnixListenCreatesOwnerOnlySocket(t *testing.T) {
 	}
 	if perm := info.Mode().Perm(); perm != 0o600 {
 		t.Fatalf("socket mode = %o, want 600", perm)
+	}
+}
+
+// Listen leaves the process's umask alone: a file another goroutine
+// creates meanwhile gets the mode it would get anyway.
+func TestUnixListenLeavesTheUmaskAlone(t *testing.T) {
+	dir := t.TempDir()
+	files := t.TempDir()
+	ref := filepath.Join(files, "ref")
+	if err := os.WriteFile(ref, nil, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := info.Mode().Perm()
+	stop := make(chan struct{})
+	var wrong atomic.Uint32
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			name := filepath.Join(files, strconv.Itoa(i))
+			if err := os.WriteFile(name, nil, 0o666); err != nil {
+				t.Error(err)
+				return
+			}
+			info, err := os.Stat(name)
+			if err == nil {
+				err = os.Remove(name)
+			}
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			if info.Mode().Perm() != want {
+				wrong.Add(1)
+			}
+		}
+	})
+	for i := range 300 {
+		l, err := Unix{Path: filepath.Join(dir, strconv.Itoa(i)+".sock")}.Listen()
+		if err != nil {
+			t.Fatal(err)
+		}
+		l.Close()
+	}
+	close(stop)
+	wg.Wait()
+	if n := wrong.Load(); n > 0 {
+		t.Fatalf("%d files created while Listen ran did not get mode %o", n, want)
+	}
+}
+
+// Of two Listens on one path at once, one listens there and the other is
+// refused: neither takes the other's socket.
+func TestUnixListenTwiceAtOnceListensOnce(t *testing.T) {
+	dir := t.TempDir()
+	for i := range 100 {
+		path := filepath.Join(dir, strconv.Itoa(i)+".sock")
+		var ls [2]net.Listener
+		var errs [2]error
+		var wg sync.WaitGroup
+		for j := range 2 {
+			wg.Go(func() { ls[j], errs[j] = Unix{Path: path}.Listen() })
+		}
+		wg.Wait()
+		listening := 0
+		for j := range 2 {
+			if errs[j] == nil {
+				listening++
+				defer ls[j].Close()
+			} else if !errors.Is(errs[j], ErrAlreadyListening) {
+				t.Fatalf("Listen %d: %v, want ErrAlreadyListening", j, errs[j])
+			}
+		}
+		if listening != 1 {
+			t.Fatalf("pair %d: %d Listens listen on %s, want 1", i, listening, path)
+		}
+	}
+}
+
+// Closing the listener removes its socket and leaves nothing else behind.
+func TestUnixListenerCloseRemovesTheSocket(t *testing.T) {
+	dir := t.TempDir()
+	l, err := Unix{Path: filepath.Join(dir, "h.sock")}.Listen()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if entries, err := os.ReadDir(dir); err != nil || len(entries) > 0 {
+		t.Fatalf("after Close the directory holds %v (%v), want nothing", entries, err)
 	}
 }
 

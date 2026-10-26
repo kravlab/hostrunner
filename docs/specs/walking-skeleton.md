@@ -24,8 +24,10 @@ Module `github.com/kravlab/hostrunner`, Go 1.27, stdlib only.
 - `internal/transport` — `Transport` interface (`Listen`, `Dial`) and a
   Unix socket implementation. A stale socket file is removed before
   listening, but a socket a live daemon still answers on is refused
-  (`ErrAlreadyListening`); the new socket is created under umask 0177
-  (mode 0600, no looser window).
+  (`ErrAlreadyListening`); the new socket is bound in a new owner-only
+  directory beside it, made mode 0600 there and linked into place, never
+  over what is there, so there is no looser window and the process's
+  umask is left alone.
 - `internal/protocol` — protocol version and frames `[type:1][len:4][payload]`:
   `Request` (JSON: version, argv, cwd), `Stdin`, `StdinClose`, `Stdout`,
   `Stderr`, `Exit` (code), `Error` (code + message), `StdinCredit` (bytes).
