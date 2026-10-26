@@ -50,8 +50,9 @@ in the container.
   checks the rules, the directory, file arguments and that the program
   is installed and executable, then exits 0 with
   `hostrun: dry run: allowed by rule "…"` (`, runs in <dir>` when the
-  rule names a directory), or with the code and message
-  the run would get. Nothing runs and stdin is not read. Anywhere after
+  rule names a directory; `allowed by a standing approval` or `by a
+  session approval` when a human's approval lets it through), or with
+  the code and message the run would get. Nothing runs and stdin is not read. Anywhere after
   the program, `--dry-run` is the command's own.
 - A refusal holding `(ask for an approval: hostrun --ask …` (with
   `; guarded: needs a second confirmation` or without) can be approved

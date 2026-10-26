@@ -204,20 +204,45 @@ next one in the same runtime directory. At the idle `>` prompt, `daemons` leaves
 list (without `--dir`) and `quit` ends the session.
 
 It serves the daemon chosen: it prints each approval request as
-it arrives, with the container directory, the argv and why the rules
-refused it, rings the terminal bell, and takes the answer, a letter and
-Enter: `r` refuses it (then an optional note for the agent, at most
-4096 bytes), `o` approves
-this request only, `l` grants a standing approval, `a` adds a rule (both
-below). Input typed before the prompt is discarded, and what came from
-the container is shown quoted, so it cannot steer the terminal; a note
-for the agent with control characters reaches it quoted too. An argument
-holding non-ASCII is shown as it is, with `⚠ non-ASCII` and its ASCII
-form (`"-\u0430"`), so a look-alike letter in a flag stands out. An
-argument over 200 characters is cut (`…(+N bytes)`) and an argv over 20
-arguments too (`…(+N args)`), with `argv truncated: ? shows all`; `?`
-prints every argument, one numbered per line, and asks again. The ASCII
-form is cut alike, and `standing` shows an argv as a request's block does.
+it arrives, with the container directory, the argv (`cmd` line) and why
+the rules refused it, rings the terminal bell, and takes the answer, a
+letter and Enter: `r` refuses it (then an optional note for the agent,
+at most 4096 bytes), `o` approves this request only, `s` grants a
+session approval (until it ends), `d` a standing approval (until the
+daemon stops), `a` adds a rule (all below), `c` shows every argument
+whole (see below), `h` prints what each answer offered does, then asks
+again. Input typed before the prompt is discarded. Each argument is
+quoted so that bash reads it back unchanged, and none can steer the
+terminal or hide where it ends:
+
+- one made only of ASCII letters, digits and `_@%+=:,./-` is shown bare
+  (`feat/x`);
+- an empty one as `''`;
+- one holding any other printable character, `'` and combining marks
+  excepted, in single quotes (`'fix: a b'`);
+- one holding `'`, a control character, a combining mark, a character
+  that is not printable or invalid UTF-8 in ANSI-C quotes
+  (`$'\x1b[2J'`): `'` and `\` as `\'` and `\\`, newline and tab as `\n`
+  and `\t`, any other ASCII control character, DEL and a byte of
+  invalid UTF-8 as `\xHH`, a combining mark and any other character
+  that is not printable as `\uHHHH`, or `\UHHHHHHHH` above U+FFFF.
+  Invalid UTF-8 reaches the session only once
+  [#101](https://github.com/kravlab/hostrunner/issues/101) is fixed;
+  until then such bytes arrive as U+FFFD.
+
+The directory, reasons and guards are shown as they are, Go-quoted when
+they hold a character that is not printable; a note for the agent with
+control characters reaches it quoted too. An argument holding non-ASCII
+gets a line of its own, `⚠ non-ASCII: argument N <as shown> is <ASCII
+form>`, the ASCII form in ANSI-C quotes with every character outside
+ASCII escaped (`'-а'` is `$'-\u0430'`), so a look-alike letter in a
+flag stands out. An argument over 200 characters is cut, its first 200
+shown as above and followed by `…(+N bytes)`, and an argv over 20
+arguments too (`…(+N args)`), with `cmd truncated: c shows all`; the
+ASCII form is cut alike. `c` prints every argument whole, one numbered
+per line, one holding non-ASCII followed by `   ⚠ non-ASCII: <ASCII
+form>`, whole too, and asks again. `standing` shows an argv cut and
+marked as a request's block does.
 Requests are shown one at a time, first in, first out; a new one rings
 the bell without interrupting the prompt and is counted in the next
 block (`(1 more waiting)`). A shown request whose agent goes away or
@@ -226,17 +251,22 @@ expired`) and the next is shown; a queued one drops out silently.
 Leaving the session (Ctrl+C, end of input) refuses the requests still
 waiting and says how many.
 
-A standing approval (`l`, "for the daemon's lifetime") lets the same argv,
-byte for byte, from the same container directory through from then on,
-with or without `--ask`, printing nothing of hostrun's own; it runs as
-the approved request did. A guarded request gets one after one `yes`,
-when it is granted. Standing approvals live in the daemon's memory: they
-work without a session, survive a container restart or rebuild that
-keeps the daemon, and end with it. While no request is shown, the
-session's `>` prompt takes `standing`, which lists them (number, argv,
-directory, `guarded`), and `revoke <n>`, which ends one; a command it
-let through keeps running. A dry run of a command one lets through
-reports `hostrun: dry run: allowed by a standing approval`.
+A standing approval (`d`, "standing (until the daemon stops)") lets the
+same argv, byte for byte, from the same container directory through from
+then on, with or without `--ask`, printing nothing of hostrun's own; it
+runs as the approved request did. A guarded request gets one after one
+`yes`, when it is granted. Standing approvals live in the daemon's
+memory: they work without a session, survive a container restart or
+rebuild that keeps the daemon, and end with it. A session approval (`s`,
+"session (until the approval session ends)") is the same, but ends when
+the session that granted it stops serving the daemon: it quits, goes to
+`daemons`, is interrupted, its input ends or its connection fails, it is
+dropped or it is taken over. While no request is shown, the session's
+`>` prompt takes `standing`, which lists both kinds (number, argv,
+directory, `guarded`, `session`), and `revoke <n>`, which ends one; a
+command it let through keeps running. A dry run of a
+command one lets through reports `hostrun: dry run: allowed by a
+standing approval` (`a session approval`).
 
 Adding a rule (`a`, not offered for a guarded refusal) proposes the
 narrowest edit of the rules file the daemon loaded, as a diff: a new rule
@@ -317,8 +347,10 @@ workspace, and a session that stops reading (suspended) is dropped
 rather than holding up its daemon. A daemon older than
 `--ask` refuses it with 125 rather than running the command. The daemon
 log, `daemon.log` in the runtime directory, records the requests and
-answers, standing approvals granted and revoked, and marks the runs one
-lets through `approved=standing`; the container can read it.
+answers, standing and session approvals granted, revoked and ended, and
+marks with `approved=standing` (`approved=session`) the run the answer
+`d` (`s`) started (with its `approval_id`) and the later runs such an
+approval lets through (without one); the container can read it.
 
 ## Rules
 

@@ -76,18 +76,38 @@ type approvals struct {
 	waiting map[uint64]*approvalRequest
 	// telling holds the requests that ended while the session is told so.
 	telling map[uint64]protocol.EndReason
-	// standing holds the standing approvals, oldest first; they live as
-	// long as the daemon, with a session or without.
-	standing     []standingApproval
-	lastStanding uint64
+	// held holds the standing and session approvals, oldest first, under
+	// one numbering: standing approvals live as long as the daemon, with a
+	// session or without; session approvals as long as the session that
+	// granted them serves the daemon.
+	held     []heldApproval
+	lastHeld uint64
 }
 
-// standingApproval is a standing approval, and the path failures it
-// passes as given: those the human saw when granting it.
-type standingApproval struct {
+// heldApproval is a standing approval, or a session approval granted
+// by the session by, and the path failures it passes as given: those the
+// human saw when granting it.
+type heldApproval struct {
 	protocol.Standing
 	passes pathPasses
+	by     *sessionConn // nil for a standing approval
 }
+
+// kind returns ScopeSession for a session approval, ScopeStanding for a
+// standing one.
+func (ha heldApproval) kind() protocol.Scope {
+	if ha.Session {
+		return protocol.ScopeSession
+	}
+	return protocol.ScopeStanding
+}
+
+// Reasons session approvals end before the daemon does; the daemon log
+// gives them.
+const (
+	approvalsEndedLeft      = "session left" // their session left or was dropped
+	approvalsEndedTakenOver = "taken over"   // their session was taken over
+)
 
 // sessionConn is a connected approval session: its connection, where its
 // frames go (each write bounded by sessionWriteTimeout), and its pid,
@@ -109,10 +129,11 @@ type approvalRequest struct {
 	deadline time.Time                // when its limit runs out
 }
 
-// outcome is how an approval request ended: the human's answer, or, when
-// ended is set, why it got none.
+// outcome is how an approval request ended: the human's answer, given in
+// the session by, or, when ended is set, why it got none.
 type outcome struct {
 	answer protocol.Answer
+	by     *sessionConn
 	ended  endReason
 }
 
@@ -243,41 +264,52 @@ func (a *approvals) answer(c *sessionConn, ans protocol.Answer) (string, protoco
 		return fmt.Sprintf("request %d is not waiting any more", ans.ID), a.telling[ans.ID]
 	}
 	delete(a.waiting, ans.ID)
-	r.done <- outcome{answer: ans}
+	r.done <- outcome{answer: ans, by: c}
 	return "", ""
 }
 
+// handover is what a session that takes the daemon over gets from the one
+// it replaces, old: the requests waiting for old's answer, now waiting for
+// the new session's, and how many session approvals old granted, which
+// ended with it.
+type handover struct {
+	old   *sessionConn
+	moved []*approvalRequest
+	ended int
+}
+
 // serve makes c the session that serves the daemon and returns why not, or
-// "". With takeOver it replaces the session serving it, which it returns
-// with the requests waiting for its answer, now waiting for c's: the caller
-// sends them to c and tells the old session (see serveSession).
-func (a *approvals) serve(c *sessionConn, takeOver bool) (string, *sessionConn, []*approvalRequest) {
+// "". With takeOver it replaces the session serving it and returns the
+// handover from it: the caller sends the requests moved to c and tells
+// the old session (see serveSession).
+func (a *approvals) serve(c *sessionConn, takeOver bool) (string, handover) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	old := a.serving
 	if old == c {
-		return "", nil, nil
+		return "", handover{}
 	}
 	if old != nil && !takeOver {
-		return protocol.ServedRefusal, nil, nil
+		return protocol.ServedRefusal, handover{}
 	}
 	a.serving = c
-	var moved []*approvalRequest
+	h := handover{old: old, ended: a.endSessionApprovals(old)}
 	for _, r := range a.waiting {
 		if r.session == old {
 			r.session = c
-			moved = append(moved, r)
+			h.moved = append(h.moved, r)
 		}
 	}
-	slices.SortFunc(moved, func(x, y *approvalRequest) int { return cmp.Compare(x.msg.ID, y.msg.ID) })
-	return "", old, moved
+	slices.SortFunc(h.moved, func(x, y *approvalRequest) int { return cmp.Compare(x.msg.ID, y.msg.ID) })
+	return "", h
 }
 
-// leave drops c, if it served the daemon, and reports whether it did. Every
-// request still waiting for c's answer ends unanswered for reason
-// (endedSessionLeft, or endedStopping when c leaves because the daemon
-// stops): nobody else would see it.
-func (a *approvals) leave(c *sessionConn, reason endReason) bool {
+// leave drops c, if it served the daemon, and reports whether it did and
+// how many session approvals it granted end with it. Every request still
+// waiting for c's answer ends unanswered for reason (endedSessionLeft, or
+// endedStopping when c leaves because the daemon stops): nobody else
+// would see it.
+func (a *approvals) leave(c *sessionConn, reason endReason) (left bool, ended int) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	for id, r := range a.waiting {
@@ -287,10 +319,21 @@ func (a *approvals) leave(c *sessionConn, reason endReason) bool {
 		}
 	}
 	if a.serving != c {
-		return false
+		return false, 0
 	}
 	a.serving = nil
-	return true
+	return true, a.endSessionApprovals(c)
+}
+
+// endSessionApprovals ends the session approvals session c granted, if
+// any, and returns how many. The caller holds a.mu.
+func (a *approvals) endSessionApprovals(c *sessionConn) int {
+	if c == nil {
+		return 0
+	}
+	n := len(a.held)
+	a.held = slices.DeleteFunc(a.held, func(ha heldApproval) bool { return ha.by == c })
+	return n - len(a.held)
 }
 
 // served reports whether a session serves the daemon.
@@ -301,32 +344,41 @@ func (a *approvals) served() bool {
 }
 
 // grant grants a standing approval for req's argv from its container
-// directory, guarded or not, passing as given the path failures passes
-// does, and returns its number. One the daemon holds for the same argv
-// and directory already takes the new approval's terms and keeps its
-// number, so one revoke ends it.
-func (a *approvals) grant(req protocol.Request, guarded bool, passes pathPasses) uint64 {
+// directory, or, with by, a session approval of session by, guarded or
+// not, passing as given the path failures passes does, and returns its
+// number. One the daemon holds for the same argv and directory already
+// takes the new approval's kind and terms and keeps its number, so one
+// revoke ends it. A session approval of a session that no longer serves
+// the daemon (it left while the approved command was checked) is not
+// granted: ok is false.
+func (a *approvals) grant(req protocol.Request, guarded bool, passes pathPasses, by *sessionConn) (n uint64, ok bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if i := a.standingIndex(req); i >= 0 {
-		a.standing[i].Guarded = guarded
-		a.standing[i].passes = passes
-		return a.standing[i].N
+	if by != nil && a.serving != by {
+		return 0, false
 	}
-	a.lastStanding++
-	a.standing = append(a.standing, standingApproval{
-		Standing: protocol.Standing{N: a.lastStanding, Argv: slices.Clone(req.Argv), Cwd: req.Cwd, Guarded: guarded},
+	if i := a.heldIndex(req); i >= 0 {
+		a.held[i].Guarded = guarded
+		a.held[i].Session = by != nil
+		a.held[i].passes = passes
+		a.held[i].by = by
+		return a.held[i].N, true
+	}
+	a.lastHeld++
+	a.held = append(a.held, heldApproval{
+		Standing: protocol.Standing{N: a.lastHeld, Argv: slices.Clone(req.Argv), Cwd: req.Cwd, Guarded: guarded, Session: by != nil},
 		passes:   passes,
+		by:       by,
 	})
-	return a.lastStanding
+	return a.lastHeld, true
 }
 
-// standingIndex returns the index in a.standing of the standing approval
+// heldIndex returns the index in a.held of the approval
 // for req, its argv byte for byte from the same container directory, or
 // -1. The caller holds a.mu.
-func (a *approvals) standingIndex(req protocol.Request) int {
-	return slices.IndexFunc(a.standing, func(sa standingApproval) bool {
-		return sa.Cwd == req.Cwd && slices.Equal(sa.Argv, req.Argv)
+func (a *approvals) heldIndex(req protocol.Request) int {
+	return slices.IndexFunc(a.held, func(ha heldApproval) bool {
+		return ha.Cwd == req.Cwd && slices.Equal(ha.Argv, req.Argv)
 	})
 }
 
@@ -350,52 +402,53 @@ func (a *approvals) heard(c *sessionConn) string {
 	return a.checkServing(c)
 }
 
-// standingFor returns the standing approval that lets req through, its
-// argv byte for byte from the same container directory, or nil. A Server
-// without approvals has none.
-func (a *approvals) standingFor(req protocol.Request) *standingApproval {
+// approvalFor returns the standing or session approval that lets req
+// through, its argv byte for byte from the same container directory, or
+// nil. A Server without approvals has none.
+func (a *approvals) approvalFor(req protocol.Request) *heldApproval {
 	if a == nil {
 		return nil
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	i := a.standingIndex(req)
+	i := a.heldIndex(req)
 	if i < 0 {
 		return nil
 	}
-	sa := a.standing[i]
-	return &sa
+	ha := a.held[i]
+	return &ha
 }
 
-// list returns the standing approvals for session c, or why c may not see
-// them.
+// list returns the standing and session approvals for session c, or why c
+// may not see them.
 func (a *approvals) list(c *sessionConn) ([]protocol.Standing, string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if why := a.checkServing(c); why != "" {
 		return nil, why
 	}
-	list := make([]protocol.Standing, len(a.standing))
-	for i, sa := range a.standing {
-		list[i] = sa.Standing
+	list := make([]protocol.Standing, len(a.held))
+	for i, ha := range a.held {
+		list[i] = ha.Standing
 	}
 	return list, ""
 }
 
-// revoke revokes standing approval n for session c and returns why not, or
-// "". A command it let through keeps running.
-func (a *approvals) revoke(c *sessionConn, n uint64) string {
+// revoke revokes standing or session approval n for session c and returns
+// why not, or "", and its kind. A command it let through keeps running.
+func (a *approvals) revoke(c *sessionConn, n uint64) (why string, kind protocol.Scope) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if why := a.checkServing(c); why != "" {
-		return why
+		return why, ""
 	}
-	i := slices.IndexFunc(a.standing, func(sa standingApproval) bool { return sa.N == n })
+	i := slices.IndexFunc(a.held, func(ha heldApproval) bool { return ha.N == n })
 	if i < 0 {
-		return fmt.Sprintf("no standing approval %d", n)
+		return fmt.Sprintf("no approval %d", n), ""
 	}
-	a.standing = slices.Delete(a.standing, i, i+1)
-	return ""
+	kind = a.held[i].kind()
+	a.held = slices.Delete(a.held, i, i+1)
+	return "", kind
 }
 
 // serveApprovals accepts approval sessions on the approval socket until it
@@ -467,8 +520,12 @@ func (s *Server) handleSession(ctx context.Context, conn net.Conn) {
 		if ctx.Err() != nil {
 			reason = endedStopping
 		}
-		if s.approvals.leave(c, reason) {
+		left, ended := s.approvals.leave(c, reason)
+		if left {
 			s.log.Info("approval session left", "pid", pid)
+		}
+		if ended > 0 && reason == endedSessionLeft {
+			s.log.Info("session approvals ended", "count", ended, "reason", approvalsEndedLeft, "pid", pid)
 		}
 	}()
 	for {
@@ -510,9 +567,9 @@ func (s *Server) handleSession(ctx context.Context, conn net.Conn) {
 				s.sessionRefused(out, pid, err)
 				return
 			}
-			why := s.approvals.revoke(c, rv.N)
+			why, kind := s.approvals.revoke(c, rv.N)
 			if why == "" {
-				s.log.Info("standing approval revoked", "standing", rv.N, "pid", pid)
+				s.log.Info(string(kind)+" approval revoked", "approval", rv.N, "pid", pid)
 			}
 			_ = out.writeJSON(protocol.FrameRevoked, protocol.Revoked{N: rv.N, Error: why})
 		case protocol.FrameReread:
@@ -585,18 +642,17 @@ func (s *Server) serveSession(c *sessionConn, takeOver bool) string {
 	s.approvals.takeovers.Lock()
 	defer s.approvals.takeovers.Unlock()
 	var (
-		why   string
-		old   *sessionConn
-		moved []*approvalRequest
+		why string
+		h   handover
 	)
 	err := c.out.batch(func(send func(protocol.FrameType, any) error) error {
-		if why, old, moved = s.approvals.serve(c, takeOver); why != "" {
+		if why, h = s.approvals.serve(c, takeOver); why != "" {
 			return nil
 		}
 		if err := send(protocol.FrameServing, nil); err != nil {
 			return err
 		}
-		for _, r := range moved {
+		for _, r := range h.moved {
 			msg := r.msg
 			msg.TimeoutMs = max(time.Until(r.deadline).Milliseconds(), 1)
 			if err := send(protocol.FrameApprovalRequest, msg); err != nil {
@@ -612,8 +668,11 @@ func (s *Server) serveSession(c *sessionConn, takeOver bool) string {
 		// As in enqueue: a session that does not take its frames is gone.
 		c.conn.Close()
 	}
-	if old != nil {
+	if old := h.old; old != nil {
 		s.log.Info("approval session taken over", "pid", old.pid, "by", c.pid)
+		if h.ended > 0 {
+			s.log.Info("session approvals ended", "count", h.ended, "reason", approvalsEndedTakenOver, "pid", old.pid)
+		}
 		_ = old.out.write(protocol.Frame{Type: protocol.FrameTakenOver})
 		// Its handleSession sees the connection end; it no longer serves.
 		old.conn.Close()
@@ -634,9 +693,9 @@ func (s *Server) sessionRefused(out *frameWriter, pid int, err error) {
 // approved, as the rule that refused it runs its allowed commands (in the
 // mirrored directory with nothing injected when no rule matched). A
 // refusal that cannot be approved is the one a plain request gets. A
-// command a standing approval lets through runs at once, as for a plain
-// request; the answer "for the daemon's lifetime" grants one, once the
-// approved command has passed its checks.
+// command a standing or session approval lets through runs at once, as
+// for a plain request; the answer "standing" or "session" grants one,
+// once the approved command has passed its checks.
 //
 // A waiting request ends unanswered when its client goes away, its limit
 // runs out, its session leaves or the daemon stops; but for the first,
@@ -771,11 +830,21 @@ func (s *Server) ask(ctx context.Context, x exchange, f protocol.Frame) {
 			return
 		}
 	}
-	if scope == protocol.ScopeLifetime {
+	if scope == protocol.ScopeStanding || scope == protocol.ScopeSession {
 		// Granted once the approved command has passed its checks, so a
-		// request refused at its start leaves nothing standing.
-		n := s.approvals.grant(req, guarded, seen)
-		s.log.Info("standing approval granted", "standing", n, "argv", req.Argv, "dir", need.hostDir, "approval_id", id)
+		// request refused at its start leaves nothing standing. A session
+		// approval belongs to the session that gave the answer.
+		var by *sessionConn
+		if scope == protocol.ScopeSession {
+			by = o.by
+		}
+		if n, ok := s.approvals.grant(req, guarded, seen, by); ok {
+			s.log.Info(string(scope)+" approval granted", "approval", n, "argv", req.Argv, "dir", need.hostDir, "approval_id", id)
+		} else {
+			// The session left while the command was checked: it runs as
+			// approved, but nothing is held for it.
+			s.log.Info("session approval not granted", "approval_id", id, "reason", approvalsEndedLeft)
+		}
 	}
 	s.start(ctx, x, req, p, frames.next, "approved", scope, "approval_id", id)
 }
@@ -795,13 +864,13 @@ type approvalNeed struct {
 // the rules, then, as a dry run, every check an approval cannot lift
 // (directories, secrets' sources, the program), with the path checks
 // collected rather than refusing. It returns nil and nil when req would run
-// without asking (the rules, or a standing approval, let it through), a
-// refusal when it would be refused without asking, or what the human
-// would be asked. A command whose standing approval no longer lets it
+// without asking (the rules, or a standing or session approval, let it
+// through), a refusal when it would be refused without asking, or what
+// the human would be asked. A command whose approval no longer lets it
 // through (a path check failing for a reason the human did not see) is
 // assessed as if it had none, so the human is asked again.
 func (s *Server) assessApproval(req protocol.Request) (*approvalNeed, *refusal) {
-	if s.approvals.standingFor(req) != nil {
+	if s.approvals.approvalFor(req) != nil {
 		p, r := s.prepare(req, true)
 		if r == nil {
 			r = lookupStart(p, req)
