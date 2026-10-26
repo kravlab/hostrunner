@@ -17,6 +17,7 @@ import (
 
 	"github.com/kravlab/hostrunner/internal/approval"
 	"github.com/kravlab/hostrunner/internal/client"
+	"github.com/kravlab/hostrunner/internal/instructions"
 	"github.com/kravlab/hostrunner/internal/launch"
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
@@ -473,10 +474,11 @@ func TestRunDispatchesUpdate(t *testing.T) {
 	}
 }
 
-// TestUsageListsUpdate checks that the top-level usage names update.
-func TestUsageListsUpdate(t *testing.T) {
-	if err := run(nil, io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "up|serve|test|approve|update|version") {
-		t.Fatalf("got %v, want the usage listing update", err)
+// TestUsageListsTheSubcommands checks that the top-level usage names
+// every subcommand.
+func TestUsageListsTheSubcommands(t *testing.T) {
+	if err := run(nil, io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "up|serve|test|approve|update|instructions|version") {
+		t.Fatalf("got %v, want the usage listing every subcommand", err)
 	}
 }
 
@@ -687,4 +689,179 @@ func TestServeRereadsItsRulesOnceARuleIsAdded(t *testing.T) {
 	if stepAside := armServe(t, cfg, p.Digest()); stepAside {
 		t.Fatal("stepped aside for the rules it reread")
 	}
+}
+
+// TestParseInstructions checks that --append takes an optional path,
+// AGENTS.md by default, and that a path needs --append.
+func TestParseInstructions(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		args []string
+		want instructionsConfig
+	}{
+		{"no flags", nil, instructionsConfig{}},
+		{"append", []string{"--append"}, instructionsConfig{append: true, path: "AGENTS.md"}},
+		{"append with path", []string{"--append", "docs/CLAUDE.md"}, instructionsConfig{append: true, path: "docs/CLAUDE.md"}},
+		{"append before an end of flags", []string{"--append", "--"}, instructionsConfig{append: true, path: "AGENTS.md"}},
+		{"append with a path starting with a dash", []string{"--append", "--", "-x.md"}, instructionsConfig{append: true, path: "-x.md"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseInstructions(tt.args, io.Discard)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tt.want {
+				t.Fatalf("got %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestParseInstructionsRejectsArguments checks that a path without
+// --append and a second path are errors carrying the usage.
+func TestParseInstructionsRejectsArguments(t *testing.T) {
+	for _, args := range [][]string{
+		{"AGENTS.md"},
+		{"--append", "AGENTS.md", "CLAUDE.md"},
+		{"AGENTS.md", "--append"},
+		{"--append=false", "AGENTS.md"},
+		{"--append", ""},
+	} {
+		if _, err := parseInstructions(args, io.Discard); err == nil || !strings.Contains(err.Error(), instructionsUsage) {
+			t.Fatalf("%q: got %v, want an error with the usage", args, err)
+		}
+	}
+}
+
+// TestParseInstructionsHelpIsTheFlagHelp checks that -h is handled like
+// the other subcommands' -h.
+func TestParseInstructionsHelpIsTheFlagHelp(t *testing.T) {
+	if _, err := parseInstructions([]string{"-h"}, io.Discard); !errors.Is(err, flag.ErrHelp) {
+		t.Fatalf("got %v, want flag.ErrHelp", err)
+	}
+}
+
+// TestRunInstructionsPrintsTheBlock checks that without --append the
+// block is printed as is, so redirecting it equals --append.
+func TestRunInstructionsPrintsTheBlock(t *testing.T) {
+	var out strings.Builder
+	if err := run([]string{"instructions"}, &out, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if out.String() != instructions.Block() {
+		t.Fatalf("got %q, want the block", out.String())
+	}
+}
+
+// TestRunInstructionsAppendsToAgentsMD checks that --append without a
+// path writes AGENTS.md in the current directory and reports it.
+func TestRunInstructionsAppendsToAgentsMD(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if err := os.WriteFile("AGENTS.md", []byte("# Agents\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out strings.Builder
+	if err := run([]string{"instructions", "--append"}, &out, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if want := "hostrunner: appended instructions to AGENTS.md\n"; out.String() != want {
+		t.Fatalf("got %q, want %q", out.String(), want)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "AGENTS.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := string(instructions.Append([]byte("# Agents\n"))); string(got) != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+// TestRunInstructionsAsksOnStderr checks that the question goes to
+// stderr and the outcome line to stdout.
+func TestRunInstructionsAsksOnStderr(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "AGENTS.md")
+	if err := os.WriteFile(path, []byte(instructions.Block()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr strings.Builder
+	cfg := instructionsConfig{append: true, path: path}
+	if err := runInstructions(cfg, strings.NewReader("c\n"), true, &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	if want := "hostrunner: " + path + " left unchanged\n"; stdout.String() != want {
+		t.Fatalf("stdout: got %q, want %q", stdout.String(), want)
+	}
+	if !strings.HasPrefix(stderr.String(), path+" already has hostrunner instructions") {
+		t.Fatalf("stderr: got %q, want the question", stderr.String())
+	}
+}
+
+// TestRunInstructionsReportsErrors checks that a refusal comes back as the
+// error and prints nothing.
+func TestRunInstructionsReportsErrors(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "AGENTS.md")
+	var stdout, stderr strings.Builder
+	cfg := instructionsConfig{append: true, path: path}
+	err := runInstructions(cfg, strings.NewReader(""), false, &stdout, &stderr)
+	if want := path + " does not exist; run in a terminal to create it"; err == nil || err.Error() != want {
+		t.Fatalf("got %v, want %q", err, want)
+	}
+	if stdout.Len() != 0 || stderr.Len() != 0 {
+		t.Fatalf("printed %q and %q despite the error", stdout.String(), stderr.String())
+	}
+}
+
+// TestInstructionsMessage checks the line --append prints for each
+// outcome.
+func TestInstructionsMessage(t *testing.T) {
+	for _, tt := range []struct {
+		outcome instructions.Outcome
+		want    string
+	}{
+		{instructions.Created, "hostrunner: created AGENTS.md"},
+		{instructions.Appended, "hostrunner: appended instructions to AGENTS.md"},
+		{instructions.Replaced, "hostrunner: replaced instructions in AGENTS.md"},
+		{instructions.Unchanged, "hostrunner: AGENTS.md left unchanged"},
+	} {
+		if got := instructionsMessage(tt.outcome, "AGENTS.md"); got != tt.want {
+			t.Fatalf("outcome %v: got %q, want %q", tt.outcome, got, tt.want)
+		}
+	}
+}
+
+// TestIsTerminal checks that a pty is a terminal and that a pipe and a
+// regular file, what stdin is when piped or redirected, are not.
+func TestIsTerminal(t *testing.T) {
+	t.Run("pty", func(t *testing.T) {
+		pty, err := os.OpenFile("/dev/ptmx", os.O_RDWR, 0)
+		if err != nil {
+			t.Skipf("no pty: %v", err)
+		}
+		defer pty.Close()
+		if !isTerminal(pty) {
+			t.Fatal("a pty not reported as a terminal")
+		}
+	})
+	t.Run("pipe", func(t *testing.T) {
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer r.Close()
+		defer w.Close()
+		if isTerminal(r) {
+			t.Fatal("a pipe reported as a terminal")
+		}
+	})
+	t.Run("regular file", func(t *testing.T) {
+		f, err := os.Create(filepath.Join(t.TempDir(), "in"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		if isTerminal(f) {
+			t.Fatal("a regular file reported as a terminal")
+		}
+	})
 }
