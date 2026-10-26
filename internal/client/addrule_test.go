@@ -160,6 +160,12 @@ func TestAddRuleArmGetsTheRereadDigest(t *testing.T) {
 // by what its allow lists refused, or turns args: none into exact lists;
 // only the rule's lines change.
 func TestAddRuleProposesTheNarrowestRule(t *testing.T) {
+	// anyargs, a program on PATH, takes any argv and succeeds.
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "anyargs"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	const head, tail = "# rules\nrules:\n  # the rule\n", "  # next\n  - command: echo\n    args: any\n"
 	tests := []struct {
 		name         string
@@ -225,10 +231,11 @@ func TestAddRuleProposesTheNarrowestRule(t *testing.T) {
 			want: "  - command: touch\n    flags:\n      allow: [-a]\n    positional:\n      allow: [marker, other]\n    # note\n",
 		},
 		{
+			// anyargs, not touch: a touch may refuse a flag given twice.
 			name: "a flag refused twice is listed once",
-			rule: "  - command: touch\n    flags:\n      allow: [-a]\n    positional:\n      allow: [marker]\n",
-			argv: "touch -m -m marker",
-			want: "  - command: touch\n    flags:\n      allow: [-a, -m]\n    positional:\n      allow: [marker]\n",
+			rule: "  - command: anyargs\n    flags:\n      allow: [-a]\n    positional:\n      allow: [marker]\n",
+			argv: "anyargs -m -m marker",
+			want: "  - command: anyargs\n    flags:\n      allow: [-a, -m]\n    positional:\n      allow: [marker]\n",
 		},
 	}
 	for _, tt := range tests {
