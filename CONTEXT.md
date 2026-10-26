@@ -132,6 +132,11 @@ _Avoid_: restart
 How long a waiting daemon waits for its armed container
 before it exits.
 
+**Runtime directory**:
+The host directory, one per devcontainer, that holds a
+daemon's socket, the hostrun client and the daemon log, and
+that the container mounts read-only.
+
 **Layout root**:
 The directory an install keeps its versions in,
 `<prefix>/lib/hostrunner`.
@@ -145,3 +150,51 @@ The symlink `current` in the layout root to the version
 directory in use; `hostrunner update` switches it with one
 rename.
 _Avoid_: current (in code and specs that is the running version)
+
+### Approvals
+
+**Approval request**:
+A command the rules do not let through, sent with `--ask` and
+waiting for a human's answer.
+_Avoid_: prompt, confirmation
+
+**Approval session**:
+The host terminal process, `hostrunner approve`, in which a
+human sees and answers one daemon's approval requests.
+_Avoid_: approver, approval UI
+
+**Serve**:
+What an approval session does for the one daemon whose
+requests it shows; approvals are on while one does.
+_Avoid_: attach (the daemon's state towards its armed container)
+
+**Take over**:
+An approval session starting to serve a daemon another session
+served, which ends the other.
+
+**Approvable**:
+Said of a refusal by the rules that a human may answer with an
+approval.
+
+**Guarded refusal**:
+An approvable refusal that needs a warning and a second
+confirmation: a deny pattern, a failed path check, an argv the
+rules cannot read, or a rule with secrets.
+
+**Explicitly denied**:
+Refused by a deny pattern; one kind of guarded refusal.
+
+**Standing approval**:
+An approval of one argv from one container directory that lets
+it through until its daemon ends or the human revokes it.
+_Avoid_: lifetime approval, grant
+
+**Session approval**:
+An approval of one argv from one container directory that lets
+it through until the approval session that granted it stops
+serving its daemon, or the human revokes it.
+_Avoid_: temporary approval
+
+**Approval socket**:
+The daemon's socket for approval sessions, beside its runtime
+directory and outside the container's reach.

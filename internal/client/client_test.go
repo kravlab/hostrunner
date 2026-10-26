@@ -3,6 +3,7 @@ package client_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/kravlab/hostrunner/internal/client"
 	"github.com/kravlab/hostrunner/internal/daemon"
+	"github.com/kravlab/hostrunner/internal/launch"
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
 	"github.com/kravlab/hostrunner/internal/transport"
@@ -26,11 +28,15 @@ import (
 const containerRoot = "/workspaces/app"
 
 // harness is a daemon serving a temporary host workspace over a temporary
-// socket, torn down when the test ends.
+// socket, and approval sessions over its approval socket beside the
+// socket's directory, torn down when the test ends.
 type harness struct {
-	transport transport.Unix
-	hostRoot  string
-	stop      func() // shuts the daemon down; safe to call more than once
+	transport      transport.Unix
+	hostRoot       string
+	runtimeDir     string // the directory holding the socket
+	approvalSocket string
+	rulesFile      string // the rules file a session adds rules to
+	stop           func() // shuts the daemon down; safe to call more than once
 }
 
 // allowAll is a policy that allows every command, for tests about
@@ -49,10 +55,38 @@ func startDaemon(t *testing.T, policies ...daemon.Policy) harness {
 // startLoggingDaemon is startDaemon with the daemon logging to log.
 func startLoggingDaemon(t *testing.T, log *slog.Logger, policies ...daemon.Policy) harness {
 	t.Helper()
+	var p daemon.Policy = allowAll{}
+	if len(policies) > 0 {
+		p = policies[0]
+	}
+	return startDaemonWith(t, log, p)
+}
+
+// startDaemonWith is startLoggingDaemon with policy p and the Server
+// options opts besides its approval socket.
+func startDaemonWith(t *testing.T, log *slog.Logger, p daemon.Policy, opts ...daemon.Option) harness {
+	t.Helper()
+	return startHarness(t, log, func(string) (daemon.Policy, []daemon.Option) { return p, opts })
+}
+
+// startHarness starts a daemon on a new host workspace, whose rules file
+// lies at its .devcontainer/hostrun.yaml; setup returns, for that path,
+// the policy the daemon serves and the Server options besides its approval
+// socket.
+func startHarness(t *testing.T, log *slog.Logger, setup func(rulesFile string) (daemon.Policy, []daemon.Option)) harness {
+	t.Helper()
 	base, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
+	return startHarnessAt(t, log, base, setup)
+}
+
+// startHarnessAt is startHarness with the daemon's runtime directory, its
+// socket's, at base, the host workspace in it: a daemon started again at
+// the same base serves the same sockets.
+func startHarnessAt(t *testing.T, log *slog.Logger, base string, setup func(rulesFile string) (daemon.Policy, []daemon.Option)) harness {
+	t.Helper()
 	hostRoot := filepath.Join(base, "app")
 	if err := os.MkdirAll(filepath.Join(hostRoot, "sub"), 0o755); err != nil {
 		t.Fatal(err)
@@ -66,13 +100,17 @@ func startLoggingDaemon(t *testing.T, log *slog.Logger, policies ...daemon.Polic
 	if err != nil {
 		t.Fatal(err)
 	}
+	approvalSocket := launch.ApprovalSocket(base)
+	al, err := transport.Unix{Path: approvalSocket}.Listen()
+	if err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	var p daemon.Policy = allowAll{}
-	if len(policies) > 0 {
-		p = policies[0]
-	}
-	srv := daemon.New(mapper, p, log)
+	rulesFile := filepath.Join(hostRoot, ".devcontainer", "hostrun.yaml")
+	p, opts := setup(rulesFile)
+	opts = append([]daemon.Option{daemon.WithApprovals(al, rulesFile)}, opts...)
+	srv := daemon.New(mapper, p, log, opts...)
 	go func() { done <- srv.Serve(ctx, l) }()
 	stop := sync.OnceFunc(func() {
 		cancel()
@@ -81,7 +119,7 @@ func startLoggingDaemon(t *testing.T, log *slog.Logger, policies ...daemon.Polic
 		}
 	})
 	t.Cleanup(stop)
-	return harness{transport: tr, hostRoot: hostRoot, stop: stop}
+	return harness{transport: tr, hostRoot: hostRoot, runtimeDir: base, approvalSocket: approvalSocket, rulesFile: rulesFile, stop: stop}
 }
 
 // result is what the user of hostrun observes.
@@ -185,21 +223,39 @@ func TestRunFailsWhenDaemonIsUnreachable(t *testing.T) {
 // status frame (Exit or Error) the daemon answers with.
 func (h harness) rawRequest(t *testing.T, req protocol.Request) protocol.Frame {
 	t.Helper()
+	payload, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, _ := h.rawFrame(t, protocol.FrameRequest, string(payload))
+	return f
+}
+
+// rawFrame sends payload as a frame of type typ on a fresh connection and
+// returns the first frame the daemon answers with that is neither output
+// nor stdin credit, and the stdout before it.
+func (h harness) rawFrame(t *testing.T, typ protocol.FrameType, payload string) (protocol.Frame, string) {
+	t.Helper()
 	conn, err := h.transport.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	if err := protocol.WriteJSON(conn, protocol.FrameRequest, req); err != nil {
+	if err := protocol.WriteFrame(conn, protocol.Frame{Type: typ, Payload: []byte(payload)}); err != nil {
 		t.Fatal(err)
 	}
+	var stdout strings.Builder
 	for {
 		f, err := protocol.ReadFrame(conn)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if f.Type == protocol.FrameExit || f.Type == protocol.FrameError {
-			return f
+		switch f.Type {
+		case protocol.FrameStdout:
+			stdout.Write(f.Payload)
+		case protocol.FrameStderr, protocol.FrameStdinCredit:
+		default:
+			return f, stdout.String()
 		}
 	}
 }
@@ -426,26 +482,25 @@ func TestRunErrorsDoNotRevealHostPaths(t *testing.T) {
 }
 
 func TestDaemonChecksVersionBeforeRequestShape(t *testing.T) {
-	h := startDaemon(t)
-	conn, err := h.transport.Dial(context.Background())
-	if err != nil {
-		t.Fatal(err)
+	futures := map[string]string{
+		"another shape":       `{"version": 99, "argv": {"program": "git"}}`,
+		"invalid UTF-8 bytes": "{\"version\": 99, \"argv\": [\"\xff\"], \"cwd\": \"" + containerRoot + "\"}",
 	}
-	defer conn.Close()
-	future := []byte(`{"version": 99, "argv": {"program": "git"}}`)
-	if err := protocol.WriteFrame(conn, protocol.Frame{Type: protocol.FrameRequest, Payload: future}); err != nil {
-		t.Fatal(err)
-	}
-	f, err := protocol.ReadFrame(conn)
-	if err != nil || f.Type != protocol.FrameError {
-		t.Fatalf("got frame %v, err %v; want FrameError", f.Type, err)
-	}
-	var e protocol.Error
-	if err := protocol.DecodeJSON(f, &e); err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(e.Message, "version") {
-		t.Fatalf("message %q does not mention the version mismatch", e.Message)
+	for name, future := range futures {
+		t.Run(name, func(t *testing.T) {
+			h := startDaemon(t)
+			f, _ := h.rawFrame(t, protocol.FrameRequest, future)
+			if f.Type != protocol.FrameError {
+				t.Fatalf("got frame %v; want FrameError", f.Type)
+			}
+			var e protocol.Error
+			if err := protocol.DecodeJSON(f, &e); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(e.Message, "version") {
+				t.Fatalf("message %q does not mention the version mismatch", e.Message)
+			}
+		})
 	}
 }
 
@@ -522,6 +577,24 @@ func TestRunRejectsCommandDeniedByRules(t *testing.T) {
 		got := h.run(t, containerRoot, "", strings.Fields(argv)...)
 		if got != (result{code: protocol.ExitRejected, stderr: want}) {
 			t.Errorf("%s: got %+v, want code %d and %q", argv, got, protocol.ExitRejected, want)
+		}
+	}
+}
+
+// A plain refusal and its dry run name only the first reason, though the
+// rules find every one (the Rules test lists them all).
+func TestRunAndDryRunReportTheFirstReasonOnly(t *testing.T) {
+	h := startDaemon(t, policy(t, `rules:
+  - command: sh
+    flags:
+      allow: [-c]
+    positional:
+      deny: ["+*"]
+`))
+	want := result{code: protocol.ExitRejected, stderr: "hostrun: denied by rule \"sh\": flag -x is not allowed\n"}
+	for _, argv := range [][]string{{"sh", "-x", "+script"}, {"--dry-run", "sh", "-x", "+script"}} {
+		if got := h.run(t, containerRoot, "", argv...); got != want {
+			t.Errorf("%q: got %+v, want %+v", argv, got, want)
 		}
 	}
 }

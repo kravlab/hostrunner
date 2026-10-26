@@ -157,6 +157,200 @@ It does not read stdin, and the daemon log records it with
 (`hostrun git push --dry-run` runs git's dry run). A daemon older than
 dry runs refuses one with 125 rather than running the command.
 
+An agent in the container needs to know how to use `hostrun`: the rules
+file, the exit codes, dry runs and approvals. On the host, add the
+instructions to the project's instructions file:
+
+```sh
+hostrunner instructions                      # print them
+hostrunner instructions --append             # add them to ./AGENTS.md
+hostrunner instructions --append CLAUDE.md   # or to another file
+```
+
+The text sits between `<!-- hostrunner instructions begin -->` and
+`<!-- hostrunner instructions end -->` lines. A missing file is created
+after a question; for a file that already holds the instructions,
+`--append` asks whether to replace them (after an update of hostrunner,
+say), append another copy or cancel. The questions need a terminal:
+without one, `--append` still adds the text to a file that lacks it and
+refuses otherwise. The file is written in place, so a symlink keeps
+pointing to it.
+
+### Approvals on the host
+
+A command the rules refuse can be approved by a human on the host, one
+request at a time. In a host terminal (not one inside the container),
+start an approval session:
+
+```sh
+hostrunner approve                                                  # choose from the list
+hostrunner approve --dir "$XDG_RUNTIME_DIR/hostrunner/<devcontainerId>"   # that devcontainer's daemon
+```
+
+Without `--dir` it lists the daemons under `$XDG_RUNTIME_DIR/hostrunner`,
+looking again every 2 seconds and waiting while there is none: the one
+whose host workspace holds the current directory is marked `*` and is
+chosen with Enter, one another session serves is marked, and one of
+another approval protocol version cannot be chosen (restart its
+container). Choosing a served daemon asks `Take over? [y/N]`: the other
+session says it was taken over and ends, and the requests waiting pass to
+this one with the rest of their limit. `--dir` serves the daemon of that
+runtime directory, the `--dir` its `initializeCommand` gives
+`hostrunner up`; a directory without an approval socket has no
+approvals; a session given `--dir` serves that daemon alone, asking first
+whether to take it over from another session serving it. When its
+daemon ends, or its connection to it fails, the session waits for the
+next one in the same runtime directory. At the idle `>` prompt, `daemons` leaves the daemon for the
+list (without `--dir`) and `quit` ends the session.
+
+It serves the daemon chosen: it prints each approval request as
+it arrives, with the container directory, the argv (`cmd` line) and why
+the rules refused it, rings the terminal bell, and takes the answer, a
+letter and Enter: `r` refuses it (then an optional note for the agent,
+at most 4096 bytes), `o` approves this request only, `s` grants a
+session approval (until it ends), `d` a standing approval (until the
+daemon stops), `a` adds a rule (all below), `c` shows every argument
+whole (see below), `h` prints what each answer offered does, then asks
+again. Input typed before the prompt is discarded. Each argument is
+quoted so that bash reads it back unchanged, and none can steer the
+terminal or hide where it ends:
+
+- one made only of ASCII letters, digits and `_@%+=:,./-` is shown bare
+  (`feat/x`);
+- an empty one as `''`;
+- one holding any other printable character, `'` and combining marks
+  excepted, in single quotes (`'fix: a b'`);
+- one holding `'`, a control character, a combining mark, a character
+  that is not printable or invalid UTF-8 in ANSI-C quotes
+  (`$'\x1b[2J'`): `'` and `\` as `\'` and `\\`, newline and tab as `\n`
+  and `\t`, any other ASCII control character, DEL and a byte of
+  invalid UTF-8 as `\xHH`, a combining mark and any other character
+  that is not printable as `\uHHHH`, or `\UHHHHHHHH` above U+FFFF.
+  Invalid UTF-8 never reaches the session: hostrun refuses an argument
+  or current directory holding it with 125.
+
+The directory, reasons and guards are shown as they are, Go-quoted when
+they hold a character that is not printable; a note for the agent with
+control characters reaches it quoted too. An argument holding non-ASCII
+gets a line of its own, `⚠ non-ASCII: argument N <as shown> is <ASCII
+form>`, the ASCII form in ANSI-C quotes with every character outside
+ASCII escaped (`'-а'` is `$'-\u0430'`), so a look-alike letter in a
+flag stands out. An argument over 200 characters is cut, its first 200
+shown as above and followed by `…(+N bytes)`, and an argv over 20
+arguments too (`…(+N args)`), with `cmd truncated: c shows all`; the
+ASCII form is cut alike. `c` prints every argument whole, one numbered
+per line, one holding non-ASCII followed by `   ⚠ non-ASCII: <ASCII
+form>`, whole too, and asks again. `standing` shows an argv cut and
+marked as a request's block does.
+Requests are shown one at a time, first in, first out; a new one rings
+the bell without interrupting the prompt and is counted in the next
+block (`(1 more waiting)`). A shown request whose agent goes away or
+whose time runs out is announced (`request 7 withdrawn`, `request 7
+expired`) and the next is shown; a queued one drops out silently.
+Leaving the session (Ctrl+C, end of input) refuses the requests still
+waiting and says how many.
+
+A standing approval (`d`, "standing (until the daemon stops)") lets the
+same argv, byte for byte, from the same container directory through from
+then on, with or without `--ask`, printing nothing of hostrun's own; it
+runs as the approved request did. A guarded request gets one after one
+`yes`, when it is granted. Standing approvals live in the daemon's
+memory: they work without a session, survive a container restart or
+rebuild that keeps the daemon, and end with it. A session approval (`s`,
+"session (until the approval session ends)") is the same, but ends when
+the session that granted it stops serving the daemon: it quits, goes to
+`daemons`, is interrupted, its input ends or its connection fails, it is
+dropped or it is taken over. While no request is shown, the session's
+`>` prompt takes `standing`, which lists both kinds (number, argv,
+directory, `guarded`, `session`), and `revoke <n>`, which ends one; a
+command it let through keeps running. A dry run of a
+command one lets through reports `hostrun: dry run: allowed by a
+standing approval` (`a session approval`).
+
+Adding a rule (`a`, not offered for a guarded refusal) proposes the
+narrowest edit of the rules file the daemon loaded, as a diff: a new rule
+for a command no rule matches (the program and the next token unless it
+is a flag, allowing exactly the flags, values and arguments given), or
+the matching rule's allow lists widened by what they refused. `w` writes
+it, `e` opens it in `$VISUAL` or `$EDITOR` first, `c` goes back to the
+answer. Only the rule's lines change; the file is written at once, and
+only when it parses and allows the request, so an edit that does not is
+offered for editing again. The daemon then rereads the file and the
+request runs under the new rule; later runs need no approval, and the
+next container start keeps the daemon. If the reread fails, the old
+rules stay and the request runs once. It also runs once, and the session
+and the agent are told so, when a rule edited by hand still fails a
+later check (a fixed directory missing). For a rules file edited by hand
+since the daemon loaded it, the session asks first whether the daemon
+rereads it, making that edit live now (`[r]eread [c]ancel`): with `r` the
+diff is against the rules the daemon then serves, with `c` the edit waits
+for the next container start and no rule is added. A rule is written only
+when the file has not changed since the proposal. A rule sharing YAML
+anchors or aliases is not widened. A missing rules file is created, but
+not its directory.
+
+In the container, ask with `--ask` as hostrun's first argument:
+
+```sh
+hostrun --ask git rebase -i main
+# hostrun: waiting for approval on the host: no rule allows "git rebase"
+# hostrun: approved on the host: this request only
+```
+
+- A command that would run without `--ask` runs at once, without asking.
+- While a session serves the daemon, a run or dry run that the rules or
+  a path check refuse ends with a hint when `--ask` would ask a human
+  about it, marked guarded when any of its reasons is:
+  `hostrun: denied by rule "git push": flag --force is not allowed (ask
+  for an approval: hostrun --ask …; guarded: needs a second
+  confirmation)`. No hint comes when `--ask` would be refused anyway:
+  the working directory, the rule's `dir`, a secret's source or the
+  program.
+- `--dry-run` and `--ask` cannot be combined: either followed by the
+  other fails with 125.
+- Approvals are on only while a session serves the daemon: without one,
+  `--ask` is refused at once with 126 and `not approved: no approval
+  session serves this devcontainer`.
+- A refusal exits 126 with `refused on the host` and the human's note
+  (`hostrun: refused on the host: use git rebase main`).
+- A request waits 10 minutes, or as long as `--ask=<duration>` says (a
+  Go duration: `--ask=3m`, `--ask=90s`); then it is refused with 126
+  `not approved: nobody answered on the host`. A limit that is not a
+  positive duration fails with 125 before connecting; the daemon refuses
+  one over 1 hour with 125. Set it within your tool's timeout.
+- Ctrl+C, or anything else that drops the connection, withdraws the
+  request. A session that leaves refuses every request still waiting
+  (126 `refused on the host`); a daemon that stops or steps aside
+  answers every waiting request with 126 `not approved: the hostrunner
+  daemon is stopping`.
+- A command the daemon would refuse anyway (the working directory, the
+  program) is refused at once, before anyone is asked. So is one too
+  large to show (`not approved: the request is too large to show`).
+- An approved command runs as the rule that refused it runs the commands
+  it allows: in its `dir`, with its injection and its secrets masked; one
+  no rule matches runs in the mirrored directory with nothing injected.
+  Arguments that pass their path check are handed over as for an allowed
+  command; one approved after failing it is passed as given.
+- Some refusals are guarded: by a deny list, by a path check, an argv the
+  rules cannot read (an ambiguous flag), or a rule that injects secrets.
+  The request shows each as `⚠ guarded: …`, the agent's wait line says
+  `(guarded)`, and `o` approves it only after the warning is read and
+  `yes` typed; anything else returns to the answer prompt.
+
+The session reaches the daemon over its approval socket,
+`<runtime directory>.approval.sock`, beside the runtime directory: the
+container mounts the runtime directory alone, so it cannot answer its own
+requests, and only the daemon's user may connect; `hostrunner serve`
+refuses to start when the approval socket would lie inside the
+workspace, and a session that stops reading (suspended) is dropped
+rather than holding up its daemon. A daemon older than
+`--ask` refuses it with 125 rather than running the command. The daemon
+log, `daemon.log` in the runtime directory, records the requests and
+answers, standing and session approvals granted, revoked and ended, and
+marks with `approved=standing` (`approved=session`) the run the answer
+`d` (`s`) started (with its `approval_id`) and the later runs such an
+approval lets through (without one); the container can read it.
+
 ## Rules
 
 ```yaml
@@ -205,7 +399,9 @@ rules:
   fail, and with it `devcontainer up`.
 - Changes apply on the next container start (reopen, restart or rebuild):
   `hostrunner up` notices that the file differs from what the running
-  daemon loaded and replaces the daemon. The file lives in `.devcontainer/`,
+  daemon loaded and replaces the daemon; a rule added from the approval
+  session, and a hand edit the human agrees to have reread then, apply at
+  once. The file lives in `.devcontainer/`,
   which is read-only inside the container, so the agent can read but not
   change its rules.
 - Matching is literal on argv: `/usr/bin/git push` and `git -C dir push` do
@@ -412,7 +608,7 @@ container, run the Rules test on the host, in the project root:
 
 ```sh
 hostrunner test git push -u origin main   # hostrunner: allowed by rule "git push"
-hostrunner test git push --force          # hostrunner: denied by rule "git push": flag --force is not allowed
+hostrunner test git push --force          # hostrunner: denied by rule "git push": flag --force is not allowed (approvable)
 hostrunner test --config draft.yaml -- tix pr list
 ```
 
@@ -426,6 +622,15 @@ the command is allowed, 126 when it is denied, and 1 when the file is
 missing or invalid (unlike the daemon, which denies everything without a
 file) or no command is given. Its flags end at the first argument that is
 not one of them, or at `--`.
+
+Unlike a refusal from the daemon, which names the first reason, a denied
+command's line lists every reason, joined by `; `, and ends with the class
+an approval would get: `(approvable)`, or `(guarded: approvable after a
+second confirmation)` for a deny pattern, an argv the rules cannot read
+(a flag missing its value, an abbreviated flag without `=`, an ambiguous
+abbreviation, a value for a flag that takes none, tokens Go flag parsers
+read differently) or a rule with secrets. A failed path check
+makes a refusal guarded too, but the Rules test does no path checks.
 
 How it works:
 
@@ -453,6 +658,12 @@ How it works:
   opened, not re-resolved, when the command starts, so a symlink swapped
   in by the container cannot redirect it.
   Symlinks inside the workspace must be relative.
+- A rule added from the approval session is written into the directory
+  the rules file was read from for the proposal, kept open meanwhile: a
+  symlink swapped in for the file or its directory after the proposal
+  cannot redirect the write. Links in the rules file's path at the
+  proposal are followed; when they lead off the configured path, the
+  proposal shows the file it writes (`writes …`).
 
 ## Exit codes
 
@@ -461,8 +672,8 @@ How it works:
 | command's own | the command ran |
 | 0 | `--dry-run`: the command would run |
 | 128+N | the command was killed by signal N |
-| 125 | hostrun failed: daemon unreachable, protocol error, or no command given |
-| 126 | refused: denied by the rules, an argument not a workspace file, working directory outside the workspace, a rule's `dir` missing, not a directory or inside the workspace, or not executable |
+| 125 | hostrun failed: daemon unreachable, protocol error, no command given, `--dry-run` and `--ask` combined, or an argument or the current directory not valid UTF-8 |
+| 126 | refused: denied by the rules, an argument not a workspace file, current directory outside the workspace, a rule's `dir` missing, not a directory or inside the workspace, or not executable; with `--ask`, not approved on the host (refused, unanswered, no approval session, too large to show, the daemon stopping) |
 | 127 | command not found on the host |
 | 130 | interrupted (Ctrl+C); the host command is killed |
 
@@ -482,6 +693,10 @@ How it works:
 - `path: check` checks a file argument when the command starts, not when
   the program opens it: the container can swap a symlink in between. Use
   `path: open` where the program accepts `/proc/self/fd/N`.
+- Arguments and the current directory must be valid UTF-8: hostrun
+  refuses others with 125 (a Latin-1 file name, binary data as an
+  argument) rather than have them reach the host changed. Pass bytes
+  through stdin instead.
 
 ## Development
 

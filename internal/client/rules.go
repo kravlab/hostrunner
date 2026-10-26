@@ -21,7 +21,8 @@ const wOK = 0x2
 // that govern it: when the nearest .devcontainer at or above cwd, or the
 // hostrun.yaml in it, is writable. A writable directory is enough, since the
 // file can then be replaced or, when missing, created; the daemon picks up
-// such a change on the next container start.
+// such a change on the next container start, or when a human adding a rule
+// agrees to have the file reread.
 //
 // It is best effort: it checks the default location only (not a --config
 // file), and finds nothing when cwd is outside the workspace. A read-only
