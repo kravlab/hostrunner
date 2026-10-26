@@ -41,7 +41,8 @@ in the container.
   message, exit 126 means refused or not started (no rule allows it, a
   flag or argument is denied, the directory is outside the workspace),
   127 not installed on the host, 125 hostrun itself failed (e.g. the
-  daemon is unreachable). Outside the workspace, `cd` into it. Otherwise,
+  daemon is unreachable, an argument or the directory is not valid
+  UTF-8). Outside the workspace, `cd` into it. Otherwise,
   and when a command needs the host but no rule allows it, report the
   command and the message to the user and wait: only the host can change
   the rules or install tools.

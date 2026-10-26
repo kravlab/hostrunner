@@ -3,6 +3,7 @@ package client_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net"
@@ -222,21 +223,39 @@ func TestRunFailsWhenDaemonIsUnreachable(t *testing.T) {
 // status frame (Exit or Error) the daemon answers with.
 func (h harness) rawRequest(t *testing.T, req protocol.Request) protocol.Frame {
 	t.Helper()
+	payload, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, _ := h.rawFrame(t, protocol.FrameRequest, string(payload))
+	return f
+}
+
+// rawFrame sends payload as a frame of type typ on a fresh connection and
+// returns the first frame the daemon answers with that is neither output
+// nor stdin credit, and the stdout before it.
+func (h harness) rawFrame(t *testing.T, typ protocol.FrameType, payload string) (protocol.Frame, string) {
+	t.Helper()
 	conn, err := h.transport.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	if err := protocol.WriteJSON(conn, protocol.FrameRequest, req); err != nil {
+	if err := protocol.WriteFrame(conn, protocol.Frame{Type: typ, Payload: []byte(payload)}); err != nil {
 		t.Fatal(err)
 	}
+	var stdout strings.Builder
 	for {
 		f, err := protocol.ReadFrame(conn)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if f.Type == protocol.FrameExit || f.Type == protocol.FrameError {
-			return f
+		switch f.Type {
+		case protocol.FrameStdout:
+			stdout.Write(f.Payload)
+		case protocol.FrameStderr, protocol.FrameStdinCredit:
+		default:
+			return f, stdout.String()
 		}
 	}
 }
@@ -463,26 +482,25 @@ func TestRunErrorsDoNotRevealHostPaths(t *testing.T) {
 }
 
 func TestDaemonChecksVersionBeforeRequestShape(t *testing.T) {
-	h := startDaemon(t)
-	conn, err := h.transport.Dial(context.Background())
-	if err != nil {
-		t.Fatal(err)
+	futures := map[string]string{
+		"another shape":       `{"version": 99, "argv": {"program": "git"}}`,
+		"invalid UTF-8 bytes": "{\"version\": 99, \"argv\": [\"\xff\"], \"cwd\": \"" + containerRoot + "\"}",
 	}
-	defer conn.Close()
-	future := []byte(`{"version": 99, "argv": {"program": "git"}}`)
-	if err := protocol.WriteFrame(conn, protocol.Frame{Type: protocol.FrameRequest, Payload: future}); err != nil {
-		t.Fatal(err)
-	}
-	f, err := protocol.ReadFrame(conn)
-	if err != nil || f.Type != protocol.FrameError {
-		t.Fatalf("got frame %v, err %v; want FrameError", f.Type, err)
-	}
-	var e protocol.Error
-	if err := protocol.DecodeJSON(f, &e); err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(e.Message, "version") {
-		t.Fatalf("message %q does not mention the version mismatch", e.Message)
+	for name, future := range futures {
+		t.Run(name, func(t *testing.T) {
+			h := startDaemon(t)
+			f, _ := h.rawFrame(t, protocol.FrameRequest, future)
+			if f.Type != protocol.FrameError {
+				t.Fatalf("got frame %v; want FrameError", f.Type)
+			}
+			var e protocol.Error
+			if err := protocol.DecodeJSON(f, &e); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(e.Message, "version") {
+				t.Fatalf("message %q does not mention the version mismatch", e.Message)
+			}
+		})
 	}
 }
 
