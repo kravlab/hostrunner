@@ -20,6 +20,7 @@ titles, comments, review replies, files. GitHub tooling may append a
 footer carrying one after you post: re-read every PR, issue or comment
 you create or edit, and remove the link before going on.
 
+<!-- hostrunner instructions begin -->
 ## Host commands (hostrun)
 
 When `hostrun` is in `PATH` (a devcontainer wired to hostrunner),
@@ -62,6 +63,7 @@ in the container.
   or `the hostrunner daemon is stopping`, report it to the user and
   wait; do not ask again.
 - No TTY: supply all input up front, through flags or stdin.
+<!-- hostrunner instructions end -->
 
 ## Go
 

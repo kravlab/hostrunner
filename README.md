@@ -157,6 +157,25 @@ It does not read stdin, and the daemon log records it with
 (`hostrun git push --dry-run` runs git's dry run). A daemon older than
 dry runs refuses one with 125 rather than running the command.
 
+An agent in the container needs to know how to use `hostrun`: the rules
+file, the exit codes, dry runs and approvals. On the host, add the
+instructions to the project's instructions file:
+
+```sh
+hostrunner instructions                      # print them
+hostrunner instructions --append             # add them to ./AGENTS.md
+hostrunner instructions --append CLAUDE.md   # or to another file
+```
+
+The text sits between `<!-- hostrunner instructions begin -->` and
+`<!-- hostrunner instructions end -->` lines. A missing file is created
+after a question; for a file that already holds the instructions,
+`--append` asks whether to replace them (after an update of hostrunner,
+say), append another copy or cancel. The questions need a terminal:
+without one, `--append` still adds the text to a file that lacks it and
+refuses otherwise. The file is written in place, so a symlink keeps
+pointing to it.
+
 ### Approvals on the host
 
 A command the rules refuse can be approved by a human on the host, one
