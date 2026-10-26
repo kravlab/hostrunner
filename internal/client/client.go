@@ -8,11 +8,14 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/kravlab/hostrunner/internal/protocol"
+	"github.com/kravlab/hostrunner/internal/textcut"
 )
 
 // Dialer opens a connection to the daemon; transport.Transport satisfies it.
@@ -89,6 +92,12 @@ func Run(ctx context.Context, d Dialer, args []string, cwd string, stdin io.Read
 	}
 	if len(argv) == 0 {
 		return fail(stderr, protocol.ExitHostrunError, "usage: hostrun [%s|%s] <command> [args...]", dryRunFlag, askFlag)
+	}
+	if lines := utf8Errors(argv, cwd); len(lines) > 0 {
+		for _, line := range lines {
+			fail(stderr, protocol.ExitHostrunError, "%s", line)
+		}
+		return protocol.ExitHostrunError
 	}
 	conn, err := d.Dial(ctx)
 	if err != nil {
@@ -279,4 +288,23 @@ func fail(stderr io.Writer, code int, format string, args ...any) int {
 // unexpectedFrame fails on a frame the daemon must not send at this point.
 func unexpectedFrame(stderr io.Writer, f protocol.Frame) int {
 	return fail(stderr, protocol.ExitHostrunError, "unexpected frame type %d from the daemon", f.Type)
+}
+
+// utf8Errors returns an error line for each argument of argv, then for
+// cwd, that is not valid UTF-8, an argument numbered from 1 as an approval
+// session numbers them, each value Go-quoted, so no byte of it reaches the
+// terminal as it is, and cut as textcut.Cut cuts it. The request is JSON,
+// whose encoding would replace such bytes with U+FFFD, so the host would
+// run another argv, or in another directory, than the one given.
+func utf8Errors(argv []string, cwd string) []string {
+	var lines []string
+	for i, arg := range argv {
+		if !utf8.ValidString(arg) {
+			lines = append(lines, fmt.Sprintf("argument %d is not valid UTF-8: %s", i+1, textcut.Cut(arg, strconv.Quote)))
+		}
+	}
+	if !utf8.ValidString(cwd) {
+		lines = append(lines, fmt.Sprintf("the current directory is not valid UTF-8: %s", textcut.Cut(cwd, strconv.Quote)))
+	}
+	return lines
 }

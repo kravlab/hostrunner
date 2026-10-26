@@ -32,6 +32,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/kravlab/hostrunner/internal/protocol"
+	"github.com/kravlab/hostrunner/internal/textcut"
 	"github.com/kravlab/hostrunner/internal/transport"
 )
 
@@ -873,8 +874,8 @@ func (t *term) prompt(p string) {
 // How much of an argv a request's block, and the list of standing and
 // session approvals, show; `c` shows all of a request's.
 const (
-	maxShownArgs  = 20  // arguments; more are counted, not shown
-	maxShownRunes = 200 // characters of one argument; more are counted
+	maxShownArgs  = 20               // arguments; more are counted, not shown
+	maxShownRunes = textcut.MaxChars // characters of one argument; more are counted
 )
 
 // isLong reports whether arg is longer than a block shows.
@@ -885,12 +886,12 @@ func shownArgs(argv []string) []string { return argv[:min(len(argv), maxShownArg
 
 // argvLine shows argv as a block does: the arguments shownArgs returns,
 // each quoted as bashQuote does, so none can steer the terminal or hide
-// where it ends, and cut (see quoteCut), the arguments left out counted.
+// where it ends, and cut (see textcut.Cut), the arguments left out counted.
 func argvLine(argv []string) string {
 	shown := shownArgs(argv)
 	cut := make([]string, len(shown))
 	for i, arg := range shown {
-		cut[i] = quoteCut(arg, bashQuote)
+		cut[i] = textcut.Cut(arg, bashQuote)
 	}
 	line := strings.Join(cut, " ")
 	if more := len(argv) - len(shown); more > 0 {
@@ -905,7 +906,7 @@ func argvLine(argv []string) string {
 func (t *term) printMarks(argv []string) {
 	for i, arg := range shownArgs(argv) {
 		if holdsNonASCII(arg) {
-			fmt.Fprintf(t.out, "  ⚠ non-ASCII: argument %d %s is %s\n", i+1, quoteCut(arg, bashQuote), quoteCut(arg, asciiQuote))
+			fmt.Fprintf(t.out, "  ⚠ non-ASCII: argument %d %s is %s\n", i+1, textcut.Cut(arg, bashQuote), textcut.Cut(arg, asciiQuote))
 		}
 	}
 }
@@ -978,20 +979,6 @@ func ansiCQuote(arg string, ascii bool) string {
 	}
 	b.WriteByte('\'')
 	return b.String()
-}
-
-// quoteCut shows arg quoted by quote, cut after maxShownRunes
-// characters, the bytes left out counted. The cut falls between two
-// characters, so an argument of megabytes shows in a few hundred bytes.
-func quoteCut(arg string, quote func(string) string) string {
-	n := 0
-	for i := range arg {
-		if n == maxShownRunes {
-			return fmt.Sprintf("%s…(+%d bytes)", quote(arg[:i]), len(arg)-i)
-		}
-		n++
-	}
-	return quote(arg)
 }
 
 // holdsNonASCII reports whether arg holds a character outside ASCII.

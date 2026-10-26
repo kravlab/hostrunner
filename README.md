@@ -226,9 +226,8 @@ terminal or hide where it ends:
   and `\t`, any other ASCII control character, DEL and a byte of
   invalid UTF-8 as `\xHH`, a combining mark and any other character
   that is not printable as `\uHHHH`, or `\UHHHHHHHH` above U+FFFF.
-  Invalid UTF-8 reaches the session only once
-  [#101](https://github.com/kravlab/hostrunner/issues/101) is fixed;
-  until then such bytes arrive as U+FFFD.
+  Invalid UTF-8 never reaches the session: hostrun refuses an argument
+  or current directory holding it with 125.
 
 The directory, reasons and guards are shown as they are, Go-quoted when
 they hold a character that is not printable; a note for the agent with
@@ -673,8 +672,8 @@ How it works:
 | command's own | the command ran |
 | 0 | `--dry-run`: the command would run |
 | 128+N | the command was killed by signal N |
-| 125 | hostrun failed: daemon unreachable, protocol error, no command given, or `--dry-run` and `--ask` combined |
-| 126 | refused: denied by the rules, an argument not a workspace file, working directory outside the workspace, a rule's `dir` missing, not a directory or inside the workspace, or not executable; with `--ask`, not approved on the host (refused, unanswered, no approval session, too large to show, the daemon stopping) |
+| 125 | hostrun failed: daemon unreachable, protocol error, no command given, `--dry-run` and `--ask` combined, or an argument or the current directory not valid UTF-8 |
+| 126 | refused: denied by the rules, an argument not a workspace file, current directory outside the workspace, a rule's `dir` missing, not a directory or inside the workspace, or not executable; with `--ask`, not approved on the host (refused, unanswered, no approval session, too large to show, the daemon stopping) |
 | 127 | command not found on the host |
 | 130 | interrupted (Ctrl+C); the host command is killed |
 
@@ -694,6 +693,10 @@ How it works:
 - `path: check` checks a file argument when the command starts, not when
   the program opens it: the container can swap a symlink in between. Use
   `path: open` where the program accepts `/proc/self/fd/N`.
+- Arguments and the current directory must be valid UTF-8: hostrun
+  refuses others with 125 (a Latin-1 file name, binary data as an
+  argument) rather than have them reach the host changed. Pass bytes
+  through stdin instead.
 
 ## Development
 
