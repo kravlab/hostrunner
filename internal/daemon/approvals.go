@@ -146,14 +146,17 @@ const (
 	endedExpired               = endReason(protocol.WithdrawnExpired)  // its limit ran out
 	endedSessionLeft endReason = "session left"                        // its session left
 	endedStopping    endReason = "daemon stopping"                     // the daemon stops or steps aside
+	endedDraining              = endReason(protocol.WithdrawnStopping) // the daemon drains
 )
 
 // withdrawn returns the reason the session is told of the end with
 // (FrameWithdrawn), and whether it is told: it still shows the request,
-// while a session that left or a stopping daemon takes it along.
+// while a session that left or a stopping daemon takes it along. A
+// draining daemon keeps the session connected until it stops, so the
+// session is told.
 func (r endReason) withdrawn() (protocol.EndReason, bool) {
 	switch r {
-	case endedWithdrawn, endedExpired:
+	case endedWithdrawn, endedExpired, endedDraining:
 		return protocol.EndReason(r), true
 	}
 	return "", false
@@ -167,7 +170,7 @@ func (r endReason) refusal() *refusal {
 		return &refusal{protocol.ExitRejected, unansweredMessage, errUnanswered}
 	case endedSessionLeft:
 		return &refusal{protocol.ExitRejected, refusedMessage, errSessionLeft}
-	case endedStopping:
+	case endedStopping, endedDraining:
 		return &refusal{protocol.ExitRejected, stoppingMessage, errStopping}
 	}
 	return nil
@@ -343,6 +346,21 @@ func (a *approvals) served() bool {
 	return a.serving != nil
 }
 
+// counts returns how many standing and session approvals the daemon
+// holds; they all end with it.
+func (a *approvals) counts() (standing, session int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, ha := range a.held {
+		if ha.kind() == protocol.ScopeSession {
+			session++
+		} else {
+			standing++
+		}
+	}
+	return standing, session
+}
+
 // grant grants a standing approval for req's argv from its container
 // directory, or, with by, a session approval of session by, guarded or
 // not, passing as given the path failures passes does, and returns its
@@ -458,7 +476,7 @@ func (s *Server) serveApprovals(ctx context.Context, wg *sync.WaitGroup) {
 	for {
 		conn, err := s.approvals.listener.Accept()
 		if err != nil {
-			if ctx.Err() != nil {
+			if ctx.Err() != nil || s.isDraining() {
 				return
 			}
 			if isTemporary(err) {
@@ -475,7 +493,8 @@ func (s *Server) serveApprovals(ctx context.Context, wg *sync.WaitGroup) {
 // handleSession serves one connection to the approval socket. Only a
 // process of the daemon's own uid may use it; it opens with FrameHello and
 // then takes FrameServe, FrameAnswer, FrameStanding, FrameRevoke and
-// FrameReread. Any other frame ends it.
+// FrameReread, and from `hostrunner stop` FrameRunning and FrameStop,
+// whatever the hello's version. Any other frame ends it.
 func (s *Server) handleSession(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
 	stop := context.AfterFunc(ctx, func() { conn.Close() })
@@ -512,6 +531,7 @@ func (s *Server) handleSession(ctx context.Context, conn net.Conn) {
 	_ = out.writeJSON(protocol.FrameDaemonInfo, protocol.DaemonInfo{
 		Version: protocol.ApprovalVersion, Workspace: host, ContainerWorkspace: container,
 		RulesFile: s.approvals.rulesFile, RulesDigest: s.rulesDigest(), Served: s.approvals.served(),
+		Stops: true, ContainerStopped: s.containerStopped != nil && s.containerStopped(),
 	})
 	defer func() {
 		// The daemon stopping closes the connection too: its requests end
@@ -579,6 +599,15 @@ func (s *Server) handleSession(ctx context.Context, conn net.Conn) {
 				return
 			}
 			_ = out.writeJSON(protocol.FrameRereadResult, s.reread(c, rr))
+		case protocol.FrameRunning:
+			_ = out.writeJSON(protocol.FrameRunningList, s.runningList())
+		case protocol.FrameStop:
+			var st protocol.Stop
+			if err := protocol.DecodeJSON(f, &st); err != nil {
+				s.sessionRefused(out, pid, err)
+				return
+			}
+			s.stop(out, pid, st)
 		default:
 			s.sessionRefused(out, pid, fmt.Errorf("frame type %d does not belong on the approval socket", f.Type))
 			return
@@ -749,6 +778,13 @@ func (s *Server) ask(ctx context.Context, x exchange, f protocol.Frame) {
 	if !closeOnStop() {
 		return
 	}
+	if s.isDraining() {
+		// A draining daemon shows the session nothing new.
+		r := endedDraining.refusal()
+		s.log.Info("approval not answered", "reason", string(endedDraining), "argv", req.Argv, "dir", need.hostDir)
+		s.reject(x.out, r.code, r.message, r.err)
+		return
+	}
 	var (
 		id      uint64
 		request *approvalRequest
@@ -785,6 +821,8 @@ func (s *Server) ask(ctx context.Context, x exchange, f protocol.Frame) {
 		o = s.approvals.end(id, request, endedExpired)
 	case <-ctx.Done():
 		o = s.approvals.end(id, request, endedStopping)
+	case <-s.draining:
+		o = s.approvals.end(id, request, endedDraining)
 	}
 	if o.ended != "" {
 		s.log.Info("approval not answered", "approval_id", id, "reason", string(o.ended))
@@ -818,6 +856,17 @@ func (s *Server) ask(ctx context.Context, x exchange, f protocol.Frame) {
 		}
 	}
 	s.log.Info("approval answered", "approval_id", id, "scope", scope)
+	if s.isDraining() {
+		// Answered as the daemon began to drain: it runs nothing new, and
+		// grants nothing.
+		if p != nil {
+			p.close()
+		}
+		r := endedDraining.refusal()
+		s.log.Info("approval not run", "approval_id", id, "reason", string(endedDraining))
+		s.reject(x.out, r.code, r.message, r.err)
+		return
+	}
 	_ = x.out.writeJSON(protocol.FrameApproved, protocol.Approved{Scope: scope})
 	// Only the path failures the human saw are passed as given, for the
 	// reason they saw: one that fails its check only now, or otherwise (a

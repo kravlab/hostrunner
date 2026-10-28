@@ -11,6 +11,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/kravlab/hostrunner/internal/hostterm"
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/ruleedit"
 	"github.com/kravlab/hostrunner/internal/rules"
@@ -137,14 +138,14 @@ func (s *session) proposeRule(r waiting) {
 		if file != nil {
 			file.close()
 		}
-		fmt.Fprintf(s.out, "cannot add a rule: %s\n", display(err.Error()))
+		fmt.Fprintf(s.out, "cannot add a rule: %s\n", hostterm.Display(err.Error()))
 		s.askAnswer()
 		return
 	}
 	s.printDiff(p.Diff)
 	if file.path != s.daemon.RulesFile {
 		// A link on the way: the diff names the file the daemon reads.
-		fmt.Fprintf(s.out, "writes %s\n", display(s.shownPath(file.path)))
+		fmt.Fprintf(s.out, "writes %s\n", hostterm.Display(s.shownPath(file.path)))
 	}
 	s.awaiting, s.adding = awaitAdd, &addition{id: r.ID, rule: p.Rule, data: p.Data, base: digest, file: file}
 	s.prompt(addPrompt)
@@ -186,7 +187,7 @@ func (s *session) writeRule() {
 		err = a.file.write(a.data)
 	}
 	if err != nil {
-		fmt.Fprintf(s.out, "nothing written: %s\n", display(err.Error()))
+		fmt.Fprintf(s.out, "nothing written: %s\n", hostterm.Display(err.Error()))
 		s.dropAddition()
 		s.awaiting = awaitAnswer
 		s.askAnswer()
@@ -222,13 +223,13 @@ func (s *session) editRule(r waiting) {
 		s.prompt(s.asking)
 		return
 	case err != nil:
-		fmt.Fprintf(s.out, "the editor failed: %s\n", display(err.Error()))
+		fmt.Fprintf(s.out, "the editor failed: %s\n", hostterm.Display(err.Error()))
 		s.prompt(s.asking)
 		return
 	}
 	a.data, a.edited = data, true
 	if err := ruleedit.Allows(data, r.Argv); err != nil {
-		fmt.Fprintf(s.out, "not written: the edited rules do not allow request %d: %s\n", r.ID, display(err.Error()))
+		fmt.Fprintf(s.out, "not written: the edited rules do not allow request %d: %s\n", r.ID, hostterm.Display(err.Error()))
 		a.invalid = true
 		s.prompt(editAgainPrompt)
 		return
@@ -258,7 +259,7 @@ func (s *session) reread(res protocol.RereadResult) {
 	scope := protocol.ScopeRule
 	if res.Error != "" {
 		scope = protocol.ScopeOnce
-		fmt.Fprintf(s.out, "rule added, but the daemon kept its old rules: %s", display(res.Error))
+		fmt.Fprintf(s.out, "rule added, but the daemon kept its old rules: %s", hostterm.Display(res.Error))
 		if waiting {
 			fmt.Fprintf(s.out, " · request %d runs once", a.id)
 		}
@@ -269,7 +270,7 @@ func (s *session) reread(res protocol.RereadResult) {
 		case !waiting:
 		case res.RunsOnce != "":
 			scope = protocol.ScopeOnce
-			fmt.Fprintf(s.out, " · request %d runs once: %s", a.id, display(res.RunsOnce))
+			fmt.Fprintf(s.out, " · request %d runs once: %s", a.id, hostterm.Display(res.RunsOnce))
 		default:
 			fmt.Fprintf(s.out, " · request %d runs under it", a.id)
 		}
@@ -320,7 +321,7 @@ func (s *session) rereadThenPropose(res protocol.RereadResult) {
 	case s.queue[0].ID != id:
 		s.askAnswer()
 	case res.Error != "":
-		fmt.Fprintf(s.out, "cannot add a rule: the rules file changed since the daemon loaded it, and the daemon cannot reread it: %s\n", display(res.Error))
+		fmt.Fprintf(s.out, "cannot add a rule: the rules file changed since the daemon loaded it, and the daemon cannot reread it: %s\n", hostterm.Display(res.Error))
 		s.askAnswer()
 	default:
 		s.proposeRule(s.queue[0])
@@ -332,7 +333,7 @@ func (s *session) rereadThenPropose(res protocol.RereadResult) {
 // quoted.
 func (s *session) printDiff(diff string) {
 	for _, l := range strings.SplitAfter(strings.TrimSuffix(diff, "\n"), "\n") {
-		fmt.Fprintln(s.out, display(strings.TrimSuffix(l, "\n")))
+		fmt.Fprintln(s.out, hostterm.Display(strings.TrimSuffix(l, "\n")))
 	}
 }
 

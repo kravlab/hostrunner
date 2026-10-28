@@ -37,6 +37,7 @@ type harness struct {
 	approvalSocket string
 	rulesFile      string // the rules file a session adds rules to
 	stop           func() // shuts the daemon down; safe to call more than once
+	served         *serveResult
 }
 
 // allowAll is a policy that allows every command, for tests about
@@ -95,7 +96,7 @@ func startHarnessAt(t *testing.T, log *slog.Logger, base string, setup func(rule
 	if err != nil {
 		t.Fatal(err)
 	}
-	tr := transport.Unix{Path: filepath.Join(base, "h.sock")}
+	tr := transport.Unix{Path: filepath.Join(base, launch.SocketName)} // where `up` puts it
 	l, err := tr.Listen()
 	if err != nil {
 		t.Fatal(err)
@@ -106,20 +107,44 @@ func startHarnessAt(t *testing.T, log *slog.Logger, base string, setup func(rule
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
+	served := &serveResult{done: make(chan struct{})}
 	rulesFile := filepath.Join(hostRoot, ".devcontainer", "hostrun.yaml")
 	p, opts := setup(rulesFile)
 	opts = append([]daemon.Option{daemon.WithApprovals(al, rulesFile)}, opts...)
 	srv := daemon.New(mapper, p, log, opts...)
-	go func() { done <- srv.Serve(ctx, l) }()
+	go func() {
+		served.err = srv.Serve(ctx, l)
+		close(served.done)
+	}()
 	stop := sync.OnceFunc(func() {
 		cancel()
-		if err := <-done; err != nil {
-			t.Errorf("Serve: %v", err)
+		<-served.done
+		if served.err != nil {
+			t.Errorf("Serve: %v", served.err)
 		}
 	})
 	t.Cleanup(stop)
-	return harness{transport: tr, hostRoot: hostRoot, runtimeDir: base, approvalSocket: approvalSocket, rulesFile: rulesFile, stop: stop}
+	return harness{transport: tr, hostRoot: hostRoot, runtimeDir: base, approvalSocket: approvalSocket, rulesFile: rulesFile, stop: stop, served: served}
+}
+
+// serveResult is what the harness's Serve returned, once done is closed.
+type serveResult struct {
+	done chan struct{}
+	err  error
+}
+
+// waitServed waits for the daemon to stop by itself, without the harness
+// stopping it, and checks Serve returned nil.
+func (h harness) waitServed(t *testing.T) {
+	t.Helper()
+	select {
+	case <-h.served.done:
+		if h.served.err != nil {
+			t.Fatalf("Serve: %v", h.served.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the daemon did not stop")
+	}
 }
 
 // result is what the user of hostrun observes.

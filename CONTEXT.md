@@ -126,7 +126,20 @@ the daemon exits.
 **Step aside**:
 The daemon's answer to an arm it will not follow: it stops,
 and `hostrunner up` starts a new daemon.
-_Avoid_: restart
+_Avoid_: restart (a human's decision, not the daemon's)
+
+**Stop**:
+A human on the host ending a daemon.
+_Avoid_: kill, shutdown
+
+**Restart**:
+A human on the host replacing a daemon with a new one for
+the same runtime directory.
+_Avoid_: step aside (the daemon's own decision), reload
+
+**Drain**:
+The state of a daemon that a stop or restart waits for: it
+takes no new requests and finishes the running ones.
 
 **Startup timeout**:
 How long a waiting daemon waits for its armed container

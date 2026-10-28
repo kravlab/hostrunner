@@ -33,13 +33,23 @@ const (
 	SocketName = "hostrunner.sock" // the daemon's socket
 	ClientName = "hostrun"         // the client binary for the container
 	LogName    = "daemon.log"      // the daemon's stdout and stderr
-	lockName   = "up.lock"         // serializes concurrent `hostrunner up`s
+	lockName   = "up.lock"         // serializes `hostrunner up`, stop and restart
 )
 
 // ApprovalSocket is the approval socket of the daemon serving the runtime
 // directory dir: beside dir, not in it, since the container mounts dir and
 // must not reach the socket approval sessions answer on.
 func ApprovalSocket(dir string) string { return filepath.Clean(dir) + protocol.ApprovalSuffix }
+
+// Socket is the socket of the daemon serving the runtime directory dir,
+// the one the container's hostrun connects to.
+func Socket(dir string) string { return filepath.Join(dir, SocketName) }
+
+// RuntimeDir is the runtime directory of the daemon whose approval socket
+// is approvalSocket: the inverse of ApprovalSocket.
+func RuntimeDir(approvalSocket string) string {
+	return strings.TrimSuffix(approvalSocket, protocol.ApprovalSuffix)
+}
 
 // armTimeout bounds one arm request, including connecting.
 const armTimeout = 5 * time.Second
@@ -74,33 +84,55 @@ type Config struct {
 // the daemon's log output if it did not come up. Concurrent calls for the
 // same directory are serialized, so they end up sharing one daemon.
 func Up(ctx context.Context, cfg Config) error {
-	socket := filepath.Join(cfg.Dir, SocketName)
+	p, err := Prepare(cfg)
+	if err != nil {
+		return err
+	}
+	unlock, err := LockDir(cfg.Dir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return p.UpLocked(ctx)
+}
+
+// Prepared is an `up` whose runtime directory is ready and whose rules
+// are valid, to run with UpLocked.
+type Prepared struct {
+	cfg            Config
+	socket, digest string
+}
+
+// Prepare readies cfg.Dir and validates cfg.Rules for an `up`; invalid
+// rules are an error.
+func Prepare(cfg Config) (*Prepared, error) {
+	socket := Socket(cfg.Dir)
 	if len(socket) > maxSocketPath {
-		return fmt.Errorf("socket path %s is too long (%d bytes, max %d)", socket, len(socket), maxSocketPath)
+		return nil, fmt.Errorf("socket path %s is too long (%d bytes, max %d)", socket, len(socket), maxSocketPath)
 	}
 	if err := prepareDir(cfg.Dir); err != nil {
-		return err
+		return nil, err
 	}
 	// Invalid rules must fail `devcontainer up` visibly, even when a daemon
 	// with older rules is still running.
 	policy, err := rules.Load(cfg.Rules)
 	if err != nil {
-		return fmt.Errorf("rules file: %w", err)
+		return nil, fmt.Errorf("rules file: %w", err)
 	}
-	digest := policy.Digest()
-	unlock, err := lockDir(cfg.Dir)
-	if err != nil {
-		return err
-	}
-	defer unlock()
+	return &Prepared{cfg: cfg, socket: socket, digest: policy.Digest()}, nil
+}
 
+// UpLocked is Up for a caller that holds the runtime directory's lock
+// (see LockDir): restart, which stopped the daemon under it.
+func (p *Prepared) UpLocked(ctx context.Context) error {
+	cfg, socket, digest := p.cfg, p.socket, p.digest
 	stepAside, err := arm(ctx, socket, digest)
 	switch {
 	case err == nil && !stepAside:
 		return nil
 	case err == nil: // the daemon is stopping for a new one
-		if err := waitStopped(ctx, socket, cfg.ReadyTimeout); err != nil {
-			return err
+		if err := WaitStopped(ctx, socket, cfg.ReadyTimeout); err != nil {
+			return fmt.Errorf("%w after stepping aside", err)
 		}
 	case !errors.Is(err, errNotListening):
 		return fmt.Errorf("%w; stop the process serving %s and retry", err, socket)
@@ -111,8 +143,9 @@ func Up(ctx context.Context, cfg Config) error {
 	return startDaemon(ctx, cfg, socket, digest)
 }
 
-// waitStopped waits until nothing accepts connections on socket.
-func waitStopped(ctx context.Context, socket string, timeout time.Duration) error {
+// WaitStopped waits until nothing accepts connections on socket, for
+// timeout at most.
+func WaitStopped(ctx context.Context, socket string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for {
 		c, err := transport.Unix{Path: socket}.Dial(ctx)
@@ -121,7 +154,7 @@ func waitStopped(ctx context.Context, socket string, timeout time.Duration) erro
 		}
 		c.Close()
 		if time.Now().After(deadline) {
-			return fmt.Errorf("the daemon on %s did not stop within %v after stepping aside", socket, timeout)
+			return fmt.Errorf("the daemon on %s did not stop within %v", socket, timeout)
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
@@ -139,19 +172,37 @@ func prepareDir(dir string) error {
 	return os.Chmod(dir, 0o700)
 }
 
-// lockDir takes an exclusive lock on dir for the rest of `up`; the returned
-// function releases it. The lock file is close-on-exec, so the daemon does
-// not inherit (and hold) it.
-func lockDir(dir string) (func(), error) {
+// LockDir takes an exclusive lock on the runtime directory dir, which
+// `up`, stop and restart each hold while they start or stop its daemon, so
+// they run one after the other; the returned function releases it. The
+// lock file is close-on-exec, so the daemon does not inherit (and hold)
+// it.
+func LockDir(dir string) (func(), error) {
+	unlock, _, err := lockDir(dir, syscall.LOCK_EX)
+	return unlock, err
+}
+
+// TryLockDir is LockDir without waiting: busy reports that another holds
+// the lock, unlock nil then.
+func TryLockDir(dir string) (unlock func(), busy bool, err error) {
+	return lockDir(dir, syscall.LOCK_EX|syscall.LOCK_NB)
+}
+
+// lockDir takes the lock of LockDir with the flock operation how; busy
+// reports that a non-blocking how found it held.
+func lockDir(dir string, how int) (unlock func(), busy bool, err error) {
 	f, err := os.OpenFile(filepath.Join(dir, lockName), os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
-		return nil, fmt.Errorf("open lock: %w", err)
+		return nil, false, fmt.Errorf("open lock: %w", err)
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+	if err := syscall.Flock(int(f.Fd()), how); err != nil {
 		f.Close()
-		return nil, fmt.Errorf("lock runtime directory: %w", err)
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, true, nil
+		}
+		return nil, false, fmt.Errorf("lock runtime directory: %w", err)
 	}
-	return func() { f.Close() }, nil
+	return func() { f.Close() }, false, nil
 }
 
 // arm asks the daemon on socket to wait for its devcontainer again, telling

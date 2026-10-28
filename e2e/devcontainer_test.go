@@ -395,6 +395,33 @@ func testLifecycle(t *testing.T, e env) {
 		}
 	})
 
+	t.Run("restart picks up a hand-edited rules file", func(t *testing.T) {
+		if _, err := e.exec(t, "hostrun", "printf", "hi"); err == nil {
+			t.Fatal("printf allowed before the rule was added")
+		}
+		rulesFile := filepath.Join(e.ws, ".devcontainer", "hostrun.yaml")
+		data, err := os.ReadFile(rulesFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data = append(data, "\n  - command: printf\n    args: any\n"...)
+		if err := os.WriteFile(rulesFile, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		before := daemonStarts(t, runtimeDir)
+		// By its path: exec resolves a bare name with the test's own PATH,
+		// not e.vars()'s, and would find an installed hostrunner.
+		if _, err := run(t, e.vars(), filepath.Join(e.bin, "hostrunner"), "restart", "--dir", runtimeDir); err != nil {
+			t.Fatalf("hostrunner restart: %v", err)
+		}
+		if got, err := e.exec(t, "hostrun", "printf", "hi"); err != nil || got != "hi" {
+			t.Fatalf("printf after the restart: %q, %v", got, err)
+		}
+		if n := daemonStarts(t, runtimeDir); n != before+1 {
+			t.Fatalf("%d daemon starts, want %d (restarted)", n, before+1)
+		}
+	})
+
 	t.Run("daemon survives a rebuild slower than its grace period", func(t *testing.T) {
 		before := daemonStarts(t, runtimeDir)
 		container = e.up(t, "--remove-existing-container", "--build-no-cache")
