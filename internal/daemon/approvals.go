@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/kravlab/hostrunner/internal/protocol"
@@ -113,9 +114,10 @@ const (
 // frames go (each write bounded by sessionWriteTimeout), and its pid,
 // which names it in the log.
 type sessionConn struct {
-	conn net.Conn
-	out  *frameWriter
-	pid  int
+	conn    net.Conn
+	out     *frameWriter
+	pid     int
+	notices atomic.Bool // it reads FrameRulesReread (protocol.Serve.Notices)
 }
 
 // approvalRequest is a request waiting for its outcome, which arrives once
@@ -346,6 +348,21 @@ func (a *approvals) served() bool {
 	return a.serving != nil
 }
 
+// notice tells the session serving the daemon, if it reads notices, that
+// the daemon reread its rules file by itself (n). A session that does not
+// take the frame is gone, as in enqueue.
+func (a *approvals) notice(n protocol.RulesReread) {
+	a.mu.Lock()
+	c := a.serving
+	a.mu.Unlock()
+	if c == nil || !c.notices.Load() {
+		return
+	}
+	if err := c.out.writeJSON(protocol.FrameRulesReread, n); err != nil {
+		c.conn.Close()
+	}
+}
+
 // counts returns how many standing and session approvals the daemon
 // holds; they all end with it.
 func (a *approvals) counts() (standing, session int) {
@@ -532,6 +549,7 @@ func (s *Server) handleSession(ctx context.Context, conn net.Conn) {
 		Version: protocol.ApprovalVersion, Workspace: host, ContainerWorkspace: container,
 		RulesFile: s.approvals.rulesFile, RulesDigest: s.rulesDigest(), Served: s.approvals.served(),
 		Stops: true, ContainerStopped: s.containerStopped != nil && s.containerStopped(),
+		Rereads: s.rereadsByItself(), NoReread: !s.rereadsByItself(),
 	})
 	defer func() {
 		// The daemon stopping closes the connection too: its requests end
@@ -566,6 +584,7 @@ func (s *Server) handleSession(ctx context.Context, conn net.Conn) {
 					return
 				}
 			}
+			c.notices.Store(sv.Notices)
 			if why := s.serveSession(c, sv.TakeOver); why != "" {
 				_ = out.writeJSON(protocol.FrameError, protocol.Error{Code: protocol.ExitRejected, Message: why})
 				continue
@@ -629,12 +648,11 @@ func (s *Server) reread(c *sessionConn, rr protocol.Reread) protocol.RereadResul
 		// A file changed by hand, reread before a rule is proposed.
 		s.log.Info("hand-edited rules reread", "file", s.approvals.rulesFile, "pid", c.pid)
 	}
-	digest, err := s.rereadRules(rr.Digest)
+	digest, _, err := s.rereadRules(rr.Digest)
+	s.logReread(digest, err)
 	if err != nil {
-		s.log.Warn("rules reread failed: the old rules stay", "file", s.approvals.rulesFile, "error", err)
 		return protocol.RereadResult{Error: err.Error()}
 	}
-	s.log.Info("rules reread", "file", s.approvals.rulesFile, "digest", digest)
 	res := protocol.RereadResult{Digest: digest}
 	if msg, ok := s.approvals.waitingMsg(rr.ID); ok {
 		// As the request will be run once answered (see ask): its checks

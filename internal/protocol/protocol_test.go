@@ -99,11 +99,11 @@ func TestDecodeJSONRejectsMalformedPayload(t *testing.T) {
 }
 
 func TestReadFrameAcceptsUpToTheLastFrameType(t *testing.T) {
-	if _, err := ReadFrame(bytes.NewReader([]byte{byte(FrameStopping), 0, 0, 0, 0})); err != nil {
-		t.Fatalf("FrameStopping: %v", err)
+	if _, err := ReadFrame(bytes.NewReader([]byte{byte(FrameRulesReread), 0, 0, 0, 0})); err != nil {
+		t.Fatalf("FrameRulesReread: %v", err)
 	}
-	if _, err := ReadFrame(bytes.NewReader([]byte{byte(FrameStopping) + 1, 0, 0, 0, 0})); !errors.Is(err, ErrUnknownFrameType) {
-		t.Fatalf("the type after FrameStopping: got %v, want ErrUnknownFrameType", err)
+	if _, err := ReadFrame(bytes.NewReader([]byte{byte(FrameRulesReread) + 1, 0, 0, 0, 0})); !errors.Is(err, ErrUnknownFrameType) {
+		t.Fatalf("the type after FrameRulesReread: got %v, want ErrUnknownFrameType", err)
 	}
 }
 
@@ -113,6 +113,7 @@ func TestFrameTypesKeepTheirWireValues(t *testing.T) {
 	for typ, want := range map[FrameType]byte{
 		FrameRequest: 1, FrameApproved: 15, FrameHello: 16, FrameTakenOver: 30,
 		FrameRunning: 31, FrameRunningList: 32, FrameStop: 33, FrameStopping: 34,
+		FrameRulesReread: 35,
 	} {
 		if byte(typ) != want {
 			t.Errorf("frame %v has value %d, want %d", typ, byte(typ), want)
@@ -139,6 +140,32 @@ func TestDaemonInfoOfStoppingDaemon(t *testing.T) {
 	}
 	if !info.Stops || !info.ContainerStopped {
 		t.Fatalf("got Stops=%v ContainerStopped=%v, want both true", info.Stops, info.ContainerStopped)
+	}
+}
+
+// The JSON names of rereading are the contract between versions: a
+// daemon's DaemonInfo, a session's Serve and the notice of a reread.
+func TestRereadWireFormat(t *testing.T) {
+	var info DaemonInfo
+	if err := DecodeJSON(Frame{Type: FrameDaemonInfo, Payload: []byte(`{"version":1,"rereads":true,"no_reread":true}`)}, &info); err != nil {
+		t.Fatal(err)
+	}
+	if !info.Rereads || !info.NoReread {
+		t.Fatalf("got Rereads=%v NoReread=%v, want both true", info.Rereads, info.NoReread)
+	}
+	var sv Serve
+	if err := DecodeJSON(Frame{Type: FrameServe, Payload: []byte(`{"take_over":true,"notices":true}`)}, &sv); err != nil {
+		t.Fatal(err)
+	}
+	if want := (Serve{TakeOver: true, Notices: true}); sv != want {
+		t.Fatalf("got %+v, want %+v", sv, want)
+	}
+	var n RulesReread
+	if err := DecodeJSON(Frame{Type: FrameRulesReread, Payload: []byte(`{"digest":"d","error":"e"}`)}, &n); err != nil {
+		t.Fatal(err)
+	}
+	if want := (RulesReread{Digest: "d", Error: "e"}); n != want {
+		t.Fatalf("got %+v, want %+v", n, want)
 	}
 }
 

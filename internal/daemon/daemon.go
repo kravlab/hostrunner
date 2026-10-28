@@ -12,7 +12,8 @@
 // approvals.go). The approval socket lies outside what the container
 // mounts, and takes no frames from the container's socket, nor that socket
 // any of its frames. A session that adds a rule to the rules file makes the
-// daemon reread it (WithReload).
+// daemon reread it (WithReload), and with WithRereadEvery the daemon
+// rereads it by itself once it changes (see reread.go).
 package daemon
 
 import (
@@ -56,7 +57,11 @@ type Server struct {
 	reload           func() (Policy, string, error)                       // nil: the rules are never reread
 	approvals        *approvals                                           // nil: no approval socket, so nothing is approved
 	containerStopped func() bool                                          // nil: the armed container is not known to have stopped
+	rereadEvery      time.Duration                                        // 0: the rules file is not watched; see WithRereadEvery
 
+	// rereading makes rereads one at a time, so a slower one never
+	// replaces the rules a later one served.
+	rereading      sync.Mutex
 	mu             sync.Mutex
 	stopServe      context.CancelFunc                 // stops the running Serve; nil when not serving
 	closeListeners func()                             // closes the running Serve's sockets; nil when not serving
@@ -126,23 +131,31 @@ func (s *Server) rules() Policy {
 
 // rereadRules rereads the rules file (see WithReload) and serves the new
 // rules from then on, provided the file has the digest want, the one the
-// session left it with; it returns their digest, or why it keeps the old
-// rules.
-func (s *Server) rereadRules(want string) (string, error) {
+// session left it with or the watcher read; it returns their digest, or
+// why it keeps the old rules: errChangedMeanwhile for another digest.
+// Rules of digest want already served, as a reread just before this one
+// left them, are not reloaded: changed reports whether the rules served
+// changed.
+func (s *Server) rereadRules(want string) (digest string, changed bool, err error) {
 	if s.reload == nil {
-		return "", errors.New("this daemon does not reread its rules")
+		return "", false, errors.New("this daemon does not reread its rules")
+	}
+	s.rereading.Lock()
+	defer s.rereading.Unlock()
+	if s.rulesDigest() == want {
+		return want, false, nil
 	}
 	p, digest, err := s.reload()
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	if digest != want {
-		return "", errors.New("the rules file changed meanwhile")
+		return "", false, errChangedMeanwhile
 	}
 	s.mu.Lock()
 	s.policy, s.digest = p, digest
 	s.mu.Unlock()
-	return digest, nil
+	return digest, true, nil
 }
 
 // New returns a Server that runs the commands policy allows, confined to
@@ -171,7 +184,8 @@ func New(mapper *workspace.Mapper, policy Policy, log *slog.Logger, opts ...Opti
 // l at once and stops Serve once no command runs; a Server stopped by a
 // stop request does not Serve again. With WithApprovals it accepts
 // approval sessions on the approval socket meanwhile, and closes that
-// socket when it stops too.
+// socket when it stops too; with WithRereadEvery it rereads the rules file
+// once it changes meanwhile.
 func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -201,6 +215,9 @@ func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 	)
 	if s.approvals != nil {
 		wg.Go(func() { s.serveApprovals(ctx, &wg) })
+	}
+	if s.rereadsByItself() {
+		wg.Go(func() { s.watchRules(ctx) })
 	}
 	for {
 		conn, err := l.Accept()

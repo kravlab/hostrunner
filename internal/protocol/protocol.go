@@ -35,7 +35,8 @@
 // FrameWithdrawn that a request ended unanswered. FrameStanding and
 // FrameRevoke list and revoke the standing and session approvals;
 // FrameReread makes the daemon reread its rules file once the session has
-// added a rule. A session that takes the daemon over from another
+// added a rule, and FrameRulesReread tells the session the daemon reread
+// it by itself. A session that takes the daemon over from another
 // (Serve.TakeOver) gets its waiting requests, and the other
 // FrameTakenOver. `hostrunner stop`, `restart` and `up --restart` open
 // with FrameHello too, without serving: FrameRunning lists what the
@@ -111,8 +112,9 @@ const (
 	FrameRunningList     // daemon → `hostrunner stop`, JSON RunningList
 	FrameStop            // `hostrunner stop` → daemon, JSON Stop
 	FrameStopping        // daemon → `hostrunner stop`, no payload: the daemon stops; the connection closes once it does, maybe before its sockets are closed and its commands are gone
+	FrameRulesReread     // daemon → session, JSON RulesReread: the daemon reread its rules file by itself, to a session that said it reads this (Serve.Notices)
 
-	lastFrameType = FrameStopping
+	lastFrameType = FrameRulesReread
 )
 
 // Exit codes for failures of hostrun itself rather than of the command,
@@ -147,10 +149,12 @@ type Request struct {
 // Arm asks a running daemon to wait for its devcontainer (again), as
 // `hostrunner up` does on every container start. ConfigDigest identifies the
 // rules file `up` just validated (rules.Policy.Digest), so a daemon running
-// older rules can step aside.
+// older rules can step aside; NoReread is the `up`'s --no-reread, so a
+// daemon that rereads its rules file otherwise can too.
 type Arm struct {
 	Version      int    `json:"version"`
 	ConfigDigest string `json:"config_digest"`
+	NoReread     bool   `json:"no_reread,omitempty"`
 }
 
 // Armed answers Arm. Restart means the daemon steps aside: it will not
@@ -275,8 +279,19 @@ const ApprovalVersion = 1
 // Serve asks the daemon to be served by the session; TakeOver replaces
 // the session that serves it, which is told so (FrameTakenOver) and whose
 // waiting requests pass to the new one with the rest of their limit.
+// Notices says the session reads FrameRulesReread: an older session takes
+// a frame it does not know for an error, so a daemon sends it none.
 type Serve struct {
 	TakeOver bool `json:"take_over,omitempty"`
+	Notices  bool `json:"notices,omitempty"`
+}
+
+// RulesReread tells the session serving the daemon that the daemon found
+// its rules file changed: it now serves the rules of Digest, or Error says
+// why it kept its old ones.
+type RulesReread struct {
+	Digest string `json:"digest,omitempty"`
+	Error  string `json:"error,omitempty"`
 }
 
 // ServedRefusal is the message of the error a daemon refuses Serve with
@@ -300,6 +315,11 @@ type Hello struct {
 // so a daemon of any version can be stopped. Older daemons report
 // neither Stops nor ContainerStopped and are stopped by signal:
 // ContainerStopped means something only when Stops is set.
+// Rereads says the daemon rereads its rules file by itself once it
+// changes, NoReread that it does not (`serve --no-reread`):
+// a daemon older than both reports neither, so a session asks before
+// having it reread a file changed by hand, and `hostrunner restart`
+// starts its successor rereading, the default.
 type DaemonInfo struct {
 	Version            int    `json:"version"`
 	Workspace          string `json:"workspace"`
@@ -309,6 +329,8 @@ type DaemonInfo struct {
 	Served             bool   `json:"served,omitempty"`
 	Stops              bool   `json:"stops,omitempty"`
 	ContainerStopped   bool   `json:"container_stopped,omitempty"`
+	Rereads            bool   `json:"rereads,omitempty"`
+	NoReread           bool   `json:"no_reread,omitempty"`
 }
 
 // RunningList answers FrameRunning: the commands the daemon runs, and

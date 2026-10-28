@@ -74,6 +74,7 @@ type Config struct {
 	Daemon             string        // hostrunner executable to start as the daemon
 	Client             string        // hostrun binary to install into Dir
 	ReadyTimeout       time.Duration // how long to wait for the daemon's socket
+	NoReread           bool          // the daemon does not reread the rules file by itself (--no-reread)
 }
 
 // Up makes sure an armed daemon serves cfg.Dir with the current rules. It
@@ -126,7 +127,7 @@ func Prepare(cfg Config) (*Prepared, error) {
 // (see LockDir): restart, which stopped the daemon under it.
 func (p *Prepared) UpLocked(ctx context.Context) error {
 	cfg, socket, digest := p.cfg, p.socket, p.digest
-	stepAside, err := arm(ctx, socket, digest)
+	stepAside, err := arm(ctx, socket, digest, cfg.NoReread)
 	switch {
 	case err == nil && !stepAside:
 		return nil
@@ -206,12 +207,13 @@ func lockDir(dir string, how int) (unlock func(), busy bool, err error) {
 }
 
 // arm asks the daemon on socket to wait for its devcontainer again, telling
-// it the digest of the current rules. stepAside reports that the daemon
-// will not follow the arm (it runs other rules, or its watch has ended) and
-// is stopping. err wraps errNotListening when nothing
+// it the digest of the current rules and whether it is not to reread them
+// by itself. stepAside reports that the daemon will not follow the arm (it
+// runs other rules or the other setting, or its watch has ended) and is
+// stopping. err wraps errNotListening when nothing
 // accepts connections, and is another error when something listens but does
 // not arm.
-func arm(ctx context.Context, socket, digest string) (stepAside bool, err error) {
+func arm(ctx context.Context, socket, digest string, noReread bool) (stepAside bool, err error) {
 	ctx, cancel := context.WithTimeout(ctx, armTimeout)
 	defer cancel()
 	c, err := transport.Unix{Path: socket}.Dial(ctx)
@@ -222,7 +224,7 @@ func arm(ctx context.Context, socket, digest string) (stepAside bool, err error)
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = c.SetDeadline(deadline)
 	}
-	if err := protocol.WriteJSON(c, protocol.FrameArm, protocol.Arm{Version: protocol.Version, ConfigDigest: digest}); err != nil {
+	if err := protocol.WriteJSON(c, protocol.FrameArm, protocol.Arm{Version: protocol.Version, ConfigDigest: digest, NoReread: noReread}); err != nil {
 		return false, fmt.Errorf("daemon on %s did not accept the arm request: %w", socket, err)
 	}
 	f, err := protocol.ReadFrame(c)
@@ -303,12 +305,16 @@ func startDaemon(ctx context.Context, cfg Config, socket, digest string) error {
 	}
 	logStart, _ := logFile.Seek(0, io.SeekEnd)
 
-	cmd := exec.Command(cfg.Daemon, "serve",
+	args := []string{"serve",
 		"--socket", socket,
 		"--workspace", cfg.Workspace,
 		"--container-workspace", cfg.ContainerWorkspace,
 		"--config", cfg.Rules,
-		"--watch")
+		"--watch"}
+	if cfg.NoReread {
+		args = append(args, "--no-reread")
+	}
+	cmd := exec.Command(cfg.Daemon, args...)
 	cmd.Dir = cfg.Dir // do not keep the workspace busy
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
@@ -335,7 +341,7 @@ func startDaemon(ctx context.Context, cfg Config, socket, digest string) error {
 			_ = cmd.Process.Kill()
 			return ctx.Err()
 		case <-ticker.C:
-			stepAside, err := arm(ctx, socket, digest)
+			stepAside, err := arm(ctx, socket, digest, cfg.NoReread)
 			if err == nil && !stepAside {
 				return nil
 			}

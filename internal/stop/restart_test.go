@@ -2,11 +2,13 @@ package stop_test
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -128,8 +130,9 @@ type currentDaemon struct {
 }
 
 // startCurrentDaemon starts a daemon of this hostrunner for a new runtime
-// directory, with the rules in rulesText; it stops when the test ends.
-func startCurrentDaemon(t *testing.T, rulesText string, containerStopped bool) *currentDaemon {
+// directory, with the rules in rulesText and the Server options opts
+// besides its approval socket; it stops when the test ends.
+func startCurrentDaemon(t *testing.T, rulesText string, containerStopped bool, opts ...daemon.Option) *currentDaemon {
 	t.Helper()
 	dir, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
@@ -159,8 +162,9 @@ func startCurrentDaemon(t *testing.T, rulesText string, containerStopped bool) *
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := daemon.New(mapper, policy, slog.New(slog.DiscardHandler),
-		daemon.WithApprovals(al, rulesFile), daemon.WithContainerStopped(func() bool { return containerStopped }))
+	srv := daemon.New(mapper, policy, slog.New(slog.DiscardHandler), append([]daemon.Option{
+		daemon.WithApprovals(al, rulesFile), daemon.WithContainerStopped(func() bool { return containerStopped }),
+	}, opts...)...)
 	ctx, cancel := context.WithCancel(context.Background())
 	d := &currentDaemon{dir: dir, workspace: ws, rulesFile: rulesFile, served: make(chan error, 1)}
 	go func() { d.served <- srv.Serve(ctx, l) }()
@@ -201,8 +205,16 @@ func (r fakeRuntime) Containers(context.Context, string) ([]watch.Container, err
 
 const validRules = "rules:\n  - command: echo\n    args: any\n"
 
+// rereading makes a current daemon one that rereads its rules file by
+// itself, as `serve` without --no-reread does, though not before the
+// test is over.
+var rereading = []daemon.Option{
+	daemon.WithReload("", func() (daemon.Policy, string, error) { return nil, "", errors.New("not reread in this test") }),
+	daemon.WithRereadEvery(time.Hour),
+}
+
 func TestRestartReplacesTheDaemon(t *testing.T) {
-	d := startCurrentDaemon(t, validRules, false)
+	d := startCurrentDaemon(t, validRules, false, rereading...)
 	out, err := runStop(t, stop.Config{Dir: d.dir, Restart: restartConfig(t)}, "")
 	if err != nil {
 		t.Fatalf("restart: %v; printed %q", err, out)
@@ -276,6 +288,34 @@ func TestRestartOfAnOlderDaemonNeedsAContainerRuntime(t *testing.T) {
 	}
 	if !d.running() {
 		t.Fatal("the older daemon was stopped")
+	}
+}
+
+// A daemon that does not reread its rules file by itself is restarted
+// as one started with --no-reread.
+func TestRestartKeepsNoReread(t *testing.T) {
+	d := startCurrentDaemon(t, validRules, false)
+	if out, err := runStop(t, stop.Config{Dir: d.dir, Restart: restartConfig(t)}, ""); err != nil {
+		t.Fatalf("restart: %v; printed %q", err, out)
+	}
+	d.waitStopped(t)
+	if args := newDaemonArgs(t, d.dir); !slices.Contains(args, "--no-reread") {
+		t.Fatalf("the new daemon runs %q, want --no-reread", args)
+	}
+}
+
+// An older daemon, which does not say whether it rereads, is restarted
+// as one that does, the default.
+func TestRestartOfAnOlderDaemonStartsOneThatRereads(t *testing.T) {
+	d := startOlderDaemon(t, false, "")
+	out, err := runStop(t, stop.Config{Dir: d.dir, Restart: restartConfig(t, fakeRuntime{true}), Commands: stop.Commands{Answer: stop.Kill}}, "")
+	if err != nil {
+		t.Fatalf("restart: %v; printed %q", err, out)
+	}
+	d.waitTerminated(t)
+	args := newDaemonArgs(t, d.dir)
+	if args == nil || slices.Contains(args, "--no-reread") {
+		t.Fatalf("the new daemon runs %q, want it without --no-reread", args)
 	}
 }
 

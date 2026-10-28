@@ -165,6 +165,28 @@ func TestParseUpRequiresEveryFlag(t *testing.T) {
 	}
 }
 
+// --no-reread keeps a daemon from rereading its rules file by itself: up
+// passes it on to the daemon it starts.
+func TestParseNoReread(t *testing.T) {
+	up, err := parseUp([]string{"--dir", "/d", "--workspace", "/w", "--container-workspace", "/c", "--no-reread"}, "/bin/hostrunner", io.Discard)
+	if err != nil || !up.launch.NoReread {
+		t.Fatalf("up: got %+v, %v; want NoReread", up.launch, err)
+	}
+	sv, err := parseServe([]string{"--socket", "/run/h.sock", "--workspace", "/w", "--container-workspace", "/c", "--no-reread"}, io.Discard)
+	if err != nil || !sv.noReread {
+		t.Fatalf("serve: got %+v, %v; want noReread", sv, err)
+	}
+}
+
+// The usages name --no-reread.
+func TestUsagesNameNoReread(t *testing.T) {
+	for name, u := range map[string]string{"up": upUsage, "serve": serveUsage} {
+		if !strings.Contains(u, "[--no-reread]") {
+			t.Errorf("%s usage %q lacks [--no-reread]", name, u)
+		}
+	}
+}
+
 func TestParseUpRejectsPositionalArguments(t *testing.T) {
 	if _, err := parseUp([]string{"--dir", "/d", "--workspace", "/w", "--container-workspace", "/c", "extra"}, "/bin/hostrunner", io.Discard); err == nil {
 		t.Fatal("expected an error for an unexpected positional argument")
@@ -375,7 +397,7 @@ func TestArmHandlerStepsAsideOnceTheWatchEnded(t *testing.T) {
 		go func() { done <- w.Run(ctx) }()
 		synctest.Wait() // the watch runs, waiting for its next poll
 
-		onArm := armHandler("rules.yaml", w, discard)
+		onArm := armHandler("rules.yaml", false, w, discard)
 		if onArm(protocol.Arm{ConfigDigest: "digest"}, "digest") {
 			t.Fatal("stepped aside while the watch runs")
 		}
@@ -389,8 +411,48 @@ func TestArmHandlerStepsAsideOnceTheWatchEnded(t *testing.T) {
 	})
 }
 
+// An arm from an up whose --no-reread differs from the daemon's makes it
+// step aside, so the new setting takes effect.
+func TestArmHandlerStepsAsideWhenRereadingDiffers(t *testing.T) {
+	for _, noReread := range []bool{false, true} {
+		onArm := armHandler("rules.yaml", noReread, nil, slog.New(slog.DiscardHandler))
+		if !onArm(protocol.Arm{ConfigDigest: "digest", NoReread: !noReread}, "digest") {
+			t.Errorf("daemon noReread=%v kept running for an arm with the other setting", noReread)
+		}
+		if onArm(protocol.Arm{ConfigDigest: "digest", NoReread: noReread}, "digest") {
+			t.Errorf("daemon noReread=%v stepped aside for an arm with its own setting", noReread)
+		}
+	}
+}
+
+// serve rereads its rules file by itself unless --no-reread, and its
+// hello says so.
+func TestServeSaysWhetherItRereads(t *testing.T) {
+	for _, noReread := range []bool{false, true} {
+		cfg := watchConfig(t)
+		cfg.noReread = noReread
+		startServe(t, cfg, &watchtest.Runtime{})
+		c, err := transport.Unix{Path: launch.ApprovalSocket(filepath.Dir(cfg.socket))}.Dial(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		if err := protocol.WriteJSON(c, protocol.FrameHello, protocol.Hello{Version: protocol.ApprovalVersion}); err != nil {
+			t.Fatal(err)
+		}
+		f, err := protocol.ReadFrame(c)
+		var info protocol.DaemonInfo
+		if err != nil || f.Type != protocol.FrameDaemonInfo || protocol.DecodeJSON(f, &info) != nil {
+			t.Fatalf("hello: frame %v, err %v", f.Type, err)
+		}
+		if info.Rereads == noReread || info.NoReread != noReread {
+			t.Errorf("--no-reread %v: got Rereads=%v NoReread=%v", noReread, info.Rereads, info.NoReread)
+		}
+	}
+}
+
 func TestArmHandlerStepsAsideWhenRulesChanged(t *testing.T) {
-	onArm := armHandler("rules.yaml", nil, slog.New(slog.DiscardHandler))
+	onArm := armHandler("rules.yaml", false, nil, slog.New(slog.DiscardHandler))
 	if !onArm(protocol.Arm{ConfigDigest: "other"}, "digest") {
 		t.Fatal("kept running with other rules")
 	}
@@ -537,7 +599,7 @@ func TestServeListensOnTheApprovalSocket(t *testing.T) {
 	if err != nil || f.Type != protocol.FrameDaemonInfo || protocol.DecodeJSON(f, &got) != nil {
 		t.Fatalf("hello: frame %v, err %v", f.Type, err)
 	}
-	want := protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: cfg.workspace, ContainerWorkspace: cfg.containerWorkspace, RulesFile: cfg.config, RulesDigest: "missing", Stops: true}
+	want := protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: cfg.workspace, ContainerWorkspace: cfg.containerWorkspace, RulesFile: cfg.config, RulesDigest: "missing", Stops: true, Rereads: true}
 	if real, err := filepath.EvalSymlinks(cfg.workspace); err == nil {
 		want.Workspace = real
 	}
