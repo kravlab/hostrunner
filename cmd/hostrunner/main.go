@@ -67,10 +67,10 @@ import (
 
 const (
 	usage             = "usage: hostrunner up|serve|test|approve|stop|restart|update|instructions|version [flags]; see `hostrunner <command> -h`"
-	upUsage           = "usage: hostrunner up [--restart [--kill | --wait]] --dir <runtime-dir> --workspace <host-path> --container-workspace <path>"
+	upUsage           = "usage: hostrunner up [--restart [--kill | --wait]] [--no-reread] --dir <runtime-dir> --workspace <host-path> --container-workspace <path>"
 	stopUsage         = "usage: hostrunner stop [--dir <runtime-dir> | --all | --choose] [--kill | --wait]"
 	restartUsage      = "usage: hostrunner restart [--dir <runtime-dir> | --all | --choose] [--kill | --wait]"
-	serveUsage        = "usage: hostrunner serve --socket <path> --workspace <host-path> --container-workspace <path> [--config <path>] [--watch]"
+	serveUsage        = "usage: hostrunner serve --socket <path> --workspace <host-path> --container-workspace <path> [--config <path>] [--watch] [--no-reread]"
 	approveUsage      = "usage: hostrunner approve [--dir <runtime-dir>]"
 	updateUsage       = "usage: hostrunner update [--check]"
 	instructionsUsage = "usage: hostrunner instructions [--append [<path>]]"
@@ -259,12 +259,14 @@ func parseUp(args []string, exe string, output io.Writer) (upConfig, error) {
 		ws         workspaceFlags
 		restart    bool
 		kill, wait bool
+		noReread   bool
 	)
 	fs := flag.NewFlagSet("up", flag.ContinueOnError)
 	fs.SetOutput(output)
 	fs.StringVar(&dir, "dir", "", "per-container runtime directory (mounted at /run/hostrunner)")
 	ws.register(fs)
 	fs.BoolVar(&restart, "restart", false, "replace the daemon serving the runtime directory, if any, with a new one")
+	fs.BoolVar(&noReread, "no-reread", false, "keep the daemon from rereading the rules file by itself once it changes")
 	registerAnswer(fs, &kill, &wait)
 	if err := parseFlags(fs, args, upUsage); err != nil {
 		return upConfig{}, err
@@ -278,6 +280,7 @@ func parseUp(args []string, exe string, output io.Writer) (upConfig, error) {
 	}
 	cfg := daemonBinaries(exe)
 	cfg.Dir, cfg.Workspace, cfg.ContainerWorkspace, cfg.Rules = dir, ws.workspace, ws.containerWorkspace, ws.rulesFile()
+	cfg.NoReread = noReread
 	return upConfig{launch: cfg, restart: restart, answer: answer}, nil
 }
 
@@ -396,9 +399,10 @@ type serveConfig struct {
 	workspaceFlags
 	config         string        // rules file; default <workspace>/.devcontainer/hostrun.yaml
 	watch          bool          // exit once the armed container stops
+	noReread       bool          // do not reread the rules file by itself once it changes
 	startupTimeout time.Duration // with watch: wait this long for the container
 	grace          time.Duration // with watch: tolerate its absence this long
-	pollInterval   time.Duration // with watch: how often runtimes are asked (not a flag)
+	pollInterval   time.Duration // how often runtimes are asked (with watch) and the rules file is looked at (not a flag)
 }
 
 // parseServe parses the flags of `hostrunner serve`; the socket and both
@@ -411,6 +415,7 @@ func parseServe(args []string, output io.Writer) (serveConfig, error) {
 	cfg.workspaceFlags.register(fs)
 	fs.StringVar(&cfg.config, "config", "", "rules file (default <workspace>/.devcontainer/hostrun.yaml)")
 	fs.BoolVar(&cfg.watch, "watch", false, "exit once the armed container stops")
+	fs.BoolVar(&cfg.noReread, "no-reread", false, "do not reread the rules file by itself once it changes")
 	fs.DurationVar(&cfg.startupTimeout, "startup-timeout", defaultStartupTimeout, "with --watch: how long to wait for the container to start")
 	fs.DurationVar(&cfg.grace, "grace", defaultGrace, "with --watch: how long the container may be gone before exiting")
 	if err := parseFlags(fs, args, serveUsage); err != nil {
@@ -610,9 +615,11 @@ func isTerminal(f *os.File) bool {
 //
 // The rules file is read here: an invalid file stops the daemon from
 // starting (fail closed), a missing one makes it deny every command. Later
-// edits, e.g. by a `git pull` on the host, take effect only in a new
-// daemon, except that an approval session which adds a rule makes the
-// daemon reread the file; the digest of the rules reread is the one arms compare.
+// edits, e.g. by a `git pull` on the host, are reread once the daemon sees
+// the file changed (every pollInterval); with noReread they take effect
+// only in a new daemon, except that an approval session which adds a rule
+// makes the daemon reread the file. The digest of the rules reread is the
+// one arms compare.
 func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []watch.Runtime) error {
 	policy, err := rules.Load(cfg.config)
 	if err != nil {
@@ -638,7 +645,7 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 		l.Close()
 		return err
 	}
-	log.Info("listening", "socket", cfg.socket, "approval_socket", approvalSocket, "workspace", cfg.workspace, "container_workspace", cfg.containerWorkspace, "config", cfg.config, "rules_digest", policy.Digest(), "watch", cfg.watch)
+	log.Info("listening", "socket", cfg.socket, "approval_socket", approvalSocket, "workspace", cfg.workspace, "container_workspace", cfg.containerWorkspace, "config", cfg.config, "rules_digest", policy.Digest(), "watch", cfg.watch, "no_reread", cfg.noReread)
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -665,7 +672,10 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 		}
 		return p, p.Digest(), nil
 	}
-	opts := []daemon.Option{daemon.WithArmHandler(armHandler(cfg.config, watcher, log)), daemon.WithApprovals(al, cfg.config), daemon.WithReload(policy.Digest(), reload)}
+	opts := []daemon.Option{daemon.WithArmHandler(armHandler(cfg.config, cfg.noReread, watcher, log)), daemon.WithApprovals(al, cfg.config), daemon.WithReload(policy.Digest(), reload)}
+	if !cfg.noReread {
+		opts = append(opts, daemon.WithRereadEvery(cfg.pollInterval))
+	}
 	if watcher != nil {
 		opts = append(opts, daemon.WithContainerStopped(watcher.ContainerStopped))
 	}
@@ -697,12 +707,17 @@ func checkApprovalSocket(workspace, socket string) error {
 // every container start with the digest of the rules it validated; digest
 // is that of the rules the daemon serves from config, which a reread
 // changes. The daemon steps aside for a new one when the digests differ,
-// or when watcher has ended and will not follow the arm; otherwise
-// watcher, if any, waits for the container of this arm.
-func armHandler(config string, watcher *watch.Watcher, log *slog.Logger) func(a protocol.Arm, digest string) (stepAside bool) {
+// when the arm's --no-reread is not the daemon's, noReread, or when
+// watcher has ended and will not follow the arm; otherwise watcher, if
+// any, waits for the container of this arm.
+func armHandler(config string, noReread bool, watcher *watch.Watcher, log *slog.Logger) func(a protocol.Arm, digest string) (stepAside bool) {
 	return func(a protocol.Arm, digest string) bool {
 		if a.ConfigDigest != digest {
 			log.Info("stepping aside: the rules file changed", "config", config)
+			return true
+		}
+		if a.NoReread != noReread {
+			log.Info("stepping aside: --no-reread changed", "no_reread", a.NoReread)
 			return true
 		}
 		if watcher == nil {

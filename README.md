@@ -102,8 +102,9 @@ not checked: use the manual steps above for `gh attestation verify`.
 
 A running daemon keeps the old version until it exits after its
 container stops; a container restart or rebuild before that reuses it
-with the old `hostrun`, unless the rules changed: then the new version
-takes over. The first `hostrunner up` after it has exited runs the new
+with the old `hostrun`, unless the rules changed while it ran with
+`--no-reread` (it rereads them otherwise): then the new version takes
+over. The first `hostrunner up` after it has exited runs the new
 version, and `hostrunner restart` (see
 [Stop and restart](#stop-and-restart)) switches a running daemon at once. A `hostrunner up` already in progress during the update may
 fail; run it again.
@@ -133,7 +134,10 @@ process that starts the devcontainer (it is in a normal desktop session).
 If `hostrunner up` fails, `devcontainer up` fails with its message.
 Adding `"--restart"` (with `"--kill"` or `"--wait"` for a daemon running
 commands) replaces a running daemon at every container start instead of
-arming it (see [Stop and restart](#stop-and-restart)).
+arming it (see [Stop and restart](#stop-and-restart)). Adding
+`"--no-reread"` keeps the daemon from rereading the rules file by itself
+when it changes; a running daemon started without it, or with it when
+`up` no longer gives it, is replaced.
 
 Add the rules as `.devcontainer/hostrun.yaml` (start from
 [the example](examples/devcontainer/.devcontainer/hostrun.yaml)), then,
@@ -285,10 +289,11 @@ next container start keeps the daemon. If the reread fails, the old
 rules stay and the request runs once. It also runs once, and the session
 and the agent are told so, when a rule edited by hand still fails a
 later check (a fixed directory missing). For a rules file edited by hand
-since the daemon loaded it, the session asks first whether the daemon
-rereads it, making that edit live now (`[r]eread [c]ancel`): with `r` the
-diff is against the rules the daemon then serves, with `c` the edit waits
-for the next container start and no rule is added. A rule is written only
+since the daemon loaded it, the daemon rereads it first, and the diff is
+against the rules it then serves; a daemon run with `--no-reread` asks
+first whether it rereads it, making that edit live now
+(`[r]eread [c]ancel`): with `r` as before, with `c` the edit waits for
+the next container start and no rule is added. A rule is written only
 when the file has not changed since the proposal. A rule sharing YAML
 anchors or aliases is not widened. A missing rules file is created, but
 not its directory.
@@ -359,8 +364,8 @@ approval lets through (without one); the container can read it.
 
 A daemon ends by itself about 15 s after its armed container stops. To
 run a new version after `hostrunner update`, pick up a hand-edited rules
-file at once or drop standing approvals, stop or restart it from a host
-terminal:
+file at once under `--no-reread` or drop standing approvals, stop or
+restart it from a host terminal:
 
 ```sh
 hostrunner stop                                                   # the daemon serving the current directory
@@ -384,7 +389,8 @@ with the daemon; the count lost is printed.
 
 `restart` reads and checks the rules file before stopping anything
 (invalid rules leave the daemon running), then starts a new daemon, the
-installed `hostrunner`, for the same workspace and rules file; a daemon
+installed `hostrunner`, for the same workspace and rules file and with
+the same `--no-reread`; a daemon
 still waiting for its container (right after `up`, during a rebuild) is
 replaced by one that waits the same way. A daemon that saw its container
 stop, and is about to exit, is only stopped
@@ -449,11 +455,19 @@ rules:
   without any of them, a relative program path or `dir`, `dir` with
   `path: check`, …) makes `hostrunner up`
   fail, and with it `devcontainer up`.
-- Changes apply on the next container start (reopen, restart or rebuild):
-  `hostrunner up` notices that the file differs from what the running
-  daemon loaded and replaces the daemon; a rule added from the approval
-  session, and a hand edit the human agrees to have reread then, apply at
-  once. The file lives in `.devcontainer/`,
+- Changes apply within about 2 s: the daemon looks at the file every 2 s
+  and, once it changed, rereads it without stopping. Running commands,
+  the approval session and standing and session approvals stay; requests
+  after it are checked against the new rules. A file that does not load
+  keeps the old rules, and a missing one denies every command, as at
+  start; `daemon.log` and the approval session serving the daemon say
+  which (`the rules file changed; the daemon reread it`, or why the old
+  rules stay). With `hostrunner up --no-reread`, changes apply on the
+  next container start (reopen, restart or rebuild): `hostrunner up`
+  notices that the file differs from what the running daemon loaded and
+  replaces the daemon; a rule added from the approval session, and a hand
+  edit the human agrees to have reread then, apply at once. The file
+  lives in `.devcontainer/`,
   which is read-only inside the container, so the agent can read but not
   change its rules.
 - Matching is literal on argv: `/usr/bin/git push` and `git -C dir push` do
@@ -732,7 +746,7 @@ How it works:
 ## Limitations
 
 - `hostrunner up` arms a running daemon again rather than replacing it,
-  unless the rules changed: after upgrading hostrunner, run
+  unless its rules or `--no-reread` differ: after upgrading hostrunner, run
   `hostrunner restart`; after changing `workspaceFolder`, which a
   restart keeps, run `hostrunner stop` before the next `up`, or give `up`
   `--restart` (see [Stop and restart](#stop-and-restart)).

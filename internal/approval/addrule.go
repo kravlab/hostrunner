@@ -110,8 +110,9 @@ func (s *session) askAnswer() {
 // disk, which must be the one the daemon serves: for a file changed by
 // hand since the daemon loaded it, the session asks whether the daemon
 // rereads it, making that change live, and proposes the rule against the
-// rules it then serves (see rereadTyped and rereadThenPropose). When
-// there is no edit, it says why and asks for the answer again.
+// rules it then serves (see rereadTyped and rereadThenPropose); a daemon
+// that rereads by itself rereads it without the question. When there is
+// no edit, it says why and asks for the answer again.
 func (s *session) proposeRule(r waiting) {
 	var (
 		digest string
@@ -124,8 +125,13 @@ func (s *session) proposeRule(r waiting) {
 	if err == nil && s.daemon.RulesDigest != "" && digest != s.daemon.RulesDigest {
 		// Changed by hand: once the human agrees, the daemon rereads the
 		// file first, so the proposal is computed against the rules it
-		// then serves (see rereadTyped).
+		// then serves (see rereadTyped). A daemon that rereads by itself
+		// would soon anyway: it is asked to at once, without a question.
 		file.close()
+		if s.daemon.Rereads {
+			s.askReread(digest)
+			return
+		}
 		s.awaiting, s.rereadDigest = awaitRereadChoice, digest
 		s.prompt(rereadPrompt)
 		return
@@ -290,8 +296,7 @@ func (s *session) reread(res protocol.RereadResult) {
 func (s *session) rereadTyped(text string) {
 	switch text {
 	case "r":
-		s.awaiting, s.rereadFor = awaitProposeReread, s.queue[0].ID
-		s.write(protocol.FrameReread, protocol.Reread{Digest: s.rereadDigest})
+		s.askReread(s.rereadDigest)
 	case "c":
 		fmt.Fprintln(s.out, "cannot add a rule: the rules file changed since the daemon loaded it; the change takes effect at the next container start")
 		s.awaiting = awaitAnswer
@@ -301,6 +306,14 @@ func (s *session) rereadTyped(text string) {
 		return
 	}
 	s.rereadDigest = ""
+}
+
+// askReread asks the daemon to reread the rules file changed by hand,
+// found with digest, so a rule for the request shown is proposed against
+// the rules it then serves (see rereadThenPropose).
+func (s *session) askReread(digest string) {
+	s.awaiting, s.rereadFor = awaitProposeReread, s.queue[0].ID
+	s.write(protocol.FrameReread, protocol.Reread{Digest: digest})
 }
 
 // rereadThenPropose takes the daemon's reread of a rules file changed by

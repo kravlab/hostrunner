@@ -372,7 +372,7 @@ func testLifecycle(t *testing.T, e env) {
 		}
 	})
 
-	t.Run("changed rules apply on the next up", func(t *testing.T) {
+	t.Run("a hand-edited rules file is reread without a restart", func(t *testing.T) {
 		if _, err := e.exec(t, "hostrun", "echo", "hi"); err == nil {
 			t.Fatal("echo allowed before the rule was added")
 		}
@@ -382,16 +382,25 @@ func testLifecycle(t *testing.T, e env) {
 			t.Fatal(err)
 		}
 		data = append(data, "\n  - command: echo\n    args: any\n"...)
+		before := daemonStarts(t, runtimeDir)
 		if err := os.WriteFile(rulesFile, data, 0o644); err != nil {
 			t.Fatal(err)
 		}
-		before := daemonStarts(t, runtimeDir)
-		e.up(t)
-		if got, err := e.exec(t, "hostrun", "echo", "hi"); err != nil || strings.TrimSpace(got) != "hi" {
-			t.Fatalf("echo after the rule was added: %q, %v", got, err)
+		// The daemon looks at the file every 2 s.
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			got, err := e.exec(t, "hostrun", "echo", "hi")
+			if err == nil && strings.TrimSpace(got) == "hi" {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("echo after the rule was added: %q, %v", got, err)
+			}
+			time.Sleep(500 * time.Millisecond)
 		}
-		if n := daemonStarts(t, runtimeDir); n != before+1 {
-			t.Fatalf("%d daemon starts, want %d (restarted for the new rules)", n, before+1)
+		e.up(t)
+		if n := daemonStarts(t, runtimeDir); n != before {
+			t.Fatalf("%d daemon starts, want %d (the rules reread, the daemon kept)", n, before)
 		}
 	})
 
