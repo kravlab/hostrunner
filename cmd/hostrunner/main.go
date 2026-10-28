@@ -3,18 +3,25 @@
 //
 // Usage:
 //
-//	hostrunner up --dir <runtime-dir> --workspace <host-path> --container-workspace <path>
+//	hostrunner up [--restart [--kill | --wait]] --dir <runtime-dir>
+//	    --workspace <host-path> --container-workspace <path>
 //	hostrunner serve --socket <path> --workspace <host-path> --container-workspace <path>
 //	    [--config <path>] [--watch [--startup-timeout 30m] [--grace 15s]]
 //	hostrunner test [--config <path>] [--] <command> [args...]
 //	hostrunner approve [--dir <runtime-dir>]
+//	hostrunner stop [--dir <runtime-dir> | --all | --choose] [--kill | --wait]
+//	hostrunner restart [--dir <runtime-dir> | --all | --choose] [--kill | --wait]
 //	hostrunner update [--check]
 //	hostrunner instructions [--append [<path>]]
 //	hostrunner version
 //
 // `up` is meant for devcontainer's initializeCommand: it installs the client
 // into the runtime directory and starts a detached `serve --watch` there,
-// which exits by itself once its armed container stops. `test` runs the Rules
+// which exits by itself once its armed container stops; with --restart it
+// replaces a daemon already serving it. `stop` stops a daemon from the
+// host, the one serving the current directory by default, asking what
+// becomes of the commands it runs unless --kill or --wait says; `restart`
+// then starts a new one for it (see internal/stop). `test` runs the Rules
 // test: whether a rules file (default .devcontainer/hostrun.yaml under the
 // current directory) allows a command; it exits 0 when it does, 126 when it
 // does not, and 1 on any error. `update` switches the versioned install
@@ -51,6 +58,7 @@ import (
 	"github.com/kravlab/hostrunner/internal/launch"
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
+	"github.com/kravlab/hostrunner/internal/stop"
 	"github.com/kravlab/hostrunner/internal/transport"
 	"github.com/kravlab/hostrunner/internal/update"
 	"github.com/kravlab/hostrunner/internal/watch"
@@ -58,8 +66,10 @@ import (
 )
 
 const (
-	usage             = "usage: hostrunner up|serve|test|approve|update|instructions|version [flags]; see `hostrunner <command> -h`"
-	upUsage           = "usage: hostrunner up --dir <runtime-dir> --workspace <host-path> --container-workspace <path>"
+	usage             = "usage: hostrunner up|serve|test|approve|stop|restart|update|instructions|version [flags]; see `hostrunner <command> -h`"
+	upUsage           = "usage: hostrunner up [--restart [--kill | --wait]] --dir <runtime-dir> --workspace <host-path> --container-workspace <path>"
+	stopUsage         = "usage: hostrunner stop [--dir <runtime-dir> | --all | --choose] [--kill | --wait]"
+	restartUsage      = "usage: hostrunner restart [--dir <runtime-dir> | --all | --choose] [--kill | --wait]"
 	serveUsage        = "usage: hostrunner serve --socket <path> --workspace <host-path> --container-workspace <path> [--config <path>] [--watch]"
 	approveUsage      = "usage: hostrunner approve [--dir <runtime-dir>]"
 	updateUsage       = "usage: hostrunner update [--check]"
@@ -116,8 +126,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
 		return errors.New(usage)
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	ctx, release := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer release()
 	switch args[0] {
 	case "up":
 		exe, err := os.Executable()
@@ -128,7 +138,28 @@ func run(args []string, stdout, stderr io.Writer) error {
 		if err != nil {
 			return err
 		}
-		return launch.Up(ctx, cfg)
+		if !cfg.restart {
+			return launch.Up(ctx, cfg.launch)
+		}
+		sctx, commands, releaseSignals := stopCommands(cfg.answer)
+		defer releaseSignals()
+		return stop.UpRestart(sctx, cfg.launch, commands, os.Stdin, stderr)
+	case "stop", "restart":
+		exe, err := os.Executable()
+		if err != nil {
+			return err
+		}
+		cfg, err := parseStop(args[0], args[1:], exe, stderr)
+		if err != nil {
+			return err
+		}
+		if cfg.Restart != nil {
+			cfg.Restart.Runtimes = watch.Detect()
+		}
+		sctx, commands, releaseSignals := stopCommands(cfg.Answer)
+		defer releaseSignals()
+		cfg.Commands = commands
+		return stop.Run(sctx, cfg, os.Stdin, stderr)
 	case "serve":
 		cfg, err := parseServe(args[1:], stderr)
 		if err != nil {
@@ -222,30 +253,141 @@ func parseFlags(fs *flag.FlagSet, args []string, usage string) error {
 // parseUp parses the flags of `hostrunner up`; all of them are required.
 // exe is the running hostrunner, which becomes the daemon; the client is
 // the hostrun binary installed next to it.
-func parseUp(args []string, exe string, output io.Writer) (launch.Config, error) {
+func parseUp(args []string, exe string, output io.Writer) (upConfig, error) {
 	var (
-		dir string
-		ws  workspaceFlags
+		dir        string
+		ws         workspaceFlags
+		restart    bool
+		kill, wait bool
 	)
 	fs := flag.NewFlagSet("up", flag.ContinueOnError)
 	fs.SetOutput(output)
 	fs.StringVar(&dir, "dir", "", "per-container runtime directory (mounted at /run/hostrunner)")
 	ws.register(fs)
+	fs.BoolVar(&restart, "restart", false, "replace the daemon serving the runtime directory, if any, with a new one")
+	registerAnswer(fs, &kill, &wait)
 	if err := parseFlags(fs, args, upUsage); err != nil {
-		return launch.Config{}, err
+		return upConfig{}, err
 	}
-	if dir == "" || ws.workspace == "" || ws.containerWorkspace == "" {
-		return launch.Config{}, errors.New(upUsage)
+	if dir == "" || ws.workspace == "" || ws.containerWorkspace == "" || (kill || wait) && !restart {
+		return upConfig{}, errors.New(upUsage)
 	}
+	answer, err := parseAnswer(kill, wait, upUsage)
+	if err != nil {
+		return upConfig{}, err
+	}
+	cfg := daemonBinaries(exe)
+	cfg.Dir, cfg.Workspace, cfg.ContainerWorkspace, cfg.Rules = dir, ws.workspace, ws.containerWorkspace, ws.rulesFile()
+	return upConfig{launch: cfg, restart: restart, answer: answer}, nil
+}
+
+// daemonBinaries is the part of a launch.Config that `up` and `restart`
+// share: the hostrunner at exe started as the daemon, the hostrun beside
+// it installed as the client, and how long the daemon may take to listen.
+func daemonBinaries(exe string) launch.Config {
 	return launch.Config{
-		Dir:                dir,
-		Workspace:          ws.workspace,
-		ContainerWorkspace: ws.containerWorkspace,
-		Rules:              ws.rulesFile(),
-		Daemon:             exe,
-		Client:             filepath.Join(filepath.Dir(exe), launch.ClientName),
-		ReadyTimeout:       readyTimeout,
-	}, nil
+		Daemon:       exe,
+		Client:       filepath.Join(filepath.Dir(exe), launch.ClientName),
+		ReadyTimeout: readyTimeout,
+	}
+}
+
+// upConfig is a parsed `hostrunner up`: with restart, the daemon serving
+// the runtime directory is replaced, its commands treated as answer says.
+type upConfig struct {
+	launch  launch.Config
+	restart bool
+	answer  stop.Answer
+}
+
+// registerAnswer registers --kill and --wait, which say what becomes of
+// the commands a daemon runs when it is stopped.
+func registerAnswer(fs *flag.FlagSet, kill, wait *bool) {
+	fs.BoolVar(kill, "kill", false, "kill the commands the daemon runs, without asking")
+	fs.BoolVar(wait, "wait", false, "let the commands the daemon runs finish first, without asking")
+}
+
+// parseAnswer returns the answer --kill and --wait give, which exclude
+// each other (a usage error then, with usage).
+func parseAnswer(kill, wait bool, usage string) (stop.Answer, error) {
+	switch {
+	case kill && wait:
+		return stop.Ask, fmt.Errorf("--kill and --wait exclude each other; %s", usage)
+	case kill:
+		return stop.Kill, nil
+	case wait:
+		return stop.Wait, nil
+	}
+	return stop.Ask, nil
+}
+
+// parseStop parses the flags of `hostrunner stop` or, for name "restart",
+// `hostrunner restart`, which starts the hostrunner at exe, and its
+// hostrun beside it, as the new daemons. Without --dir the daemons are
+// looked for under $XDG_RUNTIME_DIR/hostrunner, where `hostrunner up`
+// puts their runtime directories.
+func parseStop(name string, args []string, exe string, output io.Writer) (stop.Config, error) {
+	usage := stopUsage
+	if name == "restart" {
+		usage = restartUsage
+	}
+	var (
+		cfg        stop.Config
+		kill, wait bool
+	)
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(output)
+	fs.StringVar(&cfg.Dir, "dir", "", "runtime directory of the daemon (default: the one serving the current directory)")
+	fs.BoolVar(&cfg.All, "all", false, "every daemon")
+	fs.BoolVar(&cfg.Choose, "choose", false, "choose the daemon from the list")
+	registerAnswer(fs, &kill, &wait)
+	if err := parseFlags(fs, args, usage); err != nil {
+		return stop.Config{}, err
+	}
+	chosen := 0
+	for _, set := range []bool{cfg.Dir != "", cfg.All, cfg.Choose} {
+		if set {
+			chosen++
+		}
+	}
+	if chosen > 1 {
+		return stop.Config{}, fmt.Errorf("--dir, --all and --choose exclude each other; %s", usage)
+	}
+	var err error
+	if cfg.Answer, err = parseAnswer(kill, wait, usage); err != nil {
+		return stop.Config{}, err
+	}
+	if cfg.Cwd, err = os.Getwd(); err != nil {
+		return stop.Config{}, err
+	}
+	if cfg.Dir == "" {
+		xdg := os.Getenv("XDG_RUNTIME_DIR")
+		if xdg == "" {
+			return stop.Config{}, errors.New("XDG_RUNTIME_DIR is not set: give the runtime directory with --dir")
+		}
+		cfg.Root = filepath.Join(xdg, "hostrunner")
+	}
+	if name == "restart" {
+		b := daemonBinaries(exe)
+		cfg.Restart = &stop.Restart{Daemon: b.Daemon, Client: b.Client, ReadyTimeout: b.ReadyTimeout}
+	}
+	return cfg, nil
+}
+
+// stopCommands returns the context a stop, restart or `up --restart` runs
+// in, cancelled by SIGTERM, and how it treats the commands of a daemon it
+// stops: as answer says, or the human on stdin when it is a terminal,
+// Ctrl+C (SIGINT) asking what becomes of a draining daemon rather than
+// ending the command; release stops both signals.
+func stopCommands(answer stop.Answer) (ctx context.Context, commands stop.Commands, release func()) {
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM)
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, os.Interrupt)
+	commands = stop.Commands{Answer: answer, Terminal: isTerminal(os.Stdin), Interrupts: ch}
+	return ctx, commands, func() {
+		signal.Stop(ch)
+		cancel()
+	}
 }
 
 // serveConfig holds the settings of `hostrunner serve`.
@@ -523,7 +665,11 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 		}
 		return p, p.Digest(), nil
 	}
-	srv := daemon.New(mapper, policy, log, daemon.WithArmHandler(armHandler(cfg.config, watcher, log)), daemon.WithApprovals(al, cfg.config), daemon.WithReload(policy.Digest(), reload))
+	opts := []daemon.Option{daemon.WithArmHandler(armHandler(cfg.config, watcher, log)), daemon.WithApprovals(al, cfg.config), daemon.WithReload(policy.Digest(), reload)}
+	if watcher != nil {
+		opts = append(opts, daemon.WithContainerStopped(watcher.ContainerStopped))
+	}
+	srv := daemon.New(mapper, policy, log, opts...)
 	return srv.Serve(ctx, l)
 }
 

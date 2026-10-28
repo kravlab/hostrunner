@@ -104,7 +104,8 @@ A running daemon keeps the old version until it exits after its
 container stops; a container restart or rebuild before that reuses it
 with the old `hostrun`, unless the rules changed: then the new version
 takes over. The first `hostrunner up` after it has exited runs the new
-version. A `hostrunner up` already in progress during the update may
+version, and `hostrunner restart` (see
+[Stop and restart](#stop-and-restart)) switches a running daemon at once. A `hostrunner up` already in progress during the update may
 fail; run it again.
 
 ## Use in a devcontainer
@@ -130,6 +131,9 @@ Keep `initializeCommand` in the array form: it runs without a shell, so
 workspace paths with spaces work. `XDG_RUNTIME_DIR` must be set for the
 process that starts the devcontainer (it is in a normal desktop session).
 If `hostrunner up` fails, `devcontainer up` fails with its message.
+Adding `"--restart"` (with `"--kill"` or `"--wait"` for a daemon running
+commands) replaces a running daemon at every container start instead of
+arming it (see [Stop and restart](#stop-and-restart)).
 
 Add the rules as `.devcontainer/hostrun.yaml` (start from
 [the example](examples/devcontainer/.devcontainer/hostrun.yaml)), then,
@@ -350,6 +354,54 @@ answers, standing and session approvals granted, revoked and ended, and
 marks with `approved=standing` (`approved=session`) the run the answer
 `d` (`s`) started (with its `approval_id`) and the later runs such an
 approval lets through (without one); the container can read it.
+
+### Stop and restart
+
+A daemon ends by itself about 15 s after its armed container stops. To
+run a new version after `hostrunner update`, pick up a hand-edited rules
+file at once or drop standing approvals, stop or restart it from a host
+terminal:
+
+```sh
+hostrunner stop                                                   # the daemon serving the current directory
+hostrunner restart --dir "$XDG_RUNTIME_DIR/hostrunner/<devcontainerId>"
+hostrunner stop --all --kill                                      # every daemon, killing what they run
+hostrunner restart --choose                                       # choose from the list
+```
+
+Without a flag it takes the one daemon under `$XDG_RUNTIME_DIR/hostrunner`
+whose host workspace holds the current directory; none, or several, is an
+error listing them. `--dir` takes that runtime directory's daemon,
+`--all` every daemon (one failing does not keep the others from
+stopping), `--choose` the list `hostrunner approve` shows. A daemon
+running commands lists them and asks: `k` kills them, `w` waits for them
+to finish (the daemon closes its sockets meanwhile, so new requests fail
+and waiting approval requests end with 126 `the hostrunner daemon is
+stopping`; Ctrl+C asks again), `q` leaves it running. `--kill` or
+`--wait` answers up front; without a terminal on stdin, one of them is
+needed, or the daemon is left alone. Standing and session approvals end
+with the daemon; the count lost is printed.
+
+`restart` reads and checks the rules file before stopping anything
+(invalid rules leave the daemon running), then starts a new daemon, the
+installed `hostrunner`, for the same workspace and rules file; a daemon
+still waiting for its container (right after `up`, during a rebuild) is
+replaced by one that waits the same way. A daemon that saw its container
+stop, and is about to exit, is only stopped
+(`hostrunner: stopped <dir>; its container is not running`): the next
+`hostrunner up` starts a new one. Stop, restart and `up` take the
+runtime directory's lock, so they run one after the other.
+
+`hostrunner up --restart [--kill | --wait]` replaces a running daemon at
+a container start: in `initializeCommand` (no terminal), a daemon
+running commands makes it fail, and with it `devcontainer up`, unless
+`--kill` or `--wait` is given.
+
+A daemon of an older hostrunner, which cannot be asked to stop, is
+stopped by SIGTERM, which kills what it runs (`k` or `--kill`; `--wait`
+is refused), once the process on its socket is the user's
+`hostrunner serve --socket <that socket>`. One from before approvals is
+found only by `--dir` and cannot be restarted.
 
 ## Rules
 
@@ -679,9 +731,11 @@ How it works:
 
 ## Limitations
 
-- A running daemon is armed again, not replaced: after upgrading hostrunner
-  or changing `workspaceFolder`, stop the container (the daemon exits
-  about 15 s later) before starting it again.
+- `hostrunner up` arms a running daemon again rather than replacing it,
+  unless the rules changed: after upgrading hostrunner, run
+  `hostrunner restart`; after changing `workspaceFolder`, which a
+  restart keeps, run `hostrunner stop` before the next `up`, or give `up`
+  `--restart` (see [Stop and restart](#stop-and-restart)).
 - The container user must be root or have your host UID (devcontainers
   do this by default on Linux via `updateRemoteUserUID`): the runtime
   directory and socket are owner-only.

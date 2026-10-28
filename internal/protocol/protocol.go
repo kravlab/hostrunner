@@ -37,7 +37,9 @@
 // FrameReread makes the daemon reread its rules file once the session has
 // added a rule. A session that takes the daemon over from another
 // (Serve.TakeOver) gets its waiting requests, and the other
-// FrameTakenOver.
+// FrameTakenOver. `hostrunner stop`, `restart` and `up --restart` open
+// with FrameHello too, without serving: FrameRunning lists what the
+// daemon runs, and FrameStop, confirmed by FrameStopping, stops it.
 package protocol
 
 import (
@@ -86,9 +88,10 @@ const (
 	FrameWaiting                          // daemon → client, JSON Waiting
 	FrameApproved                         // daemon → client, JSON Approved
 
-	// Frames of the approval socket, between an approval session and the
-	// daemon; the container's socket refuses them, and the approval socket
-	// refuses every other frame.
+	// Frames of the approval socket, between the daemon and an approval
+	// session, or `hostrunner stop` (restart and `up --restart` send the
+	// same frames); the container's socket refuses them, and the approval
+	// socket refuses every other frame.
 	FrameHello           // session → daemon, JSON Hello
 	FrameDaemonInfo      // daemon → session, JSON DaemonInfo
 	FrameServe           // session → daemon, JSON Serve (or no payload): serve the daemon
@@ -104,8 +107,12 @@ const (
 	FrameReread          // session → daemon, JSON Reread
 	FrameRereadResult    // daemon → session, JSON RereadResult
 	FrameTakenOver       // daemon → session, no payload: another session took over
+	FrameRunning         // `hostrunner stop` → daemon, no payload: list the running commands and count the approvals
+	FrameRunningList     // daemon → `hostrunner stop`, JSON RunningList
+	FrameStop            // `hostrunner stop` → daemon, JSON Stop
+	FrameStopping        // daemon → `hostrunner stop`, no payload: the daemon stops; the connection closes once it does, maybe before its sockets are closed and its commands are gone
 
-	lastFrameType = FrameTakenOver
+	lastFrameType = FrameStopping
 )
 
 // Exit codes for failures of hostrun itself rather than of the command,
@@ -284,7 +291,15 @@ type Hello struct {
 // DaemonInfo answers Hello: the daemon's approval protocol version, its
 // workspace on the host and in the container, the rules file it loaded
 // and the digest of the rules it serves (empty when it never rereads
-// them), and whether a session serves it.
+// them), whether a session serves it, whether it accepts FrameRunning
+// and FrameStop, and whether it saw its armed container stopped: it is
+// attached and the last runtime answer showed that container gone, so it
+// counts the grace before it exits; not while waiting for the container
+// (after an arm, during a rebuild) or while it runs.
+// A daemon with Stops accepts those frames whatever the Hello version,
+// so a daemon of any version can be stopped. Older daemons report
+// neither Stops nor ContainerStopped and are stopped by signal:
+// ContainerStopped means something only when Stops is set.
 type DaemonInfo struct {
 	Version            int    `json:"version"`
 	Workspace          string `json:"workspace"`
@@ -292,6 +307,32 @@ type DaemonInfo struct {
 	RulesFile          string `json:"rules_file"`
 	RulesDigest        string `json:"rules_digest,omitempty"`
 	Served             bool   `json:"served,omitempty"`
+	Stops              bool   `json:"stops,omitempty"`
+	ContainerStopped   bool   `json:"container_stopped,omitempty"`
+}
+
+// RunningList answers FrameRunning: the commands the daemon runs, and
+// how many standing and session approvals end with it.
+type RunningList struct {
+	Commands []RunningCommand `json:"commands"`
+	Standing int              `json:"standing"`
+	Session  int              `json:"session"`
+}
+
+// RunningCommand is a command the daemon runs: Argv, started from the
+// container directory Cwd.
+type RunningCommand struct {
+	Argv []string `json:"argv"`
+	Cwd  string   `json:"cwd"`
+}
+
+// Stop asks the daemon to stop: it kills its running commands, or with
+// Drain takes no new requests and exits once they have finished. On the
+// connection of a draining daemon, a Stop without Drain kills what still
+// runs; it gets no second FrameStopping. Closing the connection does not
+// cancel a stop FrameStopping has confirmed.
+type Stop struct {
+	Drain bool `json:"drain,omitempty"`
 }
 
 // ApprovalRequest is a command waiting for the serving session's answer.
@@ -397,8 +438,9 @@ type EndReason string
 
 // Reasons a request ends unanswered that the session is told.
 const (
-	WithdrawnByClient EndReason = "withdrawn" // the client went away
-	WithdrawnExpired  EndReason = "expired"   // its limit ran out
+	WithdrawnByClient EndReason = "withdrawn"                     // the client went away
+	WithdrawnExpired  EndReason = "expired"                       // its limit ran out
+	WithdrawnStopping EndReason = "ended: the daemon is stopping" // the daemon drains; a session that predates it shows the text as is
 )
 
 // Exit reports the exit code of a command that ran.

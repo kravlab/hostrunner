@@ -637,3 +637,52 @@ func TestDetectFindsRuntimesInPath(t *testing.T) {
 		t.Fatalf("got %v, want only %s", got, docker)
 	}
 }
+
+// eventually waits until cond holds, polling, and fails with why if it
+// does not within a second.
+func eventually(t *testing.T, cond func() bool, why string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal(why)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// expectNotStopped fails the test if ContainerStopped holds at any time
+// during d.
+func expectNotStopped(t *testing.T, w *watch.Watcher, d time.Duration, while string) {
+	t.Helper()
+	for until := time.Now().Add(d); time.Now().Before(until); time.Sleep(time.Millisecond) {
+		if w.ContainerStopped() {
+			t.Fatalf("ContainerStopped true %s", while)
+		}
+	}
+}
+
+// ContainerStopped holds while the watcher is attached and saw its armed
+// container stopped, counting the grace before it ends: not while waiting
+// for it, after an arm too, nor while it runs.
+func TestContainerStoppedFollowsTheArmedContainer(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rt := &watchtest.Runtime{}
+	w, done := startWatcher(ctx, nil, rt)
+	expectNotStopped(t, w, 10*testConfig.PollInterval, "while waiting for the first container")
+	rt.Start("c")
+	expectNotStopped(t, w, 10*testConfig.PollInterval, "while the armed container runs")
+	w.Arm()
+	// The container that still runs becomes the armed one a grace after
+	// the arm; waiting until then.
+	expectNotStopped(t, w, 2*testConfig.Grace, "while waiting after an arm, or attached again")
+	rt.Stop("c")
+	eventually(t, w.ContainerStopped, "ContainerStopped false while the armed container is stopped")
+	select {
+	case err := <-done:
+		t.Fatalf("the watcher ended (%v) before its grace", err)
+	default:
+	}
+	expectResult(t, done, nil)
+}

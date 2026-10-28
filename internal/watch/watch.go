@@ -76,6 +76,28 @@ type Watcher struct {
 	mu      sync.Mutex
 	armedAt time.Time // time of the last arm
 	ended   error     // why the watch ended; nil while it runs
+	stopped bool      // see ContainerStopped
+}
+
+// ContainerStopped reports whether the watcher is attached and the last
+// runtime answer showed its armed container gone: it counts the grace
+// before the watch ends. Not while waiting for the armed container, after
+// an arm too, nor while it runs.
+func (w *Watcher) ContainerStopped() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.stopped
+}
+
+// setStopped records what ContainerStopped reports, as observed since the
+// arm at armedAt; an observation from before a later arm is dropped, so a
+// poll in flight during an arm does not undo it.
+func (w *Watcher) setStopped(armedAt time.Time, stopped bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if armedAt.Equal(w.armedAt) {
+		w.stopped = stopped
+	}
 }
 
 // New returns a Watcher over runtimes, armed now.
@@ -103,6 +125,7 @@ func (w *Watcher) Arm() error {
 		return fmt.Errorf("the watch has ended: %w", w.ended)
 	}
 	w.armedAt = time.Now()
+	w.stopped = false // waiting from the arm on
 	select {
 	case w.armSignal <- struct{}{}:
 	default: // an arm is already pending; it reads the latest time
@@ -179,6 +202,7 @@ func (w *Watcher) Run(ctx context.Context) error {
 			if arm.observe(containers, now, w.cfg.Grace) {
 				w.log.Info("attached to the armed container", "workspace", w.cfg.Workspace)
 			}
+			w.setStopped(arm.at, arm.attached() && !arm.absentSince.IsZero())
 		} else {
 			arm.absentSince = time.Time{} // unknown does not count
 		}
@@ -217,6 +241,7 @@ func (w *Watcher) Run(ctx context.Context) error {
 
 // waitFor starts waiting for the container of the arm at armedAt.
 func (w *Watcher) waitFor(armedAt time.Time) arming {
+	w.setStopped(armedAt, false)
 	w.log.Info("armed: waiting for the armed container", "workspace", w.cfg.Workspace)
 	return arming{at: armedAt}
 }

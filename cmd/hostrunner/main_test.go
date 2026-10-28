@@ -21,6 +21,7 @@ import (
 	"github.com/kravlab/hostrunner/internal/launch"
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
+	"github.com/kravlab/hostrunner/internal/stop"
 	"github.com/kravlab/hostrunner/internal/transport"
 	"github.com/kravlab/hostrunner/internal/update"
 	"github.com/kravlab/hostrunner/internal/watch"
@@ -144,8 +145,8 @@ func TestParseUpBuildsLaunchConfig(t *testing.T) {
 		Client:             filepath.Join("/home/u/.local/bin", "hostrun"),
 		ReadyTimeout:       10 * time.Second,
 	}
-	if got != want {
-		t.Fatalf("got %+v, want %+v", got, want)
+	if got.launch != want || got.restart || got.answer != stop.Ask {
+		t.Fatalf("got %+v, want %+v without --restart", got, want)
 	}
 }
 
@@ -477,7 +478,7 @@ func TestRunDispatchesUpdate(t *testing.T) {
 // TestUsageListsTheSubcommands checks that the top-level usage names
 // every subcommand.
 func TestUsageListsTheSubcommands(t *testing.T) {
-	if err := run(nil, io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "up|serve|test|approve|update|instructions|version") {
+	if err := run(nil, io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "up|serve|test|approve|stop|restart|update|instructions|version") {
 		t.Fatalf("got %v, want the usage listing every subcommand", err)
 	}
 }
@@ -536,7 +537,7 @@ func TestServeListensOnTheApprovalSocket(t *testing.T) {
 	if err != nil || f.Type != protocol.FrameDaemonInfo || protocol.DecodeJSON(f, &got) != nil {
 		t.Fatalf("hello: frame %v, err %v", f.Type, err)
 	}
-	want := protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: cfg.workspace, ContainerWorkspace: cfg.containerWorkspace, RulesFile: cfg.config, RulesDigest: "missing"}
+	want := protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: cfg.workspace, ContainerWorkspace: cfg.containerWorkspace, RulesFile: cfg.config, RulesDigest: "missing", Stops: true}
 	if real, err := filepath.EvalSymlinks(cfg.workspace); err == nil {
 		want.Workspace = real
 	}
@@ -864,4 +865,152 @@ func TestIsTerminal(t *testing.T) {
 			t.Fatal("a regular file reported as a terminal")
 		}
 	})
+}
+
+// helloInfo opens the approval socket of the serve on socket and returns
+// the daemon's hello.
+func helloInfo(t *testing.T, socket string) protocol.DaemonInfo {
+	t.Helper()
+	c, err := net.Dial("unix", launch.ApprovalSocket(filepath.Dir(socket)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+	if err := protocol.WriteJSON(c, protocol.FrameHello, protocol.Hello{Version: protocol.ApprovalVersion}); err != nil {
+		t.Fatal(err)
+	}
+	f, err := protocol.ReadFrame(c)
+	var info protocol.DaemonInfo
+	if err != nil || f.Type != protocol.FrameDaemonInfo || protocol.DecodeJSON(f, &info) != nil {
+		t.Fatalf("hello: frame %v, err %v", f.Type, err)
+	}
+	return info
+}
+
+// serve --watch reports its armed container stopped once the watcher sees
+// it stop, while it counts the grace; not while waiting for it or while it
+// runs.
+func TestServeReportsTheArmedContainerStopped(t *testing.T) {
+	cfg := watchConfig(t)
+	cfg.grace = 2 * time.Second // long enough to ask while it counts
+	rt := &watchtest.Runtime{}
+	startServe(t, cfg, rt)
+	if helloInfo(t, cfg.socket).ContainerStopped {
+		t.Fatal("the hello reported the container stopped while waiting for it")
+	}
+	rt.Start("c")
+	for until := time.Now().Add(20 * cfg.pollInterval); time.Now().Before(until); time.Sleep(cfg.pollInterval) {
+		if helloInfo(t, cfg.socket).ContainerStopped {
+			t.Fatal("the hello reported the armed container stopped while it runs")
+		}
+	}
+	rt.Stop("c")
+	for deadline := time.Now().Add(5 * time.Second); !helloInfo(t, cfg.socket).ContainerStopped; time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the hello never reported the armed container stopped")
+		}
+	}
+}
+
+func TestParseUpRestart(t *testing.T) {
+	base := []string{"--dir", "/d", "--workspace", "/w", "--container-workspace", "/c"}
+	for _, tt := range []struct {
+		flags  []string
+		answer stop.Answer
+	}{
+		{[]string{"--restart"}, stop.Ask},
+		{[]string{"--restart", "--kill"}, stop.Kill},
+		{[]string{"--restart", "--wait"}, stop.Wait},
+	} {
+		got, err := parseUp(append(base, tt.flags...), "/bin/hostrunner", io.Discard)
+		if err != nil {
+			t.Fatalf("%q: %v", tt.flags, err)
+		}
+		if !got.restart || got.answer != tt.answer {
+			t.Errorf("%q: got restart %v, answer %v", tt.flags, got.restart, got.answer)
+		}
+	}
+	for _, flags := range [][]string{{"--kill"}, {"--wait"}, {"--restart", "--kill", "--wait"}} {
+		if _, err := parseUp(append(base, flags...), "/bin/hostrunner", io.Discard); err == nil {
+			t.Errorf("%q: expected a usage error", flags)
+		}
+	}
+}
+
+func TestParseStop(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", "/run/user/1000")
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tt := range []struct {
+		args []string
+		want stop.Config
+	}{
+		{nil, stop.Config{Root: "/run/user/1000/hostrunner", Cwd: cwd}},
+		{[]string{"--dir", "/run/user/1000/hostrunner/abc"}, stop.Config{Dir: "/run/user/1000/hostrunner/abc", Cwd: cwd}},
+		{[]string{"--all"}, stop.Config{Root: "/run/user/1000/hostrunner", All: true, Cwd: cwd}},
+		{[]string{"--choose", "--kill"}, stop.Config{Root: "/run/user/1000/hostrunner", Choose: true, Cwd: cwd, Commands: stop.Commands{Answer: stop.Kill}}},
+		{[]string{"--wait"}, stop.Config{Root: "/run/user/1000/hostrunner", Cwd: cwd, Commands: stop.Commands{Answer: stop.Wait}}},
+	} {
+		got, err := parseStop("stop", tt.args, "/bin/hostrunner", io.Discard)
+		if err != nil {
+			t.Fatalf("%q: %v", tt.args, err)
+		}
+		if got != tt.want {
+			t.Errorf("%q: got %+v, want %+v", tt.args, got, tt.want)
+		}
+	}
+}
+
+func TestParseStopRejectsExclusiveFlags(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", "/run/user/1000")
+	for _, args := range [][]string{
+		{"--dir", "/d", "--all"},
+		{"--dir", "/d", "--choose"},
+		{"--all", "--choose"},
+		{"--kill", "--wait"},
+		{"extra"},
+	} {
+		if _, err := parseStop("stop", args, "/bin/hostrunner", io.Discard); err == nil {
+			t.Errorf("%q: expected a usage error", args)
+		}
+	}
+	if err := run([]string{"stop", "--all", "--choose"}, io.Discard, io.Discard); exitCode(err) != 1 {
+		t.Errorf("a usage error exits %d, want 1", exitCode(err))
+	}
+}
+
+func TestParseStopNeedsXDGRuntimeDirWithoutDir(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	if _, err := parseStop("stop", nil, "/bin/hostrunner", io.Discard); err == nil || !strings.Contains(err.Error(), "--dir") {
+		t.Fatalf("got %v, want it to name --dir", err)
+	}
+	if _, err := parseStop("stop", []string{"--dir", "/d"}, "/bin/hostrunner", io.Discard); err != nil {
+		t.Fatalf("--dir: %v", err)
+	}
+}
+
+func TestParseRestartStartsTheInstalledHostrunner(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", "/run/user/1000")
+	got, err := parseStop("restart", []string{"--all"}, "/home/u/.local/bin/hostrunner", io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := stop.Restart{Daemon: "/home/u/.local/bin/hostrunner", Client: "/home/u/.local/bin/hostrun", ReadyTimeout: readyTimeout}
+	if got.Restart == nil || got.Restart.Daemon != want.Daemon || got.Restart.Client != want.Client || got.Restart.ReadyTimeout != want.ReadyTimeout {
+		t.Fatalf("got %+v, want %+v", got.Restart, want)
+	}
+	if stopped, _ := parseStop("stop", nil, "/bin/hostrunner", io.Discard); stopped.Restart != nil {
+		t.Fatal("stop restarts")
+	}
+}
+
+func TestParseStopHelpIsTheFlagHelp(t *testing.T) {
+	for _, name := range []string{"stop", "restart"} {
+		if _, err := parseStop(name, []string{"-h"}, "/bin/hostrunner", io.Discard); !errors.Is(err, flag.ErrHelp) {
+			t.Errorf("%s: got %v, want flag.ErrHelp", name, err)
+		}
+	}
 }

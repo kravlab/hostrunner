@@ -12,7 +12,6 @@
 package approval
 
 import (
-	"bytes"
 	"cmp"
 	"context"
 	"errors"
@@ -24,13 +23,10 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
-	"unicode"
-	"unicode/utf8"
 
-	"golang.org/x/sys/unix"
-
+	"github.com/kravlab/hostrunner/internal/daemonlist"
+	"github.com/kravlab/hostrunner/internal/hostterm"
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/textcut"
 	"github.com/kravlab/hostrunner/internal/transport"
@@ -149,11 +145,8 @@ var scopeTexts = map[protocol.Scope]struct{ outcome, confirm string }{
 // approvals, and one another session serves is left to it unless taken
 // over.
 func Run(ctx context.Context, cfg Config, in io.Reader, out io.Writer) error {
-	done := make(chan struct{})
-	t := &term{out: out, in: in, want: make(chan struct{}, 1)}
-	t.want <- struct{}{}
-	t.lines = readLines(in, &t.read, t.want, done)
-	defer stopReading(in, done, t.lines)
+	t := &term{out: out, Input: hostterm.NewInput(in)}
+	defer t.Close()
 	socket, takeOver := cfg.Socket, false
 	first := socket != ""
 	for {
@@ -182,7 +175,7 @@ func Run(ctx context.Context, cfg Config, in io.Reader, out io.Writer) error {
 			if !yes {
 				// Unless the other session left meanwhile: there is
 				// nothing to take over then.
-				if info, perr := probe(ctx, socket); perr == nil && info.Served {
+				if info, perr := daemonlist.Probe(ctx, socket); perr == nil && info.Served {
 					return err
 				}
 			}
@@ -192,7 +185,7 @@ func Run(ctx context.Context, cfg Config, in io.Reader, out io.Writer) error {
 			if cfg.Root == "" {
 				return err
 			}
-			fmt.Fprintf(out, "cannot serve the daemon: %s\n", display(err.Error()))
+			fmt.Fprintf(out, "cannot serve the daemon: %s\n", hostterm.Display(err.Error()))
 			socket = ""
 		case then == nextList:
 			socket = ""
@@ -253,7 +246,7 @@ func (t *term) serveDaemon(ctx context.Context, socket string, takeOver, canList
 	})
 	defer stop()
 
-	info, err := hello(conn)
+	info, err := daemonlist.Hello(conn)
 	if err != nil {
 		return nextFailed, "", err
 	}
@@ -266,7 +259,7 @@ func (t *term) serveDaemon(ctx context.Context, socket string, takeOver, canList
 		}
 		return nextFailed, "", err
 	}
-	fmt.Fprintf(t.out, "serving %s (container %s)\nwaiting for requests · %s\n", display(info.Workspace), display(info.ContainerWorkspace), idleCommands)
+	fmt.Fprintf(t.out, "serving %s (container %s)\nwaiting for requests · %s\n", hostterm.Display(info.Workspace), hostterm.Display(info.ContainerWorkspace), idleCommands)
 
 	done := make(chan struct{})
 	defer close(done)
@@ -314,22 +307,6 @@ func halfClose(conn net.Conn) {
 	}
 }
 
-// hello opens the connection and returns the daemon's answer.
-func hello(conn io.ReadWriter) (protocol.DaemonInfo, error) {
-	var info protocol.DaemonInfo
-	if err := protocol.WriteJSON(conn, protocol.FrameHello, protocol.Hello{Version: protocol.ApprovalVersion}); err != nil {
-		return info, err
-	}
-	f, err := protocol.ReadFrame(conn)
-	if err != nil {
-		return info, fmt.Errorf("the daemon did not answer: %w", err)
-	}
-	if f.Type != protocol.FrameDaemonInfo {
-		return info, frameError(f)
-	}
-	return info, protocol.DecodeJSON(f, &info)
-}
-
 // serve makes the session the one that serves the daemon, taking it over
 // from the session serving it with takeOver.
 func serve(conn io.ReadWriter, takeOver bool) error {
@@ -341,44 +318,20 @@ func serve(conn io.ReadWriter, takeOver bool) error {
 		return fmt.Errorf("the daemon did not answer: %w", err)
 	}
 	if f.Type != protocol.FrameServing {
-		return frameError(f)
+		return daemonlist.ErrorOf(f)
 	}
 	return nil
 }
 
-// frameError turns a frame the daemon sent instead of the expected one into
-// an error.
-func frameError(f protocol.Frame) error {
-	var e protocol.Error
-	if f.Type == protocol.FrameError && protocol.DecodeJSON(f, &e) == nil {
-		return errors.New(e.Message)
-	}
-	return fmt.Errorf("unexpected frame type %d from the daemon", f.Type)
-}
-
 // term is the human's side of a session, kept across the daemons it
 // serves: where it prints, the lines typed, and the prompt they answer.
+// The lines are read only while the session waits for the human, never
+// while an editor has the terminal.
 type term struct {
-	out   io.Writer
-	in    io.Reader
-	lines <-chan line
-	read  atomic.Uint64 // lines read from in so far
-	// fresh is the number of the first line typed after the current
-	// prompt; lines typed before it are discarded.
-	fresh uint64
+	out io.Writer
+	*hostterm.Input
 	// asking is the current prompt.
 	asking string
-	// want lets readLines read on: it reads only while the session waits
-	// for the human, never while an editor has the terminal.
-	want chan struct{}
-}
-
-// handled lets readLines read on once the lines of its last read are
-// handled, l being one of them.
-func (t *term) handled(l line) {
-	if l.last {
-		t.want <- struct{}{}
-	}
 }
 
 // session is the state of a session serving one daemon: the requests
@@ -411,9 +364,9 @@ type session struct {
 	sent string
 
 	// daemon is what the daemon said of itself when the session connected
-	// (see hello): a rule is added to its RulesFile, in its host Workspace;
-	// RulesDigest, which a reread updates, is the digest of the rules it
-	// serves, which the file must have for a rule to be proposed.
+	// (see daemonlist.Hello): a rule is added to its RulesFile, in its host
+	// Workspace; RulesDigest, which a reread updates, is the digest of the
+	// rules it serves, which the file must have for a rule to be proposed.
 	daemon protocol.DaemonInfo
 	// adding is the rule being added (awaitAdd, awaitReread).
 	adding *addition
@@ -492,15 +445,15 @@ func (s *session) loop(ctx context.Context, frames <-chan protocol.Frame) (next,
 			if err := s.daemonFrame(f); err != nil {
 				return nextFailed, err
 			}
-		case l, ok := <-s.lines:
+		case l, ok := <-s.Lines():
 			if !ok {
 				s.leave()
 				return nextQuit, nil
 			}
-			if l.n >= s.fresh {
-				s.typed(l.text)
+			if s.Fresh(l) {
+				s.typed(l.Text)
 			}
-			s.handled(l)
+			s.Handled(l)
 			if s.after != 0 {
 				return s.after, nil
 			}
@@ -560,7 +513,7 @@ func (s *session) daemonFrame(f protocol.Frame) error {
 			fmt.Fprintln(s.out, "no approvals")
 		}
 		for _, a := range l.Approvals {
-			line := fmt.Sprintf("  %d  %s   in %s", a.N, argvLine(a.Argv), display(a.Cwd))
+			line := fmt.Sprintf("  %d  %s   in %s", a.N, hostterm.ArgvLine(a.Argv), hostterm.Display(a.Cwd))
 			if a.Guarded {
 				line += "   guarded"
 			}
@@ -592,7 +545,7 @@ func (s *session) daemonFrame(f protocol.Frame) error {
 		}
 		s.idle()
 	default:
-		return frameError(f)
+		return daemonlist.ErrorOf(f)
 	}
 	return nil
 }
@@ -627,7 +580,7 @@ func (s *session) typed(text string) {
 	case awaitAdd:
 		s.addTyped(r, text)
 	case awaitNote:
-		note := display(text)
+		note := hostterm.Display(text)
 		if len(note) > maxNoteBytes {
 			fmt.Fprintf(s.out, "note too long: at most %d bytes\n", maxNoteBytes)
 			s.prompt(notePrompt)
@@ -662,7 +615,7 @@ func (s *session) answerTyped(r waiting, text string) {
 		// guards again and typed "yes"; anything else asks for the answer
 		// again. A standing or session approval is confirmed so once, here.
 		for _, guard := range r.Guards {
-			fmt.Fprintf(s.out, "⚠ %s\n", display(guard))
+			fmt.Fprintf(s.out, "⚠ %s\n", hostterm.Display(guard))
 		}
 		s.awaiting, s.confirm = awaitConfirm, scope
 		s.prompt(scopeTexts[scope].confirm)
@@ -718,7 +671,7 @@ func (s *session) command(text string) {
 	case "quit":
 		s.after = nextQuit
 	default:
-		fmt.Fprintf(s.out, "unknown command %q: %s\n", display(text), idleCommands)
+		fmt.Fprintf(s.out, "unknown command %q: %s\n", hostterm.Display(text), idleCommands)
 		s.prompt(idlePrompt)
 	}
 }
@@ -803,7 +756,7 @@ func (s *session) leave() {
 // The daemon may well be there: it is served again once it answers on
 // its socket.
 func (s *session) connectionFailed() {
-	fmt.Fprintf(s.out, "\nthe connection to the daemon failed: %s\n", display(s.failed.Error()))
+	fmt.Fprintf(s.out, "\nthe connection to the daemon failed: %s\n", hostterm.Display(s.failed.Error()))
 	if s.awaiting == awaitReread {
 		fmt.Fprintln(s.out, "rule written, but the daemon did not reread it: it takes effect at the next container start")
 	}
@@ -838,10 +791,10 @@ func (s *session) show() {
 	left := max(time.Until(r.deadline), 0).Round(time.Second)
 	head := fmt.Sprintf("── request %d ── %d:%02d left ", r.ID, int(left.Minutes()), int(left.Seconds())%60)
 	fmt.Fprintf(s.out, "\n%s%s\n", head, strings.Repeat("─", max(0, 58-len([]rune(head)))))
-	fmt.Fprintf(s.out, "  dir   %s\n", display(r.Cwd))
-	fmt.Fprintf(s.out, "  cmd   %s\n", argvLine(r.Argv))
+	fmt.Fprintf(s.out, "  dir   %s\n", hostterm.Display(r.Cwd))
+	fmt.Fprintf(s.out, "  cmd   %s\n", hostterm.ArgvLine(r.Argv))
 	s.printMarks(r.Argv)
-	if len(r.Argv) > maxShownArgs || slices.ContainsFunc(shownArgs(r.Argv), isLong) {
+	if len(r.Argv) > hostterm.MaxShownArgs || slices.ContainsFunc(hostterm.ShownArgs(r.Argv), hostterm.IsLong) {
 		fmt.Fprintln(s.out, "  cmd truncated: c shows all")
 	}
 	for i, reason := range r.Reasons {
@@ -849,10 +802,10 @@ func (s *session) show() {
 		if i > 0 {
 			label = "    "
 		}
-		fmt.Fprintf(s.out, "  %s  %s\n", label, display(reason))
+		fmt.Fprintf(s.out, "  %s  %s\n", label, hostterm.Display(reason))
 	}
 	for _, guard := range r.Guards {
-		fmt.Fprintf(s.out, "  ⚠ guarded: %s\n", display(guard))
+		fmt.Fprintf(s.out, "  ⚠ guarded: %s\n", hostterm.Display(guard))
 	}
 	if more := len(s.queue) - 1; more > 0 {
 		fmt.Fprintf(s.out, "  (%d more waiting)\n", more)
@@ -865,125 +818,19 @@ func (s *session) show() {
 // before p is printed are the ones discarded, so an answer typed once p
 // shows always counts.
 func (t *term) prompt(p string) {
-	discardTypedAhead(t.in)
-	t.fresh = t.read.Load() + 1
 	t.asking = p
-	fmt.Fprint(t.out, p)
-}
-
-// How much of an argv a request's block, and the list of standing and
-// session approvals, show; `c` shows all of a request's.
-const (
-	maxShownArgs  = 20               // arguments; more are counted, not shown
-	maxShownRunes = textcut.MaxChars // characters of one argument; more are counted
-)
-
-// isLong reports whether arg is longer than a block shows.
-func isLong(arg string) bool { return utf8.RuneCountInString(arg) > maxShownRunes }
-
-// shownArgs returns the arguments of argv a block shows.
-func shownArgs(argv []string) []string { return argv[:min(len(argv), maxShownArgs)] }
-
-// argvLine shows argv as a block does: the arguments shownArgs returns,
-// each quoted as bashQuote does, so none can steer the terminal or hide
-// where it ends, and cut (see textcut.Cut), the arguments left out counted.
-func argvLine(argv []string) string {
-	shown := shownArgs(argv)
-	cut := make([]string, len(shown))
-	for i, arg := range shown {
-		cut[i] = textcut.Cut(arg, bashQuote)
-	}
-	line := strings.Join(cut, " ")
-	if more := len(argv) - len(shown); more > 0 {
-		line += fmt.Sprintf(" …(+%d args)", more)
-	}
-	return line
+	t.Prompt(t.out, p)
 }
 
 // printMarks prints a `⚠ non-ASCII` line for every argument argvLine
 // shows that holds non-ASCII: the argument as argvLine shows it, and its
 // ASCII form, where a look-alike letter shows its code, cut alike.
 func (t *term) printMarks(argv []string) {
-	for i, arg := range shownArgs(argv) {
-		if holdsNonASCII(arg) {
-			fmt.Fprintf(t.out, "  ⚠ non-ASCII: argument %d %s is %s\n", i+1, textcut.Cut(arg, bashQuote), textcut.Cut(arg, asciiQuote))
+	for i, arg := range hostterm.ShownArgs(argv) {
+		if hostterm.HoldsNonASCII(arg) {
+			fmt.Fprintf(t.out, "  ⚠ non-ASCII: argument %d %s is %s\n", i+1, textcut.Cut(arg, hostterm.BashQuote), textcut.Cut(arg, hostterm.ASCIIQuote))
 		}
 	}
-}
-
-// bashQuote returns arg quoted so that bash reads it back as it is: as it
-// is when every character in it is safe (see bashSafe), in single quotes
-// when every character in it is printable and none is ' or a combining
-// mark, in ANSI-C quotes otherwise (see ansiCQuote). An empty argument
-// shows as two single quotes.
-func bashQuote(arg string) string {
-	needsQuotes := func(r rune) bool { return !bashSafe(r) }
-	switch {
-	case arg == "":
-		return "''"
-	case strings.IndexFunc(arg, needsQuotes) < 0:
-		return arg
-	case printable(arg) && !strings.ContainsRune(arg, '\'') && strings.IndexFunc(arg, isMark) < 0:
-		return "'" + arg + "'"
-	}
-	return ansiCQuote(arg, false)
-}
-
-// asciiQuote returns arg's ASCII form: arg in ANSI-C quotes with every
-// character outside ASCII escaped, so a look-alike letter shows its code.
-func asciiQuote(arg string) string { return ansiCQuote(arg, true) }
-
-// bashSafe reports whether r stands for itself in a bash word, unquoted:
-// an ASCII letter or digit, or one of _@%+=:,./-. A first word holding =
-// still reads as an assignment, which the cmd line leaves as it is.
-func bashSafe(r rune) bool {
-	return r <= unicode.MaxASCII && (unicode.IsLetter(r) || unicode.IsDigit(r) || strings.ContainsRune("_@%+=:,./-", r))
-}
-
-// isMark reports whether r is a combining mark (Unicode Mn, Me), which a
-// terminal draws over the character before it, a quote included.
-func isMark(r rune) bool { return unicode.In(r, unicode.Mn, unicode.Me) }
-
-// ansiCQuote returns arg in bash's ANSI-C quotes, $'…': ' and \ escaped
-// with \, newline and tab as \n and \t, any other ASCII control character,
-// DEL and a byte of invalid UTF-8 as \xHH, a combining mark and a
-// character outside ASCII that is not printable, or any when ascii is set,
-// as \uHHHH, or \UHHHHHHHH above U+FFFF, and every other character as it
-// is.
-func ansiCQuote(arg string, ascii bool) string {
-	var b strings.Builder
-	b.WriteString("$'")
-	for i := 0; i < len(arg); {
-		r, size := utf8.DecodeRuneInString(arg[i:])
-		escape := r > unicode.MaxASCII && (ascii || isMark(r) || !strconv.IsPrint(r))
-		switch {
-		case r == utf8.RuneError && size == 1:
-			fmt.Fprintf(&b, `\x%02x`, arg[i])
-		case r == '\'' || r == '\\':
-			b.WriteByte('\\')
-			b.WriteRune(r)
-		case r == '\n':
-			b.WriteString(`\n`)
-		case r == '\t':
-			b.WriteString(`\t`)
-		case r <= unicode.MaxASCII && !strconv.IsPrint(r):
-			fmt.Fprintf(&b, `\x%02x`, r)
-		case escape && r > 0xFFFF: // past the four digits \u takes
-			fmt.Fprintf(&b, `\U%08x`, r)
-		case escape:
-			fmt.Fprintf(&b, `\u%04x`, r)
-		default:
-			b.WriteRune(r)
-		}
-		i += size
-	}
-	b.WriteByte('\'')
-	return b.String()
-}
-
-// holdsNonASCII reports whether arg holds a character outside ASCII.
-func holdsNonASCII(arg string) bool {
-	return strings.IndexFunc(arg, func(r rune) bool { return r > unicode.MaxASCII }) >= 0
 }
 
 // showHelp prints what each answer offered for r does, one per answer,
@@ -1016,110 +863,12 @@ func (s *session) showHelp(r waiting) {
 // argument holding non-ASCII with its ASCII form.
 func (s *session) showAll(r waiting) {
 	for i, arg := range r.Argv {
-		line := fmt.Sprintf("  %d  %s", i+1, bashQuote(arg))
-		if holdsNonASCII(arg) {
-			line += "   ⚠ non-ASCII: " + asciiQuote(arg)
+		line := fmt.Sprintf("  %d  %s", i+1, hostterm.BashQuote(arg))
+		if hostterm.HoldsNonASCII(arg) {
+			line += "   ⚠ non-ASCII: " + hostterm.ASCIIQuote(arg)
 		}
 		fmt.Fprintln(s.out, line)
 	}
-}
-
-// display returns text as it may be shown on the terminal: as it is when
-// every character in it is printable, Go-quoted otherwise, so control
-// characters and terminal escapes appear escaped.
-func display(text string) string {
-	if !printable(text) {
-		return strconv.Quote(text)
-	}
-	return text
-}
-
-// printable reports whether text is valid UTF-8 and every character in it
-// is printable.
-func printable(text string) bool {
-	return utf8.ValidString(text) && strings.IndexFunc(text, func(r rune) bool { return !strconv.IsPrint(r) }) < 0
-}
-
-// line is a line the human typed, its number, counting from 1, and
-// whether it is the last of what one read returned.
-type line struct {
-	n    uint64
-	text string
-	last bool
-}
-
-// stopReading stops readLines reading in, closing done: a read it waits in
-// would otherwise take the next line typed after the session. An in that
-// takes a read deadline (a file the process opened, a pipe from os.Pipe)
-// has the read cut short, and once readLines has ended, lines closed, the
-// deadline is lifted again, a deadline set before Run too. Any other (an
-// inherited stdin, terminal or pipe, which Go cannot interrupt; the
-// process leaves with the session) is left to its read.
-func stopReading(in io.Reader, done chan struct{}, lines <-chan line) {
-	close(done)
-	d, ok := in.(interface{ SetReadDeadline(time.Time) error })
-	if !ok || d.SetReadDeadline(time.Now()) != nil {
-		return
-	}
-	for range lines {
-	}
-	_ = d.SetReadDeadline(time.Time{})
-}
-
-// readLines reads lines from in into the returned channel, counting each
-// with read as soon as it is read, and closes the channel when in ends or
-// done is closed. It reads in directly, without a buffered reader, and
-// counts every line of a read before handing any on: a line is counted
-// when it is typed, not when the session gets to it, so prompt can tell
-// the lines typed before it. Only a read returning between prompt's count
-// and its own counting escapes that.
-//
-// It reads only once want lets it, after the lines of the last read are
-// handled: an editor the session runs meanwhile has the terminal to
-// itself.
-func readLines(in io.Reader, read *atomic.Uint64, want <-chan struct{}, done <-chan struct{}) <-chan line {
-	ch := make(chan line)
-	go func() {
-		defer close(ch)
-		var partial []byte
-		buf := make([]byte, 4096)
-		for {
-			select {
-			case <-want:
-			case <-done:
-				return
-			}
-			var lines []line
-			var err error
-			for len(lines) == 0 && err == nil {
-				var n int
-				n, err = in.Read(buf)
-				partial = append(partial, buf[:n]...)
-				for {
-					i := bytes.IndexByte(partial, '\n')
-					if i < 0 {
-						break
-					}
-					lines = append(lines, line{n: read.Add(1), text: string(partial[:i])})
-					partial = partial[i+1:]
-				}
-			}
-			if len(lines) > 0 {
-				lines[len(lines)-1].last = true
-			}
-			for _, l := range lines {
-				select {
-				case ch <- l:
-				case <-done:
-					return
-				}
-			}
-			if err != nil {
-				return
-			}
-		}
-	}()
-	return ch
 }
 
 // readDaemon reads the daemon's frames into the returned channel and closes
@@ -1141,25 +890,4 @@ func readDaemon(conn io.Reader, done <-chan struct{}) <-chan protocol.Frame {
 		}
 	}()
 	return ch
-}
-
-// discardTypedAhead drops the input a terminal holds that nobody has read
-// yet. Input that is not a terminal (a pipe, a file) is left alone. The
-// descriptor is reached through SyscallConn, not Fd, which would put a
-// pipe into blocking mode, where a read deadline no longer cuts a read
-// short (see stopReading).
-func discardTypedAhead(in io.Reader) {
-	f, ok := in.(*os.File)
-	if !ok {
-		return
-	}
-	raw, err := f.SyscallConn()
-	if err != nil {
-		return
-	}
-	_ = raw.Control(func(fd uintptr) {
-		if _, err := unix.IoctlGetTermios(int(fd), unix.TCGETS); err == nil {
-			_ = unix.IoctlSetInt(int(fd), unix.TCFLSH, unix.TCIFLUSH)
-		}
-	})
 }
