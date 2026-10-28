@@ -49,17 +49,24 @@ const defaultRequestTimeout = 10 * time.Second
 
 // Server accepts client connections and runs their commands.
 type Server struct {
-	mapper         *workspace.Mapper
-	log            *slog.Logger
-	requestTimeout time.Duration
-	onArm          func(a protocol.Arm, digest string) (stepAside bool) // nil: arming changes nothing
-	reload         func() (Policy, string, error)                       // nil: the rules are never reread
-	approvals      *approvals                                           // nil: no approval socket, so nothing is approved
+	mapper           *workspace.Mapper
+	log              *slog.Logger
+	requestTimeout   time.Duration
+	onArm            func(a protocol.Arm, digest string) (stepAside bool) // nil: arming changes nothing
+	reload           func() (Policy, string, error)                       // nil: the rules are never reread
+	approvals        *approvals                                           // nil: no approval socket, so nothing is approved
+	containerStopped func() bool                                          // nil: the armed container is not known to have stopped
 
-	mu        sync.Mutex
-	stopServe context.CancelFunc // stops the running Serve; nil when not serving
-	policy    Policy             // the rules served; see rules
-	digest    string             // their digest; see rulesDigest
+	mu             sync.Mutex
+	stopServe      context.CancelFunc                 // stops the running Serve; nil when not serving
+	closeListeners func()                             // closes the running Serve's sockets; nil when not serving
+	policy         Policy                             // the rules served; see rules
+	digest         string                             // their digest; see rulesDigest
+	running        map[uint64]protocol.RunningCommand // the commands started and not yet finished; see track
+	lastRunning    uint64                             // the last key track gave
+	stopping       bool                               // a stop request came
+	confirming     bool                               // a drain began and is not confirmed yet; see drain
+	draining       chan struct{}                      // closed once a stop drains the daemon
 }
 
 // Policy decides whether a command may run; rules.Policy implements it. A
@@ -145,7 +152,10 @@ func New(mapper *workspace.Mapper, policy Policy, log *slog.Logger, opts ...Opti
 	if policy == nil {
 		panic("daemon: nil Policy")
 	}
-	s := &Server{mapper: mapper, policy: policy, log: log, requestTimeout: defaultRequestTimeout}
+	s := &Server{
+		mapper: mapper, policy: policy, log: log, requestTimeout: defaultRequestTimeout,
+		running: map[uint64]protocol.RunningCommand{}, draining: make(chan struct{}),
+	}
 	for _, opt := range opts {
 		opt(s)
 	}
@@ -153,32 +163,36 @@ func New(mapper *workspace.Mapper, policy Policy, log *slog.Logger, opts ...Opti
 }
 
 // Serve accepts connections on l until ctx is cancelled, an arm handler
-// steps aside, or l fails; then it closes l, kills running commands and
-// returns once every connection is finished. Temporary accept errors (e.g.
-// out of file descriptors) are retried with backoff. It returns nil when
-// stopped by cancellation or a step aside, and the accept error otherwise.
-// With WithApprovals it accepts approval sessions on the approval socket
-// meanwhile, and closes that socket when it stops too.
+// steps aside, a stop request stops it, or l fails; then it closes l,
+// kills running commands and returns once every connection is finished.
+// Temporary accept errors (e.g. out of file descriptors) are retried with
+// backoff. It returns nil when stopped by cancellation, a step aside or a
+// stop request, and the accept error otherwise. A stop that drains closes
+// l at once and stops Serve once no command runs; a Server stopped by a
+// stop request does not Serve again. With WithApprovals it accepts
+// approval sessions on the approval socket meanwhile, and closes that
+// socket when it stops too.
 func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	s.mu.Lock()
-	s.stopServe = cancel
-	s.mu.Unlock()
-	defer func() {
-		s.mu.Lock()
-		s.stopServe = nil
-		s.mu.Unlock()
-	}()
 	// The approval socket closes first: `hostrunner up` starts the next
 	// daemon once the socket is closed, and that daemon takes the approval
 	// socket too.
-	stop := context.AfterFunc(ctx, func() {
+	closeListeners := func() {
 		if s.approvals != nil {
 			s.approvals.listener.Close()
 		}
 		l.Close()
-	})
+	}
+	s.mu.Lock()
+	s.stopServe, s.closeListeners = cancel, closeListeners
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.stopServe, s.closeListeners = nil, nil
+		s.mu.Unlock()
+	}()
+	stop := context.AfterFunc(ctx, closeListeners)
 	defer stop()
 
 	var (
@@ -200,7 +214,11 @@ func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 				case <-ctx.Done():
 				}
 			}
-			stopped := ctx.Err() != nil // cancelled by the caller or a step aside
+			if s.isDraining() {
+				// The drain closed l: the running commands finish first.
+				<-ctx.Done()
+			}
+			stopped := ctx.Err() != nil // cancelled by the caller, a step aside or a stop
 			cancel()
 			wg.Wait()
 			if stopped {
@@ -491,6 +509,15 @@ func (s *Server) start(ctx context.Context, x exchange, req protocol.Request, p 
 	// The command inherits the files; the daemon's copies go once it has
 	// started (p.files is cleared then), or with the request on failure.
 	defer p.close()
+
+	// A stop lists it as running, as the human asked it; a draining daemon
+	// starts nothing new.
+	key, ok := s.track(req)
+	if !ok {
+		s.reject(x.out, protocol.ExitHostrunError, drainingMessage, errDraining)
+		return
+	}
+	defer s.untrack(key)
 
 	cmd := newCommand(ctx, p.argv, p.dir, p.hostPath, p.env, x.out)
 	stdout, stderr := newMaskWriter(cmd.Stdout, p.masked), newMaskWriter(cmd.Stderr, p.masked)

@@ -284,6 +284,8 @@ func TestSocketsRefuseEachOthersFrames(t *testing.T) {
 	}{
 		{"hello on the container's socket", h.transport.Path, protocol.FrameHello, protocol.Hello{Version: protocol.ApprovalVersion}},
 		{"answer on the container's socket", h.transport.Path, protocol.FrameAnswer, protocol.Answer{ID: 1, Scope: protocol.ScopeOnce}},
+		{"running on the container's socket", h.transport.Path, protocol.FrameRunning, struct{}{}},
+		{"stop on the container's socket", h.transport.Path, protocol.FrameStop, protocol.Stop{}},
 		{"request on the approval socket", h.approvalSocket, protocol.FrameRequest, protocol.Request{Version: protocol.Version, Argv: []string{"echo"}, Cwd: containerRoot}},
 		{"ask on the approval socket", h.approvalSocket, protocol.FrameAsk, protocol.Ask{Request: protocol.Request{Version: protocol.Version, Argv: []string{"echo"}, Cwd: containerRoot}}},
 	}

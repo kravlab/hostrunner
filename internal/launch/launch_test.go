@@ -492,3 +492,138 @@ func TestUpReplacesDaemonThatStepsAside(t *testing.T) {
 		t.Fatal("the new daemon is not running")
 	}
 }
+
+func TestLockDirMakesTheNextWait(t *testing.T) {
+	dir := t.TempDir()
+	unlock, err := LockDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	locked := make(chan func(), 1)
+	go func() {
+		next, err := LockDir(dir)
+		if err != nil {
+			t.Error(err)
+			close(locked)
+			return
+		}
+		locked <- next
+	}()
+	select {
+	case <-locked:
+		t.Fatal("a second LockDir took the lock while the first held it")
+	case <-time.After(200 * time.Millisecond):
+	}
+	unlock()
+	select {
+	case next, ok := <-locked:
+		if ok {
+			next()
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the second LockDir did not take the lock once it was released")
+	}
+}
+
+func TestWaitStoppedReturnsOnceNothingAccepts(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), SocketName)
+	l, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.AfterFunc(200*time.Millisecond, func() { l.Close() })
+	if err := WaitStopped(context.Background(), socket, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWaitStoppedGivesUpAfterTheTimeout(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), SocketName)
+	l, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+	err = WaitStopped(context.Background(), socket, 100*time.Millisecond)
+	if want := "the daemon on " + socket + " did not stop within 100ms"; err == nil || err.Error() != want {
+		t.Fatalf("got %v, want %q", err, want)
+	}
+}
+
+func TestTryLockDirDoesNotWait(t *testing.T) {
+	dir := t.TempDir()
+	unlock, busy, err := TryLockDir(dir)
+	if err != nil || busy || unlock == nil {
+		t.Fatalf("free lock: unlock %v, busy %v, err %v", unlock != nil, busy, err)
+	}
+	if again, busy, err := TryLockDir(dir); err != nil || !busy || again != nil {
+		t.Fatalf("held lock: unlock %v, busy %v, err %v", again != nil, busy, err)
+	}
+	unlock()
+	again, busy, err := TryLockDir(dir)
+	if err != nil || busy {
+		t.Fatalf("released lock: busy %v, err %v", busy, err)
+	}
+	again()
+}
+
+func TestPrepareRejectsInvalidRules(t *testing.T) {
+	cfg := fakeConfig(t, "serve")
+	if err := os.WriteFile(cfg.Rules, []byte("rules:\n  - command: git\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Prepare(cfg); err == nil || !strings.Contains(err.Error(), cfg.Rules) {
+		t.Fatalf("got %v, want an error naming the rules file", err)
+	}
+}
+
+// UpLocked runs under the caller's lock: it does not wait for the lock
+// itself.
+func TestUpLockedStartsADaemonUnderTheCallersLock(t *testing.T) {
+	cfg := fakeConfig(t, "serve")
+	p, err := Prepare(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unlock, err := LockDir(cfg.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	done := make(chan error, 1)
+	go func() { done <- p.UpLocked(context.Background()) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("UpLocked waited for the lock its caller holds")
+	}
+	if pids := lines(t, filepath.Join(cfg.Dir, "fake.pids")); len(pids) != 1 {
+		t.Fatalf("started %d daemons, want 1", len(pids))
+	}
+}
+
+func TestSocketPaths(t *testing.T) {
+	const dir = "/run/user/1000/hostrunner/abc"
+	if got, want := Socket(dir+"/"), dir+"/hostrunner.sock"; got != want {
+		t.Errorf("Socket = %q, want %q", got, want)
+	}
+	approval := ApprovalSocket(dir + "/")
+	if want := dir + ".approval.sock"; approval != want {
+		t.Errorf("ApprovalSocket = %q, want %q", approval, want)
+	}
+	if got := RuntimeDir(approval); got != dir {
+		t.Errorf("RuntimeDir(%q) = %q, want %q", approval, got, dir)
+	}
+}
