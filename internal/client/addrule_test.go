@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kravlab/hostrunner/internal/daemon"
 	"github.com/kravlab/hostrunner/internal/protocol"
@@ -145,14 +146,20 @@ func TestAddRuleArmGetsTheRereadDigest(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 	if err := protocol.WriteJSON(conn, protocol.FrameArm, protocol.Arm{Version: protocol.Version, ConfigDigest: reread.Digest()}); err != nil {
 		t.Fatal(err)
 	}
 	if f, err := protocol.ReadFrame(conn); err != nil || f.Type != protocol.FrameArmed {
 		t.Fatalf("frame %v, err %v; want armed", f.Type, err)
 	}
-	if got := <-digests; got != reread.Digest() {
-		t.Fatalf("the arm got digest %q, want that of the reread rules %q", got, reread.Digest())
+	select {
+	case got := <-digests:
+		if got != reread.Digest() {
+			t.Fatalf("the arm got digest %q, want that of the reread rules %q", got, reread.Digest())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the arm handler was not called")
 	}
 }
 

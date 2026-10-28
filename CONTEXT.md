@@ -137,6 +137,11 @@ A human on the host replacing a daemon with a new one for
 the same runtime directory.
 _Avoid_: step aside (the daemon's own decision), reload
 
+**Reread**:
+The daemon replacing the rules it serves with the rules
+file's current content, without stopping.
+_Avoid_: reload, restart (a human replacing the daemon)
+
 **Drain**:
 The state of a daemon that a stop or restart waits for: it
 takes no new requests and finishes the running ones.

@@ -344,6 +344,7 @@ func (t *term) ending(ctx context.Context, cfg Config, dir string, info *protoco
 		Daemon:             r.Daemon,
 		Client:             r.Client,
 		ReadyTimeout:       r.ReadyTimeout,
+		NoReread:           info.NoReread,
 	})
 	if err != nil {
 		return ending{}, fmt.Errorf("%s: %w; the daemon keeps running", name, err)

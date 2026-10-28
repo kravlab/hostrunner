@@ -58,8 +58,9 @@ func TestMain(m *testing.M) {
 // runFakeDaemon records its pid in fake.pids and, in "serve" mode, listens
 // on --socket and answers every FrameArm, logging it to fake.armed. Like the
 // real daemon it compares the arm's rules digest with the rules it started
-// with and, on a mismatch, steps aside and exits. It insists on
-// --watch, which `up` must always pass.
+// with, and the arm's --no-reread with its own, and, on a mismatch,
+// steps aside and exits. It insists on --watch, which `up` must always
+// pass.
 func runFakeDaemon(mode string) {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	socket := fs.String("socket", "", "")
@@ -67,6 +68,7 @@ func runFakeDaemon(mode string) {
 	fs.String("container-workspace", "", "")
 	config := fs.String("config", "", "")
 	watch := fs.Bool("watch", false, "")
+	noReread := fs.Bool("no-reread", false, "")
 	if len(os.Args) < 2 || os.Args[1] != "serve" || fs.Parse(os.Args[2:]) != nil || !*watch || *config == "" {
 		os.Exit(2)
 	}
@@ -93,7 +95,7 @@ func runFakeDaemon(mode string) {
 		if f, err := protocol.ReadFrame(c); err == nil && f.Type == protocol.FrameArm {
 			var a protocol.Arm
 			_ = protocol.DecodeJSON(f, &a)
-			stepAside := a.ConfigDigest != policy.Digest()
+			stepAside := a.ConfigDigest != policy.Digest() || a.NoReread != *noReread
 			appendLine(filepath.Join(dir, "fake.armed"), map[bool]string{false: "armed", true: "step aside"}[stepAside])
 			_ = protocol.WriteJSON(c, protocol.FrameArmed, protocol.Armed{Version: protocol.Version, Restart: stepAside})
 			if stepAside {
@@ -490,6 +492,30 @@ func TestUpReplacesDaemonThatStepsAside(t *testing.T) {
 	second, _ := strconv.Atoi(pids[1])
 	if !alivePid(second) {
 		t.Fatal("the new daemon is not running")
+	}
+}
+
+// An up whose --no-reread differs from the running daemon's replaces it
+// with one started with the up's setting, which the next such up arms.
+func TestUpReplacesDaemonWhoseRereadingDiffers(t *testing.T) {
+	cfg := fakeConfig(t, "serve")
+	if err := Up(context.Background(), cfg); err != nil {
+		t.Fatalf("first Up: %v", err)
+	}
+	first := onlyPid(t, cfg.Dir)
+	cfg.NoReread = true
+	if err := Up(context.Background(), cfg); err != nil {
+		t.Fatalf("Up with --no-reread: %v", err)
+	}
+	waitGone(t, first)
+	if err := Up(context.Background(), cfg); err != nil {
+		t.Fatalf("another Up with --no-reread: %v", err)
+	}
+	if pids := lines(t, filepath.Join(cfg.Dir, "fake.pids")); len(pids) != 2 {
+		t.Fatalf("got pids %v, want the daemon replaced once", pids)
+	}
+	if got := lines(t, filepath.Join(cfg.Dir, "fake.armed")); strings.Join(got, " ") != "armed step aside armed armed" {
+		t.Fatalf("arms %q, want armed, step aside, then the new daemon armed twice", got)
 	}
 }
 

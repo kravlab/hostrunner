@@ -308,9 +308,10 @@ func halfClose(conn net.Conn) {
 }
 
 // serve makes the session the one that serves the daemon, taking it over
-// from the session serving it with takeOver.
+// from the session serving it with takeOver; the session reads the
+// daemon's notices of a reread (see rulesReread).
 func serve(conn io.ReadWriter, takeOver bool) error {
-	if err := protocol.WriteJSON(conn, protocol.FrameServe, protocol.Serve{TakeOver: takeOver}); err != nil {
+	if err := protocol.WriteJSON(conn, protocol.FrameServe, protocol.Serve{TakeOver: takeOver, Notices: true}); err != nil {
 		return err
 	}
 	f, err := protocol.ReadFrame(conn)
@@ -533,6 +534,12 @@ func (s *session) daemonFrame(f protocol.Frame) error {
 			return errors.New("the daemon reread the rules, which the session did not ask for")
 		}
 		s.reread(r)
+	case protocol.FrameRulesReread:
+		var r protocol.RulesReread
+		if err := protocol.DecodeJSON(f, &r); err != nil {
+			return err
+		}
+		s.rulesReread(r)
 	case protocol.FrameRevoked:
 		var r protocol.Revoked
 		if err := protocol.DecodeJSON(f, &r); err != nil {
@@ -730,6 +737,22 @@ func (s *session) withdrawn(w protocol.Withdrawn) {
 		}
 		s.confirm, s.rereadDigest = "", ""
 		s.advance()
+	}
+}
+
+// rulesReread says that the daemon found its rules file changed and reread
+// it, keeping the rules it now serves for later proposals, or why it kept
+// its old ones. The prompt shown, if any, is shown again; while the
+// session awaits the daemon none is.
+func (s *session) rulesReread(r protocol.RulesReread) {
+	if r.Error != "" {
+		fmt.Fprintf(s.out, "\nthe rules file changed, but the daemon cannot reread it, so the old rules stay: %s\n", hostterm.Display(r.Error))
+	} else {
+		s.daemon.RulesDigest = r.Digest
+		fmt.Fprintln(s.out, "\nthe rules file changed; the daemon reread it")
+	}
+	if !s.awaiting.waitsForDaemon() {
+		s.prompt(s.asking)
 	}
 }
 
