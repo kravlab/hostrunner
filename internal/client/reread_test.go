@@ -282,7 +282,7 @@ func TestAddRuleRereadsAHandEditWithoutAsking(t *testing.T) {
 	}
 	waitForLog(t, &log, `msg="hand-edited rules reread"`)
 	s.answer(t, "w")
-	s.waitFor(t, "rule added; the daemon reloaded the rules · request 1 runs under it\n")
+	s.waitFor(t, ruleAddedText+" · request 1 runs under it\n")
 	if got := awaitResult(t, ch); got.code != 0 {
 		t.Fatalf("got %+v, want it to run under the rule", got)
 	}

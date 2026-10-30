@@ -15,12 +15,12 @@ import (
 // WithRereadEvery makes the Server reread its rules file by itself once
 // it changes: every interval it looks at the file WithApprovals names
 // (stat, links followed) and, when that changed, reads it and rereads it
-// as WithReload does unless its content is that of the rules it serves.
+// as WithReread does unless its content is that of the rules it serves.
 // A file that does not load keeps the rules served and is logged once
 // for its content; a missing one loads as rules that deny every command.
 // Either way the session serving the daemon is told, if it reads that
 // (protocol.Serve.Notices).
-// Without WithApprovals or WithReload it does nothing.
+// Without WithApprovals or WithReread it does nothing.
 func WithRereadEvery(interval time.Duration) Option {
 	return func(s *Server) { s.rereadEvery = interval }
 }
@@ -32,7 +32,7 @@ var errChangedMeanwhile = errors.New("the rules file changed meanwhile")
 // rereadsByItself reports whether the Server rereads its rules file once
 // it changes (see WithRereadEvery).
 func (s *Server) rereadsByItself() bool {
-	return s.rereadEvery > 0 && s.reload != nil && s.approvals != nil
+	return s.rereadEvery > 0 && s.rereadFile != nil && s.approvals != nil
 }
 
 // fileState is what the Server last saw of its rules file: a change of

@@ -186,7 +186,7 @@ func TestServeStopsRunningCommandsOnPermanentAcceptError(t *testing.T) {
 
 func TestServeCallsArmHandlerOnArmRequest(t *testing.T) {
 	digests := make(chan string, 1)
-	srv := newServer(t, daemon.WithReload("served", nil), daemon.WithArmHandler(func(a protocol.Arm, digest string) bool {
+	srv := newServer(t, daemon.WithReread("served", nil), daemon.WithArmHandler(func(a protocol.Arm, digest string) bool {
 		if a.ConfigDigest == "abc" {
 			digests <- digest
 		}

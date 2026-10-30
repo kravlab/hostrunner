@@ -171,10 +171,11 @@ name container paths anyway, so only relative symlinks are followed.
   `positional: {}`, `allow:`) is an error (`allow: []` explicitly allows
   nothing); flag names must be `-x` or `--name` without `=`; the program
   must be a name or an absolute path; the file holds a single document.
-- **Rules reload:** `hostrunner up` validates the rules file (invalid →
+- **Rules change:** `hostrunner up` validates the rules file (invalid →
   `up` fails) and arms the daemon with its SHA-256 (`Arm.config_digest`).
   A daemon that loaded other rules answers `Armed{restart: true}` and
-  stops; `up` waits for the socket to free up and starts a new daemon.
+  steps aside (stops); `up` waits for the socket to free up and starts a
+  new daemon.
   `serve` takes `--config`; `up` passes it.
 - **Daemon:** the policy is a required argument of `daemon.New`
   (`WithPolicy` is gone); a panic while handling a connection is answered
@@ -198,4 +199,6 @@ name container paths anyway, so only relative symlinks are followed.
 
 ## Out of scope
 
-Raw-command input, mount-check profiles, hot reload of the config.
+Raw-command input, mount-check profiles.
+
+Rereading the rules file once it changes: [rules-reread.md](rules-reread.md).

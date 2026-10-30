@@ -665,14 +665,14 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 			}
 		}()
 	}
-	reload := func() (daemon.Policy, string, error) {
+	reread := func() (daemon.Policy, string, error) {
 		p, err := rules.Load(cfg.config)
 		if err != nil {
 			return nil, "", err
 		}
 		return p, p.Digest(), nil
 	}
-	opts := []daemon.Option{daemon.WithArmHandler(armHandler(cfg.config, cfg.noReread, watcher, log)), daemon.WithApprovals(al, cfg.config), daemon.WithReload(policy.Digest(), reload)}
+	opts := []daemon.Option{daemon.WithArmHandler(armHandler(cfg.config, cfg.noReread, watcher, log)), daemon.WithApprovals(al, cfg.config), daemon.WithReread(policy.Digest(), reread)}
 	if !cfg.noReread {
 		opts = append(opts, daemon.WithRereadEvery(cfg.pollInterval))
 	}

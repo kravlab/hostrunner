@@ -10,7 +10,7 @@ import (
 
 // A reread asked for the rules already served, as the watcher's that
 // lost the race against a session's own reread of the same file, does
-// not reload them and says it changed nothing.
+// not reread them and says it changed nothing.
 func TestRereadOfTheRulesServedChangesNothing(t *testing.T) {
 	mapper, err := workspace.NewMapper(t.TempDir(), "/workspaces/app")
 	if err != nil {
@@ -20,9 +20,9 @@ func TestRereadOfTheRulesServedChangesNothing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	reloads := 0
-	s := New(mapper, p, slog.New(slog.DiscardHandler), WithReload("old", func() (Policy, string, error) {
-		reloads++
+	rereads := 0
+	s := New(mapper, p, slog.New(slog.DiscardHandler), WithReread("old", func() (Policy, string, error) {
+		rereads++
 		return p, "new", nil
 	}))
 	if digest, changed, err := s.rereadRules("new"); err != nil || !changed || digest != "new" {
@@ -31,7 +31,7 @@ func TestRereadOfTheRulesServedChangesNothing(t *testing.T) {
 	if digest, changed, err := s.rereadRules("new"); err != nil || changed || digest != "new" {
 		t.Fatalf("the second reread: got %q, changed %v, %v; want new, unchanged", digest, changed, err)
 	}
-	if reloads != 1 {
-		t.Fatalf("the rules were reloaded %d times, want once", reloads)
+	if rereads != 1 {
+		t.Fatalf("the rules were reread %d times, want once", rereads)
 	}
 }
