@@ -353,7 +353,7 @@ answer [r]efuse [o]nce [s]ession stan[d]ing [a]dd rule [c]md [h]elp ? a
 +    positional:
 +      allow: [main]
 [w]rite [e]dit in $EDITOR [c]ancel ? w
-rule added; the daemon reloaded the rules · request 9 runs under it
+rule added; the daemon reread the rules · request 9 runs under it
 
 ── request 10 ── 10:00 left ─────────────────────────────
   dir   /workspaces/app

@@ -271,7 +271,7 @@ func (s *session) reread(res protocol.RereadResult) {
 		}
 	} else {
 		s.daemon.RulesDigest = res.Digest
-		fmt.Fprint(s.out, "rule added; the daemon reloaded the rules")
+		fmt.Fprint(s.out, "rule added; the daemon reread the rules")
 		switch {
 		case !waiting:
 		case res.RunsOnce != "":

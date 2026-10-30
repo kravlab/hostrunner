@@ -12,7 +12,7 @@
 // approvals.go). The approval socket lies outside what the container
 // mounts, and takes no frames from the container's socket, nor that socket
 // any of its frames. A session that adds a rule to the rules file makes the
-// daemon reread it (WithReload), and with WithRereadEvery the daemon
+// daemon reread it (WithReread), and with WithRereadEvery the daemon
 // rereads it by itself once it changes (see reread.go).
 package daemon
 
@@ -54,7 +54,7 @@ type Server struct {
 	log              *slog.Logger
 	requestTimeout   time.Duration
 	onArm            func(a protocol.Arm, digest string) (stepAside bool) // nil: arming changes nothing
-	reload           func() (Policy, string, error)                       // nil: the rules are never reread
+	rereadFile       func() (Policy, string, error)                       // nil: the rules are never reread
 	approvals        *approvals                                           // nil: no approval socket, so nothing is approved
 	containerStopped func() bool                                          // nil: the armed container is not known to have stopped
 	rereadEvery      time.Duration                                        // 0: the rules file is not watched; see WithRereadEvery
@@ -92,18 +92,18 @@ func WithRequestTimeout(d time.Duration) Option {
 	return func(s *Server) { s.requestTimeout = d }
 }
 
-// WithReload lets an approval session make the Server reread its rules
+// WithReread lets an approval session make the Server reread its rules
 // file, once it has added a rule to it. digest identifies the rules the
-// Server starts with (rules.Policy.Digest); reload returns the rules as
+// Server starts with (rules.Policy.Digest); reread returns the rules as
 // `hostrunner up` would load them, and their digest, or why they are not
 // valid, in which case the Server keeps the rules it has. Running
 // commands are untouched; new requests are checked against the new rules.
-func WithReload(digest string, reload func() (Policy, string, error)) Option {
-	return func(s *Server) { s.digest, s.reload = digest, reload }
+func WithReread(digest string, reread func() (Policy, string, error)) Option {
+	return func(s *Server) { s.digest, s.rereadFile = digest, reread }
 }
 
 // rulesDigest returns the digest of the rules the Server serves, as
-// WithReload gave it or a reread changed it; "" without WithReload.
+// WithReread gave it or a reread changed it; "" without WithReread.
 func (s *Server) rulesDigest() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -113,7 +113,7 @@ func (s *Server) rulesDigest() string {
 // WithArmHandler sets what the Server does when `hostrunner up` arms it on
 // a devcontainer start (e.g. arm the container watcher); f gets the arm
 // and the digest of the rules the Server serves at that moment
-// (WithReload's, or a reread's). If f returns true, the Server steps
+// (WithReread's, or a reread's). If f returns true, the Server steps
 // aside: it answers so and then stops Serve, so `up` can start a new
 // daemon. f is called from connection goroutines, so it must be safe for
 // concurrent use.
@@ -129,15 +129,15 @@ func (s *Server) rules() Policy {
 	return s.policy
 }
 
-// rereadRules rereads the rules file (see WithReload) and serves the new
+// rereadRules rereads the rules file (see WithReread) and serves the new
 // rules from then on, provided the file has the digest want, the one the
 // session left it with or the watcher read; it returns their digest, or
 // why it keeps the old rules: errChangedMeanwhile for another digest.
 // Rules of digest want already served, as a reread just before this one
-// left them, are not reloaded: changed reports whether the rules served
-// changed.
+// left them, are not reread again: changed reports whether the rules
+// served changed.
 func (s *Server) rereadRules(want string) (digest string, changed bool, err error) {
-	if s.reload == nil {
+	if s.rereadFile == nil {
 		return "", false, errors.New("this daemon does not reread its rules")
 	}
 	s.rereading.Lock()
@@ -145,7 +145,7 @@ func (s *Server) rereadRules(want string) (digest string, changed bool, err erro
 	if s.rulesDigest() == want {
 		return want, false, nil
 	}
-	p, digest, err := s.reload()
+	p, digest, err := s.rereadFile()
 	if err != nil {
 		return "", false, err
 	}
