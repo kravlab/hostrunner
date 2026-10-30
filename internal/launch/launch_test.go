@@ -431,7 +431,13 @@ func TestUpRejectsSocketPathOverLimit(t *testing.T) {
 func TestUpExplainsUnsetRuntimeDir(t *testing.T) {
 	cfg := fakeConfig(t, "serve")
 	t.Setenv("XDG_RUNTIME_DIR", "")
-	cfg.Dir = "/hostrunner/id" // what ${localEnv:XDG_RUNTIME_DIR}/hostrunner/<id> becomes
+	// ${localEnv:XDG_RUNTIME_DIR}/hostrunner/<id> becomes /hostrunner/<id>,
+	// which root can create; no one can create a path under a regular file.
+	notDir := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(notDir, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Dir = filepath.Join(notDir, "hostrunner", "id")
 	if err := Up(context.Background(), cfg); err == nil || !strings.Contains(err.Error(), "XDG_RUNTIME_DIR") {
 		t.Fatalf("got %v, want a hint about XDG_RUNTIME_DIR", err)
 	}
