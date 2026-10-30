@@ -18,6 +18,10 @@ import (
 // addPromptText is what the session asks once it shows a proposed rule.
 const addPromptText = "[w]rite [e]dit in $EDITOR [c]ancel ? "
 
+// ruleAddedText is what the session prints once the daemon reread the
+// rules with a rule it added.
+const ruleAddedText = "rule added; the daemon reread the rules"
+
 // errNoReread stands for a rules file the daemon fails to reread.
 var errNoReread = errors.New("the rules cannot be reread")
 
@@ -49,7 +53,7 @@ func startRulesDaemonWith(t *testing.T, log *slog.Logger, failReread bool, prepa
 		if err != nil {
 			t.Fatal(err)
 		}
-		reload := func() (daemon.Policy, string, error) {
+		reread := func() (daemon.Policy, string, error) {
 			if failReread {
 				return nil, "", errNoReread
 			}
@@ -59,7 +63,7 @@ func startRulesDaemonWith(t *testing.T, log *slog.Logger, failReread bool, prepa
 			}
 			return p, p.Digest(), nil
 		}
-		return p, append([]daemon.Option{daemon.WithReload(p.Digest(), reload)}, opts...)
+		return p, append([]daemon.Option{daemon.WithReread(p.Digest(), reread)}, opts...)
 	})
 }
 
@@ -102,7 +106,7 @@ func TestAddRuleForACommandNoRuleMatches(t *testing.T) {
 	if !strings.Contains(block, diff) {
 		t.Fatalf("the block %q lacks the diff %q", block, diff)
 	}
-	s.waitFor(t, "rule added; the daemon reloaded the rules · request 1 runs under it\n")
+	s.waitFor(t, ruleAddedText+" · request 1 runs under it\n")
 	got := awaitResult(t, ch)
 	if want := (result{stderr: "hostrun: waiting for approval on the host: no rule allows \"touch -a\"\nhostrun: approved on the host: rule added\n"}); got != want {
 		t.Fatalf("got %+v, want %+v", got, want)
@@ -135,7 +139,7 @@ func TestAddRuleArmGetsTheRereadDigest(t *testing.T) {
 	s := h.startSession(t)
 	ch := h.ask(t, "touch", "marker")
 	s.addRule(t)
-	s.waitFor(t, "rule added; the daemon reloaded the rules · request 1 runs under it\n")
+	s.waitFor(t, ruleAddedText+" · request 1 runs under it\n")
 	awaitResult(t, ch)
 	reread, err := rules.Load(h.rulesFile)
 	if err != nil {
@@ -252,7 +256,7 @@ func TestAddRuleProposesTheNarrowestRule(t *testing.T) {
 			argv := strings.Fields(tt.argv)
 			ch := h.ask(t, argv...)
 			s.addRule(t)
-			s.waitFor(t, "rule added; the daemon reloaded the rules")
+			s.waitFor(t, ruleAddedText)
 			if got := awaitResult(t, ch); got.code != 0 {
 				t.Fatalf("got %+v, want the approved command to run", got)
 			}
@@ -314,7 +318,7 @@ func TestAddRuleEditedInTheEditor(t *testing.T) {
 	s.answer(t, "w")
 	s.waitFor(t, "[e]dit again [c]ancel ? ")
 	s.answer(t, "e")
-	s.waitFor(t, "rule added; the daemon reloaded the rules")
+	s.waitFor(t, ruleAddedText)
 	if got := awaitResult(t, ch); got.code != 0 {
 		t.Fatalf("got %+v, want the approved command to run", got)
 	}
@@ -357,7 +361,7 @@ func TestAddRuleCreatesAMissingRulesFile(t *testing.T) {
 	if !strings.Contains(block, "+rules:\n+  - command: touch\n") {
 		t.Fatalf("the block %q does not create the file", block)
 	}
-	s.waitFor(t, "rule added; the daemon reloaded the rules")
+	s.waitFor(t, ruleAddedText)
 	if got := awaitResult(t, ch); got.code != 0 {
 		t.Fatalf("got %+v, want the approved command to run", got)
 	}
@@ -400,7 +404,7 @@ func TestAddRuleThatStillRefusesRunsOnce(t *testing.T) {
 	s.answer(t, "a")
 	s.waitFor(t, addPromptText)
 	s.answer(t, "e")
-	s.waitFor(t, "rule added; the daemon reloaded the rules · request 1 runs once: fixed directory /nonexistent-hostrunner-dir does not exist\n")
+	s.waitFor(t, ruleAddedText+" · request 1 runs once: fixed directory /nonexistent-hostrunner-dir does not exist\n")
 	got := awaitResult(t, ch)
 	if !strings.HasSuffix(got.stderr, "hostrun: approved on the host: this request only\n") || got.code != 0 {
 		t.Fatalf("got %+v, want it approved once", got)
@@ -534,7 +538,7 @@ func TestAddRuleRereadsAFileChangedSinceLoaded(t *testing.T) {
 	waitForLog(t, &log, `msg="hand-edited rules reread"`)
 	waitForLog(t, &log, `msg="rules reread"`)
 	s.answer(t, "w")
-	s.waitFor(t, "rule added; the daemon reloaded the rules · request 1 runs under it\n")
+	s.waitFor(t, ruleAddedText+" · request 1 runs under it\n")
 	if got := awaitResult(t, ch); got.code != 0 {
 		t.Fatalf("got %+v, want it to run under the rule", got)
 	}
@@ -630,7 +634,7 @@ func TestAddRuleKeepsStandingApprovals(t *testing.T) {
 	h.grantStanding(t, s, false, "touch", "-a", "one")
 	ch := h.ask(t, "touch", "-m", "two")
 	s.addRule(t)
-	s.waitFor(t, "rule added; the daemon reloaded the rules")
+	s.waitFor(t, ruleAddedText)
 	awaitResult(t, ch)
 	if got := h.run(t, containerRoot, "", "touch", "-a", "one"); got != (result{}) {
 		t.Fatalf("got %+v, want the standing approval to let it through", got)
@@ -643,7 +647,7 @@ func TestAddRuleKeepsCRLFLineEndings(t *testing.T) {
 	s := h.startSession(t)
 	ch := h.ask(t, "touch", "-a", "marker")
 	s.addRule(t)
-	s.waitFor(t, "rule added; the daemon reloaded the rules")
+	s.waitFor(t, ruleAddedText)
 	awaitResult(t, ch)
 	want := "rules:\r\n  - command: echo\r\n    args: any\r\n  - command: touch\r\n    flags:\r\n      allow: [-a]\r\n    positional:\r\n      allow: [marker]\r\n"
 	if file := readFile(t, h.rulesFile); file != want {
@@ -667,7 +671,7 @@ func TestAddRuleWritesThroughASymbolicLink(t *testing.T) {
 	s := h.startSession(t)
 	ch := h.ask(t, "touch", "-a", "marker")
 	s.addRule(t)
-	s.waitFor(t, "rule added; the daemon reloaded the rules")
+	s.waitFor(t, ruleAddedText)
 	awaitResult(t, ch)
 	if fi, err := os.Lstat(h.rulesFile); err != nil || fi.Mode()&os.ModeSymlink == 0 {
 		t.Fatalf("the rules file is no longer a symbolic link: %v", err)
@@ -770,7 +774,7 @@ func TestAddRuleKeepsTheModeThroughALinkSwappedInItsDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.answer(t, "w")
-	s.waitFor(t, "rule added; the daemon reloaded the rules · request 1 runs under it\n")
+	s.waitFor(t, ruleAddedText+" · request 1 runs under it\n")
 	awaitResult(t, ch)
 	fi, err := os.Lstat(h.rulesFile)
 	if err != nil {
