@@ -234,6 +234,9 @@ func TestOpenDoesNotBlockOnFIFO(t *testing.T) {
 }
 
 func TestOpenReportsInaccessibleDirectoryAsSuch(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores permission bits")
+	}
 	root, _ := newHostWorkspace(t)
 	locked := filepath.Join(root, "locked")
 	if err := os.Mkdir(locked, 0o000); err != nil {
