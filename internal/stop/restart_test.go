@@ -209,7 +209,7 @@ const validRules = "rules:\n  - command: echo\n    args: any\n"
 // itself, as `serve` without --no-reread does, though not before the
 // test is over.
 var rereading = []daemon.Option{
-	daemon.WithReload("", func() (daemon.Policy, string, error) { return nil, "", errors.New("not reread in this test") }),
+	daemon.WithReread("", func() (daemon.Policy, string, error) { return nil, "", errors.New("not reread in this test") }),
 	daemon.WithRereadEvery(time.Hour),
 }
 
