@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"log/slog"
 	"maps"
@@ -330,10 +331,72 @@ func TestServeGivenEverySettingReadsNoOtherSource(t *testing.T) {
 		t.Errorf("read %s", name)
 		return ""
 	}
-	flags := []string{"--settings", settingsFile(t, "grase: [\n"), "--startup-timeout", "1h", "--grace", "1m", "--reread"}
+	flags := []string{"--settings", settingsFile(t, "grase: [\n"), "--workspace-settings", settingsFile(t, "grase: [\n"), "--startup-timeout", "1h", "--grace", "1m", "--reread"}
 	got, err := resolveServe(flags, getenv)
 	if want := (settings.Settings{StartupTimeout: time.Hour, Grace: time.Minute, Reread: true}); err != nil || got != want {
 		t.Fatalf("got %+v, %v; want %+v", got, err, want)
+	}
+}
+
+// up and serve read the workspace's section of the host settings file
+// and the workspace settings file: .devcontainer/hostrunner.yaml in the
+// workspace, or the one --workspace-settings (relative to the current
+// directory) or HOSTRUNNER_WORKSPACE_SETTINGS (relative to the workspace)
+// names, which must exist. Each is over the one before it and under the
+// variables.
+func TestUpAndServeReadTheWorkspaceSettings(t *testing.T) {
+	ws := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(ws, ".devcontainer"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for name, content := range map[string]string{".devcontainer/hostrunner.yaml": "grace: 3m\n", "var.yaml": "grace: 5m\n", "refused.yaml": "stop_timeout: 1m\n"} {
+		if err := os.WriteFile(filepath.Join(ws, name), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cwd := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cwd, "flag.yaml"), []byte("grace: 4m\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(cwd)
+	host := settingsFile(t, fmt.Sprintf("grace: 1m\nworkspaces:\n  %q:\n    grace: 2m\n", ws))
+	sectionOnly := settingsFile(t, fmt.Sprintf("grace: 1m\nworkspaces:\n  %q:\n    grace: 2m\n", filepath.Join(ws, ".devcontainer")))
+	tests := []struct {
+		name  string
+		flags []string
+		vars  map[string]string
+		want  time.Duration
+	}{
+		{"default workspace file over the section", nil, map[string]string{"HOSTRUNNER_SETTINGS": host}, 3 * time.Minute},
+		{"another workspace's section", []string{"--workspace-settings", filepath.Join(ws, "empty.yaml")}, map[string]string{"HOSTRUNNER_SETTINGS": sectionOnly}, time.Minute},
+		{"--workspace-settings", []string{"--workspace-settings", "flag.yaml"}, map[string]string{"HOSTRUNNER_SETTINGS": host}, 4 * time.Minute},
+		{"HOSTRUNNER_WORKSPACE_SETTINGS", nil, map[string]string{"HOSTRUNNER_SETTINGS": host, "HOSTRUNNER_WORKSPACE_SETTINGS": "var.yaml"}, 5 * time.Minute},
+		{"variable over the workspace file", nil, map[string]string{"HOSTRUNNER_SETTINGS": host, "HOSTRUNNER_GRACE": "6m"}, 6 * time.Minute},
+	}
+	if err := os.WriteFile(filepath.Join(ws, "empty.yaml"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for name, resolve := range commands {
+		for _, tt := range tests {
+			// A later --workspace replaces the /w resolve gives.
+			got, err := resolve(append([]string{"--workspace", ws}, tt.flags...), envOf(tt.vars))
+			if err != nil || got.Grace != tt.want {
+				t.Errorf("%s, %s: got grace %v, %v; want %v", name, tt.name, got.Grace, err, tt.want)
+			}
+		}
+		without := t.TempDir()
+		if got, err := resolve([]string{"--workspace", without, "--settings", host}, noEnv); err != nil || got.Grace != time.Minute {
+			t.Errorf("%s, no workspace settings file: got grace %v, %v; want 1m", name, got.Grace, err)
+		}
+		missing := filepath.Join(without, "missing.yaml")
+		for _, args := range [][]string{{"--workspace-settings", missing}, {"--workspace-settings", filepath.Join(ws, "refused.yaml")}} {
+			if _, err := resolve(append([]string{"--workspace", ws}, args...), noEnv); err == nil || !strings.Contains(err.Error(), args[1]) {
+				t.Errorf("%s, %q: got %v, want an error naming %s", name, args, err, args[1])
+			}
+		}
+		if _, err := resolve([]string{"--workspace", without}, envOf(map[string]string{"HOSTRUNNER_WORKSPACE_SETTINGS": "missing.yaml"})); err == nil || !strings.Contains(err.Error(), missing) {
+			t.Errorf("%s, missing HOSTRUNNER_WORKSPACE_SETTINGS file: got %v, want an error naming %s", name, err, missing)
+		}
 	}
 }
 
@@ -363,7 +426,7 @@ func TestUpGivenEverySettingStillReadsEverySource(t *testing.T) {
 // The usages name the settings' flags.
 func TestUsagesNameTheSettingsFlags(t *testing.T) {
 	for name, u := range map[string]string{"up": upUsage, "serve": serveUsage} {
-		for _, f := range []string{"[--settings <path>]", "[--startup-timeout <duration>]", "[--grace <duration>]", "[--reread | --no-reread]"} {
+		for _, f := range []string{"[--settings <path>]", "[--workspace-settings <path>]", "[--startup-timeout <duration>]", "[--grace <duration>]", "[--reread | --no-reread]"} {
 			if !strings.Contains(u, f) {
 				t.Errorf("%s usage %q lacks %s", name, u, f)
 			}

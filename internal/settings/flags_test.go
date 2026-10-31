@@ -28,7 +28,7 @@ func TestFlagsSetOnlyTheKeysGiven(t *testing.T) {
 		{[]string{"--grace", "15s", "--startup-timeout", "30m", "--reread"}, defaults},
 	}
 	for _, tt := range tests {
-		got, err := parse(t, append(tt.args, "--settings", file)...).Resolve(env(nil))
+		got, err := parse(t, append(tt.args, "--settings", file)...).Resolve(env(nil), noWorkspace)
 		if err != nil || got != tt.want {
 			t.Errorf("%q: got %+v, %v; want %+v", tt.args, got, err, tt.want)
 		}
@@ -36,7 +36,7 @@ func TestFlagsSetOnlyTheKeysGiven(t *testing.T) {
 }
 
 func TestNoRereadOverTheDefault(t *testing.T) {
-	got, err := parse(t, "--no-reread").Resolve(env(nil))
+	got, err := parse(t, "--no-reread").Resolve(env(nil), noWorkspace)
 	if err != nil || got.Reread {
 		t.Fatalf("got %+v, %v; want no rereading", got, err)
 	}
@@ -44,7 +44,7 @@ func TestNoRereadOverTheDefault(t *testing.T) {
 
 func TestFlagsRejectNonPositiveDurations(t *testing.T) {
 	for _, args := range [][]string{{"--grace", "0s"}, {"--startup-timeout", "-1m"}} {
-		_, err := parse(t, args...).Resolve(env(nil))
+		_, err := parse(t, args...).Resolve(env(nil), noWorkspace)
 		if want := args[0] + ": must be positive"; err == nil || err.Error() != want {
 			t.Errorf("%q: got %v, want %q", args, err, want)
 		}
@@ -55,7 +55,7 @@ func TestFlagsRejectNonPositiveDurations(t *testing.T) {
 }
 
 func TestFlagsRejectRereadWithNoReread(t *testing.T) {
-	_, err := parse(t, "--reread", "--no-reread").ResolveAsGiven(env(nil))
+	_, err := parse(t, "--reread", "--no-reread").ResolveAsGiven(env(nil), noWorkspace)
 	if err == nil || !strings.Contains(err.Error(), "--reread and --no-reread exclude each other") {
 		t.Fatalf("got %v, want the conflict named", err)
 	}

@@ -17,6 +17,10 @@ import (
 // defaults are the built-in settings.
 var defaults = settings.Settings{StartupTimeout: 30 * time.Minute, Grace: 15 * time.Second, Reread: true}
 
+// noWorkspace is a workspace where nothing lies: it has no workspace
+// settings file and no section of a host settings file names it.
+const noWorkspace = "/nonexistent/workspace"
+
 // env is a getenv over vars; every other variable is empty.
 func env(vars map[string]string) func(string) string {
 	return func(name string) string { return vars[name] }
@@ -48,7 +52,7 @@ func parse(t *testing.T, args ...string) *settings.Flags {
 }
 
 func TestResolveGivesTheDefaultsWhenNoSourceSetsAKey(t *testing.T) {
-	got, err := parse(t).Resolve(env(nil))
+	got, err := parse(t).Resolve(env(nil), noWorkspace)
 	if err != nil || got != defaults {
 		t.Fatalf("got %+v, %v; want %+v", got, err, defaults)
 	}
@@ -77,7 +81,7 @@ func TestResolveTakesEachKeyFromTheHighestSourceSettingIt(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			vars := map[string]string{"HOSTRUNNER_SETTINGS": writeFile(t, tt.file)}
 			maps.Copy(vars, tt.vars)
-			got, err := parse(t, tt.flags...).Resolve(env(vars))
+			got, err := parse(t, tt.flags...).Resolve(env(vars), noWorkspace)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -93,7 +97,7 @@ func TestResolveReadsEveryVariable(t *testing.T) {
 		"HOSTRUNNER_STARTUP_TIMEOUT": "45m",
 		"HOSTRUNNER_GRACE":           "1m30s",
 		"HOSTRUNNER_REREAD":          "0",
-	}))
+	}), noWorkspace)
 	want := settings.Settings{StartupTimeout: 45 * time.Minute, Grace: 90 * time.Second, Reread: false}
 	if err != nil || got != want {
 		t.Fatalf("got %+v, %v; want %+v", got, err, want)
@@ -101,7 +105,7 @@ func TestResolveReadsEveryVariable(t *testing.T) {
 }
 
 func TestResolveTreatsAnEmptyVariableAsUnset(t *testing.T) {
-	got, err := parse(t).Resolve(env(map[string]string{"HOSTRUNNER_GRACE": "", "HOSTRUNNER_REREAD": ""}))
+	got, err := parse(t).Resolve(env(map[string]string{"HOSTRUNNER_GRACE": "", "HOSTRUNNER_REREAD": ""}), noWorkspace)
 	if err != nil || got != defaults {
 		t.Fatalf("got %+v, %v; want the defaults", got, err)
 	}
@@ -119,7 +123,7 @@ func TestResolveRejectsAnInvalidVariable(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := parse(t).Resolve(env(map[string]string{tt.variable: tt.value}))
+			_, err := parse(t).Resolve(env(map[string]string{tt.variable: tt.value}), noWorkspace)
 			if err == nil || !strings.HasPrefix(err.Error(), tt.want) {
 				t.Fatalf("got %v, want an error starting with %q", err, tt.want)
 			}
@@ -148,7 +152,7 @@ func TestResolveReadsEverySourceWhenFlagsSetEveryKey(t *testing.T) {
 		{"invalid variable", nil, map[string]string{"HOSTRUNNER_GRACE": "abc"}, "HOSTRUNNER_GRACE"},
 	}
 	for _, tt := range tests {
-		_, err := parse(t, append(everyKey, tt.flags...)...).Resolve(env(tt.vars))
+		_, err := parse(t, append(everyKey, tt.flags...)...).Resolve(env(tt.vars), noWorkspace)
 		if err == nil || !strings.Contains(err.Error(), tt.want) {
 			t.Errorf("%s: got %v, want an error containing %q", tt.name, err, tt.want)
 		}
@@ -162,7 +166,7 @@ func TestResolveAsGivenReadsNoOtherSourceWhenFlagsSetEveryKey(t *testing.T) {
 		t.Errorf("read %s", name)
 		return ""
 	}
-	got, err := parse(t, append(everyKey, "--settings", writeFile(t, "grase: [\n"))...).ResolveAsGiven(getenv)
+	got, err := parse(t, append(everyKey, "--settings", writeFile(t, "grase: [\n"))...).ResolveAsGiven(getenv, noWorkspace)
 	want := settings.Settings{StartupTimeout: time.Hour, Grace: time.Minute, Reread: false}
 	if err != nil || got != want {
 		t.Fatalf("got %+v, %v; want %+v", got, err, want)
@@ -172,18 +176,18 @@ func TestResolveAsGivenReadsNoOtherSourceWhenFlagsSetEveryKey(t *testing.T) {
 // With a key no flag sets, ResolveAsGiven resolves like Resolve.
 func TestResolveAsGivenReadsEverySourceWhenAFlagIsMissing(t *testing.T) {
 	path := writeFile(t, "grace: 2m\n")
-	got, err := parse(t, "--startup-timeout", "1h", "--reread").ResolveAsGiven(env(map[string]string{"HOSTRUNNER_SETTINGS": path}))
+	got, err := parse(t, "--startup-timeout", "1h", "--reread").ResolveAsGiven(env(map[string]string{"HOSTRUNNER_SETTINGS": path}), noWorkspace)
 	want := settings.Settings{StartupTimeout: time.Hour, Grace: 2 * time.Minute, Reread: true}
 	if err != nil || got != want {
 		t.Fatalf("got %+v, %v; want %+v", got, err, want)
 	}
-	if _, err := parse(t, "--grace", "1m").ResolveAsGiven(env(map[string]string{"HOSTRUNNER_GRACE": "abc"})); err == nil {
+	if _, err := parse(t, "--grace", "1m").ResolveAsGiven(env(map[string]string{"HOSTRUNNER_GRACE": "abc"}), noWorkspace); err == nil {
 		t.Fatal("got no error for an invalid variable")
 	}
 }
 
 func TestUsageNamesEveryFlag(t *testing.T) {
-	want := "[--settings <path>] [--startup-timeout <duration>] [--grace <duration>] [--reread | --no-reread]"
+	want := "[--settings <path>] [--workspace-settings <path>] [--startup-timeout <duration>] [--grace <duration>] [--reread | --no-reread]"
 	if got := settings.Usage(); got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}

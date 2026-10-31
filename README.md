@@ -196,26 +196,56 @@ Besides its rules, a daemon has settings:
 | `grace` | `HOSTRUNNER_GRACE` | `--grace` | `15s` | how long its container may be gone before it exits |
 | `reread` | `HOSTRUNNER_REREAD` | `--reread`, `--no-reread` | `true` | whether it rereads the rules file by itself once it changes |
 
-Each comes from the first that gives it: the flag, the variable (an
-empty one is unset), the host settings file, the default. The host
-settings file is `$XDG_CONFIG_HOME/hostrunner/settings.yaml`
+Each comes from the first that gives it:
+
+1. the flag;
+2. the variable (an empty one is unset);
+3. the workspace settings file;
+4. the workspace's section of the host settings file;
+5. the common part of the host settings file;
+6. the default.
+
+The host settings file is `$XDG_CONFIG_HOME/hostrunner/settings.yaml`
 (`~/.config/hostrunner/settings.yaml` when `XDG_CONFIG_HOME` is empty),
-or the file `--settings` or else `HOSTRUNNER_SETTINGS` names; the
-default file may be missing, a named one may not. It holds the keys at
-the top level:
+or the file `--settings` or else `HOSTRUNNER_SETTINGS` names (either
+relative to the current directory); the default file may be missing, a named one may not. It holds the keys at
+the top level, its common part, and under `workspaces` a section per
+workspace host path with keys for that workspace alone:
 
 ```yaml
 startup_timeout: 1h
 grace: 1m30s
 reread: false
+workspaces:
+  ~/src/app:
+    grace: 5m
+  /home/u/other:
+    reread: true
 ```
+
+A section applies to the workspace whose `--workspace` path is its path
+after `~` expansion and symlink resolution, and to no other (not to a
+directory inside it). Its path must be absolute after `~` expansion; one
+that does not exist matches nothing; two paths of the same workspace are
+an error.
+
+The workspace settings file is `.devcontainer/hostrunner.yaml` in the
+workspace, or the file `--workspace-settings` (relative to the current
+directory) or else `HOSTRUNNER_WORKSPACE_SETTINGS` (relative to the
+workspace) names; the default file may be missing, a named one may not.
+It holds the keys at the top level, with no `workspaces`, and wins over
+the host settings file. `runtime_root` and `stop_timeout` are allowed
+only in the common part of the host settings file: in the workspace
+settings file or a section they are an error.
 
 A duration is written with a unit (`90s`, `1m30s`, `2h`) and must be
 above zero; a bool is `true` or `false` (`1`, `0` and the like in a
 variable). An unknown key or an invalid value fails `hostrunner up`,
 and with it `devcontainer up`, naming the source and the key
 (`settings file /home/u/.config/hostrunner/settings.yaml: grase: unknown
-key`, `HOSTRUNNER_GRACE: invalid duration "abc"`). `up` resolves the
+key`, `settings file /home/u/.config/hostrunner/settings.yaml:
+workspaces./home/u/other: grase: unknown key`, `HOSTRUNNER_GRACE:
+invalid duration "abc"`). `up` resolves the
 settings and starts the daemon with every one as a flag, so its command
 line shows them; `hostrunner serve` started by hand resolves them the
 same way. `--reread` and `--no-reread` exclude each other.

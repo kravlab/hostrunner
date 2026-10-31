@@ -35,13 +35,15 @@
 // AGENTS.md by default (see internal/instructions).
 //
 // The settings of `up` and `serve` are [--settings <path>]
-// [--startup-timeout <duration>] [--grace <duration>]
-// [--reread | --no-reread]; a setting no flag gives comes from its
-// HOSTRUNNER_* variable, the host settings file
+// [--workspace-settings <path>] [--startup-timeout <duration>]
+// [--grace <duration>] [--reread | --no-reread]; a setting no flag gives
+// comes from its HOSTRUNNER_* variable, the workspace settings file
+// (<workspace>/.devcontainer/hostrunner.yaml unless --workspace-settings
+// or HOSTRUNNER_WORKSPACE_SETTINGS names another), the host settings file
 // ($XDG_CONFIG_HOME/hostrunner/settings.yaml unless --settings or
-// HOSTRUNNER_SETTINGS names another) or the default (see
-// internal/settings). `up` resolves them and starts the daemon with every
-// one as a flag.
+// HOSTRUNNER_SETTINGS names another; its section for the workspace, then
+// its common part) or the default (see internal/settings). `up` resolves
+// them and starts the daemon with every one as a flag.
 package main
 
 import (
@@ -294,7 +296,7 @@ func parseUp(args []string, exe string, getenv func(string) string, output io.Wr
 	if err != nil {
 		return upConfig{}, err
 	}
-	s, err := sf.Resolve(getenv)
+	s, err := sf.Resolve(getenv, ws.workspace)
 	if _, ok := errors.AsType[*settings.FlagError](err); ok {
 		return upConfig{}, fmt.Errorf("%w; %s", err, upUsage)
 	}
@@ -447,7 +449,7 @@ func parseServe(args []string, getenv func(string) string, output io.Writer) (se
 	if cfg.socket == "" || cfg.workspace == "" || cfg.containerWorkspace == "" {
 		return cfg, errors.New(serveUsage)
 	}
-	s, err := sf.ResolveAsGiven(getenv)
+	s, err := sf.ResolveAsGiven(getenv, cfg.workspace)
 	if _, ok := errors.AsType[*settings.FlagError](err); ok {
 		return cfg, fmt.Errorf("%w; %s", err, serveUsage)
 	}

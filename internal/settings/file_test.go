@@ -42,7 +42,7 @@ func TestHostFileIsNamedByFlagThenVariableThenXDGThenHome(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := parse(t, tt.flags...).Resolve(env(tt.vars))
+			got, err := parse(t, tt.flags...).Resolve(env(tt.vars), noWorkspace)
 			if err != nil || got.Grace != tt.want {
 				t.Fatalf("got grace %v, %v; want %v", got.Grace, err, tt.want)
 			}
@@ -58,7 +58,7 @@ func TestNoDefaultHostFileWithoutXDGOrHome(t *testing.T) {
 	writeHostFile(t, dir, "3m")
 	writeHostFile(t, filepath.Join(dir, ".config"), "4m")
 	t.Chdir(dir)
-	got, err := parse(t).Resolve(env(nil))
+	got, err := parse(t).Resolve(env(nil), noWorkspace)
 	if err != nil || got != defaults {
 		t.Fatalf("got %+v, %v; want the defaults", got, err)
 	}
@@ -73,7 +73,7 @@ func TestResolveFailsOnAMissingNamedHostFile(t *testing.T) {
 		"--settings":          {[]string{"--settings", missing}, nil},
 		"HOSTRUNNER_SETTINGS": {nil, map[string]string{"HOSTRUNNER_SETTINGS": missing}},
 	} {
-		if _, err := parse(t, tt.flags...).Resolve(env(tt.vars)); err == nil || !strings.Contains(err.Error(), missing) {
+		if _, err := parse(t, tt.flags...).Resolve(env(tt.vars), noWorkspace); err == nil || !strings.Contains(err.Error(), missing) {
 			t.Errorf("%s: got %v, want an error naming %s", name, err, missing)
 		}
 	}
@@ -81,7 +81,7 @@ func TestResolveFailsOnAMissingNamedHostFile(t *testing.T) {
 
 func TestHostFileSetsEveryKey(t *testing.T) {
 	path := writeFile(t, "# the host's settings\nstartup_timeout: 1h\ngrace: 1m30s\nreread: false\n")
-	got, err := parse(t, "--settings", path).Resolve(env(nil))
+	got, err := parse(t, "--settings", path).Resolve(env(nil), noWorkspace)
 	want := settings.Settings{StartupTimeout: time.Hour, Grace: 90 * time.Second, Reread: false}
 	if err != nil || got != want {
 		t.Fatalf("got %+v, %v; want %+v", got, err, want)
@@ -90,7 +90,7 @@ func TestHostFileSetsEveryKey(t *testing.T) {
 
 func TestHostFileWithoutSettingsSetsNothing(t *testing.T) {
 	for _, content := range []string{"", "# nothing set\n"} {
-		got, err := parse(t, "--settings", writeFile(t, content)).Resolve(env(nil))
+		got, err := parse(t, "--settings", writeFile(t, content)).Resolve(env(nil), noWorkspace)
 		if err != nil || got != defaults {
 			t.Errorf("%q: got %+v, %v; want the defaults", content, got, err)
 		}
@@ -117,7 +117,7 @@ func TestHostFileRejectsWhatItCannotApply(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			path := writeFile(t, tt.content)
-			_, err := parse(t, "--settings", path).Resolve(env(nil))
+			_, err := parse(t, "--settings", path).Resolve(env(nil), noWorkspace)
 			if err == nil {
 				t.Fatal("got no error")
 			}

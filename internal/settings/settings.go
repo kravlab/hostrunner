@@ -1,12 +1,13 @@
 // Package settings resolves what tunes a daemon besides its rules: its
 // timeouts and whether it rereads its rules file.
 //
-// Each key comes from the highest source that sets it: the command's
-// flags (Flags), the HOSTRUNNER_* variables, the host settings file (its
-// common, top-level part), then the built-in default. Every source is
-// read into a layer, a partial set of values, and resolve stacks the
-// layers; a new source is one more layer, a new key one more entry of
-// keys and one more field of Settings. An unknown key or an invalid value
+// Each key comes from the highest source that sets it (ADR 0008): the
+// command's flags (Flags), the HOSTRUNNER_* variables, the workspace
+// settings file, the workspace's section of the host settings file, the
+// host settings file's common, top-level part, then the built-in
+// default. Every source is read into a layer, a partial set of values,
+// and resolve stacks the layers; a new source is one more layer, a new
+// key one more entry of keys and one more field of Settings. An unknown key or an invalid value
 // in any source is an error naming the source and the key: a daemon must
 // not start with settings nobody chose.
 package settings
@@ -72,6 +73,13 @@ var keys = []key{
 	{"reread", boolean, "reread the rules file by itself once it changes", func(s *Settings) any { return &s.Reread }},
 }
 
+// commonOnly are the keys only the common part of the host settings file
+// may set: `stop`, `restart` and `approve` read them before they know a
+// workspace (ADR 0008), so the workspace settings file and a workspace
+// section refuse them. Neither is a key yet: the common part rejects them
+// as unknown.
+var commonOnly = []string{"runtime_root", "stop_timeout"}
+
 // variable is the environment variable that sets k: HOSTRUNNER_GRACE.
 func (k key) variable() string { return "HOSTRUNNER_" + strings.ToUpper(k.name) }
 
@@ -89,10 +97,10 @@ func lookup(name string) (key, bool) {
 }
 
 // Usage is the usage of the settings' flags, as a command's usage line
-// shows them: [--settings <path>] [--grace <duration>] [--reread |
-// --no-reread] and so on, one per key.
+// shows them: [--settings <path>] [--workspace-settings <path>] [--grace
+// <duration>] [--reread | --no-reread] and so on, one per key.
 func Usage() string {
-	parts := []string{"[--settings <path>]"}
+	parts := []string{"[--settings <path>]", "[--workspace-settings <path>]"}
 	for _, k := range keys {
 		if k.kind == boolean {
 			parts = append(parts, fmt.Sprintf("[--%s | --no-%[1]s]", k.flagName()))
@@ -143,12 +151,17 @@ func apply(s *Settings, l layer) {
 	}
 }
 
-// resolve returns the settings with each key taken from the highest
-// source that sets it: flags, the HOSTRUNNER_* variables getenv reads,
-// the host settings file (see hostFile; named is the --settings flag,
-// empty when not given), then the defaults.
-func resolve(flags layer, named string, getenv func(string) string) (Settings, error) {
-	file, err := readHostFile(named, getenv)
+// resolve returns the settings of the workspace at the host path
+// workspace, each key taken from the highest source that sets it, in the
+// order of the package doc; getenv reads the variables, workspaceNamed
+// is the --workspace-settings flag (see workspaceFile) and hostNamed the
+// --settings flag (see hostFile), each empty when not given.
+func resolve(flags layer, hostNamed, workspaceNamed, workspace string, getenv func(string) string) (Settings, error) {
+	common, section, err := readHostFile(hostNamed, workspace, getenv)
+	if err != nil {
+		return Settings{}, err
+	}
+	wsFile, err := readWorkspaceFile(workspaceNamed, workspace, getenv)
 	if err != nil {
 		return Settings{}, err
 	}
@@ -157,9 +170,9 @@ func resolve(flags layer, named string, getenv func(string) string) (Settings, e
 		return Settings{}, err
 	}
 	s := defaults()
-	apply(&s, file)
-	apply(&s, vars)
-	apply(&s, flags)
+	for _, l := range []layer{common, section, wsFile, vars, flags} {
+		apply(&s, l)
+	}
 	return s, nil
 }
 

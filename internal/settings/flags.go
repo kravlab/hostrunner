@@ -9,14 +9,16 @@ import (
 )
 
 // Flags are the flags of the settings on one command line: --settings,
-// one per key (--startup-timeout, --grace) and, for reread, both
-// --reread and --no-reread. Register them, parse, then resolve.
+// --workspace-settings, one per key (--startup-timeout, --grace) and,
+// for reread, both --reread and --no-reread. Register them, parse, then
+// resolve.
 type Flags struct {
-	fs        *flag.FlagSet
-	file      string
-	durations map[string]*time.Duration
-	reread    bool
-	noReread  bool
+	fs            *flag.FlagSet
+	file          string
+	workspaceFile string
+	durations     map[string]*time.Duration
+	reread        bool
+	noReread      bool
 }
 
 // FlagError is a settings flag given a value no setting can take
@@ -37,6 +39,7 @@ func (f *Flags) Register(fs *flag.FlagSet) {
 	f.durations = map[string]*time.Duration{}
 	defaults := defaults()
 	fs.StringVar(&f.file, "settings", "", "host settings file (default $XDG_CONFIG_HOME/hostrunner/settings.yaml)")
+	fs.StringVar(&f.workspaceFile, "workspace-settings", "", "workspace settings file (default <workspace>/.devcontainer/hostrunner.yaml)")
 	for _, k := range keys {
 		switch p := k.field(&defaults).(type) {
 		case *time.Duration:
@@ -48,31 +51,35 @@ func (f *Flags) Register(fs *flag.FlagSet) {
 	}
 }
 
-// Resolve returns the settings of the parsed command line, each key
-// taken from the highest source that sets it: its flag, its HOSTRUNNER_*
-// variable getenv reads, the host settings file (--settings, else
-// $HOSTRUNNER_SETTINGS, else $XDG_CONFIG_HOME/hostrunner/settings.yaml or
+// Resolve returns the settings of the parsed command line for the
+// workspace at the host path workspace, each key taken from the highest
+// source that sets it: its flag, its HOSTRUNNER_* variable getenv reads,
+// the workspace settings file (--workspace-settings, else
+// $HOSTRUNNER_WORKSPACE_SETTINGS, else .devcontainer/hostrunner.yaml in
+// the workspace), the workspace's section of the host settings file, its
+// common part (--settings, else $HOSTRUNNER_SETTINGS, else
+// $XDG_CONFIG_HOME/hostrunner/settings.yaml or
 // $HOME/.config/hostrunner/settings.yaml), then the default. Every source
 // is read, even when the flags set every key. A flag that cannot be
 // applied is a *FlagError.
-func (f *Flags) Resolve(getenv func(string) string) (Settings, error) {
+func (f *Flags) Resolve(getenv func(string) string, workspace string) (Settings, error) {
 	flags, err := f.layer()
 	if err != nil {
 		return Settings{}, err
 	}
-	return resolve(flags, f.file, getenv)
+	return resolve(flags, f.file, f.workspaceFile, workspace, getenv)
 }
 
 // ResolveAsGiven is Resolve, except that when the flags set every key
 // neither the variables nor any file is read: a daemon its `up` started
 // with every setting as a flag runs with them as given.
-func (f *Flags) ResolveAsGiven(getenv func(string) string) (Settings, error) {
+func (f *Flags) ResolveAsGiven(getenv func(string) string, workspace string) (Settings, error) {
 	flags, err := f.layer()
 	if err != nil {
 		return Settings{}, err
 	}
 	if len(flags) < len(keys) {
-		return resolve(flags, f.file, getenv)
+		return resolve(flags, f.file, f.workspaceFile, workspace, getenv)
 	}
 	s := defaults()
 	apply(&s, flags)
