@@ -169,6 +169,21 @@ directory in use; `hostrunner update` switches it with one
 rename.
 _Avoid_: current (in code and specs that is the running version)
 
+### Settings
+
+**Settings**:
+What tunes a daemon besides its rules: its timeouts, whether it
+rereads, where its rules file and runtime directories are.
+_Avoid_: config (`--config` names the rules file)
+
+**Host settings file**:
+The settings file a human keeps on the host, outside every
+workspace, with sections that apply to single workspaces.
+
+**Workspace settings file**:
+The settings file of one workspace, kept in the workspace unless
+its path is given; what it sets overrides the host settings file.
+
 ### Approvals
 
 **Approval request**:
