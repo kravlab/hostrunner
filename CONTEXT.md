@@ -103,7 +103,9 @@ lives as long as its armed container.
 
 **Arm**:
 The signal `hostrunner up` gives the daemon each time the
-devcontainer tooling brings a container of its workspace up.
+devcontainer tooling brings a container of its workspace up,
+carrying the digest of the rules and the daemon settings it
+resolved.
 _Avoid_: rearm
 
 **Armed container**:
@@ -150,10 +152,23 @@ takes no new requests and finishes the running ones.
 How long a waiting daemon waits for its armed container
 before it exits.
 
+**Ready timeout**:
+How long `hostrunner up` waits for the daemon it starts to
+listen; it tunes `up`, not the daemon.
+
+**Stop timeout**:
+How long a stop or restart waits for a daemon it stopped,
+past any drain, to close its sockets; it tunes the stop, not
+the daemon.
+
 **Runtime directory**:
 The host directory, one per devcontainer, that holds a
 daemon's socket, the hostrun client and the daemon log, and
 that the container mounts read-only.
+
+**Runtime root**:
+The host directory the runtime directories lie in, where a
+stop, a restart and an approval session look for daemons.
 
 **Layout root**:
 The directory an install keeps its versions in,
@@ -169,12 +184,35 @@ directory in use; `hostrunner update` switches it with one
 rename.
 _Avoid_: current (in code and specs that is the running version)
 
+### Settings
+
+**Settings**:
+What tunes a daemon besides its rules (its timeouts, whether it
+rereads, where its rules file is), and the commands that start,
+stop or approve it (how long they wait, where they look for
+daemons).
+_Avoid_: config (`--config` names the rules file)
+
+**Host settings file**:
+The settings file a human keeps on the host, outside every
+workspace, with sections that apply to single workspaces.
+
+**Workspace settings file**:
+The settings file of one workspace, kept in the workspace unless
+its path is given; what it sets overrides the host settings file.
+
 ### Approvals
 
 **Approval request**:
 A command the rules do not let through, sent with `--ask` and
 waiting for a human's answer.
 _Avoid_: prompt, confirmation
+
+**Ask timeout**:
+How long an approval request waits for a human's answer when
+hostrun sets no limit; the host chooses it, and it may exceed
+the longest limit hostrun may set.
+_Avoid_: approval timeout
 
 **Approval session**:
 The host terminal process, `hostrunner approve`, in which a

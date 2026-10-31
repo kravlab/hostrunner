@@ -102,12 +102,13 @@ not checked: use the manual steps above for `gh attestation verify`.
 
 A running daemon keeps the old version until it exits after its
 container stops; a container restart or rebuild before that reuses it
-with the old `hostrun`, unless the rules changed while it ran with
-`--no-reread` (it rereads them otherwise): then the new version takes
-over. The first `hostrunner up` after it has exited runs the new
-version, and `hostrunner restart` (see
-[Stop and restart](#stop-and-restart)) switches a running daemon at once. A `hostrunner up` already in progress during the update may
-fail; run it again.
+with the old `hostrun`, unless the next `hostrunner up` resolves other
+settings or, when it ran with `--no-reread`, the rules changed (it
+rereads them otherwise): then the new version takes over. The first
+`hostrunner up` after it has exited runs the new version, and
+`hostrunner restart` (see [Stop and restart](#stop-and-restart))
+switches a running daemon at once. A `hostrunner up` already in progress
+during the update may fail; run it again.
 
 ## Use in a devcontainer
 
@@ -137,7 +138,9 @@ commands) replaces a running daemon at every container start instead of
 arming it (see [Stop and restart](#stop-and-restart)). Adding
 `"--no-reread"` keeps the daemon from rereading the rules file by itself
 when it changes; a running daemon started without it, or with it when
-`up` no longer gives it, is replaced.
+`up` no longer gives it, is replaced. The timeouts and rereading can
+also come from variables or a host settings file (see
+[Settings](#settings)).
 
 Add the rules as `.devcontainer/hostrun.yaml` (start from
 [the example](examples/devcontainer/.devcontainer/hostrun.yaml)), then,
@@ -184,6 +187,117 @@ without one, `--append` still adds the text to a file that lacks it and
 refuses otherwise. The file is written in place, so a symlink keeps
 pointing to it.
 
+### Settings
+
+Besides its rules, a daemon has settings:
+
+| Key | Variable | Flag | Default | What it sets |
+|---|---|---|---|---|
+| `rules_file` | `HOSTRUNNER_RULES_FILE` | `--rules-file`, `--config` | `.devcontainer/hostrun.yaml` in the workspace | its rules file |
+| `startup_timeout` | `HOSTRUNNER_STARTUP_TIMEOUT` | `--startup-timeout` | `30m` | how long it waits for its container to start |
+| `grace` | `HOSTRUNNER_GRACE` | `--grace` | `15s` | how long its container may be gone before it exits |
+| `reread` | `HOSTRUNNER_REREAD` | `--reread`, `--no-reread` | `true` | whether it rereads the rules file by itself once it changes |
+| `poll_interval` | `HOSTRUNNER_POLL_INTERVAL` | `--poll-interval` | `2s` | how often it asks the container runtimes about its container and looks at the rules file |
+| `ask_timeout` | `HOSTRUNNER_ASK_TIMEOUT` | `--ask-timeout` | `10m` | how long an `--ask` request waits for an answer when hostrun sets no limit |
+| `request_timeout` | `HOSTRUNNER_REQUEST_TIMEOUT` | `--request-timeout` | `10s` | how long a new connection may take to send its request |
+| `ready_timeout` | `HOSTRUNNER_READY_TIMEOUT` | `--ready-timeout` (`up` only) | `10s` | how long `up` waits for the daemon it starts to listen |
+
+`hostrunner stop`, `restart` and `approve` have settings of their own:
+
+| Key | Variable | Flag | Default | What it sets | Read by |
+|---|---|---|---|---|---|
+| `runtime_root` | `HOSTRUNNER_RUNTIME_ROOT` | `--runtime-root` | `$XDG_RUNTIME_DIR/hostrunner` | where they look for daemons without `--dir` | `stop`, `restart`, `approve` |
+| `stop_timeout` | `HOSTRUNNER_STOP_TIMEOUT` | `--stop-timeout` | `10s` | how long they wait for a stopped daemon to close its sockets | `stop`, `restart` |
+
+They do not know a workspace before they choose a daemon, so they read
+only the flag, the variable and the common part of the host settings
+file (`--settings` names it), then the default; in the workspace
+settings file or a workspace section these two keys are an error. A
+`runtime_root` from the file or the variable must be absolute after `~`
+expansion; a relative `--runtime-root` is read against the current
+directory. Without `XDG_RUNTIME_DIR` and a runtime root from any source,
+these commands need `--dir`.
+
+`up` and `serve` neither read nor check these two settings. `up` puts
+the runtime directory where its `--dir` says, so set `runtime_root` to
+the directory that holds the `--dir` of your `devcontainer.json`;
+`up --restart` waits 10 seconds for the daemon it stops to close its
+sockets.
+
+Each daemon setting comes from the first that gives it:
+
+1. the flag;
+2. the variable (an empty one is unset);
+3. the workspace settings file;
+4. the workspace's section of the host settings file;
+5. the common part of the host settings file;
+6. the default.
+
+The host settings file is `$XDG_CONFIG_HOME/hostrunner/settings.yaml`
+(`~/.config/hostrunner/settings.yaml` when `XDG_CONFIG_HOME` is empty),
+or the file `--settings` or else `HOSTRUNNER_SETTINGS` names (either
+relative to the current directory); the default file may be missing, a named one may not. It holds the keys at
+the top level, its common part, and under `workspaces` a section per
+workspace host path with keys for that workspace alone:
+
+```yaml
+startup_timeout: 1h
+grace: 1m30s
+reread: false
+poll_interval: 5s
+ask_timeout: 30m
+request_timeout: 30s
+ready_timeout: 1m
+runtime_root: ~/.local/run/hostrunner
+stop_timeout: 1m
+workspaces:
+  ~/src/app:
+    grace: 5m
+  /home/u/other:
+    reread: true
+```
+
+A section applies to the workspace whose `--workspace` path is its path
+after `~` expansion and symlink resolution, and to no other (not to a
+directory inside it). Its path must be absolute after `~` expansion; one
+that does not exist matches nothing; two paths of the same workspace are
+an error.
+
+The workspace settings file is `.devcontainer/hostrunner.yaml` in the
+workspace, or the file `--workspace-settings` (relative to the current
+directory) or else `HOSTRUNNER_WORKSPACE_SETTINGS` (relative to the
+workspace) names; the default file may be missing, a named one may not.
+It holds the keys at the top level, with no `workspaces` and none of
+the keys of `stop`, `restart` and `approve`, and wins over the host
+settings file.
+
+A relative `rules_file` from a settings file or a variable is read
+against the workspace (after `~` expansion), so one `rules_file` in the
+common part fits every workspace; a relative flag value is read against
+the current directory. A leading `~` is `$HOME`, and an error when
+`HOME` is not set. `--config` is a synonym of `--rules-file`; giving
+both is an error.
+
+A duration is written with a unit (`90s`, `1m30s`, `2h`) and must be
+above zero; a bool is `true` or `false` (`1`, `0` and the like in a
+variable). An unknown key or an invalid value fails `hostrunner up`,
+and with it `devcontainer up`, naming the source and the key
+(`settings file /home/u/.config/hostrunner/settings.yaml: grase: unknown
+key`, `settings file /home/u/.config/hostrunner/settings.yaml:
+workspaces./home/u/other: grase: unknown key`, `HOSTRUNNER_GRACE:
+invalid duration "abc"`). `up` resolves the settings and starts the
+daemon with every one as a flag but `ready_timeout`, its own, so its
+command line shows them; `hostrunner serve` started by hand resolves
+them the same way, without reading or checking `ready_timeout`. A
+settings edit applies on the next container start (reopen, container
+restart or rebuild): `up` tells the running daemon the settings it
+resolved, and a daemon running with others steps aside for a new one,
+as for changed rules; it compares only the settings the arm carries.
+`hostrunner restart` applies a settings edit at once: it resolves the
+new daemon's settings the same way, for the workspace of the daemon it
+replaces (see [Stop and restart](#stop-and-restart)). `--reread` and
+`--no-reread` exclude each other.
+
 ### Approvals on the host
 
 A command the rules refuse can be approved by a human on the host, one
@@ -195,21 +309,23 @@ hostrunner approve                                                  # choose fro
 hostrunner approve --dir "$XDG_RUNTIME_DIR/hostrunner/<devcontainerId>"   # that devcontainer's daemon
 ```
 
-Without `--dir` it lists the daemons under `$XDG_RUNTIME_DIR/hostrunner`,
-looking again every 2 seconds and waiting while there is none: the one
-whose host workspace holds the current directory is marked `*` and is
-chosen with Enter, one another session serves is marked, and one of
-another approval protocol version cannot be chosen (restart its
-container). Choosing a served daemon asks `Take over? [y/N]`: the other
-session says it was taken over and ends, and the requests waiting pass to
-this one with the rest of their limit. `--dir` serves the daemon of that
-runtime directory, the `--dir` its `initializeCommand` gives
-`hostrunner up`; a directory without an approval socket has no
-approvals; a session given `--dir` serves that daemon alone, asking first
-whether to take it over from another session serving it. When its
-daemon ends, or its connection to it fails, the session waits for the
-next one in the same runtime directory. At the idle `>` prompt, `daemons` leaves the daemon for the
-list (without `--dir`) and `quit` ends the session.
+Without `--dir` it lists the daemons under the runtime root
+(`$XDG_RUNTIME_DIR/hostrunner` unless `runtime_root` says, see
+[Settings](#settings)), looking again every 2 seconds and waiting while
+there is none: the one whose host workspace holds the current directory
+is marked `*` and is chosen with Enter, one another session serves is
+marked, and one of another approval protocol version cannot be chosen
+(restart its container). Choosing a served daemon asks
+`Take over? [y/N]`: the other session says it was taken over and ends,
+and the requests waiting pass to this one with the rest of their limit.
+`--dir` serves the daemon of that runtime directory, the `--dir` its
+`initializeCommand` gives `hostrunner up`; a directory without an
+approval socket has no approvals; a session given `--dir` serves that
+daemon alone, asking first whether to take it over from another session
+serving it. When its daemon ends, or its connection to it fails, the
+session waits for the next one in the same runtime directory. At the
+idle `>` prompt, `daemons` leaves the daemon for the list (without
+`--dir`) and `quit` ends the session.
 
 It serves the daemon chosen: it prints each approval request as
 it arrives, with the container directory, the argv (`cmd` line) and why
@@ -322,11 +438,13 @@ hostrun --ask git rebase -i main
   session serves this devcontainer`.
 - A refusal exits 126 with `refused on the host` and the human's note
   (`hostrun: refused on the host: use git rebase main`).
-- A request waits 10 minutes, or as long as `--ask=<duration>` says (a
-  Go duration: `--ask=3m`, `--ask=90s`); then it is refused with 126
-  `not approved: nobody answered on the host`. A limit that is not a
-  positive duration fails with 125 before connecting; the daemon refuses
-  one over 1 hour with 125. Set it within your tool's timeout.
+- A request waits as long as the daemon's `ask_timeout` (10 minutes
+  unless set, see [Settings](#settings)), or as long as
+  `--ask=<duration>` says (a Go duration: `--ask=3m`, `--ask=90s`);
+  then it is refused with 126 `not approved: nobody answered on the
+  host`. A limit that is not a positive duration fails with 125 before
+  connecting; the daemon refuses one over 1 hour with 125 (`ask_timeout`
+  may be longer). Set it within your tool's timeout.
 - Ctrl+C, or anything else that drops the connection, withdraws the
   request. A session that leaves refuses every request still waiting
   (126 `refused on the host`); a daemon that stops or steps aside
@@ -364,7 +482,8 @@ approval lets through (without one); the container can read it.
 
 A daemon ends by itself about 15 s after its armed container stops. To
 run a new version after `hostrunner update`, pick up a hand-edited rules
-file at once under `--no-reread` or drop standing approvals, stop or
+file at once under `--no-reread`, apply a settings edit before the next
+container start or drop standing approvals, stop or
 restart it from a host terminal:
 
 ```sh
@@ -374,27 +493,40 @@ hostrunner stop --all --kill                                      # every daemon
 hostrunner restart --choose                                       # choose from the list
 ```
 
-Without a flag it takes the one daemon under `$XDG_RUNTIME_DIR/hostrunner`
-whose host workspace holds the current directory; none, or several, is an
-error listing them. `--dir` takes that runtime directory's daemon,
-`--all` every daemon (one failing does not keep the others from
-stopping), `--choose` the list `hostrunner approve` shows. A daemon
-running commands lists them and asks: `k` kills them, `w` waits for them
-to finish (the daemon closes its sockets meanwhile, so new requests fail
-and waiting approval requests end with 126 `the hostrunner daemon is
-stopping`; Ctrl+C asks again), `q` leaves it running. `--kill` or
-`--wait` answers up front; without a terminal on stdin, one of them is
-needed, or the daemon is left alone. Standing and session approvals end
-with the daemon; the count lost is printed.
+Without a flag it takes the one daemon under the runtime root
+(`$XDG_RUNTIME_DIR/hostrunner` unless `runtime_root` says, see
+[Settings](#settings)) whose host workspace holds the current directory;
+none, or several, is an error listing them. `--dir` takes that runtime
+directory's daemon, `--all` every daemon (one failing does not keep the
+others from stopping), `--choose` the list `hostrunner approve` shows. A
+daemon running commands lists them and asks: `k` kills them, `w` waits
+for them to finish (the daemon closes its sockets meanwhile, so new
+requests fail and waiting approval requests end with 126
+`the hostrunner daemon is stopping`; Ctrl+C asks again), `q` leaves it
+running. `--kill` or `--wait` answers up front; without a terminal on
+stdin, one of them is needed, or the daemon is left alone. A stopped
+daemon has `stop_timeout` (10 seconds unless set) to close its sockets.
+Standing and session approvals end with the daemon; the count lost is
+printed.
 
-`restart` reads and checks the rules file before stopping anything
-(invalid rules leave the daemon running), then starts a new daemon, the
-installed `hostrunner`, for the same workspace and rules file and with
-the same `--no-reread`; a daemon
-still waiting for its container (right after `up`, during a rebuild) is
-replaced by one that waits the same way. A daemon that saw its container
-stop, and is about to exit, is only stopped
-(`hostrunner: stopped <dir>; its container is not running`): the next
+`restart` resolves the new daemon's settings as `up` does, for the
+workspace the daemon serves: from the settings files as they are now,
+the variables of the terminal it runs in and its own flags
+(`--workspace-settings`, and `--rules-file` or `--config`, both read
+against the current directory and refused with `--all`, as they name one
+workspace's files; the other daemon settings have no flag here). It
+checks them and reads and checks the rules file before stopping anything
+(an invalid setting or invalid rules leave the daemon running, the error
+naming the source), then starts a new daemon, the installed
+`hostrunner`, for the same workspace, with those settings, and waits
+`ready_timeout` for it to listen. It names what they change of the old
+daemon's rules file and rereading (`hostrunner: restarted <dir>;
+rules_file <old> → <new>, reread true → false`; a daemon of an older
+hostrunner does not say whether it rereads). A daemon still waiting for
+its container (right after `up`, during a rebuild) is replaced by one
+that waits the same way. A daemon that saw its container stop, and is
+about to exit, is only stopped (`hostrunner: stopped <dir>; its
+container is not running`), its settings and rules unchecked: the next
 `hostrunner up` starts a new one. Stop, restart and `up` take the
 runtime directory's lock, so they run one after the other.
 
@@ -675,11 +807,14 @@ container, run the Rules test on the host, in the project root:
 ```sh
 hostrunner test git push -u origin main   # hostrunner: allowed by rule "git push"
 hostrunner test git push --force          # hostrunner: denied by rule "git push": flag --force is not allowed (approvable)
-hostrunner test --config draft.yaml -- tix pr list
+hostrunner test --rules-file draft.yaml -- tix pr list
 ```
 
-It reads `.devcontainer/hostrun.yaml` under the current directory, or the
-`--config` file, and tests the command against the rules alone: not the
+It reads the rules file `up` would use with the current directory as
+the workspace (`.devcontainer/hostrun.yaml` there unless `rules_file`
+names another; see [Settings](#settings)), or the `--rules-file` file
+(`--config` is its synonym; `--settings` and `--workspace-settings`
+name the settings files), and tests the command against the rules alone: not the
 working directory, path checks or the host's programs. It reports the
 rule's `dir` (`inherit` resolved) and its secrets' names as a dry run
 does, without checking that the directory exists or lies outside the
@@ -719,7 +854,7 @@ How it works:
   cannot rewrite the rules that govern it. `hostrun` warns on stderr when
   the nearest `.devcontainer/` above its working directory, or the
   `hostrun.yaml` in it, is writable (the default location only, not a
-  `--config` file).
+  `--rules-file` file).
 - The working directory (the mirrored directory, or the rule's `dir`) is
   opened, not re-resolved, when the command starts, so a symlink swapped
   in by the container cannot redirect it.
@@ -746,7 +881,8 @@ How it works:
 ## Limitations
 
 - `hostrunner up` arms a running daemon again rather than replacing it,
-  unless its rules or `--no-reread` differ: after upgrading hostrunner, run
+  unless its rules or the settings the arm carries differ: after
+  upgrading hostrunner, run
   `hostrunner restart`; after changing `workspaceFolder`, which a
   restart keeps, run `hostrunner stop` before the next `up`, or give `up`
   `--restart` (see [Stop and restart](#stop-and-restart)).

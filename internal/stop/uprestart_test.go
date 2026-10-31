@@ -12,6 +12,7 @@ import (
 	"github.com/kravlab/hostrunner/internal/client"
 	"github.com/kravlab/hostrunner/internal/launch"
 	"github.com/kravlab/hostrunner/internal/protocol"
+	"github.com/kravlab/hostrunner/internal/settings"
 	"github.com/kravlab/hostrunner/internal/stop"
 	"github.com/kravlab/hostrunner/internal/transport"
 )
@@ -25,8 +26,9 @@ func upConfig(t *testing.T, dir, workspace, rulesFile string) launch.Config {
 	t.Helper()
 	r := restartConfig(t)
 	return launch.Config{
-		Dir: dir, Workspace: workspace, ContainerWorkspace: "/workspaces/new", Rules: rulesFile,
-		Daemon: r.Daemon, Client: r.Client, ReadyTimeout: r.ReadyTimeout,
+		Dir: dir, Workspace: workspace, ContainerWorkspace: "/workspaces/new",
+		Daemon: r.Daemon, Client: r.Client,
+		Settings: settings.Settings{RulesFile: rulesFile, Reread: true, ReadyTimeout: 5 * time.Second},
 	}
 }
 
@@ -113,7 +115,7 @@ func TestUpRestartReplacesAnIdleDaemon(t *testing.T) {
 	}
 	d.waitStopped(t)
 	args := strings.Join(newDaemonArgs(t, d.dir), " ")
-	if !strings.Contains(args, "--workspace "+ws+" --container-workspace /workspaces/new --config "+rulesFile) {
+	if !strings.Contains(args, "--workspace "+ws+" --container-workspace /workspaces/new --rules-file "+rulesFile) {
 		t.Fatalf("the new daemon runs %q", args)
 	}
 }

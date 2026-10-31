@@ -14,9 +14,7 @@ import (
 // and then replaced by one for up. Invalid rules, or a busy daemon nobody
 // says what to do with, leave the daemon running.
 func UpRestart(ctx context.Context, up launch.Config, commands Commands, in io.Reader, out io.Writer) error {
-	if commands.StopTimeout == 0 {
-		commands.StopTimeout = defaultStopTimeout
-	}
+	commands = commands.withStopTimeout()
 	p, err := launch.Prepare(up)
 	if err != nil {
 		return err

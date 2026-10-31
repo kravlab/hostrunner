@@ -25,6 +25,7 @@ import (
 
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
+	"github.com/kravlab/hostrunner/internal/settings"
 	"github.com/kravlab/hostrunner/internal/transport"
 )
 
@@ -67,18 +68,20 @@ const logTailSize = 2048
 
 // Config describes one `hostrunner up` invocation.
 type Config struct {
-	Dir                string        // runtime directory, e.g. $XDG_RUNTIME_DIR/hostrunner/<devcontainerId>
-	Workspace          string        // workspace folder on the host
-	ContainerWorkspace string        // the same folder inside the container
-	Rules              string        // the rules file (.devcontainer/hostrun.yaml)
-	Daemon             string        // hostrunner executable to start as the daemon
-	Client             string        // hostrun binary to install into Dir
-	ReadyTimeout       time.Duration // how long to wait for the daemon's socket
-	NoReread           bool          // the daemon does not reread the rules file by itself (--no-reread)
+	Dir                string // runtime directory, e.g. $XDG_RUNTIME_DIR/hostrunner/<devcontainerId>
+	Workspace          string // workspace folder on the host
+	ContainerWorkspace string // the same folder inside the container
+	Daemon             string // hostrunner executable to start as the daemon
+	Client             string // hostrun binary to install into Dir
+	// Settings are the settings up, or restart, resolved. Each the daemon
+	// takes is given to it as its flag and carried in every arm;
+	// ReadyTimeout, up's own, is how long to wait for the daemon's socket
+	// and is not passed on.
+	settings.Settings
 }
 
 // Up makes sure an armed daemon serves cfg.Dir with the current rules. It
-// validates cfg.Rules first (invalid rules are an error), arms a running
+// validates cfg.RulesFile first (invalid rules are an error), arms a running
 // daemon, and starts a new one if there is none or the running one loaded
 // other rules (it steps aside when armed with a different digest). It
 // returns once the daemon has answered an arm request, or an error carrying
@@ -104,7 +107,7 @@ type Prepared struct {
 	socket, digest string
 }
 
-// Prepare readies cfg.Dir and validates cfg.Rules for an `up`; invalid
+// Prepare readies cfg.Dir and validates cfg.RulesFile for an `up`; invalid
 // rules are an error.
 func Prepare(cfg Config) (*Prepared, error) {
 	socket := Socket(cfg.Dir)
@@ -116,7 +119,7 @@ func Prepare(cfg Config) (*Prepared, error) {
 	}
 	// Invalid rules must fail `devcontainer up` visibly, even when a daemon
 	// with older rules is still running.
-	policy, err := rules.Load(cfg.Rules)
+	policy, err := rules.Load(cfg.RulesFile)
 	if err != nil {
 		return nil, fmt.Errorf("rules file: %w", err)
 	}
@@ -127,7 +130,7 @@ func Prepare(cfg Config) (*Prepared, error) {
 // (see LockDir): restart, which stopped the daemon under it.
 func (p *Prepared) UpLocked(ctx context.Context) error {
 	cfg, socket, digest := p.cfg, p.socket, p.digest
-	stepAside, err := arm(ctx, socket, digest, cfg.NoReread)
+	stepAside, err := arm(ctx, socket, digest, cfg.Settings)
 	switch {
 	case err == nil && !stepAside:
 		return nil
@@ -207,13 +210,15 @@ func lockDir(dir string, how int) (unlock func(), busy bool, err error) {
 }
 
 // arm asks the daemon on socket to wait for its devcontainer again, telling
-// it the digest of the current rules and whether it is not to reread them
-// by itself. stepAside reports that the daemon will not follow the arm (it
-// runs other rules or the other setting, or its watch has ended) and is
-// stopping. err wraps errNotListening when nothing
-// accepts connections, and is another error when something listens but does
-// not arm.
-func arm(ctx context.Context, socket, digest string, noReread bool) (stepAside bool, err error) {
+// it the digest of the current rules, the daemon settings of s (see
+// settings.Settings.Daemon; a setting left out of them is not compared)
+// and, for a daemon that predates the settings, whether it is to reread
+// the rules by itself. stepAside reports that the daemon will not follow
+// the arm (it runs other rules or other settings, or its watch has ended)
+// and is stopping. err wraps errNotListening when nothing accepts
+// connections, and is another error when something listens but does not
+// arm.
+func arm(ctx context.Context, socket, digest string, s settings.Settings) (stepAside bool, err error) {
 	ctx, cancel := context.WithTimeout(ctx, armTimeout)
 	defer cancel()
 	c, err := transport.Unix{Path: socket}.Dial(ctx)
@@ -224,7 +229,7 @@ func arm(ctx context.Context, socket, digest string, noReread bool) (stepAside b
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = c.SetDeadline(deadline)
 	}
-	if err := protocol.WriteJSON(c, protocol.FrameArm, protocol.Arm{Version: protocol.Version, ConfigDigest: digest, NoReread: noReread}); err != nil {
+	if err := protocol.WriteJSON(c, protocol.FrameArm, protocol.Arm{Version: protocol.Version, ConfigDigest: digest, NoReread: !s.Reread, Settings: s.Daemon()}); err != nil {
 		return false, fmt.Errorf("daemon on %s did not accept the arm request: %w", socket, err)
 	}
 	f, err := protocol.ReadFrame(c)
@@ -305,16 +310,7 @@ func startDaemon(ctx context.Context, cfg Config, socket, digest string) error {
 	}
 	logStart, _ := logFile.Seek(0, io.SeekEnd)
 
-	args := []string{"serve",
-		"--socket", socket,
-		"--workspace", cfg.Workspace,
-		"--container-workspace", cfg.ContainerWorkspace,
-		"--config", cfg.Rules,
-		"--watch"}
-	if cfg.NoReread {
-		args = append(args, "--no-reread")
-	}
-	cmd := exec.Command(cfg.Daemon, args...)
+	cmd := exec.Command(cfg.Daemon, serveArgs(cfg, socket)...)
 	cmd.Dir = cfg.Dir // do not keep the workspace busy
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
@@ -341,7 +337,7 @@ func startDaemon(ctx context.Context, cfg Config, socket, digest string) error {
 			_ = cmd.Process.Kill()
 			return ctx.Err()
 		case <-ticker.C:
-			stepAside, err := arm(ctx, socket, digest, cfg.NoReread)
+			stepAside, err := arm(ctx, socket, digest, cfg.Settings)
 			if err == nil && !stepAside {
 				return nil
 			}
@@ -354,6 +350,29 @@ func startDaemon(ctx context.Context, cfg Config, socket, digest string) error {
 			}
 		}
 	}
+}
+
+// serveArgs is the command line of the daemon cfg describes, listening
+// on socket. Every setting serve takes is an explicit flag, so the
+// daemon's argv shows what it runs with and it resolves none again;
+// rereading is given both ways (--reread or --no-reread).
+func serveArgs(cfg Config, socket string) []string {
+	args := []string{"serve",
+		"--socket", socket,
+		"--workspace", cfg.Workspace,
+		"--container-workspace", cfg.ContainerWorkspace,
+		"--rules-file", cfg.RulesFile,
+		"--watch"}
+	args = append(args,
+		"--startup-timeout", cfg.StartupTimeout.String(),
+		"--grace", cfg.Grace.String(),
+		"--poll-interval", cfg.PollInterval.String(),
+		"--ask-timeout", cfg.AskTimeout.String(),
+		"--request-timeout", cfg.RequestTimeout.String())
+	if cfg.Reread {
+		return append(args, "--reread")
+	}
+	return append(args, "--no-reread")
 }
 
 // openLog opens the daemon log for appending. It refuses anything but a

@@ -2,6 +2,7 @@ package stop_test
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"io"
 	"net"
@@ -56,7 +57,7 @@ func runOlderDaemon(mode string) {
 		return ""
 	}
 	socket := arg("--socket")
-	info := protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: arg("--workspace"), ContainerWorkspace: arg("--container-workspace"), RulesFile: arg("--config")}
+	info := protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: arg("--workspace"), ContainerWorkspace: arg("--container-workspace"), RulesFile: cmp.Or(arg("--rules-file"), arg("--config"))}
 	if l := os.Getenv(listenEnv); l != "" {
 		socket = l
 	}

@@ -6,10 +6,12 @@ import (
 	"errors"
 	"flag"
 	"io"
+	"maps"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,6 +21,7 @@ import (
 
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
+	"github.com/kravlab/hostrunner/internal/settings"
 )
 
 // fakeDaemonEnv makes the test binary act as the daemon when Up spawns it.
@@ -37,8 +40,8 @@ func TestMain(m *testing.M) {
 		os.Setenv(fakeDaemonEnv, "serve")
 		err := Up(context.Background(), Config{
 			Dir: dir, Workspace: "/w", ContainerWorkspace: "/c",
-			Rules:  filepath.Join(dir, "missing-rules.yaml"),
-			Daemon: os.Args[0], Client: client, ReadyTimeout: 5 * time.Second,
+			Daemon: os.Args[0], Client: client,
+			Settings: settings.Settings{RulesFile: filepath.Join(dir, "missing-rules.yaml"), Reread: true, ReadyTimeout: 5 * time.Second},
 		})
 		if err != nil {
 			os.Exit(1)
@@ -55,23 +58,34 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// runFakeDaemon records its pid in fake.pids and, in "serve" mode, listens
-// on --socket and answers every FrameArm, logging it to fake.armed. Like the
-// real daemon it compares the arm's rules digest with the rules it started
-// with, and the arm's --no-reread with its own, and, on a mismatch,
-// steps aside and exits. It insists on --watch, which `up` must always
-// pass.
+// runFakeDaemon records its pid in fake.pids and, in "serve" mode,
+// listens on --socket and answers every FrameArm, logging it to
+// fake.armed. Like the real daemon (armHandler in cmd/hostrunner, which a
+// change of the comparison must keep it in step with) it compares the
+// arm's rules digest with the rules it started with, the arm's
+// --no-reread with its own, and each setting the arm carries with the one
+// it parsed from its flags, and, on a mismatch, steps aside and exits. It
+// insists on --watch, which `up` must always pass.
 func runFakeDaemon(mode string) {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	socket := fs.String("socket", "", "")
 	fs.String("workspace", "", "")
 	fs.String("container-workspace", "", "")
-	config := fs.String("config", "", "")
+	var own settings.Settings
+	config := fs.String("rules-file", "", "")
 	watch := fs.Bool("watch", false, "")
+	fs.DurationVar(&own.StartupTimeout, "startup-timeout", 0, "")
+	fs.DurationVar(&own.Grace, "grace", 0, "")
+	fs.DurationVar(&own.PollInterval, "poll-interval", 0, "")
+	fs.DurationVar(&own.AskTimeout, "ask-timeout", 0, "")
+	fs.DurationVar(&own.RequestTimeout, "request-timeout", 0, "")
+	fs.Bool("reread", false, "") // reread is !--no-reread: up passes one of the two
 	noReread := fs.Bool("no-reread", false, "")
 	if len(os.Args) < 2 || os.Args[1] != "serve" || fs.Parse(os.Args[2:]) != nil || !*watch || *config == "" {
 		os.Exit(2)
 	}
+	own.RulesFile, own.Reread = *config, !*noReread
+	ownSettings := own.Daemon() // without a duration up did not pass, which is then not compared
 	policy, err := rules.Load(*config)
 	if err != nil {
 		os.Exit(3)
@@ -96,6 +110,10 @@ func runFakeDaemon(mode string) {
 			var a protocol.Arm
 			_ = protocol.DecodeJSON(f, &a)
 			stepAside := a.ConfigDigest != policy.Digest() || a.NoReread != *noReread
+			for name, v := range a.Settings {
+				got, ok := ownSettings[name]
+				stepAside = stepAside || !ok || got != v
+			}
 			appendLine(filepath.Join(dir, "fake.armed"), map[bool]string{false: "armed", true: "step aside"}[stepAside])
 			_ = protocol.WriteJSON(c, protocol.FrameArmed, protocol.Armed{Version: protocol.Version, Restart: stepAside})
 			if stepAside {
@@ -183,10 +201,9 @@ func fakeConfig(t *testing.T, mode string) Config {
 		Dir:                filepath.Join(base, "rt", "id"),
 		Workspace:          "/home/u/app",
 		ContainerWorkspace: "/workspaces/app",
-		Rules:              filepath.Join(base, "hostrun.yaml"),
 		Daemon:             os.Args[0],
 		Client:             mustStatic(t),
-		ReadyTimeout:       5 * time.Second,
+		Settings:           settings.Settings{RulesFile: filepath.Join(base, "hostrun.yaml"), Reread: true, ReadyTimeout: 5 * time.Second},
 	}
 	t.Setenv(fakeDaemonEnv, mode)
 	t.Cleanup(func() {
@@ -463,10 +480,10 @@ func TestCheckStatic(t *testing.T) {
 
 func TestUpRejectsInvalidRules(t *testing.T) {
 	cfg := fakeConfig(t, "serve")
-	if err := os.WriteFile(cfg.Rules, []byte("rules:\n  - command: git\n"), 0o644); err != nil {
+	if err := os.WriteFile(cfg.RulesFile, []byte("rules:\n  - command: git\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := Up(context.Background(), cfg); err == nil || !strings.Contains(err.Error(), cfg.Rules) {
+	if err := Up(context.Background(), cfg); err == nil || !strings.Contains(err.Error(), cfg.RulesFile) {
 		t.Fatalf("got %v, want an error naming the rules file", err)
 	}
 	if pids := lines(t, filepath.Join(cfg.Dir, "fake.pids")); len(pids) != 0 {
@@ -476,7 +493,7 @@ func TestUpRejectsInvalidRules(t *testing.T) {
 
 func TestUpReplacesDaemonThatStepsAside(t *testing.T) {
 	cfg := fakeConfig(t, "serve")
-	if err := os.WriteFile(cfg.Rules, []byte("rules:\n  - command: git status\n    args: any\n"), 0o644); err != nil {
+	if err := os.WriteFile(cfg.RulesFile, []byte("rules:\n  - command: git status\n    args: any\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := Up(context.Background(), cfg); err != nil {
@@ -484,7 +501,7 @@ func TestUpReplacesDaemonThatStepsAside(t *testing.T) {
 	}
 	first := onlyPid(t, cfg.Dir)
 
-	if err := os.WriteFile(cfg.Rules, []byte("rules:\n  - command: git status\n    args: none\n"), 0o644); err != nil {
+	if err := os.WriteFile(cfg.RulesFile, []byte("rules:\n  - command: git status\n    args: none\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := Up(context.Background(), cfg); err != nil {
@@ -509,7 +526,7 @@ func TestUpReplacesDaemonWhoseRereadingDiffers(t *testing.T) {
 		t.Fatalf("first Up: %v", err)
 	}
 	first := onlyPid(t, cfg.Dir)
-	cfg.NoReread = true
+	cfg.Reread = false
 	if err := Up(context.Background(), cfg); err != nil {
 		t.Fatalf("Up with --no-reread: %v", err)
 	}
@@ -522,6 +539,32 @@ func TestUpReplacesDaemonWhoseRereadingDiffers(t *testing.T) {
 	}
 	if got := lines(t, filepath.Join(cfg.Dir, "fake.armed")); strings.Join(got, " ") != "armed step aside armed armed" {
 		t.Fatalf("arms %q, want armed, step aside, then the new daemon armed twice", got)
+	}
+}
+
+// The daemon `up` starts gets every setting as an explicit flag, so its
+// argv shows them and it resolves none again; rereading is explicit both
+// ways, and ready_timeout, up's own, is no flag.
+func TestServeArgsGiveEverySetting(t *testing.T) {
+	base := Config{Workspace: "/home/u/app", ContainerWorkspace: "/workspaces/app", Settings: settings.Settings{
+		RulesFile: "/home/u/app/.devcontainer/hostrun.yaml", StartupTimeout: 30 * time.Minute, Grace: 15 * time.Second,
+		PollInterval: 2 * time.Second, AskTimeout: 10 * time.Minute, RequestTimeout: 10 * time.Second, ReadyTimeout: time.Minute,
+	}}
+	start := []string{"serve", "--socket", "/run/h.sock", "--workspace", "/home/u/app", "--container-workspace", "/workspaces/app", "--rules-file", "/home/u/app/.devcontainer/hostrun.yaml", "--watch",
+		"--startup-timeout", "30m0s", "--grace", "15s", "--poll-interval", "2s", "--ask-timeout", "10m0s", "--request-timeout", "10s"}
+	for _, tt := range []struct {
+		reread bool
+		flag   string
+	}{
+		{reread: true, flag: "--reread"},
+		{reread: false, flag: "--no-reread"},
+	} {
+		cfg := base
+		cfg.Reread = tt.reread
+		want := append(slices.Clone(start), tt.flag)
+		if got := serveArgs(cfg, "/run/h.sock"); !slices.Equal(got, want) {
+			t.Errorf("reread %v: got %q, want %q", tt.reread, got, want)
+		}
 	}
 }
 
@@ -610,10 +653,10 @@ func TestTryLockDirDoesNotWait(t *testing.T) {
 
 func TestPrepareRejectsInvalidRules(t *testing.T) {
 	cfg := fakeConfig(t, "serve")
-	if err := os.WriteFile(cfg.Rules, []byte("rules:\n  - command: git\n"), 0o644); err != nil {
+	if err := os.WriteFile(cfg.RulesFile, []byte("rules:\n  - command: git\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Prepare(cfg); err == nil || !strings.Contains(err.Error(), cfg.Rules) {
+	if _, err := Prepare(cfg); err == nil || !strings.Contains(err.Error(), cfg.RulesFile) {
 		t.Fatalf("got %v, want an error naming the rules file", err)
 	}
 }
@@ -657,5 +700,119 @@ func TestSocketPaths(t *testing.T) {
 	}
 	if got := RuntimeDir(approval); got != dir {
 		t.Errorf("RuntimeDir(%q) = %q, want %q", approval, got, dir)
+	}
+}
+
+// An arm carries the daemon settings of up as Settings.Daemon names them,
+// and still carries --no-reread for a daemon that predates the settings.
+func TestArmCarriesTheDaemonSettings(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		s            settings.Settings
+		want         map[string]string
+		wantNoReread bool
+	}{
+		{
+			name: "every setting",
+			s: settings.Settings{
+				RulesFile: "/w/rules.yaml", StartupTimeout: time.Hour, Grace: time.Minute, Reread: false,
+				PollInterval: time.Second, AskTimeout: time.Minute, RequestTimeout: time.Second, ReadyTimeout: time.Minute,
+			},
+			want: map[string]string{
+				"rules_file": "/w/rules.yaml", "startup_timeout": "1h0m0s", "grace": "1m0s", "reread": "false",
+				"poll_interval": "1s", "ask_timeout": "1m0s", "request_timeout": "1s",
+			},
+			wantNoReread: true,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			socket := filepath.Join(t.TempDir(), "s")
+			l, err := net.Listen("unix", socket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { l.Close() })
+			got := make(chan protocol.Arm, 1)
+			go func() {
+				c, err := l.Accept()
+				if err != nil {
+					return
+				}
+				defer c.Close()
+				var a protocol.Arm
+				if f, err := protocol.ReadFrame(c); err == nil && protocol.DecodeJSON(f, &a) == nil {
+					got <- a
+				}
+				_ = protocol.WriteJSON(c, protocol.FrameArmed, protocol.Armed{Version: protocol.Version})
+			}()
+			if _, err := arm(context.Background(), socket, "digest", tt.s); err != nil {
+				t.Fatal(err)
+			}
+			a := <-got
+			if !maps.Equal(a.Settings, tt.want) {
+				t.Errorf("settings %v, want %v", a.Settings, tt.want)
+			}
+			if a.NoReread != tt.wantNoReread || a.ConfigDigest != "digest" {
+				t.Errorf("no_reread %v and digest %q, want %v and digest", a.NoReread, a.ConfigDigest, tt.wantNoReread)
+			}
+		})
+	}
+}
+
+// The daemon up starts, parsing the flags serveArgs gives it as serve
+// does, has the daemon settings up resolved, so its first arm does not
+// make it step aside.
+func TestServeArgsResolveToUpsSettings(t *testing.T) {
+	full := settings.Settings{
+		RulesFile: "/home/u/app/.devcontainer/hostrun.yaml", StartupTimeout: 30 * time.Minute, Grace: 15 * time.Second,
+		Reread: true, PollInterval: 2 * time.Second, AskTimeout: 10 * time.Minute, RequestTimeout: 10 * time.Second,
+		ReadyTimeout: 10 * time.Second,
+	}
+	elsewhere := full
+	elsewhere.RulesFile, elsewhere.Reread, elsewhere.Grace = "/home/u/rules/hostrun.yaml", false, 90*time.Second
+	for _, tt := range []struct {
+		name string
+		s    settings.Settings
+	}{{"the defaults", full}, {"another rules file", elsewhere}} {
+		cfg := Config{Workspace: "/home/u/app", ContainerWorkspace: "/workspaces/app", Settings: tt.s}
+		fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+		fs.String("socket", "", "")
+		fs.String("workspace", "", "")
+		fs.String("container-workspace", "", "")
+		fs.Bool("watch", false, "")
+		var sf settings.Flags
+		sf.Register(fs)
+		if err := fs.Parse(serveArgs(cfg, "/run/h.sock")[1:]); err != nil {
+			t.Fatalf("%s: %v", tt.name, err)
+		}
+		got, err := sf.ResolveAsGiven(func(string) string { return "" }, cfg.Workspace)
+		if err != nil || !maps.Equal(got.Daemon(), tt.s.Daemon()) {
+			t.Errorf("%s: got %v, %v; want %v", tt.name, got.Daemon(), err, tt.s.Daemon())
+		}
+	}
+}
+
+// An up whose daemon settings differ from the running daemon's replaces
+// it, and the new daemon follows the next up.
+func TestUpReplacesDaemonWhoseSettingsDiffer(t *testing.T) {
+	cfg := fakeConfig(t, "serve")
+	cfg.Grace = 15 * time.Second
+	if err := Up(context.Background(), cfg); err != nil {
+		t.Fatalf("first Up: %v", err)
+	}
+	first := onlyPid(t, cfg.Dir)
+	cfg.Grace = time.Minute
+	if err := Up(context.Background(), cfg); err != nil {
+		t.Fatalf("Up with another grace: %v", err)
+	}
+	waitGone(t, first)
+	if err := Up(context.Background(), cfg); err != nil {
+		t.Fatalf("another Up with that grace: %v", err)
+	}
+	if pids := lines(t, filepath.Join(cfg.Dir, "fake.pids")); len(pids) != 2 {
+		t.Fatalf("got pids %v, want the daemon replaced once", pids)
+	}
+	if got := lines(t, filepath.Join(cfg.Dir, "fake.armed")); strings.Join(got, " ") != "armed step aside armed armed" {
+		t.Fatalf("arms %q, want armed, step aside, then the new daemon armed twice", got)
 	}
 }

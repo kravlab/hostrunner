@@ -58,7 +58,7 @@ the daemon rereads the file by itself once it changes, without stopping.
 
 ```sh
 hostrunner up    [--restart [--kill | --wait]] [--no-reread] --dir … --workspace … --container-workspace …
-hostrunner serve --socket … --workspace … --container-workspace … [--config …] [--watch] [--no-reread]
+hostrunner serve --socket … --workspace … --container-workspace … [--rules-file …] [--watch] [--no-reread]
 ```
 
 - `--no-reread`: the daemon does not reread the rules file by itself;
@@ -66,9 +66,10 @@ hostrunner serve --socket … --workspace … --container-workspace … [--confi
 - `Arm` carries the `up`'s `--no-reread` (`no_reread`); a daemon whose
   own differs steps aside, as for changed rules, and `up` starts one with
   the `up`'s setting. A daemon older than the field does not compare it.
-- `restart` starts the new daemon with `--no-reread` when `DaemonInfo`
-  says `no_reread`; an older daemon's successor rereads, the default.
-  `up --restart` takes the setting from its own flags.
+- `restart` takes the new daemon's `reread` from the settings it
+  resolves for the workspace, as `up` does (see
+  [daemon-stop-restart.md](daemon-stop-restart.md)), not from
+  `DaemonInfo`. `up --restart` takes the setting from its own flags.
 
 ## Edge cases
 
@@ -102,8 +103,8 @@ hostrunner serve --socket … --workspace … --container-workspace … [--confi
   `DaemonInfo`, `Serve` and `RulesReread`.
 - `internal/launch`: an `up` with another `--no-reread` replaces the
   daemon, and the next such `up` arms the new one.
-- `internal/stop`: `restart` keeps `--no-reread`; an older daemon's
-  successor rereads.
+- `internal/stop`: `restart` takes `reread` from the settings it
+  resolves.
 - `cmd/hostrunner`: `--no-reread` for `up` and `serve`, in their usages;
   the arm handler steps aside on another setting; `serve`'s hello says
   whether it rereads.

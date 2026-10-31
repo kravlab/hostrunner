@@ -431,6 +431,36 @@ func testLifecycle(t *testing.T, e env) {
 		}
 	})
 
+	// The settings files are read as they are at the restart: a workspace
+	// settings file written now names another rules file, which the new
+	// daemon serves, and the next up arms it as it is.
+	t.Run("restart picks up an edited workspace settings file", func(t *testing.T) {
+		if _, err := e.exec(t, "hostrun", "uname"); err == nil {
+			t.Fatal("uname allowed before the settings named rules allowing it")
+		}
+		dotDir := filepath.Join(e.ws, ".devcontainer")
+		data, err := os.ReadFile(filepath.Join(dotDir, "hostrun.yaml"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		data = append(data, "\n  - command: uname\n    args: none\n"...)
+		for name, content := range map[string][]byte{"other.yaml": data, "hostrunner.yaml": []byte("rules_file: .devcontainer/other.yaml\n")} {
+			if err := os.WriteFile(filepath.Join(dotDir, name), content, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		before := daemonStarts(t, runtimeDir)
+		if _, err := run(t, e.vars(), filepath.Join(e.bin, "hostrunner"), "restart", "--dir", runtimeDir); err != nil {
+			t.Fatalf("hostrunner restart: %v", err)
+		}
+		if got, err := e.exec(t, "hostrun", "uname"); err != nil || strings.TrimSpace(got) == "" {
+			t.Fatalf("uname after the restart: %q, %v", got, err)
+		}
+		if n := daemonStarts(t, runtimeDir); n != before+1 {
+			t.Fatalf("%d daemon starts, want %d (restarted)", n, before+1)
+		}
+	})
+
 	t.Run("daemon survives a rebuild slower than its grace period", func(t *testing.T) {
 		before := daemonStarts(t, runtimeDir)
 		container = e.up(t, "--remove-existing-container", "--build-no-cache")
