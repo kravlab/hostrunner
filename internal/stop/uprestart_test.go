@@ -12,6 +12,7 @@ import (
 	"github.com/kravlab/hostrunner/internal/client"
 	"github.com/kravlab/hostrunner/internal/launch"
 	"github.com/kravlab/hostrunner/internal/protocol"
+	"github.com/kravlab/hostrunner/internal/settings"
 	"github.com/kravlab/hostrunner/internal/stop"
 	"github.com/kravlab/hostrunner/internal/transport"
 )
@@ -27,6 +28,7 @@ func upConfig(t *testing.T, dir, workspace, rulesFile string) launch.Config {
 	return launch.Config{
 		Dir: dir, Workspace: workspace, ContainerWorkspace: "/workspaces/new", Rules: rulesFile,
 		Daemon: r.Daemon, Client: r.Client, ReadyTimeout: r.ReadyTimeout,
+		Settings: settings.Settings{Reread: true},
 	}
 }
 

@@ -137,7 +137,9 @@ commands) replaces a running daemon at every container start instead of
 arming it (see [Stop and restart](#stop-and-restart)). Adding
 `"--no-reread"` keeps the daemon from rereading the rules file by itself
 when it changes; a running daemon started without it, or with it when
-`up` no longer gives it, is replaced.
+`up` no longer gives it, is replaced. The timeouts and rereading can
+also come from variables or a host settings file (see
+[Settings](#settings)).
 
 Add the rules as `.devcontainer/hostrun.yaml` (start from
 [the example](examples/devcontainer/.devcontainer/hostrun.yaml)), then,
@@ -183,6 +185,40 @@ say), append another copy or cancel. The questions need a terminal:
 without one, `--append` still adds the text to a file that lacks it and
 refuses otherwise. The file is written in place, so a symlink keeps
 pointing to it.
+
+### Settings
+
+Besides its rules, a daemon has settings:
+
+| Key | Variable | Flag | Default | What it sets |
+|---|---|---|---|---|
+| `startup_timeout` | `HOSTRUNNER_STARTUP_TIMEOUT` | `--startup-timeout` | `30m` | how long it waits for its container to start |
+| `grace` | `HOSTRUNNER_GRACE` | `--grace` | `15s` | how long its container may be gone before it exits |
+| `reread` | `HOSTRUNNER_REREAD` | `--reread`, `--no-reread` | `true` | whether it rereads the rules file by itself once it changes |
+
+Each comes from the first that gives it: the flag, the variable (an
+empty one is unset), the host settings file, the default. The host
+settings file is `$XDG_CONFIG_HOME/hostrunner/settings.yaml`
+(`~/.config/hostrunner/settings.yaml` when `XDG_CONFIG_HOME` is empty),
+or the file `--settings` or else `HOSTRUNNER_SETTINGS` names; the
+default file may be missing, a named one may not. It holds the keys at
+the top level:
+
+```yaml
+startup_timeout: 1h
+grace: 1m30s
+reread: false
+```
+
+A duration is written with a unit (`90s`, `1m30s`, `2h`) and must be
+above zero; a bool is `true` or `false` (`1`, `0` and the like in a
+variable). An unknown key or an invalid value fails `hostrunner up`,
+and with it `devcontainer up`, naming the source and the key
+(`settings file /home/u/.config/hostrunner/settings.yaml: grase: unknown
+key`, `HOSTRUNNER_GRACE: invalid duration "abc"`). `up` resolves the
+settings and starts the daemon with every one as a flag, so its command
+line shows them; `hostrunner serve` started by hand resolves them the
+same way. `--reread` and `--no-reread` exclude each other.
 
 ### Approvals on the host
 

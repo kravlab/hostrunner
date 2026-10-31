@@ -19,6 +19,7 @@ import (
 
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
+	"github.com/kravlab/hostrunner/internal/settings"
 )
 
 // fakeDaemonEnv makes the test binary act as the daemon when Up spawns it.
@@ -39,6 +40,7 @@ func TestMain(m *testing.M) {
 			Dir: dir, Workspace: "/w", ContainerWorkspace: "/c",
 			Rules:  filepath.Join(dir, "missing-rules.yaml"),
 			Daemon: os.Args[0], Client: client, ReadyTimeout: 5 * time.Second,
+			Settings: settings.Settings{Reread: true},
 		})
 		if err != nil {
 			os.Exit(1)
@@ -68,6 +70,9 @@ func runFakeDaemon(mode string) {
 	fs.String("container-workspace", "", "")
 	config := fs.String("config", "", "")
 	watch := fs.Bool("watch", false, "")
+	fs.Duration("startup-timeout", 0, "")
+	fs.Duration("grace", 0, "")
+	fs.Bool("reread", false, "")
 	noReread := fs.Bool("no-reread", false, "")
 	if len(os.Args) < 2 || os.Args[1] != "serve" || fs.Parse(os.Args[2:]) != nil || !*watch || *config == "" {
 		os.Exit(2)
@@ -187,6 +192,7 @@ func fakeConfig(t *testing.T, mode string) Config {
 		Daemon:             os.Args[0],
 		Client:             mustStatic(t),
 		ReadyTimeout:       5 * time.Second,
+		Settings:           settings.Settings{Reread: true},
 	}
 	t.Setenv(fakeDaemonEnv, mode)
 	t.Cleanup(func() {
@@ -509,7 +515,7 @@ func TestUpReplacesDaemonWhoseRereadingDiffers(t *testing.T) {
 		t.Fatalf("first Up: %v", err)
 	}
 	first := onlyPid(t, cfg.Dir)
-	cfg.NoReread = true
+	cfg.Reread = false
 	if err := Up(context.Background(), cfg); err != nil {
 		t.Fatalf("Up with --no-reread: %v", err)
 	}
@@ -522,6 +528,34 @@ func TestUpReplacesDaemonWhoseRereadingDiffers(t *testing.T) {
 	}
 	if got := lines(t, filepath.Join(cfg.Dir, "fake.armed")); strings.Join(got, " ") != "armed step aside armed armed" {
 		t.Fatalf("arms %q, want armed, step aside, then the new daemon armed twice", got)
+	}
+}
+
+// The daemon `up` starts gets every setting as an explicit flag, so its
+// argv shows them and it resolves none again; rereading is explicit both
+// ways. A duration the caller leaves zero (restart, which does not
+// resolve settings) is left for the daemon to resolve.
+func TestServeArgsGiveEverySetting(t *testing.T) {
+	base := Config{Workspace: "/home/u/app", ContainerWorkspace: "/workspaces/app", Rules: "/home/u/app/.devcontainer/hostrun.yaml"}
+	start := []string{"serve", "--socket", "/run/h.sock", "--workspace", "/home/u/app", "--container-workspace", "/workspaces/app", "--config", "/home/u/app/.devcontainer/hostrun.yaml", "--watch"}
+	tests := []struct {
+		name string
+		edit func(*Config)
+		want []string
+	}{
+		{"rereading", func(c *Config) { c.StartupTimeout, c.Grace, c.Reread = 30*time.Minute, 15*time.Second, true }, []string{"--startup-timeout", "30m0s", "--grace", "15s", "--reread"}},
+		{"not rereading", func(c *Config) { c.StartupTimeout, c.Grace = time.Hour, 90*time.Second }, []string{"--startup-timeout", "1h0m0s", "--grace", "1m30s", "--no-reread"}},
+		{"durations unset", func(c *Config) { c.Reread = true }, []string{"--reread"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := base
+			tt.edit(&cfg)
+			got := serveArgs(cfg, "/run/h.sock")
+			if want := append(append([]string{}, start...), tt.want...); strings.Join(got, " ") != strings.Join(want, " ") {
+				t.Fatalf("got %q, want %q", got, want)
+			}
+		})
 	}
 }
 

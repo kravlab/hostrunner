@@ -22,6 +22,7 @@ import (
 	"github.com/kravlab/hostrunner/internal/hostterm"
 	"github.com/kravlab/hostrunner/internal/launch"
 	"github.com/kravlab/hostrunner/internal/protocol"
+	"github.com/kravlab/hostrunner/internal/settings"
 	"github.com/kravlab/hostrunner/internal/transport"
 	"github.com/kravlab/hostrunner/internal/watch"
 )
@@ -344,7 +345,7 @@ func (t *term) ending(ctx context.Context, cfg Config, dir string, info *protoco
 		Daemon:             r.Daemon,
 		Client:             r.Client,
 		ReadyTimeout:       r.ReadyTimeout,
-		NoReread:           info.NoReread,
+		Settings:           settings.Settings{Reread: !info.NoReread},
 	})
 	if err != nil {
 		return ending{}, fmt.Errorf("%s: %w; the daemon keeps running", name, err)

@@ -6,6 +6,7 @@ import (
 	"flag"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"os"
 	"path/filepath"
@@ -21,6 +22,7 @@ import (
 	"github.com/kravlab/hostrunner/internal/launch"
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
+	"github.com/kravlab/hostrunner/internal/settings"
 	"github.com/kravlab/hostrunner/internal/stop"
 	"github.com/kravlab/hostrunner/internal/transport"
 	"github.com/kravlab/hostrunner/internal/update"
@@ -78,7 +80,7 @@ func TestParseVersionHelpIsTheFlagHelp(t *testing.T) {
 }
 
 func TestParseServeAcceptsAllFlags(t *testing.T) {
-	got, err := parseServe([]string{"--socket", "/run/h.sock", "--workspace", "/home/u/app", "--container-workspace", "/workspaces/app"}, io.Discard)
+	got, err := parseServe([]string{"--socket", "/run/h.sock", "--workspace", "/home/u/app", "--container-workspace", "/workspaces/app"}, noEnv, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,9 +88,8 @@ func TestParseServeAcceptsAllFlags(t *testing.T) {
 		socket:         "/run/h.sock",
 		workspaceFlags: workspaceFlags{workspace: "/home/u/app", containerWorkspace: "/workspaces/app"},
 		config:         "/home/u/app/.devcontainer/hostrun.yaml",
-		startupTimeout: 30 * time.Minute,
-		grace:          15 * time.Second,
 		pollInterval:   2 * time.Second,
+		Settings:       settings.Settings{StartupTimeout: 30 * time.Minute, Grace: 15 * time.Second, Reread: true},
 	}
 	if got != want {
 		t.Fatalf("got %+v, want %+v", got, want)
@@ -99,11 +100,11 @@ func TestParseServeAcceptsWatchSettings(t *testing.T) {
 	got, err := parseServe([]string{
 		"--socket", "/run/h.sock", "--workspace", "/w", "--container-workspace", "/c",
 		"--watch", "--startup-timeout", "5m", "--grace", "3s",
-	}, io.Discard)
+	}, noEnv, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !got.watch || got.startupTimeout != 5*time.Minute || got.grace != 3*time.Second {
+	if !got.watch || got.StartupTimeout != 5*time.Minute || got.Grace != 3*time.Second {
 		t.Fatalf("got %+v, want watch with 5m startup timeout and 3s grace", got)
 	}
 }
@@ -117,7 +118,7 @@ func TestParseServeRequiresEveryFlag(t *testing.T) {
 				args = append(args, flag, value)
 			}
 		}
-		if _, err := parseServe(args, io.Discard); err == nil {
+		if _, err := parseServe(args, noEnv, io.Discard); err == nil {
 			t.Errorf("expected an error when %s is missing", missing)
 		}
 	}
@@ -125,14 +126,14 @@ func TestParseServeRequiresEveryFlag(t *testing.T) {
 
 func TestParseServeRejectsPositionalArguments(t *testing.T) {
 	args := []string{"--socket", "/run/h.sock", "--workspace", "/w", "--container-workspace", "/c", "extra"}
-	if _, err := parseServe(args, io.Discard); err == nil {
+	if _, err := parseServe(args, noEnv, io.Discard); err == nil {
 		t.Fatal("expected an error for an unexpected positional argument")
 	}
 }
 
 func TestParseUpBuildsLaunchConfig(t *testing.T) {
 	exe := "/home/u/.local/bin/hostrunner"
-	got, err := parseUp([]string{"--dir", "/run/user/1000/hostrunner/abc", "--workspace", "/home/u/app", "--container-workspace", "/workspaces/app"}, exe, io.Discard)
+	got, err := parseUp([]string{"--dir", "/run/user/1000/hostrunner/abc", "--workspace", "/home/u/app", "--container-workspace", "/workspaces/app"}, exe, noEnv, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,6 +145,7 @@ func TestParseUpBuildsLaunchConfig(t *testing.T) {
 		Daemon:             exe,
 		Client:             filepath.Join("/home/u/.local/bin", "hostrun"),
 		ReadyTimeout:       10 * time.Second,
+		Settings:           settings.Settings{StartupTimeout: 30 * time.Minute, Grace: 15 * time.Second, Reread: true},
 	}
 	if got.launch != want || got.restart || got.answer != stop.Ask {
 		t.Fatalf("got %+v, want %+v without --restart", got, want)
@@ -159,7 +161,7 @@ func TestParseUpRequiresEveryFlag(t *testing.T) {
 				args = append(args, flag, value)
 			}
 		}
-		if _, err := parseUp(args, "/bin/hostrunner", io.Discard); err == nil {
+		if _, err := parseUp(args, "/bin/hostrunner", noEnv, io.Discard); err == nil {
 			t.Errorf("expected an error when %s is missing", missing)
 		}
 	}
@@ -168,27 +170,209 @@ func TestParseUpRequiresEveryFlag(t *testing.T) {
 // --no-reread keeps a daemon from rereading its rules file by itself: up
 // passes it on to the daemon it starts.
 func TestParseNoReread(t *testing.T) {
-	up, err := parseUp([]string{"--dir", "/d", "--workspace", "/w", "--container-workspace", "/c", "--no-reread"}, "/bin/hostrunner", io.Discard)
-	if err != nil || !up.launch.NoReread {
-		t.Fatalf("up: got %+v, %v; want NoReread", up.launch, err)
+	up, err := parseUp([]string{"--dir", "/d", "--workspace", "/w", "--container-workspace", "/c", "--no-reread"}, "/bin/hostrunner", noEnv, io.Discard)
+	if err != nil || up.launch.Reread {
+		t.Fatalf("up: got %+v, %v; want no reread", up.launch, err)
 	}
-	sv, err := parseServe([]string{"--socket", "/run/h.sock", "--workspace", "/w", "--container-workspace", "/c", "--no-reread"}, io.Discard)
-	if err != nil || !sv.noReread {
-		t.Fatalf("serve: got %+v, %v; want noReread", sv, err)
+	sv, err := parseServe([]string{"--socket", "/run/h.sock", "--workspace", "/w", "--container-workspace", "/c", "--no-reread"}, noEnv, io.Discard)
+	if err != nil || sv.Reread {
+		t.Fatalf("serve: got %+v, %v; want no reread", sv, err)
 	}
 }
 
-// The usages name --no-reread.
-func TestUsagesNameNoReread(t *testing.T) {
+// noEnv is a getenv for an empty environment: no HOSTRUNNER_* variable,
+// and no HOME or XDG_CONFIG_HOME, so no default host settings file.
+func noEnv(string) string { return "" }
+
+// envOf is a getenv over vars; every other variable is empty.
+func envOf(vars map[string]string) func(string) string {
+	return func(name string) string { return vars[name] }
+}
+
+// settingsFile writes content to a host settings file in a temporary
+// directory and returns its path.
+func settingsFile(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "settings.yaml")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// resolveUp parses `hostrunner up` with flags after the required ones
+// and returns the settings it gives the daemon.
+func resolveUp(flags []string, getenv func(string) string) (settings.Settings, error) {
+	args := append([]string{"--dir", "/d", "--workspace", "/w", "--container-workspace", "/c"}, flags...)
+	cfg, err := parseUp(args, "/bin/hostrunner", getenv, io.Discard)
+	return cfg.launch.Settings, err
+}
+
+// resolveServe parses `hostrunner serve` with flags after the required
+// ones and returns the settings it runs with.
+func resolveServe(flags []string, getenv func(string) string) (settings.Settings, error) {
+	args := append([]string{"--socket", "/run/h.sock", "--workspace", "/w", "--container-workspace", "/c"}, flags...)
+	cfg, err := parseServe(args, getenv, io.Discard)
+	return cfg.Settings, err
+}
+
+// commands are the parsers that resolve the settings, by command name.
+var commands = map[string]func([]string, func(string) string) (settings.Settings, error){"up": resolveUp, "serve": resolveServe}
+
+// up and serve take each setting from the highest source that sets it:
+// the flag, the HOSTRUNNER_* variable, the host settings file, then the
+// default.
+func TestUpAndServeResolveEachSettingFromTheHighestSource(t *testing.T) {
+	file := "startup_timeout: 1h\ngrace: 1m\nreread: false\n"
+	vars := map[string]string{"HOSTRUNNER_STARTUP_TIMEOUT": "2h", "HOSTRUNNER_GRACE": "2m", "HOSTRUNNER_REREAD": "true"}
+	tests := []struct {
+		name  string
+		file  string
+		vars  map[string]string
+		flags []string
+		want  settings.Settings
+	}{
+		{"defaults", "", nil, nil, settings.Settings{StartupTimeout: 30 * time.Minute, Grace: 15 * time.Second, Reread: true}},
+		{"host settings file", file, nil, nil, settings.Settings{StartupTimeout: time.Hour, Grace: time.Minute, Reread: false}},
+		{"variables over the file", file, vars, nil, settings.Settings{StartupTimeout: 2 * time.Hour, Grace: 2 * time.Minute, Reread: true}},
+		{"flags over the variables", file, vars, []string{"--startup-timeout", "3h", "--grace", "3m", "--no-reread"}, settings.Settings{StartupTimeout: 3 * time.Hour, Grace: 3 * time.Minute, Reread: false}},
+		{"--reread over the file", file, nil, []string{"--reread"}, settings.Settings{StartupTimeout: time.Hour, Grace: time.Minute, Reread: true}},
+	}
+	for name, resolve := range commands {
+		for _, tt := range tests {
+			t.Run(name+"/"+tt.name, func(t *testing.T) {
+				env := map[string]string{"HOSTRUNNER_SETTINGS": settingsFile(t, tt.file)}
+				maps.Copy(env, tt.vars)
+				got, err := resolve(tt.flags, envOf(env))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got != tt.want {
+					t.Fatalf("got %+v, want %+v", got, tt.want)
+				}
+			})
+		}
+	}
+}
+
+// --settings names the host settings file and beats HOSTRUNNER_SETTINGS;
+// without either it is the one under $XDG_CONFIG_HOME, else $HOME/.config.
+func TestUpAndServeFindTheHostSettingsFile(t *testing.T) {
+	flagFile, varFile := settingsFile(t, "grace: 1m\n"), settingsFile(t, "grace: 2m\n")
+	xdg, home := t.TempDir(), t.TempDir()
+	for dir, grace := range map[string]string{filepath.Join(xdg, "hostrunner"): "3m", filepath.Join(home, ".config", "hostrunner"): "4m"} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "settings.yaml"), []byte("grace: "+grace+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tests := []struct {
+		name  string
+		flags []string
+		vars  map[string]string
+		want  time.Duration
+	}{
+		{"--settings", []string{"--settings", flagFile}, nil, time.Minute},
+		{"HOSTRUNNER_SETTINGS", nil, map[string]string{"HOSTRUNNER_SETTINGS": varFile}, 2 * time.Minute},
+		{"--settings beats HOSTRUNNER_SETTINGS", []string{"--settings", flagFile}, map[string]string{"HOSTRUNNER_SETTINGS": varFile}, time.Minute},
+		{"XDG_CONFIG_HOME", nil, map[string]string{"XDG_CONFIG_HOME": xdg, "HOME": home}, 3 * time.Minute},
+		{"HOME", nil, map[string]string{"HOME": home}, 4 * time.Minute},
+		{"missing default file", nil, map[string]string{"XDG_CONFIG_HOME": t.TempDir()}, 15 * time.Second},
+	}
+	for name, resolve := range commands {
+		for _, tt := range tests {
+			got, err := resolve(tt.flags, envOf(tt.vars))
+			if err != nil || got.Grace != tt.want {
+				t.Errorf("%s, %s: got grace %v, %v; want %v", name, tt.name, got.Grace, err, tt.want)
+			}
+		}
+	}
+}
+
+// An invalid setting fails up (and so `devcontainer up`) and serve, the
+// error naming its source and key.
+func TestUpAndServeFailOnAnInvalidSetting(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing.yaml")
+	unknown := settingsFile(t, "grase: 1m\n")
+	invalid := settingsFile(t, "grace: soon\n")
+	tests := []struct {
+		name  string
+		flags []string
+		vars  map[string]string
+		want  string
+	}{
+		{"missing --settings file", []string{"--settings", missing}, nil, missing},
+		{"missing HOSTRUNNER_SETTINGS file", nil, map[string]string{"HOSTRUNNER_SETTINGS": missing}, missing},
+		{"unknown key", []string{"--settings", unknown}, nil, "settings file " + unknown + ": grase: unknown key"},
+		{"invalid value in the file", []string{"--settings", invalid}, nil, "settings file " + invalid + `: grace: invalid duration "soon"`},
+		{"invalid variable", nil, map[string]string{"HOSTRUNNER_GRACE": "abc"}, `HOSTRUNNER_GRACE: invalid duration "abc"`},
+		{"zero variable", nil, map[string]string{"HOSTRUNNER_STARTUP_TIMEOUT": "0s"}, "HOSTRUNNER_STARTUP_TIMEOUT: must be positive"},
+		{"invalid bool variable", nil, map[string]string{"HOSTRUNNER_REREAD": "maybe"}, `HOSTRUNNER_REREAD: invalid bool "maybe"`},
+		{"zero flag", []string{"--grace", "0s"}, nil, "--grace: must be positive"},
+		{"negative flag", []string{"--startup-timeout", "-1m"}, nil, "--startup-timeout: must be positive"},
+		{"--reread with --no-reread", []string{"--reread", "--no-reread"}, nil, "--reread and --no-reread exclude each other"},
+	}
+	for name, resolve := range commands {
+		for _, tt := range tests {
+			if _, err := resolve(tt.flags, envOf(tt.vars)); err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("%s, %s: got %v, want an error containing %q", name, tt.name, err, tt.want)
+			}
+		}
+	}
+}
+
+// A serve given every setting as a flag, as up starts it, reads neither
+// the variables nor any settings file: a broken one is ignored.
+func TestServeGivenEverySettingReadsNoOtherSource(t *testing.T) {
+	getenv := func(name string) string {
+		t.Errorf("read %s", name)
+		return ""
+	}
+	flags := []string{"--settings", settingsFile(t, "grase: [\n"), "--startup-timeout", "1h", "--grace", "1m", "--reread"}
+	got, err := resolveServe(flags, getenv)
+	if want := (settings.Settings{StartupTimeout: time.Hour, Grace: time.Minute, Reread: true}); err != nil || got != want {
+		t.Fatalf("got %+v, %v; want %+v", got, err, want)
+	}
+}
+
+// An up given every setting as a flag still reads every other source, so
+// a missing named file, a broken file or an invalid variable fails it.
+func TestUpGivenEverySettingStillReadsEverySource(t *testing.T) {
+	all := []string{"--startup-timeout", "1m", "--grace", "1s", "--reread"}
+	missing := filepath.Join(t.TempDir(), "missing.yaml")
+	broken := settingsFile(t, "grase: 1s\n")
+	tests := []struct {
+		name  string
+		flags []string
+		vars  map[string]string
+		want  string
+	}{
+		{"missing --settings file", []string{"--settings", missing}, nil, missing},
+		{"broken file", []string{"--settings", broken}, nil, "grase: unknown key"},
+		{"invalid variable", nil, map[string]string{"HOSTRUNNER_GRACE": "abc"}, "HOSTRUNNER_GRACE"},
+	}
+	for _, tt := range tests {
+		if _, err := resolveUp(append(all, tt.flags...), envOf(tt.vars)); err == nil || !strings.Contains(err.Error(), tt.want) {
+			t.Errorf("%s: got %v, want an error containing %q", tt.name, err, tt.want)
+		}
+	}
+}
+
+// The usages name the settings' flags.
+func TestUsagesNameTheSettingsFlags(t *testing.T) {
 	for name, u := range map[string]string{"up": upUsage, "serve": serveUsage} {
-		if !strings.Contains(u, "[--no-reread]") {
-			t.Errorf("%s usage %q lacks [--no-reread]", name, u)
+		for _, f := range []string{"[--settings <path>]", "[--startup-timeout <duration>]", "[--grace <duration>]", "[--reread | --no-reread]"} {
+			if !strings.Contains(u, f) {
+				t.Errorf("%s usage %q lacks %s", name, u, f)
+			}
 		}
 	}
 }
 
 func TestParseUpRejectsPositionalArguments(t *testing.T) {
-	if _, err := parseUp([]string{"--dir", "/d", "--workspace", "/w", "--container-workspace", "/c", "extra"}, "/bin/hostrunner", io.Discard); err == nil {
+	if _, err := parseUp([]string{"--dir", "/d", "--workspace", "/w", "--container-workspace", "/c", "extra"}, "/bin/hostrunner", noEnv, io.Discard); err == nil {
 		t.Fatal("expected an error for an unexpected positional argument")
 	}
 }
@@ -206,9 +390,8 @@ func watchConfig(t *testing.T) serveConfig {
 		socket:         filepath.Join(base, "h.sock"),
 		workspaceFlags: workspaceFlags{workspace: base, containerWorkspace: "/workspaces/app"},
 		watch:          true,
-		startupTimeout: 400 * time.Millisecond,
-		grace:          100 * time.Millisecond,
 		pollInterval:   5 * time.Millisecond,
+		Settings:       settings.Settings{StartupTimeout: 400 * time.Millisecond, Grace: 100 * time.Millisecond, Reread: true},
 	}
 }
 
@@ -297,10 +480,10 @@ func TestServeWatchWaitsAgainWhenArmed(t *testing.T) {
 	select {
 	case err := <-done:
 		t.Fatalf("serve exited (%v) within the grace period after being armed", err)
-	case <-time.After(3 * cfg.grace):
+	case <-time.After(3 * cfg.Grace):
 	}
 	rt.Start("c") // the rebuilt container starts
-	time.Sleep(cfg.startupTimeout)
+	time.Sleep(cfg.StartupTimeout)
 	select {
 	case err := <-done:
 		t.Fatalf("serve exited (%v) while the rebuilt container runs", err)
@@ -311,7 +494,7 @@ func TestServeWatchWaitsAgainWhenArmed(t *testing.T) {
 }
 
 func TestParseServeAcceptsConfigPath(t *testing.T) {
-	got, err := parseServe([]string{"--socket", "/s", "--workspace", "/w", "--container-workspace", "/c", "--config", "/etc/rules.yaml"}, io.Discard)
+	got, err := parseServe([]string{"--socket", "/s", "--workspace", "/w", "--container-workspace", "/c", "--config", "/etc/rules.yaml"}, noEnv, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -397,7 +580,7 @@ func TestArmHandlerStepsAsideOnceTheWatchEnded(t *testing.T) {
 		go func() { done <- w.Run(ctx) }()
 		synctest.Wait() // the watch runs, waiting for its next poll
 
-		onArm := armHandler("rules.yaml", false, w, discard)
+		onArm := armHandler("rules.yaml", true, w, discard)
 		if onArm(protocol.Arm{ConfigDigest: "digest"}, "digest") {
 			t.Fatal("stepped aside while the watch runs")
 		}
@@ -415,7 +598,7 @@ func TestArmHandlerStepsAsideOnceTheWatchEnded(t *testing.T) {
 // step aside, so the new setting takes effect.
 func TestArmHandlerStepsAsideWhenRereadingDiffers(t *testing.T) {
 	for _, noReread := range []bool{false, true} {
-		onArm := armHandler("rules.yaml", noReread, nil, slog.New(slog.DiscardHandler))
+		onArm := armHandler("rules.yaml", !noReread, nil, slog.New(slog.DiscardHandler))
 		if !onArm(protocol.Arm{ConfigDigest: "digest", NoReread: !noReread}, "digest") {
 			t.Errorf("daemon noReread=%v kept running for an arm with the other setting", noReread)
 		}
@@ -430,7 +613,7 @@ func TestArmHandlerStepsAsideWhenRereadingDiffers(t *testing.T) {
 func TestServeSaysWhetherItRereads(t *testing.T) {
 	for _, noReread := range []bool{false, true} {
 		cfg := watchConfig(t)
-		cfg.noReread = noReread
+		cfg.Reread = !noReread
 		startServe(t, cfg, &watchtest.Runtime{})
 		c, err := transport.Unix{Path: launch.ApprovalSocket(filepath.Dir(cfg.socket))}.Dial(context.Background())
 		if err != nil {
@@ -452,7 +635,7 @@ func TestServeSaysWhetherItRereads(t *testing.T) {
 }
 
 func TestArmHandlerStepsAsideWhenRulesChanged(t *testing.T) {
-	onArm := armHandler("rules.yaml", false, nil, slog.New(slog.DiscardHandler))
+	onArm := armHandler("rules.yaml", true, nil, slog.New(slog.DiscardHandler))
 	if !onArm(protocol.Arm{ConfigDigest: "other"}, "digest") {
 		t.Fatal("kept running with other rules")
 	}
@@ -955,7 +1138,7 @@ func helloInfo(t *testing.T, socket string) protocol.DaemonInfo {
 // runs.
 func TestServeReportsTheArmedContainerStopped(t *testing.T) {
 	cfg := watchConfig(t)
-	cfg.grace = 2 * time.Second // long enough to ask while it counts
+	cfg.Grace = 2 * time.Second // long enough to ask while it counts
 	rt := &watchtest.Runtime{}
 	startServe(t, cfg, rt)
 	if helloInfo(t, cfg.socket).ContainerStopped {
@@ -985,7 +1168,7 @@ func TestParseUpRestart(t *testing.T) {
 		{[]string{"--restart", "--kill"}, stop.Kill},
 		{[]string{"--restart", "--wait"}, stop.Wait},
 	} {
-		got, err := parseUp(append(base, tt.flags...), "/bin/hostrunner", io.Discard)
+		got, err := parseUp(append(base, tt.flags...), "/bin/hostrunner", noEnv, io.Discard)
 		if err != nil {
 			t.Fatalf("%q: %v", tt.flags, err)
 		}
@@ -994,7 +1177,7 @@ func TestParseUpRestart(t *testing.T) {
 		}
 	}
 	for _, flags := range [][]string{{"--kill"}, {"--wait"}, {"--restart", "--kill", "--wait"}} {
-		if _, err := parseUp(append(base, flags...), "/bin/hostrunner", io.Discard); err == nil {
+		if _, err := parseUp(append(base, flags...), "/bin/hostrunner", noEnv, io.Discard); err == nil {
 			t.Errorf("%q: expected a usage error", flags)
 		}
 	}

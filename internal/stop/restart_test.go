@@ -224,7 +224,7 @@ func TestRestartReplacesTheDaemon(t *testing.T) {
 	}
 	d.waitStopped(t)
 	args := newDaemonArgs(t, d.dir)
-	want := []string{"serve", "--socket", filepath.Join(d.dir, launch.SocketName), "--workspace", d.workspace, "--container-workspace", "/workspaces/app", "--config", d.rulesFile, "--watch"}
+	want := []string{"serve", "--socket", filepath.Join(d.dir, launch.SocketName), "--workspace", d.workspace, "--container-workspace", "/workspaces/app", "--config", d.rulesFile, "--watch", "--reread"}
 	if strings.Join(args, " ") != strings.Join(want, " ") {
 		t.Fatalf("the new daemon runs %q, want %q", args, want)
 	}

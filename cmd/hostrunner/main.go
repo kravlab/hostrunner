@@ -4,9 +4,9 @@
 // Usage:
 //
 //	hostrunner up [--restart [--kill | --wait]] --dir <runtime-dir>
-//	    --workspace <host-path> --container-workspace <path>
+//	    --workspace <host-path> --container-workspace <path> [settings]
 //	hostrunner serve --socket <path> --workspace <host-path> --container-workspace <path>
-//	    [--config <path>] [--watch [--startup-timeout 30m] [--grace 15s]]
+//	    [--config <path>] [--watch] [settings]
 //	hostrunner test [--config <path>] [--] <command> [args...]
 //	hostrunner approve [--dir <runtime-dir>]
 //	hostrunner stop [--dir <runtime-dir> | --all | --choose] [--kill | --wait]
@@ -33,6 +33,15 @@
 // answer (see internal/approval). `instructions` prints the instructions
 // for agents working with hostrun, or with --append adds them to a file,
 // AGENTS.md by default (see internal/instructions).
+//
+// The settings of `up` and `serve` are [--settings <path>]
+// [--startup-timeout <duration>] [--grace <duration>]
+// [--reread | --no-reread]; a setting no flag gives comes from its
+// HOSTRUNNER_* variable, the host settings file
+// ($XDG_CONFIG_HOME/hostrunner/settings.yaml unless --settings or
+// HOSTRUNNER_SETTINGS names another) or the default (see
+// internal/settings). `up` resolves them and starts the daemon with every
+// one as a flag.
 package main
 
 import (
@@ -58,6 +67,7 @@ import (
 	"github.com/kravlab/hostrunner/internal/launch"
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
+	"github.com/kravlab/hostrunner/internal/settings"
 	"github.com/kravlab/hostrunner/internal/stop"
 	"github.com/kravlab/hostrunner/internal/transport"
 	"github.com/kravlab/hostrunner/internal/update"
@@ -67,24 +77,28 @@ import (
 
 const (
 	usage             = "usage: hostrunner up|serve|test|approve|stop|restart|update|instructions|version [flags]; see `hostrunner <command> -h`"
-	upUsage           = "usage: hostrunner up [--restart [--kill | --wait]] [--no-reread] --dir <runtime-dir> --workspace <host-path> --container-workspace <path>"
 	stopUsage         = "usage: hostrunner stop [--dir <runtime-dir> | --all | --choose] [--kill | --wait]"
 	restartUsage      = "usage: hostrunner restart [--dir <runtime-dir> | --all | --choose] [--kill | --wait]"
-	serveUsage        = "usage: hostrunner serve --socket <path> --workspace <host-path> --container-workspace <path> [--config <path>] [--watch] [--no-reread]"
 	approveUsage      = "usage: hostrunner approve [--dir <runtime-dir>]"
 	updateUsage       = "usage: hostrunner update [--check]"
 	instructionsUsage = "usage: hostrunner instructions [--append [<path>]]"
 	versionUsage      = "usage: hostrunner version"
 )
 
-// Defaults for following the container; see internal/watch.
+// The usages of the commands with settings, whose flags settings.Usage
+// names.
+var (
+	upUsage    = "usage: hostrunner up [--restart [--kill | --wait]] " + settings.Usage() + " --dir <runtime-dir> --workspace <host-path> --container-workspace <path>"
+	serveUsage = "usage: hostrunner serve --socket <path> --workspace <host-path> --container-workspace <path> [--config <path>] [--watch] " + settings.Usage()
+)
+
+// Defaults for following the container (see internal/watch); the
+// startup timeout and the grace are settings (see internal/settings).
 const (
-	defaultPollInterval   = 2 * time.Second
-	queryTimeout          = 10 * time.Second // one docker/podman ps call
-	defaultStartupTimeout = 30 * time.Minute // covers image builds, also after a rebuild's arm
-	defaultGrace          = 15 * time.Second // how long a stopped container is tolerated
-	readyTimeout          = 10 * time.Second // how long `up` waits for the daemon
-	updateTimeout         = 5 * time.Minute  // `update`'s version lookup and downloads
+	defaultPollInterval = 2 * time.Second
+	queryTimeout        = 10 * time.Second // one docker/podman ps call
+	readyTimeout        = 10 * time.Second // how long `up` waits for the daemon
+	updateTimeout       = 5 * time.Minute  // `update`'s version lookup and downloads
 )
 
 func main() {
@@ -134,7 +148,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 		if err != nil {
 			return err
 		}
-		cfg, err := parseUp(args[1:], exe, stderr)
+		cfg, err := parseUp(args[1:], exe, os.Getenv, stderr)
 		if err != nil {
 			return err
 		}
@@ -161,7 +175,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 		cfg.Commands = commands
 		return stop.Run(sctx, cfg, os.Stdin, stderr)
 	case "serve":
-		cfg, err := parseServe(args[1:], stderr)
+		cfg, err := parseServe(args[1:], os.Getenv, stderr)
 		if err != nil {
 			return err
 		}
@@ -250,23 +264,25 @@ func parseFlags(fs *flag.FlagSet, args []string, usage string) error {
 	return nil
 }
 
-// parseUp parses the flags of `hostrunner up`; all of them are required.
-// exe is the running hostrunner, which becomes the daemon; the client is
-// the hostrun binary installed next to it.
-func parseUp(args []string, exe string, output io.Writer) (upConfig, error) {
+// parseUp parses the flags of `hostrunner up`; --dir and both workspace
+// paths are required. exe is the running hostrunner, which becomes the
+// daemon; the client is the hostrun binary installed next to it. The
+// settings are resolved here, with getenv reading the environment, and
+// all of them given to the daemon.
+func parseUp(args []string, exe string, getenv func(string) string, output io.Writer) (upConfig, error) {
 	var (
 		dir        string
 		ws         workspaceFlags
 		restart    bool
 		kill, wait bool
-		noReread   bool
+		sf         settings.Flags
 	)
 	fs := flag.NewFlagSet("up", flag.ContinueOnError)
 	fs.SetOutput(output)
 	fs.StringVar(&dir, "dir", "", "per-container runtime directory (mounted at /run/hostrunner)")
 	ws.register(fs)
 	fs.BoolVar(&restart, "restart", false, "replace the daemon serving the runtime directory, if any, with a new one")
-	fs.BoolVar(&noReread, "no-reread", false, "keep the daemon from rereading the rules file by itself once it changes")
+	sf.Register(fs)
 	registerAnswer(fs, &kill, &wait)
 	if err := parseFlags(fs, args, upUsage); err != nil {
 		return upConfig{}, err
@@ -278,9 +294,16 @@ func parseUp(args []string, exe string, output io.Writer) (upConfig, error) {
 	if err != nil {
 		return upConfig{}, err
 	}
+	s, err := sf.Resolve(getenv)
+	if _, ok := errors.AsType[*settings.FlagError](err); ok {
+		return upConfig{}, fmt.Errorf("%w; %s", err, upUsage)
+	}
+	if err != nil {
+		return upConfig{}, err
+	}
 	cfg := daemonBinaries(exe)
 	cfg.Dir, cfg.Workspace, cfg.ContainerWorkspace, cfg.Rules = dir, ws.workspace, ws.containerWorkspace, ws.rulesFile()
-	cfg.NoReread = noReread
+	cfg.Settings = s
 	return upConfig{launch: cfg, restart: restart, answer: answer}, nil
 }
 
@@ -397,33 +420,41 @@ func stopCommands(answer stop.Answer) (ctx context.Context, commands stop.Comman
 type serveConfig struct {
 	socket string // Unix socket to listen on
 	workspaceFlags
-	config         string        // rules file; default <workspace>/.devcontainer/hostrun.yaml
-	watch          bool          // exit once the armed container stops
-	noReread       bool          // do not reread the rules file by itself once it changes
-	startupTimeout time.Duration // with watch: wait this long for the container
-	grace          time.Duration // with watch: tolerate its absence this long
-	pollInterval   time.Duration // how often runtimes are asked (with watch) and the rules file is looked at (not a flag)
+	config            string        // rules file; default <workspace>/.devcontainer/hostrun.yaml
+	watch             bool          // exit once the armed container stops
+	pollInterval      time.Duration // how often runtimes are asked (with watch) and the rules file is looked at (not a flag)
+	settings.Settings               // startup timeout and grace (with watch), reread
 }
 
 // parseServe parses the flags of `hostrunner serve`; the socket and both
-// workspace paths are required.
-func parseServe(args []string, output io.Writer) (serveConfig, error) {
+// workspace paths are required. The settings no flag gives are resolved
+// like `up` does, with getenv reading the environment, so a hand-started
+// serve runs like one `up` starts; given all of them, as `up` does, it
+// reads no other source.
+func parseServe(args []string, getenv func(string) string, output io.Writer) (serveConfig, error) {
 	cfg := serveConfig{pollInterval: defaultPollInterval}
+	var sf settings.Flags
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	fs.SetOutput(output)
 	fs.StringVar(&cfg.socket, "socket", "", "Unix socket path to listen on")
 	cfg.workspaceFlags.register(fs)
 	fs.StringVar(&cfg.config, "config", "", "rules file (default <workspace>/.devcontainer/hostrun.yaml)")
 	fs.BoolVar(&cfg.watch, "watch", false, "exit once the armed container stops")
-	fs.BoolVar(&cfg.noReread, "no-reread", false, "do not reread the rules file by itself once it changes")
-	fs.DurationVar(&cfg.startupTimeout, "startup-timeout", defaultStartupTimeout, "with --watch: how long to wait for the container to start")
-	fs.DurationVar(&cfg.grace, "grace", defaultGrace, "with --watch: how long the container may be gone before exiting")
+	sf.Register(fs)
 	if err := parseFlags(fs, args, serveUsage); err != nil {
 		return cfg, err
 	}
 	if cfg.socket == "" || cfg.workspace == "" || cfg.containerWorkspace == "" {
 		return cfg, errors.New(serveUsage)
 	}
+	s, err := sf.ResolveAsGiven(getenv)
+	if _, ok := errors.AsType[*settings.FlagError](err); ok {
+		return cfg, fmt.Errorf("%w; %s", err, serveUsage)
+	}
+	if err != nil {
+		return cfg, err
+	}
+	cfg.Settings = s
 	if cfg.config == "" {
 		cfg.config = cfg.rulesFile()
 	}
@@ -616,7 +647,7 @@ func isTerminal(f *os.File) bool {
 // The rules file is read here: an invalid file stops the daemon from
 // starting (fail closed), a missing one makes it deny every command. Later
 // edits, e.g. by a `git pull` on the host, are reread once the daemon sees
-// the file changed (every pollInterval); with noReread they take effect
+// the file changed (every pollInterval); without Reread they take effect
 // only in a new daemon, except that an approval session which adds a rule
 // makes the daemon reread the file. The digest of the rules reread is the
 // one arms compare.
@@ -645,7 +676,7 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 		l.Close()
 		return err
 	}
-	log.Info("listening", "socket", cfg.socket, "approval_socket", approvalSocket, "workspace", cfg.workspace, "container_workspace", cfg.containerWorkspace, "config", cfg.config, "rules_digest", policy.Digest(), "watch", cfg.watch, "no_reread", cfg.noReread)
+	log.Info("listening", "socket", cfg.socket, "approval_socket", approvalSocket, "workspace", cfg.workspace, "container_workspace", cfg.containerWorkspace, "config", cfg.config, "rules_digest", policy.Digest(), "watch", cfg.watch, "no_reread", !cfg.Reread)
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -655,8 +686,8 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 			Workspace:      cfg.workspace,
 			PollInterval:   cfg.pollInterval,
 			QueryTimeout:   queryTimeout,
-			StartupTimeout: cfg.startupTimeout,
-			Grace:          cfg.grace,
+			StartupTimeout: cfg.StartupTimeout,
+			Grace:          cfg.Grace,
 		}, log)
 		go func() {
 			defer cancel()
@@ -672,8 +703,8 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 		}
 		return p, p.Digest(), nil
 	}
-	opts := []daemon.Option{daemon.WithArmHandler(armHandler(cfg.config, cfg.noReread, watcher, log)), daemon.WithApprovals(al, cfg.config), daemon.WithReread(policy.Digest(), reread)}
-	if !cfg.noReread {
+	opts := []daemon.Option{daemon.WithArmHandler(armHandler(cfg.config, cfg.Reread, watcher, log)), daemon.WithApprovals(al, cfg.config), daemon.WithReread(policy.Digest(), reread)}
+	if cfg.Reread {
 		opts = append(opts, daemon.WithRereadEvery(cfg.pollInterval))
 	}
 	if watcher != nil {
@@ -707,16 +738,16 @@ func checkApprovalSocket(workspace, socket string) error {
 // every container start with the digest of the rules it validated; digest
 // is that of the rules the daemon serves from config, which a reread
 // changes. The daemon steps aside for a new one when the digests differ,
-// when the arm's --no-reread is not the daemon's, noReread, or when
-// watcher has ended and will not follow the arm; otherwise watcher, if
-// any, waits for the container of this arm.
-func armHandler(config string, noReread bool, watcher *watch.Watcher, log *slog.Logger) func(a protocol.Arm, digest string) (stepAside bool) {
+// when the arm's rereading is not the daemon's, reread, or when watcher
+// has ended and will not follow the arm; otherwise watcher, if any, waits
+// for the container of this arm.
+func armHandler(config string, reread bool, watcher *watch.Watcher, log *slog.Logger) func(a protocol.Arm, digest string) (stepAside bool) {
 	return func(a protocol.Arm, digest string) bool {
 		if a.ConfigDigest != digest {
 			log.Info("stepping aside: the rules file changed", "config", config)
 			return true
 		}
-		if a.NoReread != noReread {
+		if rereads := !a.NoReread; rereads != reread {
 			log.Info("stepping aside: --no-reread changed", "no_reread", a.NoReread)
 			return true
 		}
