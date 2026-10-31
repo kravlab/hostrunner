@@ -196,3 +196,27 @@ func TestStopWireFormat(t *testing.T) {
 		t.Fatal("got Drain=false, want true")
 	}
 }
+
+// An arm carrying settings still decodes into the Arm an older daemon
+// declares, its other fields unchanged: DecodeJSON, json.Unmarshal,
+// ignores the field the older Arm lacks. olderArm copies the fields of
+// the Arm before Settings by hand.
+func TestOlderDaemonIgnoresArmSettings(t *testing.T) {
+	type olderArm struct {
+		Version      int    `json:"version"`
+		ConfigDigest string `json:"config_digest"`
+		NoReread     bool   `json:"no_reread,omitempty"`
+	}
+	var buf bytes.Buffer
+	if err := WriteJSON(&buf, FrameArm, Arm{Version: Version, ConfigDigest: "digest", NoReread: true, Settings: map[string]string{"grace": "15s"}}); err != nil {
+		t.Fatal(err)
+	}
+	f, err := ReadFrame(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got olderArm
+	if err := DecodeJSON(f, &got); err != nil || got != (olderArm{Version: Version, ConfigDigest: "digest", NoReread: true}) {
+		t.Fatalf("got %+v, %v", got, err)
+	}
+}

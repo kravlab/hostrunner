@@ -458,7 +458,8 @@ revoked 1
   the daemon is served. A daemon gone by then is waited for, as one that
   ends while served; one served by another session when it comes asks
   again.
-  Without `--dir`, `$XDG_RUNTIME_DIR` must be set.
+  Without `--dir`, the runtime root (`$XDG_RUNTIME_DIR/hostrunner`
+  unless `runtime_root` says) must be known.
 - Choosing a served daemon asks `Take over? [y/N]`; no returns to the
   list. A session that is taken over prints `taken over by another
   session` and exits. Ctrl+C refuses the waiting requests, says how many,

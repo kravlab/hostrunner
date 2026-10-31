@@ -21,7 +21,7 @@ import (
 )
 
 // defaultAskTimeout is how long an approval request waits for an answer
-// when the client sets no limit.
+// when the client sets no limit, unless WithAskTimeout says.
 const defaultAskTimeout = 10 * time.Minute
 
 // maxAskTimeout is the longest limit a client may set on the wait.
@@ -765,14 +765,14 @@ func (s *Server) ask(ctx context.Context, x exchange, f protocol.Frame) {
 		s.reject(x.out, protocol.ExitHostrunError, err.Error(), err)
 		return
 	}
-	timeout := defaultAskTimeout
+	timeout := s.askTimeout
 	if ask.TimeoutMs > 0 {
 		timeout = time.Duration(ask.TimeoutMs) * time.Millisecond
-	}
-	if timeout > maxAskTimeout {
-		err := fmt.Errorf("--ask limit %s exceeds %s", timeout, maxAskTimeout)
-		s.reject(x.out, protocol.ExitHostrunError, err.Error(), err)
-		return
+		if timeout > maxAskTimeout {
+			err := fmt.Errorf("--ask limit %s exceeds %s", timeout, maxAskTimeout)
+			s.reject(x.out, protocol.ExitHostrunError, err.Error(), err)
+			return
+		}
 	}
 	need, r := s.assessApproval(req)
 	if r != nil {

@@ -48,11 +48,14 @@ const waitDelay = 2 * time.Second
 // its request, so idle connections cannot pile up and exhaust descriptors.
 const defaultRequestTimeout = 10 * time.Second
 
-// Server accepts client connections and runs their commands.
+// Server accepts client connections and runs their commands. A
+// connection that sends no request within requestTimeout is rejected; an
+// approval request whose client sets no limit waits askTimeout.
 type Server struct {
 	mapper           *workspace.Mapper
 	log              *slog.Logger
 	requestTimeout   time.Duration
+	askTimeout       time.Duration
 	onArm            func(a protocol.Arm, digest string) (stepAside bool) // nil: arming changes nothing
 	rereadFile       func() (Policy, string, error)                       // nil: the rules are never reread
 	approvals        *approvals                                           // nil: no approval socket, so nothing is approved
@@ -87,9 +90,16 @@ type Policy interface {
 type Option func(*Server)
 
 // WithRequestTimeout sets how long a connection may take to send its
-// request before it is rejected (default 10 s).
+// request before it is rejected (default 10 seconds).
 func WithRequestTimeout(d time.Duration) Option {
 	return func(s *Server) { s.requestTimeout = d }
+}
+
+// WithAskTimeout sets how long an approval request waits for an answer
+// when its client sets no limit (default 10 minutes). Unlike a client's
+// limit, it may exceed an hour: the host chose it.
+func WithAskTimeout(d time.Duration) Option {
+	return func(s *Server) { s.askTimeout = d }
 }
 
 // WithReread lets an approval session make the Server reread its rules
@@ -166,7 +176,8 @@ func New(mapper *workspace.Mapper, policy Policy, log *slog.Logger, opts ...Opti
 		panic("daemon: nil Policy")
 	}
 	s := &Server{
-		mapper: mapper, policy: policy, log: log, requestTimeout: defaultRequestTimeout,
+		mapper: mapper, policy: policy, log: log,
+		requestTimeout: defaultRequestTimeout, askTimeout: defaultAskTimeout,
 		running: map[uint64]protocol.RunningCommand{}, draining: make(chan struct{}),
 	}
 	for _, opt := range opts {

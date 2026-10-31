@@ -55,10 +55,13 @@ command without restarting the container.
 
 ## Rules test
 
-`hostrunner test [--config <path>] [--] <command> [args...]`, on the host.
+`hostrunner test [--settings <path>] [--workspace-settings <path>] [--rules-file <path>] [--] <command> [args...]`,
+on the host.
 
-- Reads `.devcontainer/hostrun.yaml` under the current directory, or the
-  `--config` file.
+- Reads the rules file `up` would use, the current directory being the
+  workspace: `.devcontainer/hostrun.yaml` under it unless `--rules-file`
+  (`--config`, its synonym), `HOSTRUNNER_RULES_FILE` or a settings file
+  names another.
 - Its flags end at the first argument that is not one of them, or at
   `--`; the rest is the command.
 - Tests the command against the rules alone: not the working directory,
@@ -87,7 +90,8 @@ package docs and usage text.
   the program; stdin not read; an old daemon's refusal; the log lines,
   for a malformed request too.
 - Rules test, at `run` of `cmd/hostrunner`: allowed, denied, no rule,
-  default file, `--config`, missing file, invalid file, no command, `--`.
+  default file, `--rules-file` and `--config`, missing file, invalid
+  file, no command, `--`.
 
 ## Out of scope
 

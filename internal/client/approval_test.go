@@ -642,28 +642,58 @@ func TestADirSessionAsksAgainWhenItsNextDaemonIsServed(t *testing.T) {
 	s.waitForWithin(t, takeOverPromptText, listWait)
 }
 
-// The daemon honours the client's limit on the wait.
-func TestAskHonoursTheClientsLimit(t *testing.T) {
-	h := startDaemon(t, policy(t, echoOnly))
-	h.serveRaw(t)
+// sendAsk sends a request for an approval to touch a file to h, with
+// limit (in ms) on the wait, and returns the connection, the waiting frame
+// read off it when the daemon queued the request.
+func sendAsk(t *testing.T, h harness, limit int64) net.Conn {
+	t.Helper()
 	conn, err := h.transport.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
-	ask := protocol.Ask{Request: protocol.Request{Version: protocol.Version, Argv: []string{"touch", "marker"}, Cwd: containerRoot}, TimeoutMs: 200}
+	t.Cleanup(func() { conn.Close() })
+	ask := protocol.Ask{Request: protocol.Request{Version: protocol.Version, Argv: []string{"touch", "marker"}, Cwd: containerRoot}, TimeoutMs: limit}
 	if err := protocol.WriteJSON(conn, protocol.FrameAsk, ask); err != nil {
 		t.Fatal(err)
 	}
 	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	if f, err := protocol.ReadFrame(conn); err != nil || f.Type != protocol.FrameWaiting {
-		t.Fatalf("frame %v, err %v; want waiting", f.Type, err)
+		t.Fatalf("frame %v %q, err %v; want waiting", f.Type, f.Payload, err)
 	}
+	return conn
+}
+
+// expectNobodyAnswered reads the refusal of a request nobody answered.
+func expectNobodyAnswered(t *testing.T, conn net.Conn) {
+	t.Helper()
 	f, err := protocol.ReadFrame(conn)
 	var e protocol.Error
 	if err != nil || f.Type != protocol.FrameError || protocol.DecodeJSON(f, &e) != nil || e.Message != "not approved: nobody answered on the host" {
 		t.Fatalf("frame %v %q, err %v; want nobody answered", f.Type, f.Payload, err)
 	}
+}
+
+// The daemon honours the client's limit on the wait.
+func TestAskHonoursTheClientsLimit(t *testing.T) {
+	h := startDaemon(t, policy(t, echoOnly))
+	h.serveRaw(t)
+	expectNobodyAnswered(t, sendAsk(t, h, 200))
+}
+
+// A request whose client sets no limit waits as long as the daemon's ask
+// timeout (WithAskTimeout).
+func TestAskWithoutALimitWaitsTheAskTimeout(t *testing.T) {
+	h := startDaemonWith(t, slog.New(slog.DiscardHandler), policy(t, echoOnly), daemon.WithAskTimeout(200*time.Millisecond))
+	h.serveRaw(t)
+	expectNobodyAnswered(t, sendAsk(t, h, 0))
+}
+
+// The longest limit a client may set does not bound the ask timeout the
+// host chose: a request without a limit is queued, not refused.
+func TestAnAskTimeoutAboveTheClientsMaximumIsAccepted(t *testing.T) {
+	h := startDaemonWith(t, slog.New(slog.DiscardHandler), policy(t, echoOnly), daemon.WithAskTimeout(2*time.Hour))
+	h.serveRaw(t)
+	sendAsk(t, h, 0)
 }
 
 // The daemon log records a request no session could take, and a session

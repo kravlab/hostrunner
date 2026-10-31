@@ -3,6 +3,7 @@ package stop_test
 import (
 	"context"
 	"errors"
+	"flag"
 	"log/slog"
 	"net"
 	"os"
@@ -20,6 +21,7 @@ import (
 	"github.com/kravlab/hostrunner/internal/launch"
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
+	"github.com/kravlab/hostrunner/internal/settings"
 	"github.com/kravlab/hostrunner/internal/stop"
 	"github.com/kravlab/hostrunner/internal/transport"
 	"github.com/kravlab/hostrunner/internal/watch"
@@ -85,9 +87,31 @@ var staticClient = sync.OnceValues(func() (string, error) {
 	return bin, nil
 })
 
+// resolving returns how a test's restart resolves the new daemon's
+// settings: from restart's flags args and the variables vars alone, as
+// the terminal running restart would give them.
+func resolving(t *testing.T, vars map[string]string, args ...string) func(workspace string) (settings.Settings, error) {
+	t.Helper()
+	var f settings.Flags
+	fs := flag.NewFlagSet("restart", flag.ContinueOnError)
+	f.RegisterRestart(fs)
+	if err := fs.Parse(args); err != nil {
+		t.Fatal(err)
+	}
+	return func(workspace string) (settings.Settings, error) {
+		return f.Resolve(func(name string) string { return vars[name] }, workspace)
+	}
+}
+
+// besideRules are the variables of a restart whose new daemon takes the
+// rules file hostrun.yaml in its workspace, as a current daemon of the
+// tests does.
+var besideRules = map[string]string{"HOSTRUNNER_RULES_FILE": "hostrun.yaml"}
+
 // restartConfig is how a test restarts: the test binary as the new
-// daemon, a static client, runtimes asked for an older daemon's
-// container. The new daemon is killed when the test ends.
+// daemon, a static client, the settings resolved from besideRules,
+// runtimes asked for an older daemon's container. The new daemon is
+// killed when the test ends.
 func restartConfig(t *testing.T, runtimes ...watch.Runtime) *stop.Restart {
 	t.Helper()
 	client, err := staticClient()
@@ -99,7 +123,7 @@ func restartConfig(t *testing.T, runtimes ...watch.Runtime) *stop.Restart {
 		t.Fatal(err)
 	}
 	t.Setenv(newDaemonEnv, "1")
-	return &stop.Restart{Daemon: exe, Client: client, ReadyTimeout: 5 * time.Second, Runtimes: runtimes}
+	return &stop.Restart{Daemon: exe, Client: client, Settings: resolving(t, besideRules), Runtimes: runtimes}
 }
 
 // newDaemonArgs returns the arguments the new daemon of dir started
@@ -224,7 +248,8 @@ func TestRestartReplacesTheDaemon(t *testing.T) {
 	}
 	d.waitStopped(t)
 	args := newDaemonArgs(t, d.dir)
-	want := []string{"serve", "--socket", filepath.Join(d.dir, launch.SocketName), "--workspace", d.workspace, "--container-workspace", "/workspaces/app", "--config", d.rulesFile, "--watch"}
+	want := []string{"serve", "--socket", filepath.Join(d.dir, launch.SocketName), "--workspace", d.workspace, "--container-workspace", "/workspaces/app", "--rules-file", d.rulesFile, "--watch",
+		"--startup-timeout", "30m0s", "--grace", "15s", "--poll-interval", "2s", "--ask-timeout", "10m0s", "--request-timeout", "10s", "--reread"}
 	if strings.Join(args, " ") != strings.Join(want, " ") {
 		t.Fatalf("the new daemon runs %q, want %q", args, want)
 	}
@@ -263,6 +288,40 @@ func TestRestartOfADaemonWhoseContainerStoppedOnlyStopsIt(t *testing.T) {
 	}
 }
 
+// A daemon that saw its container stop is only stopped, so neither its
+// settings nor its rules file, which no new daemon would use, keep a
+// restart from stopping it.
+func TestRestartOfADaemonWhoseContainerStoppedChecksNothingItWouldStart(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		spoil func(t *testing.T, d *currentDaemon, r *stop.Restart)
+	}{
+		{"invalid settings", func(t *testing.T, _ *currentDaemon, r *stop.Restart) {
+			host := filepath.Join(t.TempDir(), "settings.yaml")
+			if err := os.WriteFile(host, []byte("grace: soon\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			r.Settings = resolving(t, map[string]string{"HOSTRUNNER_SETTINGS": host})
+		}},
+		{"invalid rules", func(t *testing.T, d *currentDaemon, _ *stop.Restart) {
+			if err := os.WriteFile(d.rulesFile, []byte("rules:\n  - command: git\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			d := startCurrentDaemon(t, validRules, true)
+			r := restartConfig(t)
+			tt.spoil(t, d, r)
+			out, err := runStop(t, stop.Config{Dir: d.dir, Restart: r}, "")
+			if err != nil || out != "hostrunner: stopped "+d.dir+"; its container is not running\n" {
+				t.Fatalf("restart: %v; printed %q", err, out)
+			}
+			d.waitStopped(t)
+		})
+	}
+}
+
 func TestRestartOfAnOlderDaemonAsksTheContainerRuntime(t *testing.T) {
 	for _, running := range []bool{true, false} {
 		t.Run(strconv.FormatBool(running), func(t *testing.T) {
@@ -291,21 +350,102 @@ func TestRestartOfAnOlderDaemonNeedsAContainerRuntime(t *testing.T) {
 	}
 }
 
-// A daemon that does not reread its rules file by itself is restarted
-// as one started with --no-reread.
-func TestRestartKeepsNoReread(t *testing.T) {
-	d := startCurrentDaemon(t, validRules, false)
-	if out, err := runStop(t, stop.Config{Dir: d.dir, Restart: restartConfig(t)}, ""); err != nil {
+// A restart says which of what the old daemon said of itself, its rules
+// file and whether it rereads, the new daemon's settings change.
+func TestRestartSaysWhatTheSettingsChange(t *testing.T) {
+	d := startCurrentDaemon(t, validRules, false, rereading...)
+	other := filepath.Join(d.workspace, "other.yaml")
+	if err := os.WriteFile(other, []byte(validRules), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r := restartConfig(t)
+	r.Settings = resolving(t, map[string]string{"HOSTRUNNER_RULES_FILE": "other.yaml", "HOSTRUNNER_REREAD": "false"})
+	out, err := runStop(t, stop.Config{Dir: d.dir, Restart: r}, "")
+	if want := "hostrunner: restarted " + d.dir + "; rules_file " + d.rulesFile + " → " + other + ", reread true → false\n"; err != nil || out != want {
+		t.Fatalf("restart: %v; printed %q, want %q", err, out, want)
+	}
+	d.waitStopped(t)
+}
+
+// The new daemon rereads its rules file by itself as its settings say,
+// whether the old one did or not.
+func TestRestartTakesRereadingFromTheSettings(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		opts []daemon.Option
+		vars map[string]string
+		want string
+	}{
+		{"by default", nil, besideRules, "--reread"},
+		{"with reread false", rereading, map[string]string{"HOSTRUNNER_RULES_FILE": "hostrun.yaml", "HOSTRUNNER_REREAD": "false"}, "--no-reread"},
+	} {
+		d := startCurrentDaemon(t, validRules, false, tt.opts...)
+		r := restartConfig(t)
+		r.Settings = resolving(t, tt.vars)
+		if out, err := runStop(t, stop.Config{Dir: d.dir, Restart: r}, ""); err != nil {
+			t.Fatalf("%s: restart: %v; printed %q", tt.name, err, out)
+		}
+		d.waitStopped(t)
+		if args := newDaemonArgs(t, d.dir); !slices.Contains(args, tt.want) {
+			t.Errorf("%s: the new daemon runs %q, want %s", tt.name, args, tt.want)
+		}
+	}
+}
+
+// A restart resolves the new daemon's settings from the settings files
+// as they are when it runs, for the old daemon's workspace: the common
+// part of the host settings file, the workspace's section and the
+// workspace settings file all apply.
+func TestRestartPicksUpTheSettingsFilesAsTheyAreNow(t *testing.T) {
+	d := startCurrentDaemon(t, validRules, false, rereading...)
+	host := filepath.Join(t.TempDir(), "settings.yaml")
+	content := "grace: 1m\nworkspaces:\n  " + d.workspace + ":\n    poll_interval: 3s\n"
+	if err := os.WriteFile(host, []byte(content), 0o600); err != nil { // edited after the daemon started
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(d.workspace, ".devcontainer"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(d.workspace, ".devcontainer", "hostrunner.yaml"), []byte("ask_timeout: 4m\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r := restartConfig(t)
+	r.Settings = resolving(t, map[string]string{"HOSTRUNNER_RULES_FILE": "hostrun.yaml", "HOSTRUNNER_SETTINGS": host})
+	if out, err := runStop(t, stop.Config{Dir: d.dir, Restart: r}, ""); err != nil {
 		t.Fatalf("restart: %v; printed %q", err, out)
 	}
 	d.waitStopped(t)
-	if args := newDaemonArgs(t, d.dir); !slices.Contains(args, "--no-reread") {
-		t.Fatalf("the new daemon runs %q, want --no-reread", args)
+	args := strings.Join(newDaemonArgs(t, d.dir), " ")
+	for _, want := range []string{"--grace 1m0s", "--poll-interval 3s", "--ask-timeout 4m0s"} {
+		if !strings.Contains(args, want) {
+			t.Errorf("the new daemon runs %q, want %s", args, want)
+		}
+	}
+}
+
+// Invalid settings leave the old daemon running, the error naming their
+// source.
+func TestRestartWithInvalidSettingsLeavesTheDaemonRunning(t *testing.T) {
+	d := startCurrentDaemon(t, validRules, false)
+	host := filepath.Join(t.TempDir(), "settings.yaml")
+	if err := os.WriteFile(host, []byte("grace: soon\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r := restartConfig(t)
+	r.Settings = resolving(t, map[string]string{"HOSTRUNNER_SETTINGS": host})
+	_, err := runStop(t, stop.Config{Dir: d.dir, Restart: r}, "")
+	want := "settings file " + host + `: grace: invalid duration "soon"; the daemon keeps running`
+	if err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("got %v, want an error containing %q", err, want)
+	}
+	d.stillServes(t)
+	if args := newDaemonArgs(t, d.dir); args != nil {
+		t.Fatalf("a new daemon started: %q", args)
 	}
 }
 
 // An older daemon, which does not say whether it rereads, is restarted
-// as one that does, the default.
+// as one that does when the settings say nothing, the default.
 func TestRestartOfAnOlderDaemonStartsOneThatRereads(t *testing.T) {
 	d := startOlderDaemon(t, false, "")
 	out, err := runStop(t, stop.Config{Dir: d.dir, Restart: restartConfig(t, fakeRuntime{true}), Commands: stop.Commands{Answer: stop.Kill}}, "")
@@ -316,6 +456,9 @@ func TestRestartOfAnOlderDaemonStartsOneThatRereads(t *testing.T) {
 	args := newDaemonArgs(t, d.dir)
 	if args == nil || slices.Contains(args, "--no-reread") {
 		t.Fatalf("the new daemon runs %q, want it without --no-reread", args)
+	}
+	if strings.Contains(out, "reread") {
+		t.Fatalf("printed %q, a change of rereading the older daemon did not say", out)
 	}
 }
 

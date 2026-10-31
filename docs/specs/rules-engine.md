@@ -11,9 +11,11 @@ Denied calls exit 126 with a message naming the rule and the reason.
 
 ## Config loading
 
-- `hostrunner serve --config <path>`; default
-  `<workspace>/.devcontainer/hostrun.yaml` (read on the host). `up` does
-  not pass it.
+- `hostrunner serve --rules-file <path>` (`--config`, its synonym);
+  default `<workspace>/.devcontainer/hostrun.yaml` (read on the host). It
+  is the `rules_file` setting, which the settings files and
+  `HOSTRUNNER_RULES_FILE` give too (README, Settings); `up` passes the
+  one it resolves.
 - Read once at startup. Invalid file → the daemon does not start (so
   `hostrunner up`, and with it `devcontainer up`, fails with the error).
 - Missing file → the daemon starts with no rules; every call is denied
@@ -151,7 +153,7 @@ name container paths anyway, so only relative symlinks are followed.
 - End-to-end (client ↔ daemon): allowed call runs; denied call → 126 with
   the message; no config → everything denied; the command runs in the
   opened directory.
-- `cmd/hostrunner`: invalid config → `serve` fails; `--config` default.
+- `cmd/hostrunner`: invalid rules → `serve` fails; `--rules-file` default.
 - `e2e`: the workspace is a git repo using the example config (plus test
   rules for `pwd`/`sh`); `hostrun git rev-parse --show-toplevel` prints the
   host path; `hostrun git push --force` and an unlisted command → 126.
@@ -176,7 +178,7 @@ name container paths anyway, so only relative symlinks are followed.
   A daemon that loaded other rules answers `Armed{restart: true}` and
   steps aside (stops); `up` waits for the socket to free up and starts a
   new daemon.
-  `serve` takes `--config`; `up` passes it.
+  `serve` takes `--rules-file` (`--config`); `up` passes it.
 - **Daemon:** the policy is a required argument of `daemon.New`
   (`WithPolicy` is gone); a panic while handling a connection is answered
   with `Error` 125 and does not stop the daemon.
