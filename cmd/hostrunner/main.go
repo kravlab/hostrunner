@@ -9,9 +9,9 @@
 //	    [--watch] [settings]
 //	hostrunner test [--settings <path>] [--workspace-settings <path>] [--rules-file <path>]
 //	    [--] <command> [args...]
-//	hostrunner approve [--dir <runtime-dir>]
-//	hostrunner stop [--dir <runtime-dir> | --all | --choose] [--kill | --wait]
-//	hostrunner restart [--dir <runtime-dir> | --all | --choose] [--kill | --wait]
+//	hostrunner approve [--dir <runtime-dir>] [settings]
+//	hostrunner stop [--dir <runtime-dir> | --all | --choose] [--kill | --wait] [settings]
+//	hostrunner restart [--dir <runtime-dir> | --all | --choose] [--kill | --wait] [settings]
 //	hostrunner update [--check]
 //	hostrunner instructions [--append [<path>]]
 //	hostrunner version
@@ -45,7 +45,12 @@
 // ($XDG_CONFIG_HOME/hostrunner/settings.yaml unless --settings or
 // HOSTRUNNER_SETTINGS names another; its section for the workspace, then
 // its common part) or the default (see internal/settings). `up` resolves
-// them and starts the daemon with every one as a flag.
+// them and starts the daemon with every one as a flag. The settings of
+// `stop` and `restart` are [--settings <path>] [--runtime-root <path>]
+// [--stop-timeout <duration>], those of `approve` [--settings <path>]
+// [--runtime-root <path>]; a setting no flag gives comes from its
+// HOSTRUNNER_* variable, the common part of the host settings file or
+// the default.
 package main
 
 import (
@@ -81,21 +86,26 @@ import (
 
 const (
 	usage             = "usage: hostrunner up|serve|test|approve|stop|restart|update|instructions|version [flags]; see `hostrunner <command> -h`"
-	stopUsage         = "usage: hostrunner stop [--dir <runtime-dir> | --all | --choose] [--kill | --wait]"
-	restartUsage      = "usage: hostrunner restart [--dir <runtime-dir> | --all | --choose] [--kill | --wait]"
-	approveUsage      = "usage: hostrunner approve [--dir <runtime-dir>]"
 	updateUsage       = "usage: hostrunner update [--check]"
 	instructionsUsage = "usage: hostrunner instructions [--append [<path>]]"
 	versionUsage      = "usage: hostrunner version"
 )
 
-// The usages of the commands with settings, whose flags settings.Usage
+// The usages of the commands with settings, whose flags package settings
 // names.
 var (
-	upUsage    = "usage: hostrunner up [--restart [--kill | --wait]] " + settings.UpUsage() + " --dir <runtime-dir> --workspace <host-path> --container-workspace <path>"
-	serveUsage = "usage: hostrunner serve --socket <path> --workspace <host-path> --container-workspace <path> [--watch] " + settings.Usage()
-	testUsage  = "usage: hostrunner test " + settings.RulesFileUsage() + " [--] <command> [args...]"
+	upUsage      = "usage: hostrunner up [--restart [--kill | --wait]] " + settings.UpUsage() + " --dir <runtime-dir> --workspace <host-path> --container-workspace <path>"
+	serveUsage   = "usage: hostrunner serve --socket <path> --workspace <host-path> --container-workspace <path> [--watch] " + settings.Usage()
+	testUsage    = "usage: hostrunner test " + settings.RulesFileUsage() + " [--] <command> [args...]"
+	stopUsage    = "usage: hostrunner stop [--dir <runtime-dir> | --all | --choose] [--kill | --wait] " + settings.StopUsage()
+	restartUsage = "usage: hostrunner restart [--dir <runtime-dir> | --all | --choose] [--kill | --wait] " + settings.StopUsage()
+	approveUsage = "usage: hostrunner approve [--dir <runtime-dir>] " + settings.ApproveUsage()
 )
+
+// errNoRuntimeRoot is the error of stop, restart and approve given no
+// runtime directory when no source gives a runtime root and
+// XDG_RUNTIME_DIR, its default, is unset.
+var errNoRuntimeRoot = errors.New("XDG_RUNTIME_DIR is not set: give the runtime root with --runtime-root, HOSTRUNNER_RUNTIME_ROOT or runtime_root in the host settings file, or the runtime directory with --dir")
 
 // Timeouts that are not settings (see internal/settings). readyTimeout
 // is how long `restart` waits for the daemon it starts, the default
@@ -160,7 +170,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 		if !cfg.restart {
 			return launch.Up(ctx, cfg.launch)
 		}
-		sctx, commands, releaseSignals := stopCommands(cfg.answer)
+		sctx, commands, releaseSignals := stopCommands(stop.Commands{Answer: cfg.answer})
 		defer releaseSignals()
 		return stop.UpRestart(sctx, cfg.launch, commands, os.Stdin, stderr)
 	case "stop", "restart":
@@ -168,14 +178,14 @@ func run(args []string, stdout, stderr io.Writer) error {
 		if err != nil {
 			return err
 		}
-		cfg, err := parseStop(args[0], args[1:], exe, stderr)
+		cfg, err := parseStop(args[0], args[1:], exe, os.Getenv, stderr)
 		if err != nil {
 			return err
 		}
 		if cfg.Restart != nil {
 			cfg.Restart.Runtimes = watch.Detect()
 		}
-		sctx, commands, releaseSignals := stopCommands(cfg.Answer)
+		sctx, commands, releaseSignals := stopCommands(cfg.Commands)
 		defer releaseSignals()
 		cfg.Commands = commands
 		return stop.Run(sctx, cfg, os.Stdin, stderr)
@@ -198,7 +208,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 		}
 		return rulesTest(cfg, stderr)
 	case "approve":
-		cfg, err := parseApprove(args[1:], stderr)
+		cfg, err := parseApprove(args[1:], os.Getenv, stderr)
 		if err != nil {
 			return err
 		}
@@ -345,9 +355,10 @@ func parseAnswer(kill, wait bool, usage string) (stop.Answer, error) {
 // parseStop parses the flags of `hostrunner stop` or, for name "restart",
 // `hostrunner restart`, which starts the hostrunner at exe, and its
 // hostrun beside it, as the new daemons. Without --dir the daemons are
-// looked for under $XDG_RUNTIME_DIR/hostrunner, where `hostrunner up`
-// puts their runtime directories.
-func parseStop(name string, args []string, exe string, output io.Writer) (stop.Config, error) {
+// looked for under the runtime root, $XDG_RUNTIME_DIR/hostrunner (where
+// `hostrunner up` puts their runtime directories) unless a setting says;
+// the settings are resolved with getenv reading the environment.
+func parseStop(name string, args []string, exe string, getenv func(string) string, output io.Writer) (stop.Config, error) {
 	usage := stopUsage
 	if name == "restart" {
 		usage = restartUsage
@@ -355,6 +366,7 @@ func parseStop(name string, args []string, exe string, output io.Writer) (stop.C
 	var (
 		cfg        stop.Config
 		kill, wait bool
+		sf         settings.Flags
 	)
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	fs.SetOutput(output)
@@ -362,6 +374,7 @@ func parseStop(name string, args []string, exe string, output io.Writer) (stop.C
 	fs.BoolVar(&cfg.All, "all", false, "every daemon")
 	fs.BoolVar(&cfg.Choose, "choose", false, "choose the daemon from the list")
 	registerAnswer(fs, &kill, &wait)
+	sf.RegisterStop(fs)
 	if err := parseFlags(fs, args, usage); err != nil {
 		return stop.Config{}, err
 	}
@@ -381,12 +394,16 @@ func parseStop(name string, args []string, exe string, output io.Writer) (stop.C
 	if cfg.Cwd, err = os.Getwd(); err != nil {
 		return stop.Config{}, err
 	}
+	s, err := hostSettings(&sf, getenv, usage)
+	if err != nil {
+		return stop.Config{}, err
+	}
+	cfg.StopTimeout = s.StopTimeout
 	if cfg.Dir == "" {
-		xdg := os.Getenv("XDG_RUNTIME_DIR")
-		if xdg == "" {
-			return stop.Config{}, errors.New("XDG_RUNTIME_DIR is not set: give the runtime directory with --dir")
+		if s.RuntimeRoot == "" {
+			return stop.Config{}, errNoRuntimeRoot
 		}
-		cfg.Root = filepath.Join(xdg, "hostrunner")
+		cfg.Root = s.RuntimeRoot
 	}
 	if name == "restart" {
 		b := daemonBinaries(exe)
@@ -397,14 +414,16 @@ func parseStop(name string, args []string, exe string, output io.Writer) (stop.C
 
 // stopCommands returns the context a stop, restart or `up --restart` runs
 // in, cancelled by SIGTERM, and how it treats the commands of a daemon it
-// stops: as answer says, or the human on stdin when it is a terminal,
-// Ctrl+C (SIGINT) asking what becomes of a draining daemon rather than
-// ending the command; release stops both signals.
-func stopCommands(answer stop.Answer) (ctx context.Context, commands stop.Commands, release func()) {
+// stops: parsed, the Answer and StopTimeout of the command line, with the
+// human on stdin when it is a terminal and Ctrl+C (SIGINT) asking what
+// becomes of a draining daemon rather than ending the command; release
+// stops both signals.
+func stopCommands(parsed stop.Commands) (ctx context.Context, commands stop.Commands, release func()) {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM)
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, os.Interrupt)
-	commands = stop.Commands{Answer: answer, Terminal: isTerminal(os.Stdin), Interrupts: ch}
+	commands = parsed
+	commands.Terminal, commands.Interrupts = isTerminal(os.Stdin), ch
 	return ctx, commands, func() {
 		signal.Stop(ch)
 		cancel()
@@ -452,15 +471,20 @@ func parseServe(args []string, getenv func(string) string, output io.Writer) (se
 
 // parseApprove parses the flags of `hostrunner approve`: --dir, the runtime
 // directory of the daemon to serve, whose approval socket is beside it.
-// Without it the session lists the daemons of $XDG_RUNTIME_DIR/hostrunner,
-// where `hostrunner up` puts their runtime directories, and the current
-// directory chooses the default; with it, the session serves that daemon
-// alone.
-func parseApprove(args []string, output io.Writer) (approval.Config, error) {
-	var dir string
+// Without it the session lists the daemons of the runtime root,
+// $XDG_RUNTIME_DIR/hostrunner (where `hostrunner up` puts their runtime
+// directories) unless a setting says, and the current directory chooses
+// the default; with it, the session serves that daemon alone. The
+// settings are resolved with getenv reading the environment.
+func parseApprove(args []string, getenv func(string) string, output io.Writer) (approval.Config, error) {
+	var (
+		dir string
+		sf  settings.Flags
+	)
 	fs := flag.NewFlagSet("approve", flag.ContinueOnError)
 	fs.SetOutput(output)
 	fs.StringVar(&dir, "dir", "", "runtime directory of the daemon to serve (default: choose from the list)")
+	sf.RegisterApprove(fs)
 	if err := parseFlags(fs, args, approveUsage); err != nil {
 		return approval.Config{}, err
 	}
@@ -468,14 +492,28 @@ func parseApprove(args []string, output io.Writer) (approval.Config, error) {
 	if err != nil {
 		return approval.Config{}, err
 	}
+	s, err := hostSettings(&sf, getenv, approveUsage)
+	if err != nil {
+		return approval.Config{}, err
+	}
 	if dir != "" {
 		return approval.Config{Socket: launch.ApprovalSocket(dir), Cwd: cwd}, nil
 	}
-	xdg := os.Getenv("XDG_RUNTIME_DIR")
-	if xdg == "" {
-		return approval.Config{}, errors.New("XDG_RUNTIME_DIR is not set: give the runtime directory with --dir")
+	if s.RuntimeRoot == "" {
+		return approval.Config{}, errNoRuntimeRoot
 	}
-	return approval.Config{Root: filepath.Join(xdg, "hostrunner"), Cwd: cwd}, nil
+	return approval.Config{Root: s.RuntimeRoot, Cwd: cwd}, nil
+}
+
+// hostSettings resolves the settings of stop, restart or approve that sf
+// registered, with getenv reading the environment; a flag error carries
+// usage.
+func hostSettings(sf *settings.Flags, getenv func(string) string, usage string) (settings.Settings, error) {
+	s, err := sf.ResolveHost(getenv)
+	if _, ok := errors.AsType[*settings.FlagError](err); ok {
+		return s, fmt.Errorf("%w; %s", err, usage)
+	}
+	return s, err
 }
 
 // parseVersion parses the arguments of `hostrunner version`, which takes

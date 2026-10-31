@@ -17,10 +17,13 @@ container start.
 ## Commands
 
 ```sh
-hostrunner stop    [--dir <runtime-dir> | --all | --choose] [--kill | --wait]
-hostrunner restart [--dir <runtime-dir> | --all | --choose] [--kill | --wait]
+hostrunner stop    [--dir <runtime-dir> | --all | --choose] [--kill | --wait] [settings]
+hostrunner restart [--dir <runtime-dir> | --all | --choose] [--kill | --wait] [settings]
 hostrunner up --restart [--kill | --wait] --dir … --workspace … --container-workspace …
 ```
+
+The settings of `stop` and `restart` are `--settings`, `--runtime-root`
+and `--stop-timeout`, resolved as the README's Settings section says.
 
 `--dir`, `--all` and `--choose` exclude each other, and so do `--kill` and
 `--wait`; a combination is a usage error.
@@ -36,8 +39,9 @@ hostrunner up --restart [--kill | --wait] --dir … --workspace … --container-
 ## Choosing the daemon
 
 The daemons are those found as `hostrunner approve` finds them: the
-approval sockets under `$XDG_RUNTIME_DIR/hostrunner`, each answering a
-hello with its `DaemonInfo`.
+approval sockets under the runtime root (`$XDG_RUNTIME_DIR/hostrunner`
+unless `runtime_root` says), each answering a hello with its
+`DaemonInfo`.
 
 - Without a flag: the one daemon whose host workspace holds the current
   directory. None, or more than one (two devcontainer configurations of
@@ -50,7 +54,9 @@ hello with its `DaemonInfo`.
 - `--choose`: the list `hostrunner approve` shows, numbered; Enter picks
   the daemon for the current directory. Daemons of every version can be
   chosen (see Older daemons).
-- `XDG_RUNTIME_DIR` unset: an error naming `--dir`, as `approve` does.
+- `XDG_RUNTIME_DIR` unset and no runtime root from a setting: an error
+  naming `--runtime-root`, `HOSTRUNNER_RUNTIME_ROOT`, `runtime_root` and
+  `--dir`, as `approve` does.
 
 ## Running commands
 

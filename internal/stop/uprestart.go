@@ -6,6 +6,7 @@ import (
 	"io"
 
 	"github.com/kravlab/hostrunner/internal/launch"
+	"github.com/kravlab/hostrunner/internal/settings"
 )
 
 // UpRestart is `hostrunner up --restart`: as launch.Up, but a daemon
@@ -15,7 +16,7 @@ import (
 // says what to do with, leave the daemon running.
 func UpRestart(ctx context.Context, up launch.Config, commands Commands, in io.Reader, out io.Writer) error {
 	if commands.StopTimeout == 0 {
-		commands.StopTimeout = defaultStopTimeout
+		commands.StopTimeout = settings.DefaultStopTimeout
 	}
 	p, err := launch.Prepare(up)
 	if err != nil {

@@ -201,7 +201,29 @@ Besides its rules, a daemon has settings:
 | `request_timeout` | `HOSTRUNNER_REQUEST_TIMEOUT` | `--request-timeout` | `10s` | how long a new connection may take to send its request |
 | `ready_timeout` | `HOSTRUNNER_READY_TIMEOUT` | `--ready-timeout` (`up` only) | `10s` | how long `up` waits for the daemon it starts to listen |
 
-Each comes from the first that gives it:
+`hostrunner stop`, `restart` and `approve` have settings of their own:
+
+| Key | Variable | Flag | Default | What it sets | Read by |
+|---|---|---|---|---|---|
+| `runtime_root` | `HOSTRUNNER_RUNTIME_ROOT` | `--runtime-root` | `$XDG_RUNTIME_DIR/hostrunner` | where they look for daemons without `--dir` | `stop`, `restart`, `approve` |
+| `stop_timeout` | `HOSTRUNNER_STOP_TIMEOUT` | `--stop-timeout` | `10s` | how long they wait for a stopped daemon to close its sockets | `stop`, `restart` |
+
+They do not know a workspace before they choose a daemon, so they read
+only the flag, the variable and the common part of the host settings
+file (`--settings` names it), then the default; in the workspace
+settings file or a workspace section these two keys are an error. A
+`runtime_root` from the file or the variable must be absolute after `~`
+expansion; a relative `--runtime-root` is read against the current
+directory. Without `XDG_RUNTIME_DIR` and a runtime root from any source,
+these commands need `--dir`.
+
+`up` and `serve` neither read nor check these two settings. `up` puts
+the runtime directory where its `--dir` says, so set `runtime_root` to
+the directory that holds the `--dir` of your `devcontainer.json`;
+`up --restart` waits 10 seconds for the daemon it stops to close its
+sockets.
+
+Each daemon setting comes from the first that gives it:
 
 1. the flag;
 2. the variable (an empty one is unset);
@@ -225,6 +247,8 @@ poll_interval: 5s
 ask_timeout: 30m
 request_timeout: 30s
 ready_timeout: 1m
+runtime_root: ~/.local/run/hostrunner
+stop_timeout: 1m
 workspaces:
   ~/src/app:
     grace: 5m
@@ -242,10 +266,9 @@ The workspace settings file is `.devcontainer/hostrunner.yaml` in the
 workspace, or the file `--workspace-settings` (relative to the current
 directory) or else `HOSTRUNNER_WORKSPACE_SETTINGS` (relative to the
 workspace) names; the default file may be missing, a named one may not.
-It holds the keys at the top level, with no `workspaces`, and wins over
-the host settings file. `runtime_root` and `stop_timeout` are allowed
-only in the common part of the host settings file: in the workspace
-settings file or a section they are an error.
+It holds the keys at the top level, with no `workspaces` and none of
+the keys of `stop`, `restart` and `approve`, and wins over the host
+settings file.
 
 A relative `rules_file` from a settings file or a variable is read
 against the workspace (after `~` expansion), so one `rules_file` in the
@@ -278,21 +301,23 @@ hostrunner approve                                                  # choose fro
 hostrunner approve --dir "$XDG_RUNTIME_DIR/hostrunner/<devcontainerId>"   # that devcontainer's daemon
 ```
 
-Without `--dir` it lists the daemons under `$XDG_RUNTIME_DIR/hostrunner`,
-looking again every 2 seconds and waiting while there is none: the one
-whose host workspace holds the current directory is marked `*` and is
-chosen with Enter, one another session serves is marked, and one of
-another approval protocol version cannot be chosen (restart its
-container). Choosing a served daemon asks `Take over? [y/N]`: the other
-session says it was taken over and ends, and the requests waiting pass to
-this one with the rest of their limit. `--dir` serves the daemon of that
-runtime directory, the `--dir` its `initializeCommand` gives
-`hostrunner up`; a directory without an approval socket has no
-approvals; a session given `--dir` serves that daemon alone, asking first
-whether to take it over from another session serving it. When its
-daemon ends, or its connection to it fails, the session waits for the
-next one in the same runtime directory. At the idle `>` prompt, `daemons` leaves the daemon for the
-list (without `--dir`) and `quit` ends the session.
+Without `--dir` it lists the daemons under the runtime root
+(`$XDG_RUNTIME_DIR/hostrunner` unless `runtime_root` says, see
+[Settings](#settings)), looking again every 2 seconds and waiting while
+there is none: the one whose host workspace holds the current directory
+is marked `*` and is chosen with Enter, one another session serves is
+marked, and one of another approval protocol version cannot be chosen
+(restart its container). Choosing a served daemon asks
+`Take over? [y/N]`: the other session says it was taken over and ends,
+and the requests waiting pass to this one with the rest of their limit.
+`--dir` serves the daemon of that runtime directory, the `--dir` its
+`initializeCommand` gives `hostrunner up`; a directory without an
+approval socket has no approvals; a session given `--dir` serves that
+daemon alone, asking first whether to take it over from another session
+serving it. When its daemon ends, or its connection to it fails, the
+session waits for the next one in the same runtime directory. At the
+idle `>` prompt, `daemons` leaves the daemon for the list (without
+`--dir`) and `quit` ends the session.
 
 It serves the daemon chosen: it prints each approval request as
 it arrives, with the container directory, the argv (`cmd` line) and why
@@ -459,18 +484,21 @@ hostrunner stop --all --kill                                      # every daemon
 hostrunner restart --choose                                       # choose from the list
 ```
 
-Without a flag it takes the one daemon under `$XDG_RUNTIME_DIR/hostrunner`
-whose host workspace holds the current directory; none, or several, is an
-error listing them. `--dir` takes that runtime directory's daemon,
-`--all` every daemon (one failing does not keep the others from
-stopping), `--choose` the list `hostrunner approve` shows. A daemon
-running commands lists them and asks: `k` kills them, `w` waits for them
-to finish (the daemon closes its sockets meanwhile, so new requests fail
-and waiting approval requests end with 126 `the hostrunner daemon is
-stopping`; Ctrl+C asks again), `q` leaves it running. `--kill` or
-`--wait` answers up front; without a terminal on stdin, one of them is
-needed, or the daemon is left alone. Standing and session approvals end
-with the daemon; the count lost is printed.
+Without a flag it takes the one daemon under the runtime root
+(`$XDG_RUNTIME_DIR/hostrunner` unless `runtime_root` says, see
+[Settings](#settings)) whose host workspace holds the current directory;
+none, or several, is an error listing them. `--dir` takes that runtime
+directory's daemon, `--all` every daemon (one failing does not keep the
+others from stopping), `--choose` the list `hostrunner approve` shows. A
+daemon running commands lists them and asks: `k` kills them, `w` waits
+for them to finish (the daemon closes its sockets meanwhile, so new
+requests fail and waiting approval requests end with 126
+`the hostrunner daemon is stopping`; Ctrl+C asks again), `q` leaves it
+running. `--kill` or `--wait` answers up front; without a terminal on
+stdin, one of them is needed, or the daemon is left alone. A stopped
+daemon has `stop_timeout` (10 seconds unless set) to close its sockets.
+Standing and session approvals end with the daemon; the count lost is
+printed.
 
 `restart` reads and checks the rules file before stopping anything
 (invalid rules leave the daemon running), then starts a new daemon, the

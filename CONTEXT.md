@@ -154,10 +154,19 @@ before it exits.
 How long `hostrunner up` waits for the daemon it starts to
 listen; it tunes `up`, not the daemon.
 
+**Stop timeout**:
+How long a stop or restart waits for a daemon it stopped,
+past any drain, to close its sockets; it tunes the stop, not
+the daemon.
+
 **Runtime directory**:
 The host directory, one per devcontainer, that holds a
 daemon's socket, the hostrun client and the daemon log, and
 that the container mounts read-only.
+
+**Runtime root**:
+The host directory the runtime directories lie in, where a
+stop, a restart and an approval session look for daemons.
 
 **Layout root**:
 The directory an install keeps its versions in,
@@ -176,8 +185,10 @@ _Avoid_: current (in code and specs that is the running version)
 ### Settings
 
 **Settings**:
-What tunes a daemon besides its rules: its timeouts, whether it
-rereads, where its rules file and runtime directories are.
+What tunes a daemon besides its rules (its timeouts, whether it
+rereads, where its rules file is), and the commands that start,
+stop or approve it (how long they wait, where they look for
+daemons).
 _Avoid_: config (`--config` names the rules file)
 
 **Host settings file**:

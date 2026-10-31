@@ -6,7 +6,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"slices"
 
 	"go.yaml.in/yaml/v3"
 )
@@ -95,8 +94,10 @@ func readFile(in scopes, path string, host bool) (layer, map[string]layer, error
 // begins its errors (`settings file P: ` or, in a section, `settings
 // file P: workspaces./home/u/app: `). The common part of the host
 // settings file (host) may hold `workspaces`, read into sections; any
-// other mapping refuses the keys of commonOnly. A key outside in, which
-// the command does not take, is neither read nor checked.
+// other mapping refuses the keys only the common part may set (see
+// scope.commonOnly), and a command that knows no workspace skips the
+// sections unread. A key outside in, which the command does not take, is
+// neither read nor checked.
 func readSettings(in scopes, m *yaml.Node, where string, host bool) (layer, map[string]layer, error) {
 	if m.Kind != yaml.MappingNode {
 		return nil, nil, fmt.Errorf("%snot a mapping of settings (line %d)", where, m.Line)
@@ -108,8 +109,12 @@ func readSettings(in scopes, m *yaml.Node, where string, host bool) (layer, map[
 	for i := 0; i+1 < len(m.Content); i += 2 {
 		name, value := m.Content[i].Value, m.Content[i+1]
 		if host && name == "workspaces" {
-			if sections != nil { // readSections never returns nil
+			if seen[name] {
 				return nil, nil, fail(name, "given twice")
+			}
+			seen[name] = true
+			if !in.knowWorkspace() { // the sections hold no key the command takes
+				continue
 			}
 			s, err := readSections(in, value, where)
 			if err != nil {
@@ -118,12 +123,12 @@ func readSettings(in scopes, m *yaml.Node, where string, host bool) (layer, map[
 			sections = s
 			continue
 		}
-		if !host && slices.Contains(commonOnly, name) {
-			return nil, nil, fail(name, "only allowed in the common part of the host settings file")
-		}
 		k, ok := lookup(name)
 		if !ok {
 			return nil, nil, fail(name, "unknown key")
+		}
+		if !host && k.scope.commonOnly() {
+			return nil, nil, fail(name, "only allowed in the common part of the host settings file")
 		}
 		if seen[name] {
 			return nil, nil, fail(name, "given twice")

@@ -50,7 +50,9 @@ type Commands struct {
 	// `up` or stop, it ends the stop, which stops no more daemons.
 	Interrupts <-chan os.Signal
 	// StopTimeout bounds how long a daemon may take to close its sockets
-	// once it has stopped; zero means defaultStopTimeout.
+	// once it has stopped: the stop_timeout setting of stop and restart.
+	// Zero, as `up --restart` gives it (up takes no stop_timeout), means
+	// settings.DefaultStopTimeout.
 	StopTimeout time.Duration
 }
 
@@ -58,7 +60,7 @@ type Commands struct {
 // All and Choose exclude each other; without any, the daemon whose host
 // workspace holds Cwd is stopped.
 type Config struct {
-	Root   string // where the daemons' approval sockets are: $XDG_RUNTIME_DIR/hostrunner
+	Root   string // the runtime root, under which the daemons' runtime directories are
 	Dir    string // the runtime directory of the daemon to stop
 	All    bool   // stop every daemon under Root
 	Choose bool   // let the human choose from the daemons under Root
@@ -108,9 +110,6 @@ type ending struct {
 	up   *launch.Prepared
 }
 
-// defaultStopTimeout is the StopTimeout of a Config without one.
-const defaultStopTimeout = 10 * time.Second
-
 // exchangeTimeout bounds one question to a daemon (its hello, what it
 // runs, the confirmation of a stop), connecting included.
 const exchangeTimeout = 5 * time.Second
@@ -145,7 +144,7 @@ var (
 // Ctrl+C stops no more.
 func Run(ctx context.Context, cfg Config, in io.Reader, out io.Writer) error {
 	if cfg.StopTimeout == 0 {
-		cfg.StopTimeout = defaultStopTimeout
+		cfg.StopTimeout = settings.DefaultStopTimeout
 	}
 	t := &term{in: in, out: out, interrupts: cfg.Interrupts}
 	defer t.close()

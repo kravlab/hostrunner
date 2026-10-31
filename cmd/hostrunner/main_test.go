@@ -446,6 +446,16 @@ func TestUsagesNameTheSettingsFlags(t *testing.T) {
 			}
 		}
 	}
+	for name, u := range map[string]string{"stop": stopUsage, "restart": restartUsage, "approve": approveUsage} {
+		for _, f := range []string{"[--settings <path>]", "[--runtime-root <path>]"} {
+			if !strings.Contains(u, f) {
+				t.Errorf("%s usage %q lacks %s", name, u, f)
+			}
+		}
+		if hasStop := strings.Contains(u, "[--stop-timeout <duration>]"); hasStop != (name != "approve") {
+			t.Errorf("%s usage %q: --stop-timeout named %v", name, u, hasStop)
+		}
+	}
 	if !strings.Contains(upUsage, "[--ready-timeout <duration>]") {
 		t.Errorf("up usage %q lacks --ready-timeout", upUsage)
 	}
@@ -983,8 +993,10 @@ func TestServeListensOnTheApprovalSocket(t *testing.T) {
 	}
 }
 
+// With --dir, the session serves the approval socket beside that runtime
+// directory alone.
 func TestParseApproveServesTheRuntimeDirectorysApprovalSocket(t *testing.T) {
-	got, err := parseApprove([]string{"--dir", "/run/user/1000/hostrunner/abc"}, io.Discard)
+	got, err := parseApprove([]string{"--dir", "/run/user/1000/hostrunner/abc"}, xdgEnv, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -996,11 +1008,10 @@ func TestParseApproveServesTheRuntimeDirectorysApprovalSocket(t *testing.T) {
 	}
 }
 
-// Without --dir, the session lists the daemons of the user's runtime
-// directory, the current directory choosing the default.
-func TestParseApproveListsTheDaemonsWithoutADirectory(t *testing.T) {
-	t.Setenv("XDG_RUNTIME_DIR", "/run/user/1000")
-	got, err := parseApprove(nil, io.Discard)
+// Without --dir, the session lists the daemons under the runtime root,
+// the current directory choosing the default.
+func TestParseApproveListsTheDaemonsOfTheRuntimeRootWithoutADirectory(t *testing.T) {
+	got, err := parseApprove(nil, xdgEnv, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1011,11 +1022,10 @@ func TestParseApproveListsTheDaemonsWithoutADirectory(t *testing.T) {
 	if want := (approval.Config{Root: "/run/user/1000/hostrunner", Cwd: cwd}); got != want {
 		t.Fatalf("got %+v, want %+v", got, want)
 	}
-	t.Setenv("XDG_RUNTIME_DIR", "")
-	if _, err := parseApprove(nil, io.Discard); err == nil || !strings.Contains(err.Error(), "XDG_RUNTIME_DIR") {
-		t.Fatalf("got %v, want it to need XDG_RUNTIME_DIR", err)
+	if _, err := parseApprove(nil, noEnv, io.Discard); !errors.Is(err, errNoRuntimeRoot) {
+		t.Fatalf("got %v, want it to need a runtime root", err)
 	}
-	if _, err := parseApprove([]string{"--dir", "/d", "extra"}, io.Discard); err == nil {
+	if _, err := parseApprove([]string{"--dir", "/d", "extra"}, xdgEnv, io.Discard); err == nil {
 		t.Fatal("expected an error for an unexpected positional argument")
 	}
 }
@@ -1368,23 +1378,30 @@ func TestParseUpRestart(t *testing.T) {
 	}
 }
 
+// xdgVars are the variables of xdgEnv, a getenv with
+// XDG_RUNTIME_DIR=/run/user/1000 alone.
+var (
+	xdgVars = map[string]string{"XDG_RUNTIME_DIR": "/run/user/1000"}
+	xdgEnv  = envOf(xdgVars)
+)
+
 func TestParseStop(t *testing.T) {
-	t.Setenv("XDG_RUNTIME_DIR", "/run/user/1000")
 	cwd, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
 	}
+	const stopTimeout = 10 * time.Second // the default
 	for _, tt := range []struct {
 		args []string
 		want stop.Config
 	}{
-		{nil, stop.Config{Root: "/run/user/1000/hostrunner", Cwd: cwd}},
-		{[]string{"--dir", "/run/user/1000/hostrunner/abc"}, stop.Config{Dir: "/run/user/1000/hostrunner/abc", Cwd: cwd}},
-		{[]string{"--all"}, stop.Config{Root: "/run/user/1000/hostrunner", All: true, Cwd: cwd}},
-		{[]string{"--choose", "--kill"}, stop.Config{Root: "/run/user/1000/hostrunner", Choose: true, Cwd: cwd, Commands: stop.Commands{Answer: stop.Kill}}},
-		{[]string{"--wait"}, stop.Config{Root: "/run/user/1000/hostrunner", Cwd: cwd, Commands: stop.Commands{Answer: stop.Wait}}},
+		{nil, stop.Config{Root: "/run/user/1000/hostrunner", Cwd: cwd, Commands: stop.Commands{StopTimeout: stopTimeout}}},
+		{[]string{"--dir", "/run/user/1000/hostrunner/abc"}, stop.Config{Dir: "/run/user/1000/hostrunner/abc", Cwd: cwd, Commands: stop.Commands{StopTimeout: stopTimeout}}},
+		{[]string{"--all"}, stop.Config{Root: "/run/user/1000/hostrunner", All: true, Cwd: cwd, Commands: stop.Commands{StopTimeout: stopTimeout}}},
+		{[]string{"--choose", "--kill"}, stop.Config{Root: "/run/user/1000/hostrunner", Choose: true, Cwd: cwd, Commands: stop.Commands{Answer: stop.Kill, StopTimeout: stopTimeout}}},
+		{[]string{"--wait"}, stop.Config{Root: "/run/user/1000/hostrunner", Cwd: cwd, Commands: stop.Commands{Answer: stop.Wait, StopTimeout: stopTimeout}}},
 	} {
-		got, err := parseStop("stop", tt.args, "/bin/hostrunner", io.Discard)
+		got, err := parseStop("stop", tt.args, "/bin/hostrunner", xdgEnv, io.Discard)
 		if err != nil {
 			t.Fatalf("%q: %v", tt.args, err)
 		}
@@ -1395,7 +1412,7 @@ func TestParseStop(t *testing.T) {
 }
 
 func TestParseStopRejectsExclusiveFlags(t *testing.T) {
-	t.Setenv("XDG_RUNTIME_DIR", "/run/user/1000")
+	t.Setenv("XDG_RUNTIME_DIR", "/run/user/1000") // run below reads the process environment
 	for _, args := range [][]string{
 		{"--dir", "/d", "--all"},
 		{"--dir", "/d", "--choose"},
@@ -1403,7 +1420,7 @@ func TestParseStopRejectsExclusiveFlags(t *testing.T) {
 		{"--kill", "--wait"},
 		{"extra"},
 	} {
-		if _, err := parseStop("stop", args, "/bin/hostrunner", io.Discard); err == nil {
+		if _, err := parseStop("stop", args, "/bin/hostrunner", xdgEnv, io.Discard); err == nil {
 			t.Errorf("%q: expected a usage error", args)
 		}
 	}
@@ -1412,19 +1429,107 @@ func TestParseStopRejectsExclusiveFlags(t *testing.T) {
 	}
 }
 
-func TestParseStopNeedsXDGRuntimeDirWithoutDir(t *testing.T) {
-	t.Setenv("XDG_RUNTIME_DIR", "")
-	if _, err := parseStop("stop", nil, "/bin/hostrunner", io.Discard); err == nil || !strings.Contains(err.Error(), "--dir") {
-		t.Fatalf("got %v, want it to name --dir", err)
+// Without XDG_RUNTIME_DIR, stop needs a runtime root from a setting or a
+// runtime directory.
+func TestParseStopNeedsARuntimeRootWithoutDir(t *testing.T) {
+	if _, err := parseStop("stop", nil, "/bin/hostrunner", noEnv, io.Discard); !errors.Is(err, errNoRuntimeRoot) {
+		t.Fatalf("got %v, want it to need a runtime root or --dir", err)
 	}
-	if _, err := parseStop("stop", []string{"--dir", "/d"}, "/bin/hostrunner", io.Discard); err != nil {
+	if _, err := parseStop("stop", []string{"--dir", "/d"}, "/bin/hostrunner", noEnv, io.Discard); err != nil {
 		t.Fatalf("--dir: %v", err)
+	}
+	if got, err := parseStop("stop", []string{"--runtime-root", "/r"}, "/bin/hostrunner", noEnv, io.Discard); err != nil || got.Root != "/r" {
+		t.Fatalf("--runtime-root: got %q, %v; want /r", got.Root, err)
+	}
+}
+
+// stop, restart and approve hand the settings they resolve (the order of
+// the sources is internal/settings' to test) to what they run: the
+// runtime root to look for daemons under and, for stop and restart, the
+// stop timeout. A flag comes first, then the variable, then the common
+// part of the host settings file, by default the one under
+// XDG_CONFIG_HOME; the workspace sections are not read.
+func TestStopRestartAndApproveResolveTheirSettings(t *testing.T) {
+	config := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(config, "hostrunner"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	content := "runtime_root: /file/root\nstop_timeout: 1m\ngrace: soon\nworkspaces:\n  /w:\n    grase: 1m\n"
+	if err := os.WriteFile(filepath.Join(config, "hostrunner", "settings.yaml"), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fromFile := map[string]string{"XDG_CONFIG_HOME": config}
+	tests := []struct {
+		name        string
+		vars        map[string]string
+		stopFlags   []string // for stop and restart
+		rootFlags   []string // for approve
+		root        string
+		stopTimeout time.Duration
+	}{
+		{"the default host settings file", fromFile, nil, nil, "/file/root", time.Minute},
+		{"variables", map[string]string{"XDG_CONFIG_HOME": config, "HOSTRUNNER_RUNTIME_ROOT": "/var/root", "HOSTRUNNER_STOP_TIMEOUT": "2m"}, nil, nil, "/var/root", 2 * time.Minute},
+		{"flags", fromFile, []string{"--runtime-root", "/flag/root", "--stop-timeout", "3m"}, []string{"--runtime-root", "/flag/root"}, "/flag/root", 3 * time.Minute},
+	}
+	for _, tt := range tests {
+		for _, name := range []string{"stop", "restart"} {
+			got, err := parseStop(name, tt.stopFlags, "/bin/hostrunner", envOf(tt.vars), io.Discard)
+			if err != nil || got.Root != tt.root || got.StopTimeout != tt.stopTimeout {
+				t.Errorf("%s, %s: got %q and %v, %v; want %q and %v", name, tt.name, got.Root, got.StopTimeout, err, tt.root, tt.stopTimeout)
+			}
+		}
+		got, err := parseApprove(tt.rootFlags, envOf(tt.vars), io.Discard)
+		if err != nil || got.Root != tt.root {
+			t.Errorf("approve, %s: got %q, %v; want %q", tt.name, got.Root, err, tt.root)
+		}
+	}
+	if _, err := parseApprove([]string{"--stop-timeout", "1m"}, xdgEnv, io.Discard); err == nil {
+		t.Error("approve: got no error for --stop-timeout")
+	}
+}
+
+// An invalid setting of stop, restart or approve fails the command, a
+// flag's with the command's usage.
+func TestStopRestartAndApproveRefuseInvalidSettings(t *testing.T) {
+	withFile := func(content string) map[string]string {
+		return map[string]string{"XDG_RUNTIME_DIR": "/run/user/1000", "HOSTRUNNER_SETTINGS": settingsFile(t, content)}
+	}
+	relative := withFile("runtime_root: rel\n")
+	for _, tt := range []struct {
+		name string
+		vars map[string]string
+		args []string
+		want string
+	}{
+		{"relative variable", map[string]string{"XDG_RUNTIME_DIR": "/run/user/1000", "HOSTRUNNER_RUNTIME_ROOT": "rel"}, nil, `HOSTRUNNER_RUNTIME_ROOT: must be absolute, got "rel"`},
+		{"relative in the file", relative, nil, "settings file " + relative["HOSTRUNNER_SETTINGS"] + `: runtime_root: must be absolute, got "rel"`},
+		{"invalid variable", map[string]string{"XDG_RUNTIME_DIR": "/run/user/1000", "HOSTRUNNER_STOP_TIMEOUT": "soon"}, nil, `HOSTRUNNER_STOP_TIMEOUT: invalid duration "soon"`},
+		{"invalid in the file", withFile("stop_timeout: soon\n"), nil, `stop_timeout: invalid duration "soon"`},
+		{"zero flag", xdgVars, []string{"--stop-timeout", "0s"}, "--stop-timeout: must be positive; usage: hostrunner stop"},
+		{"empty flag", xdgVars, []string{"--runtime-root", ""}, "--runtime-root: empty path; usage: hostrunner stop"},
+	} {
+		if _, err := parseStop("stop", tt.args, "/bin/hostrunner", envOf(tt.vars), io.Discard); err == nil || !strings.Contains(err.Error(), tt.want) {
+			t.Errorf("stop, %s: got %v, want an error containing %q", tt.name, err, tt.want)
+		}
+	}
+	for _, tt := range []struct {
+		name string
+		vars map[string]string
+		args []string
+		want string
+	}{
+		{"relative in the file", relative, nil, `runtime_root: must be absolute, got "rel"`},
+		{"empty flag", xdgVars, []string{"--runtime-root", ""}, "--runtime-root: empty path; usage: hostrunner approve"},
+	} {
+		if _, err := parseApprove(tt.args, envOf(tt.vars), io.Discard); err == nil || !strings.Contains(err.Error(), tt.want) {
+			t.Errorf("approve, %s: got %v, want an error containing %q", tt.name, err, tt.want)
+		}
 	}
 }
 
 func TestParseRestartStartsTheInstalledHostrunner(t *testing.T) {
 	t.Setenv("XDG_RUNTIME_DIR", "/run/user/1000")
-	got, err := parseStop("restart", []string{"--all"}, "/home/u/.local/bin/hostrunner", io.Discard)
+	got, err := parseStop("restart", []string{"--all"}, "/home/u/.local/bin/hostrunner", xdgEnv, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1432,14 +1537,14 @@ func TestParseRestartStartsTheInstalledHostrunner(t *testing.T) {
 	if got.Restart == nil || got.Restart.Daemon != want.Daemon || got.Restart.Client != want.Client || got.Restart.ReadyTimeout != want.ReadyTimeout {
 		t.Fatalf("got %+v, want %+v", got.Restart, want)
 	}
-	if stopped, _ := parseStop("stop", nil, "/bin/hostrunner", io.Discard); stopped.Restart != nil {
+	if stopped, _ := parseStop("stop", nil, "/bin/hostrunner", xdgEnv, io.Discard); stopped.Restart != nil {
 		t.Fatal("stop restarts")
 	}
 }
 
 func TestParseStopHelpIsTheFlagHelp(t *testing.T) {
 	for _, name := range []string{"stop", "restart"} {
-		if _, err := parseStop(name, []string{"-h"}, "/bin/hostrunner", io.Discard); !errors.Is(err, flag.ErrHelp) {
+		if _, err := parseStop(name, []string{"-h"}, "/bin/hostrunner", xdgEnv, io.Discard); !errors.Is(err, flag.ErrHelp) {
 			t.Errorf("%s: got %v, want flag.ErrHelp", name, err)
 		}
 	}

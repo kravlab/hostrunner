@@ -9,17 +9,17 @@ import (
 	"time"
 )
 
-// Flags are the flags of the settings on one command line: --settings,
-// --workspace-settings, one per key the command takes (--rules-file,
-// --startup-timeout, --grace and so on), --config as the synonym of
-// --rules-file and, for reread, both --reread and --no-reread. Register
-// them, parse, then resolve.
+// Flags are the flags of the settings on one command line. Every command
+// has --settings; a command that knows a workspace also has
+// --workspace-settings. Each key the command takes has its flag
+// (--rules-file, --grace, --stop-timeout and so on); --rules-file also
+// has the synonym --config, and reread has both --reread and
+// --no-reread. Register them, parse, then resolve.
 type Flags struct {
 	fs            *flag.FlagSet
 	file          string
 	workspaceFile string
-	rulesFile     string
-	config        string
+	paths         map[string]*string
 	durations     map[string]*time.Duration
 	reread        bool
 	noReread      bool
@@ -40,28 +40,13 @@ func (e *FlagError) Error() string { return e.err.Error() }
 func (e *FlagError) Unwrap() error { return e.err }
 
 // Register adds to fs the flags of the settings serve takes: every key
-// but up's own (ready_timeout).
-func (f *Flags) Register(fs *flag.FlagSet) { f.register(fs, scopeDaemon) }
+// a daemon applies.
+func (f *Flags) Register(fs *flag.FlagSet) { f.register(fs, keysOf(scopeDaemon), scopeDaemon) }
 
 // RegisterUp adds to fs the flags of the settings up takes: those
 // Register adds, and --ready-timeout.
-func (f *Flags) RegisterUp(fs *flag.FlagSet) { f.register(fs, scopeDaemon, scopeUp) }
-
-// register adds to fs the flags of the keys of in, which alone are read.
-func (f *Flags) register(fs *flag.FlagSet, in ...scope) {
-	f.RegisterRulesFile(fs)
-	f.scopes = in
-	f.durations = map[string]*time.Duration{}
-	defaults := defaults("")
-	for _, k := range keysOf(in...) {
-		switch p := k.field(&defaults).(type) {
-		case *time.Duration:
-			f.durations[k.name] = fs.Duration(k.flagName(), *p, k.usage)
-		case *bool:
-			fs.BoolVar(&f.reread, k.flagName(), false, k.usage)
-			fs.BoolVar(&f.noReread, "no-"+k.flagName(), false, "do not "+k.usage)
-		}
-	}
+func (f *Flags) RegisterUp(fs *flag.FlagSet) {
+	f.register(fs, keysOf(scopeDaemon, scopeUp), scopeDaemon, scopeUp)
 }
 
 // RegisterRulesFile adds to fs only the flags that choose the rules
@@ -69,13 +54,54 @@ func (f *Flags) register(fs *flag.FlagSet, in ...scope) {
 // a command that uses no other setting; the other keys serve takes still
 // come from the variables and the files, as for serve.
 func (f *Flags) RegisterRulesFile(fs *flag.FlagSet) {
-	f.fs = fs
-	f.scopes = scopes{scopeDaemon}
 	k, _ := lookup("rules_file")
+	f.register(fs, []key{k}, scopeDaemon)
+}
+
+// RegisterStop adds to fs the flags of the settings stop and restart
+// take: --settings, --runtime-root and --stop-timeout. Resolve them with
+// ResolveHost.
+func (f *Flags) RegisterStop(fs *flag.FlagSet) {
+	f.register(fs, keysOf(scopeRuntimeRoot, scopeStop), scopeRuntimeRoot, scopeStop)
+}
+
+// RegisterApprove adds to fs the flags of the settings approve takes:
+// --settings and --runtime-root. Resolve them with ResolveHost.
+func (f *Flags) RegisterApprove(fs *flag.FlagSet) {
+	f.register(fs, keysOf(scopeRuntimeRoot), scopeRuntimeRoot)
+}
+
+// synonyms are the flags that set the key of another flag, by their names:
+// --config sets the rules file as --rules-file does.
+var synonyms = map[string]string{"config": "rules-file"}
+
+// register adds to fs --settings, --workspace-settings for a command
+// that knows a workspace, and the flags of flagged; only the keys of in
+// are read.
+func (f *Flags) register(fs *flag.FlagSet, flagged []key, in ...scope) {
+	f.fs, f.scopes = fs, in
+	f.paths, f.durations = map[string]*string{}, map[string]*time.Duration{}
 	fs.StringVar(&f.file, "settings", "", "host settings file (default $XDG_CONFIG_HOME/hostrunner/settings.yaml)")
-	fs.StringVar(&f.workspaceFile, "workspace-settings", "", "workspace settings file (default <workspace>/.devcontainer/hostrunner.yaml)")
-	fs.StringVar(&f.rulesFile, k.flagName(), "", k.usage)
-	fs.StringVar(&f.config, "config", "", "synonym of --"+k.flagName())
+	if f.scopes.knowWorkspace() {
+		fs.StringVar(&f.workspaceFile, "workspace-settings", "", "workspace settings file (default <workspace>/.devcontainer/hostrunner.yaml)")
+	}
+	defaults := flagDefaults()
+	for _, k := range flagged {
+		switch p := k.field(&defaults).(type) {
+		case *string:
+			f.paths[k.name] = fs.String(k.flagName(), "", k.usage)
+			for synonym, of := range synonyms {
+				if of == k.flagName() {
+					fs.String(synonym, "", "synonym of --"+of)
+				}
+			}
+		case *time.Duration:
+			f.durations[k.name] = fs.Duration(k.flagName(), *p, k.usage)
+		case *bool:
+			fs.BoolVar(&f.reread, k.flagName(), false, k.usage)
+			fs.BoolVar(&f.noReread, "no-"+k.flagName(), false, "do not "+k.usage)
+		}
+	}
 }
 
 // Resolve returns the settings of the parsed command line for the
@@ -115,11 +141,26 @@ func (f *Flags) ResolveAsGiven(getenv func(string) string, workspace string) (Se
 	return s, nil
 }
 
+// ResolveHost returns the settings of a parsed command line of a command
+// that knows no workspace (stop, restart, approve), each key it takes
+// from its flag, its HOSTRUNNER_* variable getenv reads, the common part
+// of the host settings file (as for Resolve), then the default: the
+// runtime root under $XDG_RUNTIME_DIR, none when it is unset, and 10s to
+// stop. A runtime root from the file or a variable must be absolute
+// after ~ expansion. A flag that cannot be applied is a *FlagError.
+func (f *Flags) ResolveHost(getenv func(string) string) (Settings, error) {
+	flags, err := f.layer()
+	if err != nil {
+		return Settings{}, err
+	}
+	return resolveHost(f.scopes, flags, f.file, getenv)
+}
+
 // layer returns the keys the parsed command line sets: only flags given
 // count, even with their default value. A path is made absolute against
 // the current directory. A duration at or below zero (`--grace: must be
-// positive`), an empty path, --reread with --no-reread and --rules-file
-// with --config are *FlagErrors.
+// positive`), an empty path, --reread with --no-reread and a flag with
+// its synonym (--rules-file with --config) are *FlagErrors.
 func (f *Flags) layer() (layer, error) {
 	l := layer{}
 	var err error
@@ -127,7 +168,11 @@ func (f *Flags) layer() (layer, error) {
 		if err != nil {
 			return
 		}
-		name := strings.ReplaceAll(fl.Name, "-", "_")
+		flagName := fl.Name
+		if of, ok := synonyms[fl.Name]; ok {
+			flagName = of
+		}
+		name := strings.ReplaceAll(flagName, "-", "_")
 		switch {
 		case f.durations[name] != nil:
 			if d := *f.durations[name]; d > 0 {
@@ -135,9 +180,9 @@ func (f *Flags) layer() (layer, error) {
 			} else {
 				err = &FlagError{fmt.Errorf("--%s: %w", fl.Name, errNotPositive)}
 			}
-		case name == "rules_file" || name == "config":
-			if _, set := l["rules_file"]; set {
-				err = &FlagError{errors.New("--rules-file and --config exclude each other")}
+		case f.paths[name] != nil:
+			if _, set := l[name]; set { // given as itself and as its synonym
+				err = &FlagError{fmt.Errorf("--%s and --%s exclude each other", flagName, synonymOf(flagName))}
 				return
 			}
 			if fl.Value.String() == "" {
@@ -149,7 +194,7 @@ func (f *Flags) layer() (layer, error) {
 				err = &FlagError{fmt.Errorf("--%s: %w", fl.Name, absErr)}
 				return
 			}
-			l["rules_file"] = p
+			l[name] = p
 		case name == "reread" || name == "no_reread":
 			if _, set := l["reread"]; set {
 				err = &FlagError{errors.New("--reread and --no-reread exclude each other")}
@@ -163,4 +208,14 @@ func (f *Flags) layer() (layer, error) {
 		}
 	})
 	return l, err
+}
+
+// synonymOf returns the synonym of the flag named flagName.
+func synonymOf(flagName string) string {
+	for synonym, of := range synonyms {
+		if of == flagName {
+			return synonym
+		}
+	}
+	return ""
 }

@@ -22,8 +22,9 @@ import (
 	"time"
 )
 
-// Settings are the resolved settings of a daemon, and of the up that
-// starts it.
+// Settings are the resolved settings of a daemon, of the up that starts
+// it, and of stop, restart and approve; a command's settings hold the
+// keys it takes.
 type Settings struct {
 	// RulesFile (rules_file) is the rules file, absolute when the
 	// workspace path is.
@@ -48,6 +49,13 @@ type Settings struct {
 	// ReadyTimeout (ready_timeout) is how long up waits for the daemon it
 	// starts to listen; up's own, not passed to the daemon.
 	ReadyTimeout time.Duration
+	// RuntimeRoot (runtime_root) is where stop, restart and approve look
+	// for daemons' runtime directories; empty when no source gives one
+	// and XDG_RUNTIME_DIR is unset.
+	RuntimeRoot string
+	// StopTimeout (stop_timeout) is how long stop and restart wait for a
+	// daemon to close its sockets once it has stopped.
+	StopTimeout time.Duration
 }
 
 // rulesPath is where a workspace keeps its rules file by default,
@@ -69,6 +77,18 @@ func defaults(workspace string) Settings {
 	}
 }
 
+// DefaultStopTimeout is the stop_timeout no source sets: as long as a
+// daemon takes to close its sockets, unless something is wrong.
+const DefaultStopTimeout = 10 * time.Second
+
+// flagDefaults are the defaults the flags' help shows: those of every
+// key, the runtime root aside, whose usage names its default.
+func flagDefaults() Settings {
+	s := defaults("")
+	s.StopTimeout = DefaultStopTimeout
+	return s
+}
+
 // layer is what one source sets: values by key name (as in a settings
 // file), each a string, a time.Duration or a bool as its key's kind
 // says. A key the source does not set is absent.
@@ -80,7 +100,8 @@ type kind int
 const (
 	duration kind = iota // a time.Duration above zero, written like 1m30s
 	boolean              // a bool
-	path                 // a file path, not empty; relative to the workspace unless a flag gives it
+	path                 // a file path, not empty; a relative one is read against the workspace
+	absPath              // a directory path, not empty; a relative one is an error
 )
 
 // String names the kind in errors ("invalid duration") and usages.
@@ -88,7 +109,7 @@ func (k kind) String() string {
 	switch k {
 	case boolean:
 		return "bool"
-	case path:
+	case path, absPath:
 		return "path"
 	}
 	return "duration"
@@ -98,9 +119,17 @@ func (k kind) String() string {
 type scope int
 
 const (
-	scopeDaemon scope = iota // serve, and up, which resolves it and passes it to serve
-	scopeUp                  // up alone: it tunes up, not the daemon
+	scopeDaemon      scope = iota // serve, and up, which resolves it and passes it to serve
+	scopeUp                       // up alone: it tunes up, not the daemon
+	scopeRuntimeRoot              // stop, restart and approve
+	scopeStop                     // stop and restart
 )
+
+// commonOnly says whether only the common part of the host settings file
+// may set the keys of s: their commands (stop, restart, approve) know no
+// workspace when they read them (ADR 0008), so the workspace settings file
+// and a workspace section refuse them.
+func (s scope) commonOnly() bool { return s == scopeRuntimeRoot || s == scopeStop }
 
 // key is one setting: its name in a settings file, from which its
 // variable and flag are named, the commands that take its flag, and the
@@ -155,6 +184,16 @@ var keys = []key{
 		usage: "how long to wait for the daemon to listen",
 		field: func(s *Settings) any { return &s.ReadyTimeout },
 	},
+	{
+		name: "runtime_root", kind: absPath, scope: scopeRuntimeRoot,
+		usage: "where to look for daemons (default $XDG_RUNTIME_DIR/hostrunner)",
+		field: func(s *Settings) any { return &s.RuntimeRoot },
+	},
+	{
+		name: "stop_timeout", kind: duration, scope: scopeStop,
+		usage: "how long to wait for a stopped daemon to close its sockets",
+		field: func(s *Settings) any { return &s.StopTimeout },
+	},
 }
 
 // scopes are the scopes of the keys one command takes.
@@ -162,6 +201,14 @@ type scopes []scope
 
 // takes says whether the command takes k.
 func (in scopes) takes(k key) bool { return slices.Contains(in, k.scope) }
+
+// knowWorkspace says whether the command knows a workspace: whether it
+// takes a key a workspace may set. Only such a command reads the
+// workspace settings file and the workspace sections, and takes
+// --workspace-settings.
+func (in scopes) knowWorkspace() bool {
+	return slices.ContainsFunc(in, func(s scope) bool { return !s.commonOnly() })
+}
 
 // keysOf returns the keys whose flags the commands of in take.
 func keysOf(in ...scope) []key {
@@ -173,13 +220,6 @@ func keysOf(in ...scope) []key {
 	}
 	return out
 }
-
-// commonOnly are the keys only the common part of the host settings file
-// may set: `stop`, `restart` and `approve` read them before they know a
-// workspace (ADR 0008), so the workspace settings file and a workspace
-// section refuse them. Neither is a key yet: the common part rejects them
-// as unknown.
-var commonOnly = []string{"runtime_root", "stop_timeout"}
 
 // variable is the environment variable that sets k: HOSTRUNNER_GRACE.
 func (k key) variable() string { return "HOSTRUNNER_" + strings.ToUpper(k.name) }
@@ -208,10 +248,22 @@ func Usage() string { return usage(scopeDaemon) }
 // shows them: Usage and [--ready-timeout <duration>].
 func UpUsage() string { return usage(scopeDaemon, scopeUp) }
 
-// usage is the usage of the flags of the keys of scopes.
-func usage(scopes ...scope) string {
-	parts := []string{fileFlagsUsage}
-	for _, k := range keysOf(scopes...) {
+// StopUsage is the usage of the flags RegisterStop adds: [--settings
+// <path>] [--runtime-root <path>] [--stop-timeout <duration>].
+func StopUsage() string { return usage(scopeRuntimeRoot, scopeStop) }
+
+// ApproveUsage is the usage of the flags RegisterApprove adds:
+// [--settings <path>] [--runtime-root <path>].
+func ApproveUsage() string { return usage(scopeRuntimeRoot) }
+
+// usage is the usage of the flags of a command that takes the keys of
+// in.
+func usage(in ...scope) string {
+	parts := []string{settingsFlagUsage}
+	if scopes(in).knowWorkspace() {
+		parts = append(parts, workspaceFlagUsage)
+	}
+	for _, k := range keysOf(in...) {
 		parts = append(parts, k.usageOf())
 	}
 	return strings.Join(parts, " ")
@@ -221,11 +273,15 @@ func usage(scopes ...scope) string {
 // that choose the rules file.
 func RulesFileUsage() string {
 	k, _ := lookup("rules_file")
-	return fileFlagsUsage + " " + k.usageOf()
+	return settingsFlagUsage + " " + workspaceFlagUsage + " " + k.usageOf()
 }
 
-// fileFlagsUsage is the usage of the flags that name the settings files.
-const fileFlagsUsage = "[--settings <path>] [--workspace-settings <path>]"
+// settingsFlagUsage and workspaceFlagUsage are the usages of the flags
+// that name the host settings file and the workspace settings file.
+const (
+	settingsFlagUsage  = "[--settings <path>]"
+	workspaceFlagUsage = "[--workspace-settings <path>]"
+)
 
 // usageOf is k's flag as a usage line shows it: [--grace <duration>].
 func (k key) usageOf() string {
@@ -246,7 +302,7 @@ var errEmptyPath = errors.New("empty path")
 // kind k; the error describes the problem without naming the source.
 func (k kind) parse(raw string) (any, error) {
 	switch k {
-	case path:
+	case path, absPath:
 		if raw == "" {
 			return nil, errEmptyPath
 		}
@@ -308,27 +364,39 @@ func resolve(in scopes, flags layer, hostNamed, workspaceNamed, workspace string
 	}
 	s := defaults(workspace)
 	for _, l := range []layer{common, section, wsFile, vars} {
-		apply(&s, inWorkspace(l, workspace, getenv))
+		if l, err = hostPaths(l, workspace, getenv, nil); err != nil {
+			return Settings{}, err
+		}
+		apply(&s, l)
 	}
 	apply(&s, flags)
 	return s, nil
 }
 
-// inWorkspace is l with each path made a host path: ~ expanded (with
-// $HOME getenv reads), then a relative one joined to the workspace.
-func inWorkspace(l layer, workspace string, getenv func(string) string) layer {
+// hostPaths is l with each path ~ expanded (with $HOME getenv reads) and
+// cleaned, as filepath.Abs cleans a flag's: a relative path joined to the
+// workspace, a relative absPath an error naming source(k), the source of
+// key k. A command that knows a workspace takes no absPath key, so it
+// passes no source.
+func hostPaths(l layer, workspace string, getenv func(string) string, source func(key) string) (layer, error) {
 	out := layer{}
 	for name, v := range l {
-		if k, _ := lookup(name); k.kind == path {
+		k, _ := lookup(name)
+		if k.kind == path || k.kind == absPath {
 			p := expandHome(v.(string), getenv)
-			if !filepath.IsAbs(p) {
+			switch {
+			case filepath.IsAbs(p):
+				p = filepath.Clean(p)
+			case k.kind == path:
 				p = filepath.Join(workspace, p)
+			default:
+				return nil, fmt.Errorf("%s: must be absolute, got %q", source(k), v)
 			}
 			v = p
 		}
 		out[name] = v
 	}
-	return out
+	return out, nil
 }
 
 // env reads the HOSTRUNNER_* variables of the keys of in through getenv;
@@ -348,4 +416,49 @@ func env(in scopes, getenv func(string) string) (layer, error) {
 		l[k.name] = v
 	}
 	return l, nil
+}
+
+// hostDefaults are the settings of stop, restart and approve that no
+// source sets: the runtime root under $XDG_RUNTIME_DIR, which getenv
+// reads (none when it is unset), and DefaultStopTimeout.
+func hostDefaults(getenv func(string) string) Settings {
+	s := Settings{StopTimeout: DefaultStopTimeout}
+	if xdg := getenv("XDG_RUNTIME_DIR"); xdg != "" {
+		s.RuntimeRoot = filepath.Join(xdg, "hostrunner")
+	}
+	return s
+}
+
+// resolveHost returns the settings of a command that knows no workspace
+// and takes the keys of in, each from the highest source that sets it:
+// flags, the variables getenv reads, the common part of the host
+// settings file hostNamed or the defaults name (see hostFile), then
+// hostDefaults. No workspace section and no workspace settings file is
+// read. A runtime root from the file or a variable must be absolute after
+// ~ expansion. It mirrors resolve, less the workspace's sources.
+func resolveHost(in scopes, flags layer, hostNamed string, getenv func(string) string) (Settings, error) {
+	var common layer
+	file, required := hostFile(hostNamed, getenv)
+	if file != "" {
+		l, _, err := readNamed(in, file, required, true)
+		if err != nil {
+			return Settings{}, err
+		}
+		common, err = hostPaths(l, "", getenv, func(k key) string { return "settings file " + file + ": " + k.name })
+		if err != nil {
+			return Settings{}, err
+		}
+	}
+	vars, err := env(in, getenv)
+	if err != nil {
+		return Settings{}, err
+	}
+	if vars, err = hostPaths(vars, "", getenv, key.variable); err != nil {
+		return Settings{}, err
+	}
+	s := hostDefaults(getenv)
+	for _, l := range []layer{common, vars, flags} {
+		apply(&s, l)
+	}
+	return s, nil
 }
