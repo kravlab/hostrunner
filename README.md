@@ -292,8 +292,10 @@ settings edit applies on the next container start (reopen, container
 restart or rebuild): `up` tells the running daemon the settings it
 resolved, and a daemon running with others steps aside for a new one,
 as for changed rules; it compares only the settings the arm carries.
-`hostrunner restart` waits 10 seconds for the new daemon, whatever
-`ready_timeout` says. `--reread` and `--no-reread` exclude each other.
+`hostrunner restart` applies a settings edit at once: it resolves the
+new daemon's settings the same way, for the workspace of the daemon it
+replaces (see [Stop and restart](#stop-and-restart)). `--reread` and
+`--no-reread` exclude each other.
 
 ### Approvals on the host
 
@@ -479,7 +481,8 @@ approval lets through (without one); the container can read it.
 
 A daemon ends by itself about 15 s after its armed container stops. To
 run a new version after `hostrunner update`, pick up a hand-edited rules
-file at once under `--no-reread` or drop standing approvals, stop or
+file at once under `--no-reread`, apply a settings edit before the next
+container start or drop standing approvals, stop or
 restart it from a host terminal:
 
 ```sh
@@ -505,15 +508,25 @@ daemon has `stop_timeout` (10 seconds unless set) to close its sockets.
 Standing and session approvals end with the daemon; the count lost is
 printed.
 
-`restart` reads and checks the rules file before stopping anything
-(invalid rules leave the daemon running), then starts a new daemon, the
-installed `hostrunner`, for the same workspace and rules file and with
-the same `--no-reread`; a daemon
-still waiting for its container (right after `up`, during a rebuild) is
-replaced by one that waits the same way. A daemon that saw its container
-stop, and is about to exit, is only stopped
-(`hostrunner: stopped <dir>; its container is not running`): the next
-`hostrunner up` starts a new one. Stop, restart and `up` take the
+`restart` resolves the new daemon's settings as `up` does, for the
+workspace the daemon serves: from the settings files as they are now,
+the variables of the terminal it runs in and its own flags
+(`--workspace-settings`, and `--rules-file` or `--config`, both read
+against the current directory; the other daemon settings have no flag
+here). It checks them and reads and checks the rules file before
+stopping anything (an invalid setting or invalid rules leave the daemon
+running, the error naming the source), then starts a new daemon, the
+installed `hostrunner`, for the same workspace, with those settings,
+and waits `ready_timeout` for it to listen. It names what they change
+of the old daemon's rules file and rereading
+(`hostrunner: restarted <dir>; rules_file <old> → <new>, reread true →
+false`; a daemon of an older hostrunner does not say whether it
+rereads). A daemon still waiting for its container (right after `up`,
+during a rebuild) is replaced by one that waits the same way. A daemon
+that saw its container stop, and is about to exit, is only stopped
+(`hostrunner: stopped <dir>; its container is not running`), its
+settings and rules unchecked: the next `hostrunner up` starts a new
+one. Stop, restart and `up` take the
 runtime directory's lock, so they run one after the other.
 
 `hostrunner up --restart [--kill | --wait]` replaces a running daemon at
@@ -867,7 +880,8 @@ How it works:
 ## Limitations
 
 - `hostrunner up` arms a running daemon again rather than replacing it,
-  unless its rules or `--no-reread` differ: after upgrading hostrunner, run
+  unless its rules or the settings the arm carries differ: after
+  upgrading hostrunner, run
   `hostrunner restart`; after changing `workspaceFolder`, which a
   restart keeps, run `hostrunner stop` before the next `up`, or give `up`
   `--restart` (see [Stop and restart](#stop-and-restart)).

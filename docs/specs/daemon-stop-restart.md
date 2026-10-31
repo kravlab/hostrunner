@@ -24,6 +24,8 @@ hostrunner up --restart [--kill | --wait] --dir … --workspace … --container-
 
 The settings of `stop` and `restart` are `--settings`, `--runtime-root`
 and `--stop-timeout`, resolved as the README's Settings section says.
+`restart` also takes `--workspace-settings` and `--rules-file` (or
+`--config`), for the new daemon's settings.
 
 `--dir`, `--all` and `--choose` exclude each other, and so do `--kill` and
 `--wait`; a combination is a usage error.
@@ -92,10 +94,19 @@ and session approvals it holds.
 
 ## Restart
 
-- The workspace, container workspace and rules file come from the running
-  daemon (`DaemonInfo`), the runtime directory from where it was found.
-- The rules file is read and validated before anything stops; invalid
-  rules are an error and the daemon keeps running.
+- The workspace and container workspace come from the running daemon
+  (`DaemonInfo`), the runtime directory from where it was found.
+- The new daemon's settings, its rules file and `ready_timeout` included,
+  are resolved as `up` resolves them, for that workspace: from the
+  settings files as they are now, the variables of `restart`'s
+  environment and its flags.
+- The settings are resolved and the rules file read and validated before
+  anything stops; an invalid setting or invalid rules are an error naming
+  the source, and the daemon keeps running. A daemon about to exit, which
+  is only stopped, has neither checked.
+- `restart` names what the new settings change of the rules file and
+  rereading the old daemon reports: `hostrunner: restarted <dir>;
+  rules_file <old> → <new>, reread true → false`.
 - The daemon is stopped as above, then a new one is started and armed as
   `up` does, with the installed `hostrunner` (the one `restart` runs as).
 - A daemon that saw its armed container stop (attached, the container
@@ -190,9 +201,16 @@ does not say what it serves (workspace, container workspace, rules file):
   daemons): choosing by the current directory (one, none, several); `--dir`
   with no daemon; busy without a terminal and without `--kill`/`--wait`
   errors and leaves the daemon running; the daemon exiting while asked.
-- Restart (`internal/stop`): invalid rules leave the daemon running; a
-  daemon that saw its container stop is only stopped; one waiting for its
-  container is replaced.
+- Restart (`internal/stop`): invalid rules or invalid settings leave the
+  daemon running, naming the source; the new daemon's settings come from
+  the settings files as they are at the restart, their workspace section
+  and the workspace settings file included, its rereading from them and
+  not from the old daemon; the restart names what they change; a daemon
+  that saw its container stop is only stopped, its settings and rules
+  unchecked; one waiting for its container is replaced.
+- Restart's flags (`internal/settings`, `cmd/hostrunner`):
+  `--workspace-settings` and `--rules-file`/`--config`, read against the
+  current directory; stop takes neither.
 - Older daemons (`internal/stop`): the PID check refuses a process whose
   command line names another socket; `--wait` is refused; restart asks
   the container runtime whether the workspace's container runs.
@@ -202,4 +220,5 @@ does not say what it serves (workspace, container workspace, rules file):
 - `up --restart` (`internal/stop`): with no daemon starts one; with an
   idle daemon replaces it; with a busy daemon and no flag fails and leaves
   it; with `--kill` replaces it.
-- e2e: restart picks up a hand-edited rules file in a running container.
+- e2e: restart picks up a hand-edited rules file in a running container,
+  and an edited workspace settings file naming another rules file.

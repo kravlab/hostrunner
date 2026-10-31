@@ -326,7 +326,7 @@ type Hello struct {
 // changes, NoReread that it does not (`serve --no-reread`):
 // a daemon older than both reports neither, so a session asks before
 // having it reread a file changed by hand, and `hostrunner restart`
-// starts its successor rereading, the default.
+// names no change of rereading.
 type DaemonInfo struct {
 	Version            int    `json:"version"`
 	Workspace          string `json:"workspace"`

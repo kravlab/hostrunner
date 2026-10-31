@@ -33,3 +33,7 @@ settings file.
   two container starts, the arm of `up` carries the daemon settings it
   resolved, and a daemon running with others steps aside: a settings
   edit applies on the next container start.
+- `hostrunner restart` resolves the new daemon's settings as `up` does,
+  for the old daemon's workspace, from the settings files as they are
+  then and its own environment, not the environment `up` saw: a restart
+  applies a settings edit at once.

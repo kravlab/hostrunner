@@ -73,9 +73,8 @@ type Config struct {
 	ContainerWorkspace string // the same folder inside the container
 	Daemon             string // hostrunner executable to start as the daemon
 	Client             string // hostrun binary to install into Dir
-	// Settings are the settings up resolved. Each the daemon takes is
-	// given to it as its flag, a duration left zero leaving it to the
-	// daemon, and carried in every arm, but such a duration;
+	// Settings are the settings up, or restart, resolved. Each the daemon
+	// takes is given to it as its flag and carried in every arm;
 	// ReadyTimeout, up's own, is how long to wait for the daemon's socket
 	// and is not passed on.
 	settings.Settings
@@ -356,9 +355,7 @@ func startDaemon(ctx context.Context, cfg Config, socket, digest string) error {
 // serveArgs is the command line of the daemon cfg describes, listening
 // on socket. Every setting serve takes is an explicit flag, so the
 // daemon's argv shows what it runs with and it resolves none again;
-// rereading is given both ways (--reread or --no-reread). A duration left
-// zero, by a restart that resolves no settings, is no flag: the daemon
-// resolves it itself.
+// rereading is given both ways (--reread or --no-reread).
 func serveArgs(cfg Config, socket string) []string {
 	args := []string{"serve",
 		"--socket", socket,
@@ -366,21 +363,12 @@ func serveArgs(cfg Config, socket string) []string {
 		"--container-workspace", cfg.ContainerWorkspace,
 		"--rules-file", cfg.RulesFile,
 		"--watch"}
-	if cfg.StartupTimeout > 0 {
-		args = append(args, "--startup-timeout", cfg.StartupTimeout.String())
-	}
-	if cfg.Grace > 0 {
-		args = append(args, "--grace", cfg.Grace.String())
-	}
-	if cfg.PollInterval > 0 {
-		args = append(args, "--poll-interval", cfg.PollInterval.String())
-	}
-	if cfg.AskTimeout > 0 {
-		args = append(args, "--ask-timeout", cfg.AskTimeout.String())
-	}
-	if cfg.RequestTimeout > 0 {
-		args = append(args, "--request-timeout", cfg.RequestTimeout.String())
-	}
+	args = append(args,
+		"--startup-timeout", cfg.StartupTimeout.String(),
+		"--grace", cfg.Grace.String(),
+		"--poll-interval", cfg.PollInterval.String(),
+		"--ask-timeout", cfg.AskTimeout.String(),
+		"--request-timeout", cfg.RequestTimeout.String())
 	if cfg.Reread {
 		return append(args, "--reread")
 	}

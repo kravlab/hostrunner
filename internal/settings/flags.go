@@ -54,8 +54,7 @@ func (f *Flags) RegisterUp(fs *flag.FlagSet) {
 // a command that uses no other setting; the other keys serve takes still
 // come from the variables and the files, as for serve.
 func (f *Flags) RegisterRulesFile(fs *flag.FlagSet) {
-	k, _ := lookup("rules_file")
-	f.register(fs, []key{k}, scopeDaemon)
+	f.register(fs, []key{mustLookup("rules_file")}, scopeDaemon)
 }
 
 // RegisterStop adds to fs the flags of the settings stop and restart
@@ -70,6 +69,13 @@ func (f *Flags) RegisterStop(fs *flag.FlagSet) {
 func (f *Flags) RegisterApprove(fs *flag.FlagSet) {
 	f.register(fs, keysOf(scopeRuntimeRoot), scopeRuntimeRoot)
 }
+
+// RegisterRestart adds to fs the flags of the settings restart takes:
+// those RegisterStop adds, for restart itself, and --workspace-settings
+// and --rules-file (with --config) for the new daemon. Resolve restart's
+// with ResolveHost and the new daemon's, for the old daemon's workspace,
+// with Resolve, which reads every key up takes from its other sources.
+func (f *Flags) RegisterRestart(fs *flag.FlagSet) { f.register(fs, restartKeys(), restartScopes...) }
 
 // synonyms are the flags that set the key of another flag, by their names:
 // --config sets the rules file as --rules-file does.
@@ -105,9 +111,10 @@ func (f *Flags) register(fs *flag.FlagSet, flagged []key, in ...scope) {
 }
 
 // Resolve returns the settings of the parsed command line for the
-// workspace at the host path workspace, each key taken from the highest
-// source that sets it: its flag, its HOSTRUNNER_* variable getenv reads,
-// the workspace settings file (--workspace-settings, else
+// workspace at the host path workspace, those ResolveHost does not
+// resolve, each key taken from the highest source that sets it: its
+// flag, its HOSTRUNNER_* variable getenv reads, the workspace settings
+// file (--workspace-settings, else
 // $HOSTRUNNER_WORKSPACE_SETTINGS, else .devcontainer/hostrunner.yaml in
 // the workspace), the workspace's section of the host settings file, its
 // common part (--settings, else $HOSTRUNNER_SETTINGS, else
@@ -116,24 +123,26 @@ func (f *Flags) register(fs *flag.FlagSet, flagged []key, in ...scope) {
 // is read, even when the flags set every key. A flag that cannot be
 // applied is a *FlagError.
 func (f *Flags) Resolve(getenv func(string) string, workspace string) (Settings, error) {
-	flags, err := f.layer()
+	in := f.scopes.ofWorkspace()
+	flags, err := f.given(in)
 	if err != nil {
 		return Settings{}, err
 	}
-	return resolve(f.scopes, flags, f.file, f.workspaceFile, workspace, getenv)
+	return resolve(in, flags, f.file, f.workspaceFile, workspace, getenv)
 }
 
 // ResolveAsGiven is Resolve, except that when the flags set every key
 // serve takes neither the variables nor any file is read: a daemon its
 // `up` started with every setting as a flag runs with them as given.
 func (f *Flags) ResolveAsGiven(getenv func(string) string, workspace string) (Settings, error) {
-	flags, err := f.layer()
+	in := f.scopes.ofWorkspace()
+	flags, err := f.given(in)
 	if err != nil {
 		return Settings{}, err
 	}
 	for _, k := range keysOf(scopeDaemon) {
 		if _, given := flags[k.name]; !given {
-			return resolve(f.scopes, flags, f.file, f.workspaceFile, workspace, getenv)
+			return resolve(in, flags, f.file, f.workspaceFile, workspace, getenv)
 		}
 	}
 	s := defaults(workspace)
@@ -141,19 +150,29 @@ func (f *Flags) ResolveAsGiven(getenv func(string) string, workspace string) (Se
 	return s, nil
 }
 
-// ResolveHost returns the settings of a parsed command line of a command
-// that knows no workspace (stop, restart, approve), each key it takes
+// ResolveHost returns the settings of a parsed command line that stop,
+// restart and approve resolve before they know a workspace, each key
 // from its flag, its HOSTRUNNER_* variable getenv reads, the common part
 // of the host settings file (as for Resolve), then the default: the
 // runtime root under $XDG_RUNTIME_DIR, none when it is unset, and 10s to
 // stop. A runtime root from the file or a variable must be absolute
 // after ~ expansion. A flag that cannot be applied is a *FlagError.
 func (f *Flags) ResolveHost(getenv func(string) string) (Settings, error) {
-	flags, err := f.layer()
+	in := f.scopes.hostOnly()
+	flags, err := f.given(in)
 	if err != nil {
 		return Settings{}, err
 	}
-	return resolveHost(f.scopes, flags, f.file, getenv)
+	return resolveHost(in, flags, f.file, getenv)
+}
+
+// given returns the keys of in the parsed command line sets (see layer).
+func (f *Flags) given(in scopes) (layer, error) {
+	l, err := f.layer()
+	if err != nil {
+		return nil, err
+	}
+	return l.only(in), nil
 }
 
 // layer returns the keys the parsed command line sets: only flags given

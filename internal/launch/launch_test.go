@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -543,33 +544,27 @@ func TestUpReplacesDaemonWhoseRereadingDiffers(t *testing.T) {
 
 // The daemon `up` starts gets every setting as an explicit flag, so its
 // argv shows them and it resolves none again; rereading is explicit both
-// ways. A duration the caller leaves zero (restart, which does not
-// resolve settings) is left for the daemon to resolve.
+// ways, and ready_timeout, up's own, is no flag.
 func TestServeArgsGiveEverySetting(t *testing.T) {
-	base := Config{Workspace: "/home/u/app", ContainerWorkspace: "/workspaces/app", Settings: settings.Settings{RulesFile: "/home/u/app/.devcontainer/hostrun.yaml"}}
-	start := []string{"serve", "--socket", "/run/h.sock", "--workspace", "/home/u/app", "--container-workspace", "/workspaces/app", "--rules-file", "/home/u/app/.devcontainer/hostrun.yaml", "--watch"}
-	tests := []struct {
-		name string
-		edit func(*Config)
-		want []string
+	base := Config{Workspace: "/home/u/app", ContainerWorkspace: "/workspaces/app", Settings: settings.Settings{
+		RulesFile: "/home/u/app/.devcontainer/hostrun.yaml", StartupTimeout: 30 * time.Minute, Grace: 15 * time.Second,
+		PollInterval: 2 * time.Second, AskTimeout: 10 * time.Minute, RequestTimeout: 10 * time.Second, ReadyTimeout: time.Minute,
+	}}
+	start := []string{"serve", "--socket", "/run/h.sock", "--workspace", "/home/u/app", "--container-workspace", "/workspaces/app", "--rules-file", "/home/u/app/.devcontainer/hostrun.yaml", "--watch",
+		"--startup-timeout", "30m0s", "--grace", "15s", "--poll-interval", "2s", "--ask-timeout", "10m0s", "--request-timeout", "10s"}
+	for _, tt := range []struct {
+		reread bool
+		flag   string
 	}{
-		{"rereading", func(c *Config) { c.StartupTimeout, c.Grace, c.Reread = 30*time.Minute, 15*time.Second, true }, []string{"--startup-timeout", "30m0s", "--grace", "15s", "--reread"}},
-		{"not rereading", func(c *Config) { c.StartupTimeout, c.Grace = time.Hour, 90*time.Second }, []string{"--startup-timeout", "1h0m0s", "--grace", "1m30s", "--no-reread"}},
-		{"timings", func(c *Config) {
-			c.PollInterval, c.AskTimeout, c.RequestTimeout, c.Reread = 2*time.Second, 10*time.Minute, 10*time.Second, true
-		}, []string{"--poll-interval", "2s", "--ask-timeout", "10m0s", "--request-timeout", "10s", "--reread"}},
-		{"ready timeout is up's own", func(c *Config) { c.ReadyTimeout, c.Reread = time.Minute, true }, []string{"--reread"}},
-		{"durations unset", func(c *Config) { c.Reread = true }, []string{"--reread"}},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			cfg := base
-			tt.edit(&cfg)
-			got := serveArgs(cfg, "/run/h.sock")
-			if want := append(append([]string{}, start...), tt.want...); strings.Join(got, " ") != strings.Join(want, " ") {
-				t.Fatalf("got %q, want %q", got, want)
-			}
-		})
+		{reread: true, flag: "--reread"},
+		{reread: false, flag: "--no-reread"},
+	} {
+		cfg := base
+		cfg.Reread = tt.reread
+		want := append(slices.Clone(start), tt.flag)
+		if got := serveArgs(cfg, "/run/h.sock"); !slices.Equal(got, want) {
+			t.Errorf("reread %v: got %q, want %q", tt.reread, got, want)
+		}
 	}
 }
 
@@ -709,9 +704,7 @@ func TestSocketPaths(t *testing.T) {
 }
 
 // An arm carries the daemon settings of up as Settings.Daemon names them,
-// leaving out a duration not set (restart's, until it resolves the
-// settings), and still carries --no-reread for a daemon that predates the
-// settings.
+// and still carries --no-reread for a daemon that predates the settings.
 func TestArmCarriesTheDaemonSettings(t *testing.T) {
 	for _, tt := range []struct {
 		name         string
@@ -730,11 +723,6 @@ func TestArmCarriesTheDaemonSettings(t *testing.T) {
 				"poll_interval": "1s", "ask_timeout": "1m0s", "request_timeout": "1s",
 			},
 			wantNoReread: true,
-		},
-		{
-			name: "durations not set",
-			s:    settings.Settings{RulesFile: "/w/rules.yaml", Reread: true},
-			want: map[string]string{"rules_file": "/w/rules.yaml", "reread": "true"},
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

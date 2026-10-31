@@ -10,8 +10,7 @@ import (
 
 // Daemon names every setting serve takes, by its key, with its value as
 // a settings file writes it; the keys of up, stop, restart and approve
-// are left out, and so is a duration not set (zero), while a string is
-// kept even when empty.
+// are left out, and a string is kept even when empty.
 func TestDaemonNamesEverySettingServeTakes(t *testing.T) {
 	for _, tt := range []struct {
 		name string
@@ -33,14 +32,12 @@ func TestDaemonNamesEverySettingServeTakes(t *testing.T) {
 			},
 		},
 		{
-			name: "durations not set",
-			s:    settings.Settings{RulesFile: "/w/rules.yaml", Reread: true},
-			want: map[string]string{"rules_file": "/w/rules.yaml", "reread": "true"},
-		},
-		{
 			name: "an empty rules file",
-			s:    settings.Settings{Grace: time.Second},
-			want: map[string]string{"rules_file": "", "grace": "1s", "reread": "false"},
+			s:    settings.Settings{StartupTimeout: time.Hour, Grace: time.Second, PollInterval: time.Second, AskTimeout: time.Minute, RequestTimeout: time.Second},
+			want: map[string]string{
+				"rules_file": "", "startup_timeout": "1h0m0s", "grace": "1s", "reread": "false",
+				"poll_interval": "1s", "ask_timeout": "1m0s", "request_timeout": "1s",
+			},
 		},
 	} {
 		if got := tt.s.Daemon(); !maps.Equal(got, tt.want) {

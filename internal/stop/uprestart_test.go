@@ -28,7 +28,7 @@ func upConfig(t *testing.T, dir, workspace, rulesFile string) launch.Config {
 	return launch.Config{
 		Dir: dir, Workspace: workspace, ContainerWorkspace: "/workspaces/new",
 		Daemon: r.Daemon, Client: r.Client,
-		Settings: settings.Settings{RulesFile: rulesFile, Reread: true, ReadyTimeout: r.ReadyTimeout},
+		Settings: settings.Settings{RulesFile: rulesFile, Reread: true, ReadyTimeout: 5 * time.Second},
 	}
 }
 

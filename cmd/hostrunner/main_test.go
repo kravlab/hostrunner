@@ -475,6 +475,13 @@ func TestUsagesNameTheSettingsFlags(t *testing.T) {
 			t.Errorf("%s usage %q: --stop-timeout named %v", name, u, hasStop)
 		}
 	}
+	for name, u := range map[string]string{"stop": stopUsage, "restart": restartUsage} {
+		for _, f := range []string{"[--workspace-settings <path>]", "[--rules-file <path>]"} {
+			if strings.Contains(u, f) != (name == "restart") {
+				t.Errorf("%s usage %q: %s named %v", name, u, f, name != "restart")
+			}
+		}
+	}
 	if !strings.Contains(upUsage, "[--ready-timeout <duration>]") {
 		t.Errorf("up usage %q lacks --ready-timeout", upUsage)
 	}
@@ -1619,17 +1626,82 @@ func TestStopRestartAndApproveRefuseInvalidSettings(t *testing.T) {
 }
 
 func TestParseRestartStartsTheInstalledHostrunner(t *testing.T) {
-	t.Setenv("XDG_RUNTIME_DIR", "/run/user/1000")
 	got, err := parseStop("restart", []string{"--all"}, "/home/u/.local/bin/hostrunner", xdgEnv, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := stop.Restart{Daemon: "/home/u/.local/bin/hostrunner", Client: "/home/u/.local/bin/hostrun", ReadyTimeout: readyTimeout}
-	if got.Restart == nil || got.Restart.Daemon != want.Daemon || got.Restart.Client != want.Client || got.Restart.ReadyTimeout != want.ReadyTimeout {
-		t.Fatalf("got %+v, want %+v", got.Restart, want)
+	if got.Restart == nil || got.Restart.Daemon != "/home/u/.local/bin/hostrunner" || got.Restart.Client != "/home/u/.local/bin/hostrun" || got.Restart.Settings == nil {
+		t.Fatalf("got %+v, want the installed hostrunner and hostrun, and the settings resolved", got.Restart)
 	}
 	if stopped, _ := parseStop("stop", nil, "/bin/hostrunner", xdgEnv, io.Discard); stopped.Restart != nil {
 		t.Fatal("stop restarts")
+	}
+}
+
+// restart resolves the new daemon's settings for the old daemon's
+// workspace as up would, from restart's flags, the environment getenv
+// reads and the settings files: their section for that workspace and the
+// workspace settings file apply, and ready_timeout too; its own
+// settings stay apart.
+func TestParseRestartResolvesTheNewDaemonsSettings(t *testing.T) {
+	ws := t.TempDir()
+	host := settingsFile(t, "stop_timeout: 1m\ngrace: 2m\nworkspaces:\n  "+ws+":\n    poll_interval: 3s\n")
+	wsFile := settingsFile(t, "ask_timeout: 4m\n")
+	vars := map[string]string{"XDG_RUNTIME_DIR": "/run/user/1000", "HOSTRUNNER_SETTINGS": host, "HOSTRUNNER_READY_TIMEOUT": "5s"}
+	got, err := parseStop("restart", []string{"--workspace-settings", wsFile, "--rules-file", "/r/hostrun.yaml"}, "/bin/hostrunner", envOf(vars), io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.StopTimeout != time.Minute {
+		t.Errorf("stop timeout %v, want 1m", got.StopTimeout)
+	}
+	s, err := got.Restart.Settings(ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		name      string
+		got, want any
+	}{
+		{"rules file (flag)", s.RulesFile, "/r/hostrun.yaml"},
+		{"ready timeout (variable)", s.ReadyTimeout, 5 * time.Second},
+		{"ask timeout (workspace settings file)", s.AskTimeout, 4 * time.Minute},
+		{"poll interval (workspace section)", s.PollInterval, 3 * time.Second},
+		{"grace (common part)", s.Grace, 2 * time.Minute},
+	} {
+		if c.got != c.want {
+			t.Errorf("%s: got %v, want %v", c.name, c.got, c.want)
+		}
+	}
+}
+
+// stop has no flag of a new daemon's settings.
+func TestParseStopRefusesTheRulesFileFlag(t *testing.T) {
+	if _, err := parseStop("stop", []string{"--rules-file", "/r/hostrun.yaml"}, "/bin/hostrunner", xdgEnv, io.Discard); err == nil {
+		t.Fatal("got no error for --rules-file")
+	}
+}
+
+// A path flag of the new daemon that cannot be applied is a usage error
+// of restart.
+func TestParseRestartRefusesAnEmptyConfig(t *testing.T) {
+	_, err := parseStop("restart", []string{"--config", ""}, "/bin/hostrunner", xdgEnv, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "--config: empty path; usage: hostrunner restart") {
+		t.Fatalf("got %v, want the flag error with the usage", err)
+	}
+}
+
+// An invalid daemon setting does not fail restart's own parsing: it is
+// found when the new daemon's settings are resolved, named with its
+// source.
+func TestParseRestartFindsAnInvalidDaemonSettingForTheNewDaemon(t *testing.T) {
+	bad := settingsFile(t, "grace: soon\n")
+	got, err := parseStop("restart", nil, "/bin/hostrunner", envOf(map[string]string{"XDG_RUNTIME_DIR": "/run/user/1000", "HOSTRUNNER_SETTINGS": bad}), io.Discard)
+	if err != nil {
+		t.Fatalf("parse: %v; want the setting found only for the new daemon", err)
+	}
+	if _, err := got.Restart.Settings(t.TempDir()); err == nil || !strings.Contains(err.Error(), "settings file "+bad+`: grace: invalid duration "soon"`) {
+		t.Fatalf("got %v, want the invalid setting named with its source", err)
 	}
 }
 

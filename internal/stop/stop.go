@@ -76,16 +76,22 @@ type Config struct {
 }
 
 // Restart describes how `hostrunner restart` starts the new daemon of a
-// runtime directory, as `hostrunner up` does, for the workspace,
-// container workspace and rules file the old one served. Its rules file
-// is validated before the old daemon stops: invalid rules leave it
-// running. A daemon that saw its armed container stop, and so is about
-// to exit, is only stopped, and so is one that stops by itself meanwhile;
-// the next `up` starts a new one.
+// runtime directory, as `hostrunner up` does, for the workspace and
+// container workspace the old one served, with the settings Settings
+// resolves for that workspace now. Its settings and rules file are
+// validated before the old daemon stops: an error in either leaves it
+// running. The restart names what they change of the old daemon's rules
+// file and rereading. A daemon that saw its armed container stop, and so
+// is about to exit, is only stopped, its settings and rules unchecked,
+// and so is one that stops by itself meanwhile; the next `up` starts a
+// new one.
 type Restart struct {
-	Daemon       string        // hostrunner executable to start as the daemon
-	Client       string        // hostrun binary to install into the runtime directory
-	ReadyTimeout time.Duration // how long to wait for the new daemon's socket
+	Daemon string // hostrunner executable to start as the daemon
+	Client string // hostrun binary to install into the runtime directory
+	// Settings resolves the new daemon's settings, those of up, for the
+	// host workspace workspace (ready_timeout bounding the wait for its
+	// socket); an error names the source.
+	Settings func(workspace string) (settings.Settings, error)
 	// Runtimes are asked whether the container of a daemon of an older
 	// hostrunner, which does not say, is running.
 	Runtimes []watch.Runtime
@@ -104,10 +110,12 @@ const (
 )
 
 // ending is what follows a daemon stopping, with, for startNew, the new
-// daemon, prepared.
+// daemon, prepared, and for a restart what of the old daemon's settings
+// it changes (see changes).
 type ending struct {
-	kind endingKind
-	up   *launch.Prepared
+	kind    endingKind
+	up      *launch.Prepared
+	changes []string
 }
 
 // exchangeTimeout bounds one question to a daemon (its hello, what it
@@ -317,10 +325,12 @@ func (t *term) stopDaemon(ctx context.Context, cfg Config, socket string) error 
 
 // ending returns what follows the daemon of dir, which said info of itself
 // (nil for a daemon from before approvals, which says nothing), stopping:
-// for a restart, a new daemon, prepared now so that invalid rules leave
-// the old one running, unless the daemon saw its armed container stop and
-// is about to exit (for a daemon of an older hostrunner, which does not
-// say: unless no container of its workspace runs). A daemon still waiting
+// for a restart, a new daemon, prepared now so that invalid settings or
+// rules leave the old one running, unless the daemon saw its armed
+// container stop and is about to exit (for a daemon of an older
+// hostrunner, which does not say: unless no container of its workspace
+// runs), which is only stopped, its settings and rules unchecked as
+// nothing would use them. A daemon still waiting
 // for its container (after an arm, during a rebuild) is replaced by one
 // that waits for it the same way. Not knowing what to start, or whether
 // the container runs, is an error.
@@ -336,17 +346,6 @@ func (t *term) ending(ctx context.Context, cfg Config, dir string, info *protoco
 	if info == nil {
 		return ending{}, fmt.Errorf("%s: a daemon from before approvals cannot be restarted, as it does not say what it serves: stop it, and the next hostrunner up starts a new one", name)
 	}
-	p, err := launch.Prepare(launch.Config{
-		Dir:                dir,
-		Workspace:          info.Workspace,
-		ContainerWorkspace: info.ContainerWorkspace,
-		Daemon:             r.Daemon,
-		Client:             r.Client,
-		Settings:           settings.Settings{RulesFile: info.RulesFile, Reread: !info.NoReread, ReadyTimeout: r.ReadyTimeout},
-	})
-	if err != nil {
-		return ending{}, fmt.Errorf("%s: %w; the daemon keeps running", name, err)
-	}
 	stopped := info.ContainerStopped
 	if !info.Stops {
 		running, err := containerRuns(ctx, r.Runtimes, info.Workspace)
@@ -358,7 +357,36 @@ func (t *term) ending(ctx context.Context, cfg Config, dir string, info *protoco
 	if stopped {
 		return ending{kind: notRunning}, nil
 	}
-	return ending{kind: startNew, up: p}, nil
+	s, err := r.Settings(info.Workspace)
+	if err != nil {
+		return ending{}, fmt.Errorf("%s: %w; the daemon keeps running", name, err)
+	}
+	p, err := launch.Prepare(launch.Config{
+		Dir:                dir,
+		Workspace:          info.Workspace,
+		ContainerWorkspace: info.ContainerWorkspace,
+		Daemon:             r.Daemon,
+		Client:             r.Client,
+		Settings:           s,
+	})
+	if err != nil {
+		return ending{}, fmt.Errorf("%s: %w; the daemon keeps running", name, err)
+	}
+	return ending{kind: startNew, up: p, changes: changes(info, s)}, nil
+}
+
+// changes names, as `<key> <old> → <new>`, what the settings s change of
+// what a daemon said of itself, info: its rules file and, when it says,
+// whether it rereads that by itself.
+func changes(info *protocol.DaemonInfo, s settings.Settings) []string {
+	var out []string
+	if info.RulesFile != s.RulesFile {
+		out = append(out, "rules_file "+hostterm.Display(info.RulesFile)+" → "+hostterm.Display(s.RulesFile))
+	}
+	if (info.Rereads || info.NoReread) && info.Rereads != s.Reread {
+		out = append(out, fmt.Sprintf("reread %t → %t", info.Rereads, s.Reread))
+	}
+	return out
 }
 
 // containerRuns asks runtimes whether a container of the host workspace
@@ -602,7 +630,11 @@ func (t *term) stopped(ctx context.Context, cfg Config, dir string, e ending) er
 		if err := e.up.UpLocked(ctx); err != nil {
 			return fmt.Errorf("%s: stopped, but the new daemon did not start: %w", name, err)
 		}
-		fmt.Fprintf(t.out, "hostrunner: restarted %s\n", name)
+		if len(e.changes) == 0 {
+			fmt.Fprintf(t.out, "hostrunner: restarted %s\n", name)
+		} else {
+			fmt.Fprintf(t.out, "hostrunner: restarted %s; %s\n", name, strings.Join(e.changes, ", "))
+		}
 	case notRunning:
 		fmt.Fprintf(t.out, "hostrunner: stopped %s; its container is not running\n", name)
 	default:

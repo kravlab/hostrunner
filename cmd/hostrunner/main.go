@@ -50,7 +50,9 @@
 // [--stop-timeout <duration>], those of `approve` [--settings <path>]
 // [--runtime-root <path>]; a setting no flag gives comes from its
 // HOSTRUNNER_* variable, the common part of the host settings file or
-// the default.
+// the default. `restart` resolves the new daemon's settings as `up`
+// does, for the old daemon's workspace, also taking
+// [--workspace-settings <path>] and [--rules-file <path>].
 package main
 
 import (
@@ -99,7 +101,7 @@ var (
 	serveUsage   = "usage: hostrunner serve --socket <path> --workspace <host-path> --container-workspace <path> [--watch] " + settings.Usage()
 	testUsage    = "usage: hostrunner test " + settings.RulesFileUsage() + " [--] <command> [args...]"
 	stopUsage    = "usage: hostrunner stop [--dir <runtime-dir> | --all | --choose] [--kill | --wait] " + settings.StopUsage()
-	restartUsage = "usage: hostrunner restart [--dir <runtime-dir> | --all | --choose] [--kill | --wait] " + settings.StopUsage()
+	restartUsage = "usage: hostrunner restart [--dir <runtime-dir> | --all | --choose] [--kill | --wait] " + settings.RestartUsage()
 	approveUsage = "usage: hostrunner approve [--dir <runtime-dir>] " + settings.ApproveUsage()
 )
 
@@ -108,12 +110,9 @@ var (
 // XDG_RUNTIME_DIR, its default, is unset.
 var errNoRuntimeRoot = errors.New("XDG_RUNTIME_DIR is not set: give the runtime root with --runtime-root, HOSTRUNNER_RUNTIME_ROOT or runtime_root in the host settings file, or the runtime directory with --dir")
 
-// Timeouts that are not settings (see internal/settings). readyTimeout
-// is how long `restart` waits for the daemon it starts, the default
-// ready_timeout, until restart resolves the settings.
+// Timeouts that are not settings (see internal/settings).
 const (
 	queryTimeout  = 10 * time.Second // one docker/podman ps call
-	readyTimeout  = 10 * time.Second // how long `restart` waits for the daemon
 	updateTimeout = 5 * time.Minute  // `update`'s version lookup and downloads
 )
 
@@ -373,7 +372,9 @@ func parseAnswer(kill, wait bool, usage string) (stop.Answer, error) {
 // hostrun beside it, as the new daemons. Without --dir the daemons are
 // looked for under the runtime root, $XDG_RUNTIME_DIR/hostrunner (where
 // `hostrunner up` puts their runtime directories) unless a setting says;
-// the settings are resolved with getenv reading the environment.
+// the settings are resolved with getenv reading the environment, those
+// of a new daemon as up resolves them, for the old daemon's workspace,
+// when restart starts it.
 func parseStop(name string, args []string, exe string, getenv func(string) string, output io.Writer) (stop.Config, error) {
 	usage := stopUsage
 	if name == "restart" {
@@ -390,7 +391,11 @@ func parseStop(name string, args []string, exe string, getenv func(string) strin
 	fs.BoolVar(&cfg.All, "all", false, "every daemon")
 	fs.BoolVar(&cfg.Choose, "choose", false, "choose the daemon from the list")
 	registerAnswer(fs, &kill, &wait)
-	sf.RegisterStop(fs)
+	if name == "restart" {
+		sf.RegisterRestart(fs)
+	} else {
+		sf.RegisterStop(fs)
+	}
 	if err := parseFlags(fs, args, usage); err != nil {
 		return stop.Config{}, err
 	}
@@ -423,7 +428,9 @@ func parseStop(name string, args []string, exe string, getenv func(string) strin
 	}
 	if name == "restart" {
 		b := daemonBinaries(exe)
-		cfg.Restart = &stop.Restart{Daemon: b.Daemon, Client: b.Client, ReadyTimeout: readyTimeout}
+		cfg.Restart = &stop.Restart{Daemon: b.Daemon, Client: b.Client, Settings: func(workspace string) (settings.Settings, error) {
+			return sf.Resolve(getenv, workspace)
+		}}
 	}
 	return cfg, nil
 }

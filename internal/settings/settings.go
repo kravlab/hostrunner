@@ -92,9 +92,7 @@ func flagDefaults() Settings {
 // Daemon returns the settings serve takes, keyed by their names, each
 // value written as a settings file writes it (`1m30s`, `true`, a path):
 // what an arm of up carries to the daemon, and what the daemon compares
-// it with. A duration of zero, which no source gives, is not set
-// (restart's, until it resolves the settings) and is left out; a string
-// is always kept, even an empty one.
+// it with.
 func (s Settings) Daemon() map[string]string {
 	daemonKeys := keysOf(scopeDaemon)
 	out := make(map[string]string, len(daemonKeys))
@@ -103,9 +101,7 @@ func (s Settings) Daemon() map[string]string {
 		case *string:
 			out[k.name] = *p
 		case *time.Duration:
-			if *p != 0 {
-				out[k.name] = p.String()
-			}
+			out[k.name] = p.String()
 		case *bool:
 			out[k.name] = strconv.FormatBool(*p)
 		default:
@@ -236,6 +232,29 @@ func (in scopes) knowWorkspace() bool {
 	return slices.ContainsFunc(in, func(s scope) bool { return !s.commonOnly() })
 }
 
+// hostOnly returns the scopes of in whose keys only the common part of
+// the host settings file may set, those ResolveHost resolves: restart's
+// own.
+func (in scopes) hostOnly() scopes {
+	return slices.DeleteFunc(slices.Clone(in), func(s scope) bool { return !s.commonOnly() })
+}
+
+// ofWorkspace returns the scopes of in whose keys a workspace may set,
+// those Resolve resolves: for restart, the new daemon's.
+func (in scopes) ofWorkspace() scopes {
+	return slices.DeleteFunc(slices.Clone(in), scope.commonOnly)
+}
+
+// restartScopes are the scopes of the keys restart takes: those of stop,
+// and those of up for the new daemon, which it starts as up does.
+var restartScopes = []scope{scopeRuntimeRoot, scopeStop, scopeDaemon, scopeUp}
+
+// restartKeys are the keys restart has flags for: the rules file of the
+// new daemon and the keys of stop.
+func restartKeys() []key {
+	return append([]key{mustLookup("rules_file")}, keysOf(scopeRuntimeRoot, scopeStop)...)
+}
+
 // keysOf returns the keys whose flags the commands of in take.
 func keysOf(in ...scope) []key {
 	var out []key
@@ -263,33 +282,47 @@ func lookup(name string) (key, bool) {
 	return key{}, false
 }
 
+// mustLookup returns the key named name, one of keys.
+func mustLookup(name string) key {
+	k, ok := lookup(name)
+	if !ok {
+		panic("settings: no key " + name)
+	}
+	return k
+}
+
 // Usage is the usage of the settings' flags Register adds, as serve's
 // usage line shows them: [--settings <path>] [--workspace-settings
 // <path>] [--rules-file <path>] [--grace <duration>] [--reread |
 // --no-reread] and so on, one per key; --config, the synonym of
 // --rules-file, is left out.
-func Usage() string { return usage(scopeDaemon) }
+func Usage() string { return usageOf(keysOf(scopeDaemon)) }
 
 // UpUsage is Usage for the flags RegisterUp adds, as up's usage line
 // shows them: Usage and [--ready-timeout <duration>].
-func UpUsage() string { return usage(scopeDaemon, scopeUp) }
+func UpUsage() string { return usageOf(keysOf(scopeDaemon, scopeUp)) }
 
 // StopUsage is the usage of the flags RegisterStop adds: [--settings
 // <path>] [--runtime-root <path>] [--stop-timeout <duration>].
-func StopUsage() string { return usage(scopeRuntimeRoot, scopeStop) }
+func StopUsage() string { return usageOf(keysOf(scopeRuntimeRoot, scopeStop)) }
 
 // ApproveUsage is the usage of the flags RegisterApprove adds:
 // [--settings <path>] [--runtime-root <path>].
-func ApproveUsage() string { return usage(scopeRuntimeRoot) }
+func ApproveUsage() string { return usageOf(keysOf(scopeRuntimeRoot)) }
 
-// usage is the usage of the flags of a command that takes the keys of
-// in.
-func usage(in ...scope) string {
+// RestartUsage is the usage of the flags RegisterRestart adds: those of
+// StopUsage, [--workspace-settings <path>] and [--rules-file <path>].
+func RestartUsage() string { return usageOf(restartKeys()) }
+
+// usageOf is the usage of the flags of a command with a flag for each
+// key of flagged, and --workspace-settings when one of them is a key a
+// workspace may set (see scopes.knowWorkspace).
+func usageOf(flagged []key) string {
 	parts := []string{settingsFlagUsage}
-	if scopes(in).knowWorkspace() {
+	if slices.ContainsFunc(flagged, func(k key) bool { return !k.scope.commonOnly() }) {
 		parts = append(parts, workspaceFlagUsage)
 	}
-	for _, k := range keysOf(in...) {
+	for _, k := range flagged {
 		parts = append(parts, k.usageOf())
 	}
 	return strings.Join(parts, " ")
@@ -297,10 +330,7 @@ func usage(in ...scope) string {
 
 // RulesFileUsage is the usage of the flags RegisterRulesFile adds, those
 // that choose the rules file.
-func RulesFileUsage() string {
-	k, _ := lookup("rules_file")
-	return settingsFlagUsage + " " + workspaceFlagUsage + " " + k.usageOf()
-}
+func RulesFileUsage() string { return usageOf([]key{mustLookup("rules_file")}) }
 
 // settingsFlagUsage and workspaceFlagUsage are the usages of the flags
 // that name the host settings file and the workspace settings file.
@@ -348,6 +378,17 @@ func (k kind) parse(raw string) (any, error) {
 		return nil, fmt.Errorf("%w, got %s", errNotPositive, raw)
 	}
 	return d, nil
+}
+
+// only is l with the keys in takes alone.
+func (l layer) only(in scopes) layer {
+	out := layer{}
+	for name, v := range l {
+		if k, _ := lookup(name); in.takes(k) {
+			out[name] = v
+		}
+	}
+	return out
 }
 
 // apply sets the fields of s that l sets.
