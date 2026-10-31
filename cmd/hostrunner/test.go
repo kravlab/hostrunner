@@ -5,32 +5,50 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
 
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
+	"github.com/kravlab/hostrunner/internal/settings"
 )
-
-const testUsage = "usage: hostrunner test [--config <path>] [--] <command> [args...]"
 
 // testConfig holds the settings of `hostrunner test`.
 type testConfig struct {
-	config string   // rules file
-	argv   []string // the command to test
+	rulesFile string   // rules file
+	argv      []string // the command to test
 }
 
 // parseTest parses the arguments of `hostrunner test`: its flags end at
-// the first non-flag argument or `--`, and the rest is the command.
-func parseTest(args []string, output io.Writer) (testConfig, error) {
-	var cfg testConfig
+// the first non-flag argument or `--`, and the rest is the command. The
+// rules file is resolved as `up` resolves it (see internal/settings),
+// with getenv reading the environment and the current directory as the
+// workspace, so the test reads the rules file the daemon would.
+func parseTest(args []string, getenv func(string) string, output io.Writer) (testConfig, error) {
+	var (
+		cfg testConfig
+		sf  settings.Flags
+	)
 	fs := flag.NewFlagSet("test", flag.ContinueOnError)
 	fs.SetOutput(output)
-	fs.StringVar(&cfg.config, "config", rulesPath, "rules file")
+	sf.RegisterRulesFile(fs)
 	if err := fs.Parse(args); err != nil {
 		return cfg, err
 	}
 	if cfg.argv = fs.Args(); len(cfg.argv) == 0 {
 		return cfg, errors.New(testUsage)
 	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return cfg, err
+	}
+	s, err := sf.Resolve(getenv, cwd)
+	if _, ok := errors.AsType[*settings.FlagError](err); ok {
+		return cfg, fmt.Errorf("%w; %s", err, testUsage)
+	}
+	if err != nil {
+		return cfg, err
+	}
+	cfg.rulesFile = s.RulesFile
 	return cfg, nil
 }
 
@@ -43,7 +61,7 @@ func parseTest(args []string, output io.Writer) (testConfig, error) {
 // Unlike the daemon, it takes a missing file for an error; an invalid one
 // fails as in `hostrunner up`.
 func rulesTest(cfg testConfig, stderr io.Writer) error {
-	policy, err := rules.Read(cfg.config)
+	policy, err := rules.Read(cfg.rulesFile)
 	if err != nil {
 		return fmt.Errorf("rules file: %w", err)
 	}

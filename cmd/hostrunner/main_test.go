@@ -88,9 +88,8 @@ func TestParseServeAcceptsAllFlags(t *testing.T) {
 	want := serveConfig{
 		socket:         "/run/h.sock",
 		workspaceFlags: workspaceFlags{workspace: "/home/u/app", containerWorkspace: "/workspaces/app"},
-		config:         "/home/u/app/.devcontainer/hostrun.yaml",
 		pollInterval:   2 * time.Second,
-		Settings:       settings.Settings{StartupTimeout: 30 * time.Minute, Grace: 15 * time.Second, Reread: true},
+		Settings:       settings.Settings{RulesFile: "/home/u/app/.devcontainer/hostrun.yaml", StartupTimeout: 30 * time.Minute, Grace: 15 * time.Second, Reread: true},
 	}
 	if got != want {
 		t.Fatalf("got %+v, want %+v", got, want)
@@ -142,11 +141,10 @@ func TestParseUpBuildsLaunchConfig(t *testing.T) {
 		Dir:                "/run/user/1000/hostrunner/abc",
 		Workspace:          "/home/u/app",
 		ContainerWorkspace: "/workspaces/app",
-		Rules:              "/home/u/app/.devcontainer/hostrun.yaml",
 		Daemon:             exe,
 		Client:             filepath.Join("/home/u/.local/bin", "hostrun"),
 		ReadyTimeout:       10 * time.Second,
-		Settings:           settings.Settings{StartupTimeout: 30 * time.Minute, Grace: 15 * time.Second, Reread: true},
+		Settings:           settings.Settings{RulesFile: "/home/u/app/.devcontainer/hostrun.yaml", StartupTimeout: 30 * time.Minute, Grace: 15 * time.Second, Reread: true},
 	}
 	if got.launch != want || got.restart || got.answer != stop.Ask {
 		t.Fatalf("got %+v, want %+v without --restart", got, want)
@@ -225,6 +223,7 @@ var commands = map[string]func([]string, func(string) string) (settings.Settings
 // default.
 func TestUpAndServeResolveEachSettingFromTheHighestSource(t *testing.T) {
 	file := "startup_timeout: 1h\ngrace: 1m\nreread: false\n"
+	defaultRules := filepath.Join("/w", ".devcontainer", "hostrun.yaml")
 	vars := map[string]string{"HOSTRUNNER_STARTUP_TIMEOUT": "2h", "HOSTRUNNER_GRACE": "2m", "HOSTRUNNER_REREAD": "true"}
 	tests := []struct {
 		name  string
@@ -233,11 +232,11 @@ func TestUpAndServeResolveEachSettingFromTheHighestSource(t *testing.T) {
 		flags []string
 		want  settings.Settings
 	}{
-		{"defaults", "", nil, nil, settings.Settings{StartupTimeout: 30 * time.Minute, Grace: 15 * time.Second, Reread: true}},
-		{"host settings file", file, nil, nil, settings.Settings{StartupTimeout: time.Hour, Grace: time.Minute, Reread: false}},
-		{"variables over the file", file, vars, nil, settings.Settings{StartupTimeout: 2 * time.Hour, Grace: 2 * time.Minute, Reread: true}},
-		{"flags over the variables", file, vars, []string{"--startup-timeout", "3h", "--grace", "3m", "--no-reread"}, settings.Settings{StartupTimeout: 3 * time.Hour, Grace: 3 * time.Minute, Reread: false}},
-		{"--reread over the file", file, nil, []string{"--reread"}, settings.Settings{StartupTimeout: time.Hour, Grace: time.Minute, Reread: true}},
+		{"defaults", "", nil, nil, settings.Settings{RulesFile: defaultRules, StartupTimeout: 30 * time.Minute, Grace: 15 * time.Second, Reread: true}},
+		{"host settings file", file, nil, nil, settings.Settings{RulesFile: defaultRules, StartupTimeout: time.Hour, Grace: time.Minute, Reread: false}},
+		{"variables over the file", file, vars, nil, settings.Settings{RulesFile: defaultRules, StartupTimeout: 2 * time.Hour, Grace: 2 * time.Minute, Reread: true}},
+		{"flags over the variables", file, vars, []string{"--startup-timeout", "3h", "--grace", "3m", "--no-reread"}, settings.Settings{RulesFile: defaultRules, StartupTimeout: 3 * time.Hour, Grace: 3 * time.Minute, Reread: false}},
+		{"--reread over the file", file, nil, []string{"--reread"}, settings.Settings{RulesFile: defaultRules, StartupTimeout: time.Hour, Grace: time.Minute, Reread: true}},
 	}
 	for name, resolve := range commands {
 		for _, tt := range tests {
@@ -331,9 +330,9 @@ func TestServeGivenEverySettingReadsNoOtherSource(t *testing.T) {
 		t.Errorf("read %s", name)
 		return ""
 	}
-	flags := []string{"--settings", settingsFile(t, "grase: [\n"), "--workspace-settings", settingsFile(t, "grase: [\n"), "--startup-timeout", "1h", "--grace", "1m", "--reread"}
+	flags := []string{"--settings", settingsFile(t, "grase: [\n"), "--workspace-settings", settingsFile(t, "grase: [\n"), "--rules-file", "/r.yaml", "--startup-timeout", "1h", "--grace", "1m", "--reread"}
 	got, err := resolveServe(flags, getenv)
-	if want := (settings.Settings{StartupTimeout: time.Hour, Grace: time.Minute, Reread: true}); err != nil || got != want {
+	if want := (settings.Settings{RulesFile: "/r.yaml", StartupTimeout: time.Hour, Grace: time.Minute, Reread: true}); err != nil || got != want {
 		t.Fatalf("got %+v, %v; want %+v", got, err, want)
 	}
 }
@@ -403,7 +402,7 @@ func TestUpAndServeReadTheWorkspaceSettings(t *testing.T) {
 // An up given every setting as a flag still reads every other source, so
 // a missing named file, a broken file or an invalid variable fails it.
 func TestUpGivenEverySettingStillReadsEverySource(t *testing.T) {
-	all := []string{"--startup-timeout", "1m", "--grace", "1s", "--reread"}
+	all := []string{"--rules-file", "/r.yaml", "--startup-timeout", "1m", "--grace", "1s", "--reread"}
 	missing := filepath.Join(t.TempDir(), "missing.yaml")
 	broken := settingsFile(t, "grase: 1s\n")
 	tests := []struct {
@@ -557,24 +556,64 @@ func TestServeWatchWaitsAgainWhenArmed(t *testing.T) {
 }
 
 func TestParseServeAcceptsConfigPath(t *testing.T) {
-	got, err := parseServe([]string{"--socket", "/s", "--workspace", "/w", "--container-workspace", "/c", "--config", "/etc/rules.yaml"}, noEnv, io.Discard)
-	if err != nil {
-		t.Fatal(err)
+	for _, name := range []string{"--rules-file", "--config"} {
+		got, err := parseServe([]string{"--socket", "/s", "--workspace", "/w", "--container-workspace", "/c", name, "/etc/rules.yaml"}, noEnv, io.Discard)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.RulesFile != "/etc/rules.yaml" {
+			t.Fatalf("%s: rules file %q, want /etc/rules.yaml", name, got.RulesFile)
+		}
 	}
-	if got.config != "/etc/rules.yaml" {
-		t.Fatalf("config = %q, want /etc/rules.yaml", got.config)
+}
+
+// up and serve take the rules file from rules_file in any source: a
+// relative path from a file or a variable against the workspace, from a
+// flag against the current directory.
+func TestUpAndServeResolveTheRulesFile(t *testing.T) {
+	ws, cwd := t.TempDir(), t.TempDir()
+	t.Chdir(cwd)
+	host := settingsFile(t, "rules_file: common.yaml\n")
+	tests := []struct {
+		name  string
+		vars  map[string]string
+		flags []string
+		want  string
+	}{
+		{"default", nil, nil, filepath.Join(ws, ".devcontainer", "hostrun.yaml")},
+		{"host settings file", map[string]string{"HOSTRUNNER_SETTINGS": host}, nil, filepath.Join(ws, "common.yaml")},
+		{"variable", map[string]string{"HOSTRUNNER_SETTINGS": host, "HOSTRUNNER_RULES_FILE": "var.yaml"}, nil, filepath.Join(ws, "var.yaml")},
+		{"--rules-file", map[string]string{"HOSTRUNNER_RULES_FILE": "var.yaml"}, []string{"--rules-file", "flag.yaml"}, filepath.Join(cwd, "flag.yaml")},
+		{"--config", map[string]string{"HOSTRUNNER_RULES_FILE": "var.yaml"}, []string{"--config", "flag.yaml"}, filepath.Join(cwd, "flag.yaml")},
+	}
+	for name, resolve := range commands {
+		for _, tt := range tests {
+			got, err := resolve(append([]string{"--workspace", ws}, tt.flags...), envOf(tt.vars))
+			if err != nil || got.RulesFile != tt.want {
+				t.Errorf("%s, %s: got rules file %q, %v; want %q", name, tt.name, got.RulesFile, err, tt.want)
+			}
+		}
+	}
+}
+
+func TestUpAndServeRejectRulesFileWithConfig(t *testing.T) {
+	for name, resolve := range commands {
+		_, err := resolve([]string{"--rules-file", "/a.yaml", "--config", "/b.yaml"}, noEnv)
+		if err == nil || !strings.HasPrefix(err.Error(), "--rules-file and --config exclude each other; usage: hostrunner "+name) {
+			t.Errorf("%s: got %v, want the conflict with the usage", name, err)
+		}
 	}
 }
 
 func TestServeRefusesInvalidConfig(t *testing.T) {
 	cfg := watchConfig(t)
 	cfg.watch = false
-	cfg.config = filepath.Join(cfg.workspace, "hostrun.yaml")
-	if err := os.WriteFile(cfg.config, []byte("rules:\n  - command: git\n"), 0o644); err != nil {
+	cfg.RulesFile = filepath.Join(cfg.workspace, "hostrun.yaml")
+	if err := os.WriteFile(cfg.RulesFile, []byte("rules:\n  - command: git\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	err := serve(context.Background(), cfg, slog.New(slog.DiscardHandler), nil)
-	if err == nil || !strings.Contains(err.Error(), cfg.config) {
+	if err == nil || !strings.Contains(err.Error(), cfg.RulesFile) {
 		t.Fatalf("got %v, want an error naming the config", err)
 	}
 	if _, err := os.Stat(cfg.socket); !os.IsNotExist(err) {
@@ -585,8 +624,8 @@ func TestServeRefusesInvalidConfig(t *testing.T) {
 func TestServeEnforcesConfig(t *testing.T) {
 	cfg := watchConfig(t)
 	cfg.watch = false
-	cfg.config = filepath.Join(cfg.workspace, "hostrun.yaml")
-	if err := os.WriteFile(cfg.config, []byte("rules:\n  - command: true\n    args: none\n"), 0o644); err != nil {
+	cfg.RulesFile = filepath.Join(cfg.workspace, "hostrun.yaml")
+	if err := os.WriteFile(cfg.RulesFile, []byte("rules:\n  - command: true\n    args: none\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	startServe(t, cfg)
@@ -605,7 +644,7 @@ func TestServeEnforcesConfig(t *testing.T) {
 // rulesDigest is the digest of the rules serve loaded for cfg.
 func rulesDigest(t *testing.T, cfg serveConfig) string {
 	t.Helper()
-	p, err := rules.Load(cfg.config)
+	p, err := rules.Load(cfg.RulesFile)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -816,7 +855,7 @@ func TestUpdateMessage(t *testing.T) {
 func TestServeListensOnTheApprovalSocket(t *testing.T) {
 	cfg := watchConfig(t)
 	cfg.watch = false
-	cfg.config = filepath.Join(cfg.workspace, "hostrun.yaml")
+	cfg.RulesFile = filepath.Join(cfg.workspace, "hostrun.yaml")
 	approvalSocket := launch.ApprovalSocket(filepath.Dir(cfg.socket))
 	t.Cleanup(func() { os.Remove(approvalSocket) })
 	ctx, cancel := context.WithCancel(context.Background())
@@ -845,7 +884,7 @@ func TestServeListensOnTheApprovalSocket(t *testing.T) {
 	if err != nil || f.Type != protocol.FrameDaemonInfo || protocol.DecodeJSON(f, &got) != nil {
 		t.Fatalf("hello: frame %v, err %v", f.Type, err)
 	}
-	want := protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: cfg.workspace, ContainerWorkspace: cfg.containerWorkspace, RulesFile: cfg.config, RulesDigest: "missing", Stops: true, Rereads: true}
+	want := protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: cfg.workspace, ContainerWorkspace: cfg.containerWorkspace, RulesFile: cfg.RulesFile, RulesDigest: "missing", Stops: true, Rereads: true}
 	if real, err := filepath.EvalSymlinks(cfg.workspace); err == nil {
 		want.Workspace = real
 	}
@@ -952,8 +991,8 @@ func TestServeClosesTheApprovalSocketFirstWhenSteppingAside(t *testing.T) {
 func TestServeRereadsItsRulesOnceARuleIsAdded(t *testing.T) {
 	cfg := watchConfig(t)
 	cfg.watch = false
-	cfg.config = filepath.Join(cfg.workspace, "hostrun.yaml")
-	if err := os.WriteFile(cfg.config, []byte("rules:\n  - command: echo\n    args: any\n"), 0o644); err != nil {
+	cfg.RulesFile = filepath.Join(cfg.workspace, "hostrun.yaml")
+	if err := os.WriteFile(cfg.RulesFile, []byte("rules:\n  - command: echo\n    args: any\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	approvalSocket := launch.ApprovalSocket(filepath.Dir(cfg.socket))
@@ -977,7 +1016,7 @@ func TestServeRereadsItsRulesOnceARuleIsAdded(t *testing.T) {
 		t.Fatalf("serve: frame %v, err %v", f.Type, err)
 	}
 	added := []byte("rules:\n  - command: echo\n    args: any\n  - command: date\n    args: none\n")
-	if err := os.WriteFile(cfg.config, added, 0o644); err != nil {
+	if err := os.WriteFile(cfg.RulesFile, added, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := protocol.WriteJSON(c, protocol.FrameReread, protocol.Reread{Rule: "date", Digest: rules.ContentDigest(added)}); err != nil {
@@ -988,7 +1027,7 @@ func TestServeRereadsItsRulesOnceARuleIsAdded(t *testing.T) {
 	if err != nil || f.Type != protocol.FrameRereadResult || protocol.DecodeJSON(f, &res) != nil {
 		t.Fatalf("reread: frame %v, err %v", f.Type, err)
 	}
-	p, err := rules.Load(cfg.config)
+	p, err := rules.Load(cfg.RulesFile)
 	if err != nil {
 		t.Fatal(err)
 	}

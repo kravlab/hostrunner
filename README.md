@@ -192,6 +192,7 @@ Besides its rules, a daemon has settings:
 
 | Key | Variable | Flag | Default | What it sets |
 |---|---|---|---|---|
+| `rules_file` | `HOSTRUNNER_RULES_FILE` | `--rules-file`, `--config` | `.devcontainer/hostrun.yaml` in the workspace | its rules file |
 | `startup_timeout` | `HOSTRUNNER_STARTUP_TIMEOUT` | `--startup-timeout` | `30m` | how long it waits for its container to start |
 | `grace` | `HOSTRUNNER_GRACE` | `--grace` | `15s` | how long its container may be gone before it exits |
 | `reread` | `HOSTRUNNER_REREAD` | `--reread`, `--no-reread` | `true` | whether it rereads the rules file by itself once it changes |
@@ -237,6 +238,12 @@ It holds the keys at the top level, with no `workspaces`, and wins over
 the host settings file. `runtime_root` and `stop_timeout` are allowed
 only in the common part of the host settings file: in the workspace
 settings file or a section they are an error.
+
+A relative `rules_file` from a settings file or a variable is read
+against the workspace (after `~` expansion), so one `rules_file` in the
+common part fits every workspace; a relative flag value is read against
+the current directory. `--config` is a synonym of `--rules-file`;
+giving both is an error.
 
 A duration is written with a unit (`90s`, `1m30s`, `2h`) and must be
 above zero; a bool is `true` or `false` (`1`, `0` and the like in a
@@ -741,11 +748,14 @@ container, run the Rules test on the host, in the project root:
 ```sh
 hostrunner test git push -u origin main   # hostrunner: allowed by rule "git push"
 hostrunner test git push --force          # hostrunner: denied by rule "git push": flag --force is not allowed (approvable)
-hostrunner test --config draft.yaml -- tix pr list
+hostrunner test --rules-file draft.yaml -- tix pr list
 ```
 
-It reads `.devcontainer/hostrun.yaml` under the current directory, or the
-`--config` file, and tests the command against the rules alone: not the
+It reads the rules file `up` would use with the current directory as
+the workspace (`.devcontainer/hostrun.yaml` there unless `rules_file`
+names another; see [Settings](#settings)), or the `--rules-file` file
+(`--config` is its synonym; `--settings` and `--workspace-settings`
+name the settings files), and tests the command against the rules alone: not the
 working directory, path checks or the host's programs. It reports the
 rule's `dir` (`inherit` resolved) and its secrets' names as a dry run
 does, without checking that the directory exists or lies outside the
@@ -785,7 +795,7 @@ How it works:
   cannot rewrite the rules that govern it. `hostrun` warns on stderr when
   the nearest `.devcontainer/` above its working directory, or the
   `hostrun.yaml` in it, is writable (the default location only, not a
-  `--config` file).
+  `--rules-file` file).
 - The working directory (the mirrored directory, or the rule's `dir`) is
   opened, not re-resolved, when the command starts, so a symlink swapped
   in by the container cannot redirect it.

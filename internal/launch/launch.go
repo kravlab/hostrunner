@@ -71,7 +71,6 @@ type Config struct {
 	Dir                string        // runtime directory, e.g. $XDG_RUNTIME_DIR/hostrunner/<devcontainerId>
 	Workspace          string        // workspace folder on the host
 	ContainerWorkspace string        // the same folder inside the container
-	Rules              string        // the rules file (.devcontainer/hostrun.yaml)
 	Daemon             string        // hostrunner executable to start as the daemon
 	Client             string        // hostrun binary to install into Dir
 	ReadyTimeout       time.Duration // how long to wait for the daemon's socket
@@ -81,7 +80,7 @@ type Config struct {
 }
 
 // Up makes sure an armed daemon serves cfg.Dir with the current rules. It
-// validates cfg.Rules first (invalid rules are an error), arms a running
+// validates cfg.RulesFile first (invalid rules are an error), arms a running
 // daemon, and starts a new one if there is none or the running one loaded
 // other rules (it steps aside when armed with a different digest). It
 // returns once the daemon has answered an arm request, or an error carrying
@@ -107,7 +106,7 @@ type Prepared struct {
 	socket, digest string
 }
 
-// Prepare readies cfg.Dir and validates cfg.Rules for an `up`; invalid
+// Prepare readies cfg.Dir and validates cfg.RulesFile for an `up`; invalid
 // rules are an error.
 func Prepare(cfg Config) (*Prepared, error) {
 	socket := Socket(cfg.Dir)
@@ -119,7 +118,7 @@ func Prepare(cfg Config) (*Prepared, error) {
 	}
 	// Invalid rules must fail `devcontainer up` visibly, even when a daemon
 	// with older rules is still running.
-	policy, err := rules.Load(cfg.Rules)
+	policy, err := rules.Load(cfg.RulesFile)
 	if err != nil {
 		return nil, fmt.Errorf("rules file: %w", err)
 	}
@@ -360,7 +359,7 @@ func serveArgs(cfg Config, socket string) []string {
 		"--socket", socket,
 		"--workspace", cfg.Workspace,
 		"--container-workspace", cfg.ContainerWorkspace,
-		"--config", cfg.Rules,
+		"--rules-file", cfg.RulesFile,
 		"--watch"}
 	if cfg.StartupTimeout > 0 {
 		args = append(args, "--startup-timeout", cfg.StartupTimeout.String())

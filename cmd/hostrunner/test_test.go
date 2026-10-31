@@ -32,6 +32,11 @@ func writeRules(t *testing.T, content string) string {
 // would use, stdout and stderr.
 func runTest(t *testing.T, args ...string) (int, string, string) {
 	t.Helper()
+	// No host settings file or HOSTRUNNER_* variable of the machine
+	// running the tests may choose the rules file.
+	for _, name := range []string{"HOME", "XDG_CONFIG_HOME", "HOSTRUNNER_SETTINGS", "HOSTRUNNER_WORKSPACE_SETTINGS", "HOSTRUNNER_RULES_FILE"} {
+		t.Setenv(name, "")
+	}
 	var stdout, stderr strings.Builder
 	err := run(append([]string{"test"}, args...), &stdout, &stderr)
 	if err != nil {
@@ -257,6 +262,37 @@ func TestRulesTestReadsTheRulesFileUnderTheCurrentDirectory(t *testing.T) {
 	}
 	if want := "hostrunner: allowed by rule \"git push\"\n"; stderr != want {
 		t.Fatalf("stderr %q, want %q", stderr, want)
+	}
+}
+
+// test resolves the rules file as up would, with the current directory as
+// the workspace: rules_file in the workspace settings file names it, and
+// --rules-file and --config override it.
+func TestRulesTestResolvesTheRulesFileWithTheCurrentDirectoryAsTheWorkspace(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, ".devcontainer"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".devcontainer", "hostrunner.yaml"), []byte("rules_file: rules.yaml\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "rules.yaml"), []byte(testRules), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	if code, _, stderr := runTest(t, "git", "push"); code != 0 {
+		t.Fatalf("workspace settings file: exit code %d, want 0 (stderr %q)", code, stderr)
+	}
+	missing := filepath.Join(t.TempDir(), "missing.yaml")
+	for _, name := range []string{"--rules-file", "--config"} {
+		code, _, stderr := runTest(t, name, missing, "git", "push")
+		if want := "hostrunner: rules file: open " + missing + ": no such file or directory\n"; code != 1 || stderr != want {
+			t.Fatalf("%s: exit code %d, stderr %q; want 1, %q", name, code, stderr, want)
+		}
+	}
+	code, _, stderr := runTest(t, "--rules-file", missing, "--config", missing, "git")
+	if code != 1 || !strings.Contains(stderr, "--rules-file and --config exclude each other; "+testUsage) {
+		t.Fatalf("both flags: exit code %d, stderr %q; want the conflict with the usage", code, stderr)
 	}
 }
 

@@ -4,27 +4,31 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 )
 
 // Flags are the flags of the settings on one command line: --settings,
-// --workspace-settings, one per key (--startup-timeout, --grace) and,
-// for reread, both --reread and --no-reread. Register them, parse, then
-// resolve.
+// --workspace-settings, one per key (--rules-file, --startup-timeout,
+// --grace), --config as the synonym of --rules-file and, for reread,
+// both --reread and --no-reread. Register them, parse, then resolve.
 type Flags struct {
 	fs            *flag.FlagSet
 	file          string
 	workspaceFile string
+	rulesFile     string
+	config        string
 	durations     map[string]*time.Duration
 	reread        bool
 	noReread      bool
 }
 
 // FlagError is a settings flag given a value no setting can take
-// (`--grace: must be positive`) or --reread with --no-reread, as the
-// resolving methods of Flags return it, so a caller can tell it from an
-// invalid variable or file and add its usage.
+// (`--grace: must be positive`), or --reread with --no-reread, or
+// --rules-file with --config, as the resolving methods of Flags return
+// it, so a caller can tell it from an invalid variable or file and add
+// its usage.
 type FlagError struct{ err error }
 
 // Error is the problem with the flag, naming it.
@@ -35,11 +39,9 @@ func (e *FlagError) Unwrap() error { return e.err }
 
 // Register adds the settings' flags to fs.
 func (f *Flags) Register(fs *flag.FlagSet) {
-	f.fs = fs
+	f.RegisterRulesFile(fs)
 	f.durations = map[string]*time.Duration{}
-	defaults := defaults()
-	fs.StringVar(&f.file, "settings", "", "host settings file (default $XDG_CONFIG_HOME/hostrunner/settings.yaml)")
-	fs.StringVar(&f.workspaceFile, "workspace-settings", "", "workspace settings file (default <workspace>/.devcontainer/hostrunner.yaml)")
+	defaults := defaults("")
 	for _, k := range keys {
 		switch p := k.field(&defaults).(type) {
 		case *time.Duration:
@@ -49,6 +51,19 @@ func (f *Flags) Register(fs *flag.FlagSet) {
 			fs.BoolVar(&f.noReread, "no-"+k.flagName(), false, "do not "+k.usage)
 		}
 	}
+}
+
+// RegisterRulesFile adds to fs only the flags that choose the rules
+// file: --settings, --workspace-settings, --rules-file and --config, for
+// a command that uses no other setting; the other keys still come from
+// the variables and the files.
+func (f *Flags) RegisterRulesFile(fs *flag.FlagSet) {
+	f.fs = fs
+	k, _ := lookup("rules_file")
+	fs.StringVar(&f.file, "settings", "", "host settings file (default $XDG_CONFIG_HOME/hostrunner/settings.yaml)")
+	fs.StringVar(&f.workspaceFile, "workspace-settings", "", "workspace settings file (default <workspace>/.devcontainer/hostrunner.yaml)")
+	fs.StringVar(&f.rulesFile, k.flagName(), "", k.usage)
+	fs.StringVar(&f.config, "config", "", "synonym of --"+k.flagName())
 }
 
 // Resolve returns the settings of the parsed command line for the
@@ -81,15 +96,16 @@ func (f *Flags) ResolveAsGiven(getenv func(string) string, workspace string) (Se
 	if len(flags) < len(keys) {
 		return resolve(flags, f.file, f.workspaceFile, workspace, getenv)
 	}
-	s := defaults()
+	s := defaults(workspace)
 	apply(&s, flags)
 	return s, nil
 }
 
 // layer returns the keys the parsed command line sets: only flags given
-// count, even with their default value. A duration at or below zero
-// (`--grace: must be positive`) and --reread with --no-reread are
-// *FlagErrors.
+// count, even with their default value. A path is made absolute against
+// the current directory. A duration at or below zero (`--grace: must be
+// positive`), an empty path, --reread with --no-reread and --rules-file
+// with --config are *FlagErrors.
 func (f *Flags) layer() (layer, error) {
 	l := layer{}
 	var err error
@@ -105,6 +121,21 @@ func (f *Flags) layer() (layer, error) {
 			} else {
 				err = &FlagError{fmt.Errorf("--%s: %w", fl.Name, errNotPositive)}
 			}
+		case name == "rules_file" || name == "config":
+			if _, set := l["rules_file"]; set {
+				err = &FlagError{errors.New("--rules-file and --config exclude each other")}
+				return
+			}
+			if fl.Value.String() == "" {
+				err = &FlagError{fmt.Errorf("--%s: %w", fl.Name, errEmptyPath)}
+				return
+			}
+			p, absErr := filepath.Abs(fl.Value.String())
+			if absErr != nil {
+				err = &FlagError{fmt.Errorf("--%s: %w", fl.Name, absErr)}
+				return
+			}
+			l["rules_file"] = p
 		case name == "reread" || name == "no_reread":
 			if _, set := l["reread"]; set {
 				err = &FlagError{errors.New("--reread and --no-reread exclude each other")}

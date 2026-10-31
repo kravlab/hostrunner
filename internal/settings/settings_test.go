@@ -14,12 +14,15 @@ import (
 	"github.com/kravlab/hostrunner/internal/settings"
 )
 
-// defaults are the built-in settings.
-var defaults = settings.Settings{StartupTimeout: 30 * time.Minute, Grace: 15 * time.Second, Reread: true}
+// defaults are the built-in settings of noWorkspace.
+var defaults = settings.Settings{RulesFile: rulesIn(noWorkspace), StartupTimeout: 30 * time.Minute, Grace: 15 * time.Second, Reread: true}
 
 // noWorkspace is a workspace where nothing lies: it has no workspace
 // settings file and no section of a host settings file names it.
 const noWorkspace = "/nonexistent/workspace"
+
+// rulesIn is the default rules file of the workspace at ws.
+func rulesIn(ws string) string { return filepath.Join(ws, ".devcontainer", "hostrun.yaml") }
 
 // env is a getenv over vars; every other variable is empty.
 func env(vars map[string]string) func(string) string {
@@ -72,10 +75,10 @@ func TestResolveTakesEachKeyFromTheHighestSourceSettingIt(t *testing.T) {
 		want  settings.Settings
 	}{
 		{"defaults", "", nil, nil, defaults},
-		{"file over defaults", file, nil, nil, settings.Settings{StartupTimeout: time.Hour, Grace: time.Minute, Reread: false}},
-		{"variables over file", file, vars, nil, settings.Settings{StartupTimeout: 2 * time.Hour, Grace: 2 * time.Minute, Reread: true}},
-		{"flags over variables", file, vars, flags, settings.Settings{StartupTimeout: 3 * time.Hour, Grace: 3 * time.Minute, Reread: false}},
-		{"one key per source", "grace: 1m\n", map[string]string{"HOSTRUNNER_REREAD": "false"}, []string{"--startup-timeout", "1h"}, settings.Settings{StartupTimeout: time.Hour, Grace: time.Minute, Reread: false}},
+		{"file over defaults", file, nil, nil, settings.Settings{RulesFile: defaults.RulesFile, StartupTimeout: time.Hour, Grace: time.Minute, Reread: false}},
+		{"variables over file", file, vars, nil, settings.Settings{RulesFile: defaults.RulesFile, StartupTimeout: 2 * time.Hour, Grace: 2 * time.Minute, Reread: true}},
+		{"flags over variables", file, vars, flags, settings.Settings{RulesFile: defaults.RulesFile, StartupTimeout: 3 * time.Hour, Grace: 3 * time.Minute, Reread: false}},
+		{"one key per source", "grace: 1m\n", map[string]string{"HOSTRUNNER_REREAD": "false"}, []string{"--startup-timeout", "1h"}, settings.Settings{RulesFile: defaults.RulesFile, StartupTimeout: time.Hour, Grace: time.Minute, Reread: false}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -98,7 +101,7 @@ func TestResolveReadsEveryVariable(t *testing.T) {
 		"HOSTRUNNER_GRACE":           "1m30s",
 		"HOSTRUNNER_REREAD":          "0",
 	}), noWorkspace)
-	want := settings.Settings{StartupTimeout: 45 * time.Minute, Grace: 90 * time.Second, Reread: false}
+	want := settings.Settings{RulesFile: defaults.RulesFile, StartupTimeout: 45 * time.Minute, Grace: 90 * time.Second, Reread: false}
 	if err != nil || got != want {
 		t.Fatalf("got %+v, %v; want %+v", got, err, want)
 	}
@@ -134,8 +137,11 @@ func TestResolveRejectsAnInvalidVariable(t *testing.T) {
 	}
 }
 
+// givenRules is the rules file everyKey gives.
+const givenRules = "/given/hostrun.yaml"
+
 // everyKey gives every setting as a flag.
-var everyKey = []string{"--startup-timeout", "1h", "--grace", "1m", "--no-reread"}
+var everyKey = []string{"--rules-file", givenRules, "--startup-timeout", "1h", "--grace", "1m", "--no-reread"}
 
 // Resolve reads every source even when the flags set every key: a
 // missing named file, a broken file or an invalid variable is an error.
@@ -167,9 +173,14 @@ func TestResolveAsGivenReadsNoOtherSourceWhenFlagsSetEveryKey(t *testing.T) {
 		return ""
 	}
 	got, err := parse(t, append(everyKey, "--settings", writeFile(t, "grase: [\n"))...).ResolveAsGiven(getenv, noWorkspace)
-	want := settings.Settings{StartupTimeout: time.Hour, Grace: time.Minute, Reread: false}
+	want := settings.Settings{RulesFile: givenRules, StartupTimeout: time.Hour, Grace: time.Minute, Reread: false}
 	if err != nil || got != want {
 		t.Fatalf("got %+v, %v; want %+v", got, err, want)
+	}
+	// --config gives rules_file as --rules-file does.
+	got, err = parse(t, "--config", givenRules, "--startup-timeout", "1h", "--grace", "1m", "--no-reread").ResolveAsGiven(getenv, noWorkspace)
+	if err != nil || got != want {
+		t.Fatalf("--config: got %+v, %v; want %+v", got, err, want)
 	}
 }
 
@@ -177,18 +188,70 @@ func TestResolveAsGivenReadsNoOtherSourceWhenFlagsSetEveryKey(t *testing.T) {
 func TestResolveAsGivenReadsEverySourceWhenAFlagIsMissing(t *testing.T) {
 	path := writeFile(t, "grace: 2m\n")
 	got, err := parse(t, "--startup-timeout", "1h", "--reread").ResolveAsGiven(env(map[string]string{"HOSTRUNNER_SETTINGS": path}), noWorkspace)
-	want := settings.Settings{StartupTimeout: time.Hour, Grace: 2 * time.Minute, Reread: true}
+	want := settings.Settings{RulesFile: defaults.RulesFile, StartupTimeout: time.Hour, Grace: 2 * time.Minute, Reread: true}
 	if err != nil || got != want {
 		t.Fatalf("got %+v, %v; want %+v", got, err, want)
 	}
 	if _, err := parse(t, "--grace", "1m").ResolveAsGiven(env(map[string]string{"HOSTRUNNER_GRACE": "abc"}), noWorkspace); err == nil {
 		t.Fatal("got no error for an invalid variable")
 	}
+	if _, err := parse(t, "--startup-timeout", "1h", "--grace", "1m", "--reread").ResolveAsGiven(env(map[string]string{"HOSTRUNNER_GRACE": "abc"}), noWorkspace); err == nil {
+		t.Fatal("without --rules-file: got no error for an invalid variable")
+	}
+}
+
+// rules_file comes from every source. A relative path is read against the
+// workspace when a file or a variable gives it, wherever that file lies,
+// and against the current directory when a flag does.
+func TestResolveTakesTheRulesFileFromEverySource(t *testing.T) {
+	ws, cwd := t.TempDir(), t.TempDir()
+	t.Chdir(cwd)
+	tests := []struct {
+		name         string
+		host, wsFile string
+		vars         map[string]string
+		flags        []string
+		want         string
+	}{
+		{"default", "", "", nil, nil, rulesIn(ws)},
+		{"common part, relative", "rules_file: common.yaml\n", "", nil, nil, filepath.Join(ws, "common.yaml")},
+		{"common part, absolute", "rules_file: /etc/common.yaml\n", "", nil, nil, "/etc/common.yaml"},
+		{"common part, ~", "rules_file: ~/rules/app.yaml\n", "", map[string]string{"HOME": "/home/u"}, nil, "/home/u/rules/app.yaml"},
+		{"variable, ~", "", "", map[string]string{"HOME": "/home/u", "HOSTRUNNER_RULES_FILE": "~/var.yaml"}, nil, "/home/u/var.yaml"},
+		{"section, relative", "rules_file: common.yaml\n" + section(ws, "rules_file: rules/section.yaml"), "", nil, nil, filepath.Join(ws, "rules", "section.yaml")},
+		{"workspace file, relative", "rules_file: common.yaml\n", "rules_file: ws.yaml\n", nil, nil, filepath.Join(ws, "ws.yaml")},
+		{"variable, relative", "", "rules_file: ws.yaml\n", map[string]string{"HOSTRUNNER_RULES_FILE": "var.yaml"}, nil, filepath.Join(ws, "var.yaml")},
+		{"variable, absolute", "", "", map[string]string{"HOSTRUNNER_RULES_FILE": "/etc/var.yaml"}, nil, "/etc/var.yaml"},
+		{"empty variable", "", "rules_file: ws.yaml\n", map[string]string{"HOSTRUNNER_RULES_FILE": ""}, nil, filepath.Join(ws, "ws.yaml")},
+		{"--rules-file, relative", "", "", map[string]string{"HOSTRUNNER_RULES_FILE": "var.yaml"}, []string{"--rules-file", "flag.yaml"}, filepath.Join(cwd, "flag.yaml")},
+		{"--rules-file, absolute", "", "", nil, []string{"--rules-file", "/etc/flag.yaml"}, "/etc/flag.yaml"},
+		{"--config, relative", "", "", map[string]string{"HOSTRUNNER_RULES_FILE": "var.yaml"}, []string{"--config", "flag.yaml"}, filepath.Join(cwd, "flag.yaml")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vars := map[string]string{"HOSTRUNNER_SETTINGS": writeFile(t, tt.host)}
+			if tt.wsFile != "" {
+				vars["HOSTRUNNER_WORKSPACE_SETTINGS"] = writeFile(t, tt.wsFile)
+			}
+			maps.Copy(vars, tt.vars)
+			got, err := parse(t, tt.flags...).Resolve(env(vars), ws)
+			if err != nil || got.RulesFile != tt.want {
+				t.Fatalf("got rules file %q, %v; want %q", got.RulesFile, err, tt.want)
+			}
+		})
+	}
 }
 
 func TestUsageNamesEveryFlag(t *testing.T) {
-	want := "[--settings <path>] [--workspace-settings <path>] [--startup-timeout <duration>] [--grace <duration>] [--reread | --no-reread]"
+	want := "[--settings <path>] [--workspace-settings <path>] [--rules-file <path>] [--startup-timeout <duration>] [--grace <duration>] [--reread | --no-reread]"
 	if got := settings.Usage(); got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestRulesFileUsageNamesTheFlagsThatChooseTheRulesFile(t *testing.T) {
+	want := "[--settings <path>] [--workspace-settings <path>] [--rules-file <path>]"
+	if got := settings.RulesFileUsage(); got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}
 }

@@ -38,9 +38,8 @@ func TestMain(m *testing.M) {
 		os.Setenv(fakeDaemonEnv, "serve")
 		err := Up(context.Background(), Config{
 			Dir: dir, Workspace: "/w", ContainerWorkspace: "/c",
-			Rules:  filepath.Join(dir, "missing-rules.yaml"),
 			Daemon: os.Args[0], Client: client, ReadyTimeout: 5 * time.Second,
-			Settings: settings.Settings{Reread: true},
+			Settings: settings.Settings{RulesFile: filepath.Join(dir, "missing-rules.yaml"), Reread: true},
 		})
 		if err != nil {
 			os.Exit(1)
@@ -68,7 +67,7 @@ func runFakeDaemon(mode string) {
 	socket := fs.String("socket", "", "")
 	fs.String("workspace", "", "")
 	fs.String("container-workspace", "", "")
-	config := fs.String("config", "", "")
+	config := fs.String("rules-file", "", "")
 	watch := fs.Bool("watch", false, "")
 	fs.Duration("startup-timeout", 0, "")
 	fs.Duration("grace", 0, "")
@@ -188,11 +187,10 @@ func fakeConfig(t *testing.T, mode string) Config {
 		Dir:                filepath.Join(base, "rt", "id"),
 		Workspace:          "/home/u/app",
 		ContainerWorkspace: "/workspaces/app",
-		Rules:              filepath.Join(base, "hostrun.yaml"),
 		Daemon:             os.Args[0],
 		Client:             mustStatic(t),
 		ReadyTimeout:       5 * time.Second,
-		Settings:           settings.Settings{Reread: true},
+		Settings:           settings.Settings{RulesFile: filepath.Join(base, "hostrun.yaml"), Reread: true},
 	}
 	t.Setenv(fakeDaemonEnv, mode)
 	t.Cleanup(func() {
@@ -469,10 +467,10 @@ func TestCheckStatic(t *testing.T) {
 
 func TestUpRejectsInvalidRules(t *testing.T) {
 	cfg := fakeConfig(t, "serve")
-	if err := os.WriteFile(cfg.Rules, []byte("rules:\n  - command: git\n"), 0o644); err != nil {
+	if err := os.WriteFile(cfg.RulesFile, []byte("rules:\n  - command: git\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := Up(context.Background(), cfg); err == nil || !strings.Contains(err.Error(), cfg.Rules) {
+	if err := Up(context.Background(), cfg); err == nil || !strings.Contains(err.Error(), cfg.RulesFile) {
 		t.Fatalf("got %v, want an error naming the rules file", err)
 	}
 	if pids := lines(t, filepath.Join(cfg.Dir, "fake.pids")); len(pids) != 0 {
@@ -482,7 +480,7 @@ func TestUpRejectsInvalidRules(t *testing.T) {
 
 func TestUpReplacesDaemonThatStepsAside(t *testing.T) {
 	cfg := fakeConfig(t, "serve")
-	if err := os.WriteFile(cfg.Rules, []byte("rules:\n  - command: git status\n    args: any\n"), 0o644); err != nil {
+	if err := os.WriteFile(cfg.RulesFile, []byte("rules:\n  - command: git status\n    args: any\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := Up(context.Background(), cfg); err != nil {
@@ -490,7 +488,7 @@ func TestUpReplacesDaemonThatStepsAside(t *testing.T) {
 	}
 	first := onlyPid(t, cfg.Dir)
 
-	if err := os.WriteFile(cfg.Rules, []byte("rules:\n  - command: git status\n    args: none\n"), 0o644); err != nil {
+	if err := os.WriteFile(cfg.RulesFile, []byte("rules:\n  - command: git status\n    args: none\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := Up(context.Background(), cfg); err != nil {
@@ -536,8 +534,8 @@ func TestUpReplacesDaemonWhoseRereadingDiffers(t *testing.T) {
 // ways. A duration the caller leaves zero (restart, which does not
 // resolve settings) is left for the daemon to resolve.
 func TestServeArgsGiveEverySetting(t *testing.T) {
-	base := Config{Workspace: "/home/u/app", ContainerWorkspace: "/workspaces/app", Rules: "/home/u/app/.devcontainer/hostrun.yaml"}
-	start := []string{"serve", "--socket", "/run/h.sock", "--workspace", "/home/u/app", "--container-workspace", "/workspaces/app", "--config", "/home/u/app/.devcontainer/hostrun.yaml", "--watch"}
+	base := Config{Workspace: "/home/u/app", ContainerWorkspace: "/workspaces/app", Settings: settings.Settings{RulesFile: "/home/u/app/.devcontainer/hostrun.yaml"}}
+	start := []string{"serve", "--socket", "/run/h.sock", "--workspace", "/home/u/app", "--container-workspace", "/workspaces/app", "--rules-file", "/home/u/app/.devcontainer/hostrun.yaml", "--watch"}
 	tests := []struct {
 		name string
 		edit func(*Config)
@@ -644,10 +642,10 @@ func TestTryLockDirDoesNotWait(t *testing.T) {
 
 func TestPrepareRejectsInvalidRules(t *testing.T) {
 	cfg := fakeConfig(t, "serve")
-	if err := os.WriteFile(cfg.Rules, []byte("rules:\n  - command: git\n"), 0o644); err != nil {
+	if err := os.WriteFile(cfg.RulesFile, []byte("rules:\n  - command: git\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Prepare(cfg); err == nil || !strings.Contains(err.Error(), cfg.Rules) {
+	if _, err := Prepare(cfg); err == nil || !strings.Contains(err.Error(), cfg.RulesFile) {
 		t.Fatalf("got %v, want an error naming the rules file", err)
 	}
 }

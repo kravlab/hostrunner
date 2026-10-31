@@ -341,11 +341,10 @@ func (t *term) ending(ctx context.Context, cfg Config, dir string, info *protoco
 		Dir:                dir,
 		Workspace:          info.Workspace,
 		ContainerWorkspace: info.ContainerWorkspace,
-		Rules:              info.RulesFile,
 		Daemon:             r.Daemon,
 		Client:             r.Client,
 		ReadyTimeout:       r.ReadyTimeout,
-		Settings:           settings.Settings{Reread: !info.NoReread},
+		Settings:           settings.Settings{RulesFile: info.RulesFile, Reread: !info.NoReread},
 	})
 	if err != nil {
 		return ending{}, fmt.Errorf("%s: %w; the daemon keeps running", name, err)

@@ -56,13 +56,13 @@ func TestResolveTakesEachKeyFromTheHighestOfFiveSources(t *testing.T) {
 		flags        []string
 		want         settings.Settings
 	}{
-		{"common part", common, "", nil, nil, settings.Settings{StartupTimeout: time.Hour, Grace: time.Minute, Reread: false}},
-		{"section over common part", common + sec, "", nil, nil, settings.Settings{StartupTimeout: 2 * time.Hour, Grace: 2 * time.Minute, Reread: true}},
-		{"workspace file over section", common + sec, wsFile, nil, nil, settings.Settings{StartupTimeout: 3 * time.Hour, Grace: 3 * time.Minute, Reread: false}},
-		{"variables over workspace file", common + sec, wsFile, vars, nil, settings.Settings{StartupTimeout: 4 * time.Hour, Grace: 4 * time.Minute, Reread: true}},
-		{"flags over variables", common + sec, wsFile, vars, flags, settings.Settings{StartupTimeout: 5 * time.Hour, Grace: 5 * time.Minute, Reread: false}},
-		{"one key per source", "reread: false\n" + section(ws, "grace: 2m"), "startup_timeout: 3h\n", nil, nil, settings.Settings{StartupTimeout: 3 * time.Hour, Grace: 2 * time.Minute, Reread: false}},
-		{"workspace file over common part", "grace: 1m\n", "grace: 3m\n", nil, nil, settings.Settings{StartupTimeout: defaults.StartupTimeout, Grace: 3 * time.Minute, Reread: true}},
+		{"common part", common, "", nil, nil, settings.Settings{RulesFile: rulesIn(ws), StartupTimeout: time.Hour, Grace: time.Minute, Reread: false}},
+		{"section over common part", common + sec, "", nil, nil, settings.Settings{RulesFile: rulesIn(ws), StartupTimeout: 2 * time.Hour, Grace: 2 * time.Minute, Reread: true}},
+		{"workspace file over section", common + sec, wsFile, nil, nil, settings.Settings{RulesFile: rulesIn(ws), StartupTimeout: 3 * time.Hour, Grace: 3 * time.Minute, Reread: false}},
+		{"variables over workspace file", common + sec, wsFile, vars, nil, settings.Settings{RulesFile: rulesIn(ws), StartupTimeout: 4 * time.Hour, Grace: 4 * time.Minute, Reread: true}},
+		{"flags over variables", common + sec, wsFile, vars, flags, settings.Settings{RulesFile: rulesIn(ws), StartupTimeout: 5 * time.Hour, Grace: 5 * time.Minute, Reread: false}},
+		{"one key per source", "reread: false\n" + section(ws, "grace: 2m"), "startup_timeout: 3h\n", nil, nil, settings.Settings{RulesFile: rulesIn(ws), StartupTimeout: 3 * time.Hour, Grace: 2 * time.Minute, Reread: false}},
+		{"workspace file over common part", "grace: 1m\n", "grace: 3m\n", nil, nil, settings.Settings{RulesFile: rulesIn(ws), StartupTimeout: defaults.StartupTimeout, Grace: 3 * time.Minute, Reread: true}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -144,7 +144,9 @@ func TestNoSectionAppliesToAMissingWorkspace(t *testing.T) {
 	ws := filepath.Join(t.TempDir(), "gone")
 	path := writeFile(t, section(ws, "grace: 1m"))
 	got, err := parse(t, "--settings", path).Resolve(env(nil), ws)
-	if err != nil || got != defaults {
+	want := defaults
+	want.RulesFile = rulesIn(ws)
+	if err != nil || got != want {
 		t.Fatalf("got %+v, %v; want the defaults", got, err)
 	}
 }
@@ -221,8 +223,11 @@ func TestWorkspaceFileIsNamedByFlagThenVariableThenTheWorkspace(t *testing.T) {
 }
 
 func TestMissingDefaultWorkspaceFileSetsNothing(t *testing.T) {
-	got, err := parse(t).Resolve(env(nil), newWorkspace(t, ""))
-	if err != nil || got != defaults {
+	ws := newWorkspace(t, "")
+	got, err := parse(t).Resolve(env(nil), ws)
+	want := defaults
+	want.RulesFile = rulesIn(ws)
+	if err != nil || got != want {
 		t.Fatalf("got %+v, %v; want the defaults", got, err)
 	}
 }
@@ -293,7 +298,7 @@ func TestCommonOnlyKeysAreRefusedOutsideTheCommonPart(t *testing.T) {
 func TestResolveAsGivenReadsNoWorkspaceFileWhenFlagsSetEveryKey(t *testing.T) {
 	ws := newWorkspace(t, "grase: [\n")
 	got, err := parse(t, everyKey...).ResolveAsGiven(env(nil), ws)
-	want := settings.Settings{StartupTimeout: time.Hour, Grace: time.Minute, Reread: false}
+	want := settings.Settings{RulesFile: givenRules, StartupTimeout: time.Hour, Grace: time.Minute, Reread: false}
 	if err != nil || got != want {
 		t.Fatalf("got %+v, %v; want %+v", got, err, want)
 	}

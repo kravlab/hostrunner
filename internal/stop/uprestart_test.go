@@ -26,9 +26,9 @@ func upConfig(t *testing.T, dir, workspace, rulesFile string) launch.Config {
 	t.Helper()
 	r := restartConfig(t)
 	return launch.Config{
-		Dir: dir, Workspace: workspace, ContainerWorkspace: "/workspaces/new", Rules: rulesFile,
+		Dir: dir, Workspace: workspace, ContainerWorkspace: "/workspaces/new",
 		Daemon: r.Daemon, Client: r.Client, ReadyTimeout: r.ReadyTimeout,
-		Settings: settings.Settings{Reread: true},
+		Settings: settings.Settings{RulesFile: rulesFile, Reread: true},
 	}
 }
 
@@ -115,7 +115,7 @@ func TestUpRestartReplacesAnIdleDaemon(t *testing.T) {
 	}
 	d.waitStopped(t)
 	args := strings.Join(newDaemonArgs(t, d.dir), " ")
-	if !strings.Contains(args, "--workspace "+ws+" --container-workspace /workspaces/new --config "+rulesFile) {
+	if !strings.Contains(args, "--workspace "+ws+" --container-workspace /workspaces/new --rules-file "+rulesFile) {
 		t.Fatalf("the new daemon runs %q", args)
 	}
 }

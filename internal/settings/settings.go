@@ -1,5 +1,5 @@
 // Package settings resolves what tunes a daemon besides its rules: its
-// timeouts and whether it rereads its rules file.
+// rules file, its timeouts and whether it rereads the rules file.
 //
 // Each key comes from the highest source that sets it (ADR 0008): the
 // command's flags (Flags), the HOSTRUNNER_* variables, the workspace
@@ -7,14 +7,15 @@
 // host settings file's common, top-level part, then the built-in
 // default. Every source is read into a layer, a partial set of values,
 // and resolve stacks the layers; a new source is one more layer, a new
-// key one more entry of keys and one more field of Settings. An unknown key or an invalid value
-// in any source is an error naming the source and the key: a daemon must
-// not start with settings nobody chose.
+// key one more entry of keys and one more field of Settings. An unknown
+// key or an invalid value in any source is an error naming the source
+// and the key: a daemon must not start with settings nobody chose.
 package settings
 
 import (
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -22,14 +23,21 @@ import (
 
 // Settings are the resolved settings of a daemon.
 type Settings struct {
+	RulesFile      string        // rules_file: the rules file, absolute when the workspace path is
 	StartupTimeout time.Duration // startup_timeout: with --watch, how long to wait for the container
 	Grace          time.Duration // grace: with --watch, how long the container may be gone
 	Reread         bool          // reread: reread the rules file by itself once it changes
 }
 
-// defaults are the settings no source sets.
-func defaults() Settings {
+// rulesPath is where a workspace keeps its rules file by default,
+// relative to the workspace.
+var rulesPath = filepath.Join(".devcontainer", "hostrun.yaml")
+
+// defaults are the settings no source sets, for the workspace at the
+// host path workspace.
+func defaults(workspace string) Settings {
 	return Settings{
+		RulesFile:      filepath.Join(workspace, rulesPath),
 		StartupTimeout: 30 * time.Minute, // covers image builds, also after a rebuild's arm
 		Grace:          15 * time.Second, // how long a stopped container is tolerated
 		Reread:         true,
@@ -37,8 +45,8 @@ func defaults() Settings {
 }
 
 // layer is what one source sets: values by key name (as in a settings
-// file), each a time.Duration or a bool as its key's kind says. A key
-// the source does not set is absent.
+// file), each a string, a time.Duration or a bool as its key's kind
+// says. A key the source does not set is absent.
 type layer map[string]any
 
 // kind is the type of a key's value.
@@ -47,12 +55,16 @@ type kind int
 const (
 	duration kind = iota // a time.Duration above zero, written like 1m30s
 	boolean              // a bool
+	path                 // a file path, not empty; relative to the workspace unless a flag gives it
 )
 
 // String names the kind in errors ("invalid duration") and usages.
 func (k kind) String() string {
-	if k == boolean {
+	switch k {
+	case boolean:
 		return "bool"
+	case path:
+		return "path"
 	}
 	return "duration"
 }
@@ -63,11 +75,12 @@ type key struct {
 	name  string
 	kind  kind
 	usage string                // the flag's help
-	field func(s *Settings) any // a *time.Duration or *bool into s
+	field func(s *Settings) any // a *string, *time.Duration or *bool into s
 }
 
 // keys are every setting, in the order errors and flags follow.
 var keys = []key{
+	{"rules_file", path, "rules file (default <workspace>/.devcontainer/hostrun.yaml)", func(s *Settings) any { return &s.RulesFile }},
 	{"startup_timeout", duration, "with --watch: how long to wait for the container to start", func(s *Settings) any { return &s.StartupTimeout }},
 	{"grace", duration, "with --watch: how long the container may be gone before exiting", func(s *Settings) any { return &s.Grace }},
 	{"reread", boolean, "reread the rules file by itself once it changes", func(s *Settings) any { return &s.Reread }},
@@ -97,28 +110,53 @@ func lookup(name string) (key, bool) {
 }
 
 // Usage is the usage of the settings' flags, as a command's usage line
-// shows them: [--settings <path>] [--workspace-settings <path>] [--grace
-// <duration>] [--reread | --no-reread] and so on, one per key.
+// shows them: [--settings <path>] [--workspace-settings <path>]
+// [--rules-file <path>] [--grace <duration>] [--reread | --no-reread]
+// and so on, one per key; --config, the synonym of --rules-file, is
+// left out.
 func Usage() string {
-	parts := []string{"[--settings <path>]", "[--workspace-settings <path>]"}
+	parts := []string{fileFlagsUsage}
 	for _, k := range keys {
-		if k.kind == boolean {
-			parts = append(parts, fmt.Sprintf("[--%s | --no-%[1]s]", k.flagName()))
-		} else {
-			parts = append(parts, fmt.Sprintf("[--%s <%s>]", k.flagName(), k.kind))
-		}
+		parts = append(parts, k.usageOf())
 	}
 	return strings.Join(parts, " ")
+}
+
+// RulesFileUsage is the usage of the flags RegisterRulesFile adds, those
+// that choose the rules file.
+func RulesFileUsage() string {
+	k, _ := lookup("rules_file")
+	return fileFlagsUsage + " " + k.usageOf()
+}
+
+// fileFlagsUsage is the usage of the flags that name the settings files.
+const fileFlagsUsage = "[--settings <path>] [--workspace-settings <path>]"
+
+// usageOf is k's flag as a usage line shows it: [--grace <duration>].
+func (k key) usageOf() string {
+	if k.kind == boolean {
+		return fmt.Sprintf("[--%s | --no-%[1]s]", k.flagName())
+	}
+	return fmt.Sprintf("[--%s <%s>]", k.flagName(), k.kind)
 }
 
 // errNotPositive is the problem with a duration at or below zero, which
 // no setting can mean.
 var errNotPositive = errors.New("must be positive")
 
+// errEmptyPath is the problem with an empty path, which names no file.
+var errEmptyPath = errors.New("empty path")
+
 // parse reads raw, the text a variable or a file gives, as a value of
 // kind k; the error describes the problem without naming the source.
 func (k kind) parse(raw string) (any, error) {
-	if k == boolean {
+	switch k {
+	case path:
+		if raw == "" {
+			return nil, errEmptyPath
+		}
+		return raw, nil
+	case boolean:
 		b, err := strconv.ParseBool(raw)
 		if err != nil {
 			return nil, fmt.Errorf("invalid bool %q", raw)
@@ -143,6 +181,8 @@ func apply(s *Settings, l layer) {
 			continue
 		}
 		switch p := k.field(s).(type) {
+		case *string:
+			*p = v.(string)
 		case *time.Duration:
 			*p = v.(time.Duration)
 		case *bool:
@@ -155,7 +195,9 @@ func apply(s *Settings, l layer) {
 // workspace, each key taken from the highest source that sets it, in the
 // order of the package doc; getenv reads the variables, workspaceNamed
 // is the --workspace-settings flag (see workspaceFile) and hostNamed the
-// --settings flag (see hostFile), each empty when not given.
+// --settings flag (see hostFile), each empty when not given. A path a
+// file or a variable gives is read against the workspace, after ~
+// expansion; flags gives its paths absolute already.
 func resolve(flags layer, hostNamed, workspaceNamed, workspace string, getenv func(string) string) (Settings, error) {
 	common, section, err := readHostFile(hostNamed, workspace, getenv)
 	if err != nil {
@@ -169,11 +211,29 @@ func resolve(flags layer, hostNamed, workspaceNamed, workspace string, getenv fu
 	if err != nil {
 		return Settings{}, err
 	}
-	s := defaults()
-	for _, l := range []layer{common, section, wsFile, vars, flags} {
-		apply(&s, l)
+	s := defaults(workspace)
+	for _, l := range []layer{common, section, wsFile, vars} {
+		apply(&s, inWorkspace(l, workspace, getenv))
 	}
+	apply(&s, flags)
 	return s, nil
+}
+
+// inWorkspace is l with each path made a host path: ~ expanded (with
+// $HOME getenv reads), then a relative one joined to the workspace.
+func inWorkspace(l layer, workspace string, getenv func(string) string) layer {
+	out := layer{}
+	for name, v := range l {
+		if k, _ := lookup(name); k.kind == path {
+			p := expandHome(v.(string), getenv)
+			if !filepath.IsAbs(p) {
+				p = filepath.Join(workspace, p)
+			}
+			v = p
+		}
+		out[name] = v
+	}
+	return out
 }
 
 // env reads the HOSTRUNNER_* variables of every key through getenv; an

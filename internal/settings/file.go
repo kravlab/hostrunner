@@ -160,7 +160,7 @@ func readSections(m *yaml.Node, where string) (map[string]layer, error) {
 // into a time.Duration as nanoseconds and `yes` into a bool, so the node's
 // tag must match: a string for a duration, a bool for a bool.
 func nodeValue(k kind, n *yaml.Node) (any, error) {
-	want := "!!str"
+	want := "!!str" // a duration or a path
 	if k == boolean {
 		want = "!!bool"
 	}

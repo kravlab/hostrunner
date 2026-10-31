@@ -6,8 +6,9 @@
 //	hostrunner up [--restart [--kill | --wait]] --dir <runtime-dir>
 //	    --workspace <host-path> --container-workspace <path> [settings]
 //	hostrunner serve --socket <path> --workspace <host-path> --container-workspace <path>
-//	    [--config <path>] [--watch] [settings]
-//	hostrunner test [--config <path>] [--] <command> [args...]
+//	    [--watch] [settings]
+//	hostrunner test [--settings <path>] [--workspace-settings <path>] [--rules-file <path>]
+//	    [--] <command> [args...]
 //	hostrunner approve [--dir <runtime-dir>]
 //	hostrunner stop [--dir <runtime-dir> | --all | --choose] [--kill | --wait]
 //	hostrunner restart [--dir <runtime-dir> | --all | --choose] [--kill | --wait]
@@ -22,9 +23,10 @@
 // host, the one serving the current directory by default, asking what
 // becomes of the commands it runs unless --kill or --wait says; `restart`
 // then starts a new one for it (see internal/stop). `test` runs the Rules
-// test: whether a rules file (default .devcontainer/hostrun.yaml under the
-// current directory) allows a command; it exits 0 when it does, 126 when it
-// does not, and 1 on any error. `update` switches the versioned install
+// test: whether the rules file `up` would use with the current directory
+// as the workspace (default .devcontainer/hostrun.yaml) allows a
+// command; it exits 0 when it does, 126 when it does not, and 1 on any
+// error. `update` switches the versioned install
 // of hostrunner and hostrun to the latest release (see internal/update).
 // `version` prints the module version Go stamped into the binary (see
 // buildVersion). `approve` runs an approval session in a host terminal: it
@@ -91,7 +93,8 @@ const (
 // names.
 var (
 	upUsage    = "usage: hostrunner up [--restart [--kill | --wait]] " + settings.Usage() + " --dir <runtime-dir> --workspace <host-path> --container-workspace <path>"
-	serveUsage = "usage: hostrunner serve --socket <path> --workspace <host-path> --container-workspace <path> [--config <path>] [--watch] " + settings.Usage()
+	serveUsage = "usage: hostrunner serve --socket <path> --workspace <host-path> --container-workspace <path> [--watch] " + settings.Usage()
+	testUsage  = "usage: hostrunner test " + settings.RulesFileUsage() + " [--] <command> [args...]"
 )
 
 // Defaults for following the container (see internal/watch); the
@@ -189,7 +192,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 		}
 		return serve(ctx, cfg, slog.New(slog.NewTextHandler(stderr, nil)), runtimes)
 	case "test":
-		cfg, err := parseTest(args[1:], stderr)
+		cfg, err := parseTest(args[1:], os.Getenv, stderr)
 		if err != nil {
 			return err
 		}
@@ -238,15 +241,6 @@ func buildVersion(info *debug.BuildInfo, ok bool) string {
 type workspaceFlags struct {
 	workspace          string // workspace path on the host
 	containerWorkspace string // the same workspace's path inside the container
-}
-
-// rulesPath is where a workspace keeps its rules file, relative to the
-// workspace.
-var rulesPath = filepath.Join(".devcontainer", "hostrun.yaml")
-
-// rulesFile is the default rules file of a host workspace.
-func (w *workspaceFlags) rulesFile() string {
-	return filepath.Join(w.workspace, rulesPath)
 }
 
 // register adds --workspace and --container-workspace to fs.
@@ -304,7 +298,7 @@ func parseUp(args []string, exe string, getenv func(string) string, output io.Wr
 		return upConfig{}, err
 	}
 	cfg := daemonBinaries(exe)
-	cfg.Dir, cfg.Workspace, cfg.ContainerWorkspace, cfg.Rules = dir, ws.workspace, ws.containerWorkspace, ws.rulesFile()
+	cfg.Dir, cfg.Workspace, cfg.ContainerWorkspace = dir, ws.workspace, ws.containerWorkspace
 	cfg.Settings = s
 	return upConfig{launch: cfg, restart: restart, answer: answer}, nil
 }
@@ -422,10 +416,9 @@ func stopCommands(answer stop.Answer) (ctx context.Context, commands stop.Comman
 type serveConfig struct {
 	socket string // Unix socket to listen on
 	workspaceFlags
-	config            string        // rules file; default <workspace>/.devcontainer/hostrun.yaml
 	watch             bool          // exit once the armed container stops
 	pollInterval      time.Duration // how often runtimes are asked (with watch) and the rules file is looked at (not a flag)
-	settings.Settings               // startup timeout and grace (with watch), reread
+	settings.Settings               // rules file, startup timeout and grace (with watch), reread
 }
 
 // parseServe parses the flags of `hostrunner serve`; the socket and both
@@ -440,7 +433,6 @@ func parseServe(args []string, getenv func(string) string, output io.Writer) (se
 	fs.SetOutput(output)
 	fs.StringVar(&cfg.socket, "socket", "", "Unix socket path to listen on")
 	cfg.workspaceFlags.register(fs)
-	fs.StringVar(&cfg.config, "config", "", "rules file (default <workspace>/.devcontainer/hostrun.yaml)")
 	fs.BoolVar(&cfg.watch, "watch", false, "exit once the armed container stops")
 	sf.Register(fs)
 	if err := parseFlags(fs, args, serveUsage); err != nil {
@@ -457,9 +449,6 @@ func parseServe(args []string, getenv func(string) string, output io.Writer) (se
 		return cfg, err
 	}
 	cfg.Settings = s
-	if cfg.config == "" {
-		cfg.config = cfg.rulesFile()
-	}
 	return cfg, nil
 }
 
@@ -654,7 +643,7 @@ func isTerminal(f *os.File) bool {
 // makes the daemon reread the file. The digest of the rules reread is the
 // one arms compare.
 func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []watch.Runtime) error {
-	policy, err := rules.Load(cfg.config)
+	policy, err := rules.Load(cfg.RulesFile)
 	if err != nil {
 		return err
 	}
@@ -678,7 +667,7 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 		l.Close()
 		return err
 	}
-	log.Info("listening", "socket", cfg.socket, "approval_socket", approvalSocket, "workspace", cfg.workspace, "container_workspace", cfg.containerWorkspace, "config", cfg.config, "rules_digest", policy.Digest(), "watch", cfg.watch, "no_reread", !cfg.Reread)
+	log.Info("listening", "socket", cfg.socket, "approval_socket", approvalSocket, "workspace", cfg.workspace, "container_workspace", cfg.containerWorkspace, "rules_file", cfg.RulesFile, "rules_digest", policy.Digest(), "watch", cfg.watch, "no_reread", !cfg.Reread)
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -699,13 +688,13 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 		}()
 	}
 	reread := func() (daemon.Policy, string, error) {
-		p, err := rules.Load(cfg.config)
+		p, err := rules.Load(cfg.RulesFile)
 		if err != nil {
 			return nil, "", err
 		}
 		return p, p.Digest(), nil
 	}
-	opts := []daemon.Option{daemon.WithArmHandler(armHandler(cfg.config, cfg.Reread, watcher, log)), daemon.WithApprovals(al, cfg.config), daemon.WithReread(policy.Digest(), reread)}
+	opts := []daemon.Option{daemon.WithArmHandler(armHandler(cfg.RulesFile, cfg.Reread, watcher, log)), daemon.WithApprovals(al, cfg.RulesFile), daemon.WithReread(policy.Digest(), reread)}
 	if cfg.Reread {
 		opts = append(opts, daemon.WithRereadEvery(cfg.pollInterval))
 	}
@@ -746,7 +735,7 @@ func checkApprovalSocket(workspace, socket string) error {
 func armHandler(config string, reread bool, watcher *watch.Watcher, log *slog.Logger) func(a protocol.Arm, digest string) (stepAside bool) {
 	return func(a protocol.Arm, digest string) bool {
 		if a.ConfigDigest != digest {
-			log.Info("stepping aside: the rules file changed", "config", config)
+			log.Info("stepping aside: the rules file changed", "rules_file", config)
 			return true
 		}
 		if rereads := !a.NoReread; rereads != reread {

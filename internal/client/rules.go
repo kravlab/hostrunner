@@ -24,9 +24,9 @@ const wOK = 0x2
 // such a change on the next container start, or when a human adding a rule
 // agrees to have the file reread.
 //
-// It is best effort: it checks the default location only (not a --config
-// file), and finds nothing when cwd is outside the workspace. A read-only
-// mount fails the check even for root (EROFS).
+// It is best effort: it checks the default location only (not a file
+// rules_file names), and finds nothing when cwd is outside the
+// workspace. A read-only mount fails the check even for root (EROFS).
 func WarnWritableRules(cwd string, stderr io.Writer) {
 	dir, ok := findRulesDir(cwd)
 	if !ok {

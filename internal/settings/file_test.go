@@ -82,7 +82,7 @@ func TestResolveFailsOnAMissingNamedHostFile(t *testing.T) {
 func TestHostFileSetsEveryKey(t *testing.T) {
 	path := writeFile(t, "# the host's settings\nstartup_timeout: 1h\ngrace: 1m30s\nreread: false\n")
 	got, err := parse(t, "--settings", path).Resolve(env(nil), noWorkspace)
-	want := settings.Settings{StartupTimeout: time.Hour, Grace: 90 * time.Second, Reread: false}
+	want := settings.Settings{RulesFile: defaults.RulesFile, StartupTimeout: time.Hour, Grace: 90 * time.Second, Reread: false}
 	if err != nil || got != want {
 		t.Fatalf("got %+v, %v; want %+v", got, err, want)
 	}
@@ -110,6 +110,10 @@ func TestHostFileRejectsWhatItCannotApply(t *testing.T) {
 		{"unparsable bool", "reread: maybe\n", `reread: invalid bool "maybe"`},
 		{"bool as a string", "reread: \"true\"\n", `reread: invalid bool "true"`},
 		{"empty value", "grace:\n", `grace: invalid duration`},
+		{"empty path", "rules_file: \"\"\n", `rules_file: empty path`},
+		{"path without value", "rules_file:\n", `rules_file: invalid path: no value`},
+		{"path as a number", "rules_file: 12\n", `rules_file: invalid path 12`},
+		{"path as a list", "rules_file: [a]\n", `rules_file: invalid path: not a single value`},
 		{"key given twice", "grace: 1s\ngrace: 2s\n", `grace: given twice`},
 		{"not a mapping", "- grace\n", `not a mapping of settings`},
 		{"broken YAML", "grace: [\n", `settings file`},

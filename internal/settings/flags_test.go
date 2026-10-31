@@ -2,6 +2,9 @@ package settings_test
 
 import (
 	"errors"
+	"flag"
+	"io"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -13,17 +16,17 @@ import (
 // every other key comes from the host settings file, which sets them all.
 func TestFlagsSetOnlyTheKeysGiven(t *testing.T) {
 	file := writeFile(t, "startup_timeout: 1h\ngrace: 1m\nreread: false\n")
-	fromFile := settings.Settings{StartupTimeout: time.Hour, Grace: time.Minute, Reread: false}
+	fromFile := settings.Settings{RulesFile: defaults.RulesFile, StartupTimeout: time.Hour, Grace: time.Minute, Reread: false}
 	tests := []struct {
 		args []string
 		want settings.Settings
 	}{
 		{nil, fromFile},
-		{[]string{"--startup-timeout", "2h"}, settings.Settings{StartupTimeout: 2 * time.Hour, Grace: time.Minute, Reread: false}},
-		{[]string{"--grace", "1m30s"}, settings.Settings{StartupTimeout: time.Hour, Grace: 90 * time.Second, Reread: false}},
-		{[]string{"--reread"}, settings.Settings{StartupTimeout: time.Hour, Grace: time.Minute, Reread: true}},
+		{[]string{"--startup-timeout", "2h"}, settings.Settings{RulesFile: defaults.RulesFile, StartupTimeout: 2 * time.Hour, Grace: time.Minute, Reread: false}},
+		{[]string{"--grace", "1m30s"}, settings.Settings{RulesFile: defaults.RulesFile, StartupTimeout: time.Hour, Grace: 90 * time.Second, Reread: false}},
+		{[]string{"--reread"}, settings.Settings{RulesFile: defaults.RulesFile, StartupTimeout: time.Hour, Grace: time.Minute, Reread: true}},
 		{[]string{"--reread=false"}, fromFile},
-		{[]string{"--no-reread=false"}, settings.Settings{StartupTimeout: time.Hour, Grace: time.Minute, Reread: true}},
+		{[]string{"--no-reread=false"}, settings.Settings{RulesFile: defaults.RulesFile, StartupTimeout: time.Hour, Grace: time.Minute, Reread: true}},
 		// A flag given with its default value is still given.
 		{[]string{"--grace", "15s", "--startup-timeout", "30m", "--reread"}, defaults},
 	}
@@ -61,5 +64,50 @@ func TestFlagsRejectRereadWithNoReread(t *testing.T) {
 	}
 	if _, ok := errors.AsType[*settings.FlagError](err); !ok {
 		t.Fatalf("got %v, want a flag error", err)
+	}
+}
+
+func TestFlagsRejectRulesFileWithConfig(t *testing.T) {
+	_, err := parse(t, "--rules-file", "a.yaml", "--config", "b.yaml").ResolveAsGiven(env(nil), noWorkspace)
+	if want := "--rules-file and --config exclude each other"; err == nil || err.Error() != want {
+		t.Fatalf("got %v, want %q", err, want)
+	}
+	if _, ok := errors.AsType[*settings.FlagError](err); !ok {
+		t.Fatalf("got %v, want a flag error", err)
+	}
+}
+
+func TestFlagsRejectAnEmptyRulesFile(t *testing.T) {
+	for _, name := range []string{"--rules-file", "--config"} {
+		_, err := parse(t, name, "").Resolve(env(nil), noWorkspace)
+		if want := name + ": empty path"; err == nil || err.Error() != want {
+			t.Errorf("%s: got %v, want %q", name, err, want)
+		}
+		if _, ok := errors.AsType[*settings.FlagError](err); !ok {
+			t.Errorf("%s: got %v, want a flag error", name, err)
+		}
+	}
+}
+
+// RegisterRulesFile adds only the flags that choose the rules file; the
+// settings are still resolved from every source.
+func TestRegisterRulesFileAddsTheFlagsThatChooseTheRulesFile(t *testing.T) {
+	var f settings.Flags
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	f.RegisterRulesFile(fs)
+	var names []string
+	fs.VisitAll(func(fl *flag.Flag) { names = append(names, fl.Name) })
+	if want := []string{"config", "rules-file", "settings", "workspace-settings"}; !slices.Equal(names, want) {
+		t.Fatalf("got flags %q, want %q", names, want)
+	}
+	host := writeFile(t, "grace: 1m\n")
+	if err := fs.Parse([]string{"--settings", host, "--rules-file", "/r.yaml"}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := f.Resolve(env(map[string]string{"HOSTRUNNER_REREAD": "false"}), noWorkspace)
+	want := settings.Settings{RulesFile: "/r.yaml", StartupTimeout: defaults.StartupTimeout, Grace: time.Minute, Reread: false}
+	if err != nil || got != want {
+		t.Fatalf("got %+v, %v; want %+v", got, err, want)
 	}
 }
