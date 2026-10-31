@@ -25,7 +25,8 @@ hostrunner up --restart [--kill | --wait] --dir … --workspace … --container-
 The settings of `stop` and `restart` are `--settings`, `--runtime-root`
 and `--stop-timeout`, resolved as the README's Settings section says.
 `restart` also takes `--workspace-settings` and `--rules-file` (or
-`--config`), for the new daemon's settings.
+`--config`), for the new daemon's settings; with `--all` they are a
+usage error, as they name one workspace's files.
 
 `--dir`, `--all` and `--choose` exclude each other, and so do `--kill` and
 `--wait`; a combination is a usage error.

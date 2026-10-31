@@ -81,8 +81,10 @@ func defaults(workspace string) Settings {
 // daemon takes to close its sockets, unless something is wrong.
 const DefaultStopTimeout = 10 * time.Second
 
-// flagDefaults are the defaults the flags' help shows: those of every
-// key, the runtime root aside, whose usage names its default.
+// flagDefaults are the defaults the flags' help shows, those of
+// defaults and DefaultStopTimeout: --runtime-root, whose default depends
+// on XDG_RUNTIME_DIR, and --rules-file, whose default depends on the
+// workspace, name theirs in their usage instead.
 func flagDefaults() Settings {
 	s := defaults("")
 	s.StopTimeout = DefaultStopTimeout
@@ -97,16 +99,7 @@ func (s Settings) Daemon() map[string]string {
 	daemonKeys := keysOf(scopeDaemon)
 	out := make(map[string]string, len(daemonKeys))
 	for _, k := range daemonKeys {
-		switch p := k.field(&s).(type) {
-		case *string:
-			out[k.name] = *p
-		case *time.Duration:
-			out[k.name] = p.String()
-		case *bool:
-			out[k.name] = strconv.FormatBool(*p)
-		default:
-			panic(fmt.Sprintf("settings: key %s has a field of type %T", k.name, p))
-		}
+		out[k.name] = k.kind.format(k.get(&s))
 	}
 	return out
 }
@@ -120,18 +113,18 @@ type layer map[string]any
 type kind int
 
 const (
-	duration kind = iota // a time.Duration above zero, written like 1m30s
-	boolean              // a bool
-	path                 // a file path, not empty; a relative one is read against the workspace
-	absPath              // a directory path, not empty; a relative one is an error
+	kindDuration kind = iota // a time.Duration above zero, written like 1m30s
+	kindBool                 // a bool
+	kindPath                 // a file path, not empty; a relative one is read against the workspace
+	kindAbsPath              // a directory path, not empty; a relative one is an error
 )
 
 // String names the kind in errors ("invalid duration") and usages.
 func (k kind) String() string {
 	switch k {
-	case boolean:
+	case kindBool:
 		return "bool"
-	case path, absPath:
+	case kindPath, kindAbsPath:
 		return "path"
 	}
 	return "duration"
@@ -164,55 +157,84 @@ type key struct {
 	field func(s *Settings) any // a *string, *time.Duration or *bool into s
 }
 
+// get returns the value of k in s: a string, a time.Duration or a bool,
+// as k's kind says.
+func (k key) get(s *Settings) any {
+	switch p := k.field(s).(type) {
+	case *string:
+		return *p
+	case *time.Duration:
+		return *p
+	case *bool:
+		return *p
+	default:
+		panic(fmt.Sprintf("settings: key %s has a field of type %T", k.name, p))
+	}
+}
+
+// set sets the value of k in s to v, a value of k's kind.
+func (k key) set(s *Settings, v any) {
+	switch p := k.field(s).(type) {
+	case *string:
+		*p = v.(string)
+	case *time.Duration:
+		*p = v.(time.Duration)
+	case *bool:
+		*p = v.(bool)
+	default:
+		panic(fmt.Sprintf("settings: key %s has a field of type %T", k.name, p))
+	}
+}
+
 // keys are every setting, in the order errors and flags follow.
 var keys = []key{
 	{
-		name: "rules_file", kind: path, scope: scopeDaemon,
+		name: "rules_file", kind: kindPath, scope: scopeDaemon,
 		usage: "rules file (default <workspace>/.devcontainer/hostrun.yaml)",
 		field: func(s *Settings) any { return &s.RulesFile },
 	},
 	{
-		name: "startup_timeout", kind: duration, scope: scopeDaemon,
+		name: "startup_timeout", kind: kindDuration, scope: scopeDaemon,
 		usage: "with --watch: how long to wait for the container to start",
 		field: func(s *Settings) any { return &s.StartupTimeout },
 	},
 	{
-		name: "grace", kind: duration, scope: scopeDaemon,
+		name: "grace", kind: kindDuration, scope: scopeDaemon,
 		usage: "with --watch: how long the container may be gone before exiting",
 		field: func(s *Settings) any { return &s.Grace },
 	},
 	{
-		name: "reread", kind: boolean, scope: scopeDaemon,
+		name: "reread", kind: kindBool, scope: scopeDaemon,
 		usage: "reread the rules file by itself once it changes",
 		field: func(s *Settings) any { return &s.Reread },
 	},
 	{
-		name: "poll_interval", kind: duration, scope: scopeDaemon,
+		name: "poll_interval", kind: kindDuration, scope: scopeDaemon,
 		usage: "how often to ask the runtimes (with --watch) and look at the rules file",
 		field: func(s *Settings) any { return &s.PollInterval },
 	},
 	{
-		name: "ask_timeout", kind: duration, scope: scopeDaemon,
+		name: "ask_timeout", kind: kindDuration, scope: scopeDaemon,
 		usage: "how long an approval request waits when the client sets no limit",
 		field: func(s *Settings) any { return &s.AskTimeout },
 	},
 	{
-		name: "request_timeout", kind: duration, scope: scopeDaemon,
+		name: "request_timeout", kind: kindDuration, scope: scopeDaemon,
 		usage: "how long a new connection may take to send its request",
 		field: func(s *Settings) any { return &s.RequestTimeout },
 	},
 	{
-		name: "ready_timeout", kind: duration, scope: scopeUp,
+		name: "ready_timeout", kind: kindDuration, scope: scopeUp,
 		usage: "how long to wait for the daemon to listen",
 		field: func(s *Settings) any { return &s.ReadyTimeout },
 	},
 	{
-		name: "runtime_root", kind: absPath, scope: scopeRuntimeRoot,
+		name: "runtime_root", kind: kindAbsPath, scope: scopeRuntimeRoot,
 		usage: "where to look for daemons (default $XDG_RUNTIME_DIR/hostrunner)",
 		field: func(s *Settings) any { return &s.RuntimeRoot },
 	},
 	{
-		name: "stop_timeout", kind: duration, scope: scopeStop,
+		name: "stop_timeout", kind: kindDuration, scope: scopeStop,
 		usage: "how long to wait for a stopped daemon to close its sockets",
 		field: func(s *Settings) any { return &s.StopTimeout },
 	},
@@ -232,16 +254,16 @@ func (in scopes) knowWorkspace() bool {
 	return slices.ContainsFunc(in, func(s scope) bool { return !s.commonOnly() })
 }
 
-// hostOnly returns the scopes of in whose keys only the common part of
+// commonOnly returns the scopes of in whose keys only the common part of
 // the host settings file may set, those ResolveHost resolves: restart's
 // own.
-func (in scopes) hostOnly() scopes {
+func (in scopes) commonOnly() scopes {
 	return slices.DeleteFunc(slices.Clone(in), func(s scope) bool { return !s.commonOnly() })
 }
 
-// ofWorkspace returns the scopes of in whose keys a workspace may set,
-// those Resolve resolves: for restart, the new daemon's.
-func (in scopes) ofWorkspace() scopes {
+// workspaceSettable returns the scopes of in whose keys a workspace may
+// set, those Resolve resolves: for restart, the new daemon's.
+func (in scopes) workspaceSettable() scopes {
 	return slices.DeleteFunc(slices.Clone(in), scope.commonOnly)
 }
 
@@ -341,7 +363,7 @@ const (
 
 // usageOf is k's flag as a usage line shows it: [--grace <duration>].
 func (k key) usageOf() string {
-	if k.kind == boolean {
+	if k.kind == kindBool {
 		return fmt.Sprintf("[--%s | --no-%[1]s]", k.flagName())
 	}
 	return fmt.Sprintf("[--%s <%s>]", k.flagName(), k.kind)
@@ -358,12 +380,12 @@ var errEmptyPath = errors.New("empty path")
 // kind k; the error describes the problem without naming the source.
 func (k kind) parse(raw string) (any, error) {
 	switch k {
-	case path, absPath:
+	case kindPath, kindAbsPath:
 		if raw == "" {
 			return nil, errEmptyPath
 		}
 		return raw, nil
-	case boolean:
+	case kindBool:
 		b, err := strconv.ParseBool(raw)
 		if err != nil {
 			return nil, fmt.Errorf("invalid bool %q", raw)
@@ -380,6 +402,19 @@ func (k kind) parse(raw string) (any, error) {
 	return d, nil
 }
 
+// format writes v, a value of kind k, as a settings file writes it:
+// `1m30s`, `true`, a path.
+func (k kind) format(v any) string {
+	switch k {
+	case kindDuration:
+		return v.(time.Duration).String()
+	case kindBool:
+		return strconv.FormatBool(v.(bool))
+	default:
+		return v.(string)
+	}
+}
+
 // only is l with the keys in takes alone.
 func (l layer) only(in scopes) layer {
 	out := layer{}
@@ -394,17 +429,8 @@ func (l layer) only(in scopes) layer {
 // apply sets the fields of s that l sets.
 func apply(s *Settings, l layer) {
 	for _, k := range keys {
-		v, ok := l[k.name]
-		if !ok {
-			continue
-		}
-		switch p := k.field(s).(type) {
-		case *string:
-			*p = v.(string)
-		case *time.Duration:
-			*p = v.(time.Duration)
-		case *bool:
-			*p = v.(bool)
+		if v, ok := l[k.name]; ok {
+			k.set(s, v)
 		}
 	}
 }
@@ -430,34 +456,53 @@ func resolve(in scopes, flags layer, hostNamed, workspaceNamed, workspace string
 		return Settings{}, err
 	}
 	s := defaults(workspace)
-	for _, l := range []layer{common, section, wsFile, vars} {
-		if l, err = hostPaths(l, workspace, getenv, nil); err != nil {
-			return Settings{}, err
-		}
-		apply(&s, l)
+	if err := stack(&s, workspace, getenv, flags, common, section, wsFile, sourced{vars, key.variable}); err != nil {
+		return Settings{}, err
 	}
-	apply(&s, flags)
 	return s, nil
 }
 
-// hostPaths is l with each path ~ expanded (with $HOME getenv reads) and
-// cleaned, as filepath.Abs cleans a flag's: a relative path joined to the
-// workspace, a relative absPath an error naming source(k), the source of
-// key k. A command that knows a workspace takes no absPath key, so it
-// passes no source.
-func hostPaths(l layer, workspace string, getenv func(string) string, source func(key) string) (layer, error) {
+// sourced is a layer read from one source, with how errors name a key
+// of that source (`HOSTRUNNER_GRACE`, `settings file <path>: grace`).
+type sourced struct {
+	layer
+	name func(key) string
+}
+
+// stack sets in s, lowest first, what each of sources sets, its paths
+// made absolute for the workspace at the host path workspace (see
+// hostPaths), then what flags, whose paths are absolute already, set.
+func stack(s *Settings, workspace string, getenv func(string) string, flags layer, sources ...sourced) error {
+	for _, src := range sources {
+		l, err := hostPaths(src, workspace, getenv)
+		if err != nil {
+			return err
+		}
+		apply(s, l)
+	}
+	apply(s, flags)
+	return nil
+}
+
+// hostPaths is the layer of src with each path ~ expanded (with $HOME
+// getenv reads) and cleaned, as filepath.Abs cleans a flag's: a relative
+// path joined to the workspace. A relative absPath, and a ~ with HOME
+// unset, are errors naming the key's source.
+func hostPaths(src sourced, workspace string, getenv func(string) string) (layer, error) {
 	out := layer{}
-	for name, v := range l {
+	for name, v := range src.layer {
 		k, _ := lookup(name)
-		if k.kind == path || k.kind == absPath {
-			p := expandHome(v.(string), getenv)
+		if k.kind == kindPath || k.kind == kindAbsPath {
+			p, ok := expandHome(v.(string), getenv)
 			switch {
+			case !ok:
+				return nil, fmt.Errorf("%s: ~ needs HOME, which is not set", src.name(k))
 			case filepath.IsAbs(p):
 				p = filepath.Clean(p)
-			case k.kind == path:
+			case k.kind == kindPath:
 				p = filepath.Join(workspace, p)
 			default:
-				return nil, fmt.Errorf("%s: must be absolute, got %q", source(k), v)
+				return nil, fmt.Errorf("%s: must be absolute, got %q", src.name(k), v)
 			}
 			v = p
 		}
@@ -504,28 +549,21 @@ func hostDefaults(getenv func(string) string) Settings {
 // read. A runtime root from the file or a variable must be absolute after
 // ~ expansion. It mirrors resolve, less the workspace's sources.
 func resolveHost(in scopes, flags layer, hostNamed string, getenv func(string) string) (Settings, error) {
-	var common layer
-	file, required := hostFile(hostNamed, getenv)
-	if file != "" {
+	var common sourced
+	if file, required := hostFile(hostNamed, getenv); file != "" {
 		l, _, err := readNamed(in, file, required, true)
 		if err != nil {
 			return Settings{}, err
 		}
-		common, err = hostPaths(l, "", getenv, func(k key) string { return "settings file " + file + ": " + k.name })
-		if err != nil {
-			return Settings{}, err
-		}
+		common = sourced{l, inFile(file, "")}
 	}
 	vars, err := env(in, getenv)
 	if err != nil {
 		return Settings{}, err
 	}
-	if vars, err = hostPaths(vars, "", getenv, key.variable); err != nil {
-		return Settings{}, err
-	}
 	s := hostDefaults(getenv)
-	for _, l := range []layer{common, vars, flags} {
-		apply(&s, l)
+	if err := stack(&s, "", getenv, flags, common, sourced{vars, key.variable}); err != nil {
+		return Settings{}, err
 	}
 	return s, nil
 }

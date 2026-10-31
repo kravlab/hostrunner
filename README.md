@@ -274,8 +274,9 @@ settings file.
 A relative `rules_file` from a settings file or a variable is read
 against the workspace (after `~` expansion), so one `rules_file` in the
 common part fits every workspace; a relative flag value is read against
-the current directory. `--config` is a synonym of `--rules-file`;
-giving both is an error.
+the current directory. A leading `~` is `$HOME`, and an error when
+`HOME` is not set. `--config` is a synonym of `--rules-file`; giving
+both is an error.
 
 A duration is written with a unit (`90s`, `1m30s`, `2h`) and must be
 above zero; a bool is `true` or `false` (`1`, `0` and the like in a
@@ -512,21 +513,21 @@ printed.
 workspace the daemon serves: from the settings files as they are now,
 the variables of the terminal it runs in and its own flags
 (`--workspace-settings`, and `--rules-file` or `--config`, both read
-against the current directory; the other daemon settings have no flag
-here). It checks them and reads and checks the rules file before
-stopping anything (an invalid setting or invalid rules leave the daemon
-running, the error naming the source), then starts a new daemon, the
-installed `hostrunner`, for the same workspace, with those settings,
-and waits `ready_timeout` for it to listen. It names what they change
-of the old daemon's rules file and rereading
-(`hostrunner: restarted <dir>; rules_file <old> → <new>, reread true →
-false`; a daemon of an older hostrunner does not say whether it
-rereads). A daemon still waiting for its container (right after `up`,
-during a rebuild) is replaced by one that waits the same way. A daemon
-that saw its container stop, and is about to exit, is only stopped
-(`hostrunner: stopped <dir>; its container is not running`), its
-settings and rules unchecked: the next `hostrunner up` starts a new
-one. Stop, restart and `up` take the
+against the current directory and refused with `--all`, as they name one
+workspace's files; the other daemon settings have no flag here). It
+checks them and reads and checks the rules file before stopping anything
+(an invalid setting or invalid rules leave the daemon running, the error
+naming the source), then starts a new daemon, the installed
+`hostrunner`, for the same workspace, with those settings, and waits
+`ready_timeout` for it to listen. It names what they change of the old
+daemon's rules file and rereading (`hostrunner: restarted <dir>;
+rules_file <old> → <new>, reread true → false`; a daemon of an older
+hostrunner does not say whether it rereads). A daemon still waiting for
+its container (right after `up`, during a rebuild) is replaced by one
+that waits the same way. A daemon that saw its container stop, and is
+about to exit, is only stopped (`hostrunner: stopped <dir>; its
+container is not running`), its settings and rules unchecked: the next
+`hostrunner up` starts a new one. Stop, restart and `up` take the
 runtime directory's lock, so they run one after the other.
 
 `hostrunner up --restart [--kill | --wait]` replaces a running daemon at

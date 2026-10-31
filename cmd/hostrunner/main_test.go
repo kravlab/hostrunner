@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -900,6 +901,20 @@ func TestArmHandlerStepsAsideWhenSettingsDiffer(t *testing.T) {
 	}
 }
 
+// An arm carrying settings has the daemon compare its rereading with
+// them, so a change of it is logged as the other settings' are; only an
+// arm from an up that predates them is compared by its no_reread.
+func TestArmHandlerComparesRereadingAmongTheSettings(t *testing.T) {
+	var logged bytes.Buffer
+	onArm := armHandler("rules.yaml", true, map[string]string{"reread": "true"}, nil, slog.New(slog.NewTextHandler(&logged, nil)))
+	if !onArm(protocol.Arm{ConfigDigest: "digest", NoReread: true, Settings: map[string]string{"reread": "false"}}, "digest") {
+		t.Fatal("kept running for an arm that does not reread")
+	}
+	if got := logged.String(); !strings.Contains(got, "stepping aside: the settings changed") || !strings.Contains(got, `reread="true → false"`) {
+		t.Fatalf("logged %q, want the change of reread among the settings", got)
+	}
+}
+
 func TestArmHandlerStepsAsideWhenRulesChanged(t *testing.T) {
 	onArm := armHandler("rules.yaml", true, noSettings, nil, slog.New(slog.DiscardHandler))
 	if !onArm(protocol.Arm{ConfigDigest: "other"}, "digest") {
@@ -1672,6 +1687,21 @@ func TestParseRestartResolvesTheNewDaemonsSettings(t *testing.T) {
 		if c.got != c.want {
 			t.Errorf("%s: got %v, want %v", c.name, c.got, c.want)
 		}
+	}
+}
+
+// The path flags of the new daemon name the files of one workspace, so
+// restart refuses them with --all, which restarts the daemons of every
+// workspace.
+func TestParseRestartRefusesTheDaemonsPathFlagsWithAll(t *testing.T) {
+	for _, flagName := range []string{"rules-file", "config", "workspace-settings"} {
+		_, err := parseStop("restart", []string{"--all", "--" + flagName, "/r/file.yaml"}, "/bin/hostrunner", xdgEnv, io.Discard)
+		if want := "--" + flagName + " and --all exclude each other"; err == nil || !strings.Contains(err.Error(), want) || !strings.Contains(err.Error(), "usage: hostrunner restart") {
+			t.Errorf("--%s: got %v, want %q with the usage", flagName, err, want)
+		}
+	}
+	if _, err := parseStop("restart", []string{"--choose", "--rules-file", "/r/file.yaml"}, "/bin/hostrunner", xdgEnv, io.Discard); err != nil {
+		t.Errorf("--choose, which restarts one daemon: %v", err)
 	}
 }
 

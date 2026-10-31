@@ -305,6 +305,29 @@ func TestResolveTakesTheRulesFileFromEverySource(t *testing.T) {
 	}
 }
 
+// A ~ that cannot be expanded, HOME being unset, is an error naming the
+// source, not a directory named ~ in the workspace.
+func TestResolveRefusesATildeWithoutHome(t *testing.T) {
+	ws := t.TempDir()
+	host, wsFile := writeFile(t, "rules_file: ~/common.yaml\n"), writeFile(t, "rules_file: ~/ws.yaml\n")
+	withSection := writeFile(t, section(ws, "rules_file: ~/section.yaml"))
+	const problem = "rules_file: ~ needs HOME, which is not set"
+	for _, tt := range []struct {
+		name string
+		vars map[string]string
+		want string
+	}{
+		{"common part", map[string]string{"HOSTRUNNER_SETTINGS": host}, "settings file " + host + ": " + problem},
+		{"section", map[string]string{"HOSTRUNNER_SETTINGS": withSection}, "settings file " + withSection + ": workspaces." + ws + ": " + problem},
+		{"workspace file", map[string]string{"HOSTRUNNER_WORKSPACE_SETTINGS": wsFile}, "settings file " + wsFile + ": " + problem},
+		{"variable", map[string]string{"HOSTRUNNER_RULES_FILE": "~/var.yaml"}, "HOSTRUNNER_RULES_FILE: ~ needs HOME, which is not set"},
+	} {
+		if _, err := parse(t).Resolve(env(tt.vars), ws); err == nil || err.Error() != tt.want {
+			t.Errorf("%s: got %v, want %q", tt.name, err, tt.want)
+		}
+	}
+}
+
 func TestUsageNamesEveryFlagServeTakes(t *testing.T) {
 	want := "[--settings <path>] [--workspace-settings <path>] [--rules-file <path>] [--startup-timeout <duration>] [--grace <duration>] [--reread | --no-reread] [--poll-interval <duration>] [--ask-timeout <duration>] [--request-timeout <duration>]"
 	if got := settings.Usage(); got != want {

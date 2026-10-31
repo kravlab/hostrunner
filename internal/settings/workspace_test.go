@@ -30,10 +30,10 @@ func newWorkspace(t *testing.T, content string) string {
 }
 
 // section is a workspaces map of the host settings file with one section,
-// for path, holding settings (one `key: value` per line).
-func section(path string, settings ...string) string {
+// for path, holding lines (one `key: value` each).
+func section(path string, lines ...string) string {
 	s := fmt.Sprintf("workspaces:\n  %q:\n", path)
-	for _, line := range settings {
+	for _, line := range lines {
 		s += "    " + line + "\n"
 	}
 	return s
@@ -169,6 +169,7 @@ func TestSectionsRejectWhatTheyCannotApply(t *testing.T) {
 		{"workspaces given twice", "workspaces: {}\nworkspaces: {}\n", "workspaces: given twice"},
 		{"section given twice", fmt.Sprintf("workspaces:\n  %q: {}\n  %[1]q: {}\n", other), "workspaces." + other + ": given twice"},
 		{"relative path", section("app", "grace: 1m"), "workspaces.app: not an absolute path"},
+		{"~ without HOME", section("~/app", "grace: 1m"), "workspaces.~/app: ~ needs HOME, which is not set"},
 		{"two paths of the workspace", fmt.Sprintf("workspaces:\n  %q: {}\n  %q: {}\n", ws, link), "workspaces: " + ws + " and " + link + " both name the workspace " + ws},
 	}
 	for _, tt := range tests {

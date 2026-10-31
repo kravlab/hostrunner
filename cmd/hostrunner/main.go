@@ -52,7 +52,8 @@
 // HOSTRUNNER_* variable, the common part of the host settings file or
 // the default. `restart` resolves the new daemon's settings as `up`
 // does, for the old daemon's workspace, also taking
-// [--workspace-settings <path>] and [--rules-file <path>].
+// [--workspace-settings <path>] and [--rules-file <path>] (not with
+// --all).
 package main
 
 import (
@@ -409,6 +410,17 @@ func parseStop(name string, args []string, exe string, getenv func(string) strin
 		return stop.Config{}, fmt.Errorf("--dir, --all and --choose exclude each other; %s", usage)
 	}
 	var err error
+	if cfg.All {
+		// The new daemons' path flags name one workspace's files.
+		fs.Visit(func(f *flag.Flag) {
+			if err == nil && slices.Contains([]string{"rules-file", "config", "workspace-settings"}, f.Name) {
+				err = fmt.Errorf("--%s and --all exclude each other: it names a file of one workspace; %s", f.Name, usage)
+			}
+		})
+		if err != nil {
+			return stop.Config{}, err
+		}
+	}
 	if cfg.Answer, err = parseAnswer(kill, wait, usage); err != nil {
 		return stop.Config{}, err
 	}
@@ -796,20 +808,20 @@ func checkApprovalSocket(workspace, socket string) error {
 // armHandler answers the arms of `hostrunner up`, which arms the daemon on
 // every container start with the digest of the rules it validated and
 // the daemon settings it resolved. digest is that of the rules the daemon
-// serves from config, which a reread changes; ownSettings are the
-// daemon's settings (settings.Settings.Daemon). The daemon steps aside
-// for a new one when the digests differ, when the arm's rereading is not
-// the daemon's, reread, when a setting the arm carries is not its own, or
-// when watcher has ended and will not follow the arm; otherwise watcher,
-// if any, waits for the container of this arm. A current `up` carries
-// reread both ways, so a change of it is logged as --no-reread's.
-func armHandler(config string, reread bool, ownSettings map[string]string, watcher *watch.Watcher, log *slog.Logger) func(a protocol.Arm, digest string) (stepAside bool) {
+// serves from rulesFile, which a reread changes; ownSettings are the
+// daemon's settings (settings.Settings.Daemon), reread among them. The
+// daemon steps aside for a new one when the digests differ, when a
+// setting the arm carries is not its own, when an arm carrying none, from
+// an `up` that predates them, does not reread as the daemon does, or when
+// watcher has ended and will not follow the arm; otherwise watcher, if
+// any, waits for the container of this arm.
+func armHandler(rulesFile string, reread bool, ownSettings map[string]string, watcher *watch.Watcher, log *slog.Logger) func(a protocol.Arm, digest string) (stepAside bool) {
 	return func(a protocol.Arm, digest string) bool {
 		if a.ConfigDigest != digest {
-			log.Info("stepping aside: the rules file changed", "rules_file", config)
+			log.Info("stepping aside: the rules file changed", "rules_file", rulesFile)
 			return true
 		}
-		if rereads := !a.NoReread; rereads != reread {
+		if rereads := !a.NoReread; a.Settings == nil && rereads != reread {
 			log.Info("stepping aside: --no-reread changed", "no_reread", a.NoReread)
 			return true
 		}

@@ -11,23 +11,34 @@ import (
 )
 
 // readHostFile reads the host settings file hostFile names: its common
-// part and its section for workspace (see workspaceSection), nil when it
-// has none. A missing default file sets nothing, a missing named one is
-// an error.
-func readHostFile(in scopes, named, workspace string, getenv func(string) string) (common, section layer, err error) {
+// part and its section for workspace (see workspaceSection), empty when
+// it has none. A missing default file sets nothing, a missing named one
+// is an error.
+func readHostFile(in scopes, named, workspace string, getenv func(string) string) (common, section sourced, err error) {
 	path, required := hostFile(named, getenv)
 	if path == "" {
-		return nil, nil, nil
+		return sourced{}, sourced{}, nil
 	}
-	common, sections, err := readNamed(in, path, required, true)
+	l, sections, err := readNamed(in, path, required, true)
 	if err != nil {
-		return nil, nil, err
+		return sourced{}, sourced{}, err
 	}
-	section, err = workspaceSection(sections, path, workspace, getenv)
+	match, err := workspaceSection(sections, path, workspace, getenv)
 	if err != nil {
-		return nil, nil, err
+		return sourced{}, sourced{}, err
+	}
+	common = sourced{l, inFile(path, "")}
+	if match != "" {
+		section = sourced{sections[match], inFile(path, "workspaces."+match+": ")}
 	}
 	return common, section, nil
+}
+
+// inFile names a key of the settings file at path, within the part of it
+// where says (empty for its top level) in errors:
+// `settings file <path>: workspaces.<section>: grace`.
+func inFile(path, where string) func(key) string {
+	return func(k key) string { return "settings file " + path + ": " + where + k.name }
 }
 
 // readNamed reads the settings file at path as readFile does, except
@@ -173,7 +184,7 @@ func readSections(in scopes, m *yaml.Node, where string) (map[string]layer, erro
 // tag must match: a string for a duration, a bool for a bool.
 func nodeValue(k kind, n *yaml.Node) (any, error) {
 	want := "!!str" // a duration or a path
-	if k == boolean {
+	if k == kindBool {
 		want = "!!bool"
 	}
 	switch {
@@ -183,7 +194,7 @@ func nodeValue(k kind, n *yaml.Node) (any, error) {
 		return k.parse(n.Value)
 	case n.Tag == "!!null":
 		return nil, fmt.Errorf("invalid %s: no value (line %d)", k, n.Line)
-	case k == duration && (n.Tag == "!!int" || n.Tag == "!!float"):
+	case k == kindDuration && (n.Tag == "!!int" || n.Tag == "!!float"):
 		return nil, fmt.Errorf("invalid duration %s: give a unit, e.g. 90s", n.Value)
 	case n.Tag == "!!str":
 		return nil, fmt.Errorf("invalid %s %q", k, n.Value)

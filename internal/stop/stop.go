@@ -56,6 +56,15 @@ type Commands struct {
 	StopTimeout time.Duration
 }
 
+// withStopTimeout is c with its StopTimeout, settings.DefaultStopTimeout
+// when zero.
+func (c Commands) withStopTimeout() Commands {
+	if c.StopTimeout == 0 {
+		c.StopTimeout = settings.DefaultStopTimeout
+	}
+	return c
+}
+
 // Config describes one `hostrunner stop` or `hostrunner restart`. Dir,
 // All and Choose exclude each other; without any, the daemon whose host
 // workspace holds Cwd is stopped.
@@ -151,9 +160,7 @@ var (
 // others from being stopped, a daemon gone meanwhile is not a failure, and
 // Ctrl+C stops no more.
 func Run(ctx context.Context, cfg Config, in io.Reader, out io.Writer) error {
-	if cfg.StopTimeout == 0 {
-		cfg.StopTimeout = settings.DefaultStopTimeout
-	}
+	cfg.Commands = cfg.Commands.withStopTimeout()
 	t := &term{in: in, out: out, interrupts: cfg.Interrupts}
 	defer t.close()
 	chosen, err := t.choose(ctx, cfg)

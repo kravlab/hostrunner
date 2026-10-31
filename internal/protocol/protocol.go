@@ -154,9 +154,9 @@ type Request struct {
 // daemon settings `up` resolved, key to value text, as
 // settings.Settings.Daemon writes them, so a daemon running with others
 // steps aside too. A daemon that predates them ignores the field and
-// still reads NoReread, which Settings' reread then repeats; an arm
-// without the field, from an `up` that predates it, has the daemon
-// compare no setting.
+// still reads NoReread, which Settings' reread then repeats, and a
+// current daemon reads only Settings; an arm without the field, from an
+// `up` that predates it, has the daemon compare its NoReread alone.
 type Arm struct {
 	Version      int               `json:"version"`
 	ConfigDigest string            `json:"config_digest"`

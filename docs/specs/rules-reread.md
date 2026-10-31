@@ -58,7 +58,7 @@ the daemon rereads the file by itself once it changes, without stopping.
 
 ```sh
 hostrunner up    [--restart [--kill | --wait]] [--no-reread] --dir … --workspace … --container-workspace …
-hostrunner serve --socket … --workspace … --container-workspace … [--config …] [--watch] [--no-reread]
+hostrunner serve --socket … --workspace … --container-workspace … [--rules-file …] [--watch] [--no-reread]
 ```
 
 - `--no-reread`: the daemon does not reread the rules file by itself;

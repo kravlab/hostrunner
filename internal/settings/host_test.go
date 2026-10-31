@@ -13,9 +13,9 @@ import (
 	"github.com/kravlab/hostrunner/internal/settings"
 )
 
-// hostDefaults are the settings of stop and restart without any source
+// stopDefaults are the settings of stop and restart without any source
 // but XDG_RUNTIME_DIR=/run/user/1000: they hold the keys they take alone.
-func hostDefaults() settings.Settings {
+func stopDefaults() settings.Settings {
 	return settings.Settings{RuntimeRoot: "/run/user/1000/hostrunner", StopTimeout: 10 * time.Second}
 }
 
@@ -94,7 +94,7 @@ func TestResolveHostTakesEachKeyFromTheHighestSource(t *testing.T) {
 	}
 	for _, tt := range tests {
 		got, err := parseWith(t, (*settings.Flags).RegisterStop, tt.flags...).ResolveHost(env(withXDG(tt.vars)))
-		want := hostDefaults()
+		want := stopDefaults()
 		want.RuntimeRoot, want.StopTimeout = tt.root, tt.stop
 		if err != nil || got != want {
 			t.Errorf("%s: got %+v, %v; want %+v", tt.name, got, err, want)
@@ -129,6 +129,7 @@ func TestResolveHostRuntimeRootPaths(t *testing.T) {
 	}{
 		{name: "~ in the file", vars: map[string]string{"HOME": "/home/u", "HOSTRUNNER_SETTINGS": writeFile(t, "runtime_root: ~/rt\n")}, want: "/home/u/rt"},
 		{name: "~ in the variable", vars: map[string]string{"HOME": "/home/u", "HOSTRUNNER_RUNTIME_ROOT": "~/var"}, want: "/home/u/var"},
+		{name: "~ in the variable without HOME", vars: map[string]string{"HOSTRUNNER_RUNTIME_ROOT": "~/var"}, wantErr: "HOSTRUNNER_RUNTIME_ROOT: ~ needs HOME, which is not set"},
 		{name: "unclean variable", vars: map[string]string{"HOSTRUNNER_RUNTIME_ROOT": "/a//b/../c/"}, want: "/a/c"},
 		{name: "relative flag", flags: []string{"--runtime-root", "rt"}, want: filepath.Join(cwd, "rt")},
 		{name: "relative in the file", vars: map[string]string{"HOSTRUNNER_SETTINGS": relative}, wantErr: "settings file " + relative + `: runtime_root: must be absolute, got "rt"`},
@@ -161,7 +162,7 @@ func TestResolveHostReadsTheCommonPartAlone(t *testing.T) {
 		"HOSTRUNNER_GRACE":              "abc",
 		"HOSTRUNNER_WORKSPACE_SETTINGS": "/nonexistent/hostrunner.yaml",
 	})))
-	if want := hostDefaults(); err != nil || got != want {
+	if want := stopDefaults(); err != nil || got != want {
 		t.Fatalf("got %+v, %v; want %+v", got, err, want)
 	}
 }
