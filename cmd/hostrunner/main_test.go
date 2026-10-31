@@ -88,8 +88,7 @@ func TestParseServeAcceptsAllFlags(t *testing.T) {
 	want := serveConfig{
 		socket:         "/run/h.sock",
 		workspaceFlags: workspaceFlags{workspace: "/home/u/app", containerWorkspace: "/workspaces/app"},
-		pollInterval:   2 * time.Second,
-		Settings:       settings.Settings{RulesFile: "/home/u/app/.devcontainer/hostrun.yaml", StartupTimeout: 30 * time.Minute, Grace: 15 * time.Second, Reread: true},
+		Settings:       tuned("/home/u/app/.devcontainer/hostrun.yaml", 30*time.Minute, 15*time.Second, true),
 	}
 	if got != want {
 		t.Fatalf("got %+v, want %+v", got, want)
@@ -143,8 +142,7 @@ func TestParseUpBuildsLaunchConfig(t *testing.T) {
 		ContainerWorkspace: "/workspaces/app",
 		Daemon:             exe,
 		Client:             filepath.Join("/home/u/.local/bin", "hostrun"),
-		ReadyTimeout:       10 * time.Second,
-		Settings:           settings.Settings{RulesFile: "/home/u/app/.devcontainer/hostrun.yaml", StartupTimeout: 30 * time.Minute, Grace: 15 * time.Second, Reread: true},
+		Settings:           tuned("/home/u/app/.devcontainer/hostrun.yaml", 30*time.Minute, 15*time.Second, true),
 	}
 	if got.launch != want || got.restart || got.answer != stop.Ask {
 		t.Fatalf("got %+v, want %+v without --restart", got, want)
@@ -176,6 +174,21 @@ func TestParseNoReread(t *testing.T) {
 	sv, err := parseServe([]string{"--socket", "/run/h.sock", "--workspace", "/w", "--container-workspace", "/c", "--no-reread"}, noEnv, io.Discard)
 	if err != nil || sv.Reread {
 		t.Fatalf("serve: got %+v, %v; want no reread", sv, err)
+	}
+}
+
+// tuned is the built-in settings with the rules file, the startup
+// timeout, the grace and reread given.
+func tuned(rulesFile string, startupTimeout, grace time.Duration, reread bool) settings.Settings {
+	return settings.Settings{
+		RulesFile:      rulesFile,
+		StartupTimeout: startupTimeout,
+		Grace:          grace,
+		Reread:         reread,
+		PollInterval:   2 * time.Second,
+		AskTimeout:     10 * time.Minute,
+		RequestTimeout: 10 * time.Second,
+		ReadyTimeout:   10 * time.Second,
 	}
 }
 
@@ -232,11 +245,11 @@ func TestUpAndServeResolveEachSettingFromTheHighestSource(t *testing.T) {
 		flags []string
 		want  settings.Settings
 	}{
-		{"defaults", "", nil, nil, settings.Settings{RulesFile: defaultRules, StartupTimeout: 30 * time.Minute, Grace: 15 * time.Second, Reread: true}},
-		{"host settings file", file, nil, nil, settings.Settings{RulesFile: defaultRules, StartupTimeout: time.Hour, Grace: time.Minute, Reread: false}},
-		{"variables over the file", file, vars, nil, settings.Settings{RulesFile: defaultRules, StartupTimeout: 2 * time.Hour, Grace: 2 * time.Minute, Reread: true}},
-		{"flags over the variables", file, vars, []string{"--startup-timeout", "3h", "--grace", "3m", "--no-reread"}, settings.Settings{RulesFile: defaultRules, StartupTimeout: 3 * time.Hour, Grace: 3 * time.Minute, Reread: false}},
-		{"--reread over the file", file, nil, []string{"--reread"}, settings.Settings{RulesFile: defaultRules, StartupTimeout: time.Hour, Grace: time.Minute, Reread: true}},
+		{"defaults", "", nil, nil, tuned(defaultRules, 30*time.Minute, 15*time.Second, true)},
+		{"host settings file", file, nil, nil, tuned(defaultRules, time.Hour, time.Minute, false)},
+		{"variables over the file", file, vars, nil, tuned(defaultRules, 2*time.Hour, 2*time.Minute, true)},
+		{"flags over the variables", file, vars, []string{"--startup-timeout", "3h", "--grace", "3m", "--no-reread"}, tuned(defaultRules, 3*time.Hour, 3*time.Minute, false)},
+		{"--reread over the file", file, nil, []string{"--reread"}, tuned(defaultRules, time.Hour, time.Minute, true)},
 	}
 	for name, resolve := range commands {
 		for _, tt := range tests {
@@ -330,9 +343,11 @@ func TestServeGivenEverySettingReadsNoOtherSource(t *testing.T) {
 		t.Errorf("read %s", name)
 		return ""
 	}
-	flags := []string{"--settings", settingsFile(t, "grase: [\n"), "--workspace-settings", settingsFile(t, "grase: [\n"), "--rules-file", "/r.yaml", "--startup-timeout", "1h", "--grace", "1m", "--reread"}
+	flags := []string{"--settings", settingsFile(t, "grase: [\n"), "--workspace-settings", settingsFile(t, "grase: [\n"), "--rules-file", "/r.yaml", "--startup-timeout", "1h", "--grace", "1m", "--reread", "--poll-interval", "1s", "--ask-timeout", "1m", "--request-timeout", "1s"}
 	got, err := resolveServe(flags, getenv)
-	if want := (settings.Settings{RulesFile: "/r.yaml", StartupTimeout: time.Hour, Grace: time.Minute, Reread: true}); err != nil || got != want {
+	want := tuned("/r.yaml", time.Hour, time.Minute, true)
+	want.PollInterval, want.AskTimeout, want.RequestTimeout = time.Second, time.Minute, time.Second
+	if err != nil || got != want {
 		t.Fatalf("got %+v, %v; want %+v", got, err, want)
 	}
 }
@@ -402,7 +417,7 @@ func TestUpAndServeReadTheWorkspaceSettings(t *testing.T) {
 // An up given every setting as a flag still reads every other source, so
 // a missing named file, a broken file or an invalid variable fails it.
 func TestUpGivenEverySettingStillReadsEverySource(t *testing.T) {
-	all := []string{"--rules-file", "/r.yaml", "--startup-timeout", "1m", "--grace", "1s", "--reread"}
+	all := []string{"--rules-file", "/r.yaml", "--startup-timeout", "1m", "--grace", "1s", "--reread", "--poll-interval", "1s", "--ask-timeout", "1m", "--request-timeout", "1s", "--ready-timeout", "1s"}
 	missing := filepath.Join(t.TempDir(), "missing.yaml")
 	broken := settingsFile(t, "grase: 1s\n")
 	tests := []struct {
@@ -425,11 +440,73 @@ func TestUpGivenEverySettingStillReadsEverySource(t *testing.T) {
 // The usages name the settings' flags.
 func TestUsagesNameTheSettingsFlags(t *testing.T) {
 	for name, u := range map[string]string{"up": upUsage, "serve": serveUsage} {
-		for _, f := range []string{"[--settings <path>]", "[--workspace-settings <path>]", "[--startup-timeout <duration>]", "[--grace <duration>]", "[--reread | --no-reread]"} {
+		for _, f := range []string{"[--settings <path>]", "[--workspace-settings <path>]", "[--startup-timeout <duration>]", "[--grace <duration>]", "[--reread | --no-reread]", "[--poll-interval <duration>]", "[--ask-timeout <duration>]", "[--request-timeout <duration>]"} {
 			if !strings.Contains(u, f) {
 				t.Errorf("%s usage %q lacks %s", name, u, f)
 			}
 		}
+	}
+	if !strings.Contains(upUsage, "[--ready-timeout <duration>]") {
+		t.Errorf("up usage %q lacks --ready-timeout", upUsage)
+	}
+	if strings.Contains(serveUsage, "--ready-timeout") {
+		t.Errorf("serve usage %q names --ready-timeout, which serve does not take", serveUsage)
+	}
+}
+
+// up and serve take the poll interval, the ask timeout and the request
+// timeout from the settings file, their variables and their flags; up
+// also takes its ready timeout, which serve neither reads nor checks.
+func TestUpAndServeResolveTheTimings(t *testing.T) {
+	file := "poll_interval: 3s\nask_timeout: 3m\nrequest_timeout: 3s\nready_timeout: 3s\n"
+	vars := map[string]string{"HOSTRUNNER_POLL_INTERVAL": "4s", "HOSTRUNNER_ASK_TIMEOUT": "4m", "HOSTRUNNER_REQUEST_TIMEOUT": "4s", "HOSTRUNNER_READY_TIMEOUT": "4s"}
+	flags := []string{"--poll-interval", "5s", "--ask-timeout", "5m", "--request-timeout", "5s"}
+	timings := func(d time.Duration) settings.Settings {
+		s := tuned(filepath.Join("/w", ".devcontainer", "hostrun.yaml"), 30*time.Minute, 15*time.Second, true)
+		s.PollInterval, s.AskTimeout, s.RequestTimeout, s.ReadyTimeout = d, time.Duration(d.Seconds())*time.Minute, d, d
+		return s
+	}
+	tests := []struct {
+		name  string
+		vars  map[string]string
+		flags []string
+		want  settings.Settings
+	}{
+		{"settings file", nil, nil, timings(3 * time.Second)},
+		{"variables over the file", vars, nil, timings(4 * time.Second)},
+	}
+	for name, resolve := range commands {
+		for _, tt := range tests {
+			env := map[string]string{"HOSTRUNNER_SETTINGS": settingsFile(t, file)}
+			maps.Copy(env, tt.vars)
+			want := tt.want
+			if name == "serve" {
+				want.ReadyTimeout = 10 * time.Second
+			}
+			if got, err := resolve(tt.flags, envOf(env)); err != nil || got != want {
+				t.Errorf("%s, %s: got %+v, %v; want %+v", name, tt.name, got, err, want)
+			}
+		}
+	}
+	env := map[string]string{"HOSTRUNNER_SETTINGS": settingsFile(t, file)}
+	maps.Copy(env, vars)
+	want := timings(5 * time.Second)
+	want.ReadyTimeout = 10 * time.Second
+	if got, err := resolveServe(flags, envOf(env)); err != nil || got != want {
+		t.Errorf("serve, flags over the variables: got %+v, %v; want %+v", got, err, want)
+	}
+	want.ReadyTimeout = 5 * time.Second
+	if got, err := resolveUp(append(flags, "--ready-timeout", "5s"), envOf(env)); err != nil || got != want {
+		t.Errorf("up, flags over the variables: got %+v, %v; want %+v", got, err, want)
+	}
+	if _, err := resolveServe([]string{"--ready-timeout", "5s"}, noEnv); err == nil {
+		t.Error("serve: got no error for --ready-timeout")
+	}
+	if _, err := resolveServe(nil, envOf(map[string]string{"HOSTRUNNER_READY_TIMEOUT": "soon"})); err != nil {
+		t.Errorf("serve: got %v for an invalid HOSTRUNNER_READY_TIMEOUT, which it does not read", err)
+	}
+	if _, err := resolveUp(nil, envOf(map[string]string{"HOSTRUNNER_READY_TIMEOUT": "soon"})); err == nil {
+		t.Error("up: got no error for an invalid HOSTRUNNER_READY_TIMEOUT")
 	}
 }
 
@@ -452,8 +529,14 @@ func watchConfig(t *testing.T) serveConfig {
 		socket:         filepath.Join(base, "h.sock"),
 		workspaceFlags: workspaceFlags{workspace: base, containerWorkspace: "/workspaces/app"},
 		watch:          true,
-		pollInterval:   5 * time.Millisecond,
-		Settings:       settings.Settings{StartupTimeout: 400 * time.Millisecond, Grace: 100 * time.Millisecond, Reread: true},
+		Settings: settings.Settings{
+			StartupTimeout: 400 * time.Millisecond,
+			Grace:          100 * time.Millisecond,
+			Reread:         true,
+			PollInterval:   5 * time.Millisecond,
+			AskTimeout:     10 * time.Minute,
+			RequestTimeout: 10 * time.Second,
+		},
 	}
 }
 
@@ -1247,7 +1330,7 @@ func TestServeReportsTheArmedContainerStopped(t *testing.T) {
 		t.Fatal("the hello reported the container stopped while waiting for it")
 	}
 	rt.Start("c")
-	for until := time.Now().Add(20 * cfg.pollInterval); time.Now().Before(until); time.Sleep(cfg.pollInterval) {
+	for until := time.Now().Add(20 * cfg.PollInterval); time.Now().Before(until); time.Sleep(cfg.PollInterval) {
 		if helloInfo(t, cfg.socket).ContainerStopped {
 			t.Fatal("the hello reported the armed container stopped while it runs")
 		}

@@ -10,9 +10,10 @@ import (
 )
 
 // Flags are the flags of the settings on one command line: --settings,
-// --workspace-settings, one per key (--rules-file, --startup-timeout,
-// --grace), --config as the synonym of --rules-file and, for reread,
-// both --reread and --no-reread. Register them, parse, then resolve.
+// --workspace-settings, one per key the command takes (--rules-file,
+// --startup-timeout, --grace and so on), --config as the synonym of
+// --rules-file and, for reread, both --reread and --no-reread. Register
+// them, parse, then resolve.
 type Flags struct {
 	fs            *flag.FlagSet
 	file          string
@@ -22,6 +23,7 @@ type Flags struct {
 	durations     map[string]*time.Duration
 	reread        bool
 	noReread      bool
+	scopes        scopes // the keys the command takes, which alone are read
 }
 
 // FlagError is a settings flag given a value no setting can take
@@ -37,12 +39,21 @@ func (e *FlagError) Error() string { return e.err.Error() }
 // Unwrap returns the problem.
 func (e *FlagError) Unwrap() error { return e.err }
 
-// Register adds the settings' flags to fs.
-func (f *Flags) Register(fs *flag.FlagSet) {
+// Register adds to fs the flags of the settings serve takes: every key
+// but up's own (ready_timeout).
+func (f *Flags) Register(fs *flag.FlagSet) { f.register(fs, scopeDaemon) }
+
+// RegisterUp adds to fs the flags of the settings up takes: those
+// Register adds, and --ready-timeout.
+func (f *Flags) RegisterUp(fs *flag.FlagSet) { f.register(fs, scopeDaemon, scopeUp) }
+
+// register adds to fs the flags of the keys of in, which alone are read.
+func (f *Flags) register(fs *flag.FlagSet, in ...scope) {
 	f.RegisterRulesFile(fs)
+	f.scopes = in
 	f.durations = map[string]*time.Duration{}
 	defaults := defaults("")
-	for _, k := range keys {
+	for _, k := range keysOf(in...) {
 		switch p := k.field(&defaults).(type) {
 		case *time.Duration:
 			f.durations[k.name] = fs.Duration(k.flagName(), *p, k.usage)
@@ -55,10 +66,11 @@ func (f *Flags) Register(fs *flag.FlagSet) {
 
 // RegisterRulesFile adds to fs only the flags that choose the rules
 // file: --settings, --workspace-settings, --rules-file and --config, for
-// a command that uses no other setting; the other keys still come from
-// the variables and the files.
+// a command that uses no other setting; the other keys serve takes still
+// come from the variables and the files, as for serve.
 func (f *Flags) RegisterRulesFile(fs *flag.FlagSet) {
 	f.fs = fs
+	f.scopes = scopes{scopeDaemon}
 	k, _ := lookup("rules_file")
 	fs.StringVar(&f.file, "settings", "", "host settings file (default $XDG_CONFIG_HOME/hostrunner/settings.yaml)")
 	fs.StringVar(&f.workspaceFile, "workspace-settings", "", "workspace settings file (default <workspace>/.devcontainer/hostrunner.yaml)")
@@ -82,19 +94,21 @@ func (f *Flags) Resolve(getenv func(string) string, workspace string) (Settings,
 	if err != nil {
 		return Settings{}, err
 	}
-	return resolve(flags, f.file, f.workspaceFile, workspace, getenv)
+	return resolve(f.scopes, flags, f.file, f.workspaceFile, workspace, getenv)
 }
 
 // ResolveAsGiven is Resolve, except that when the flags set every key
-// neither the variables nor any file is read: a daemon its `up` started
-// with every setting as a flag runs with them as given.
+// serve takes neither the variables nor any file is read: a daemon its
+// `up` started with every setting as a flag runs with them as given.
 func (f *Flags) ResolveAsGiven(getenv func(string) string, workspace string) (Settings, error) {
 	flags, err := f.layer()
 	if err != nil {
 		return Settings{}, err
 	}
-	if len(flags) < len(keys) {
-		return resolve(flags, f.file, f.workspaceFile, workspace, getenv)
+	for _, k := range keysOf(scopeDaemon) {
+		if _, given := flags[k.name]; !given {
+			return resolve(f.scopes, flags, f.file, f.workspaceFile, workspace, getenv)
+		}
 	}
 	s := defaults(workspace)
 	apply(&s, flags)

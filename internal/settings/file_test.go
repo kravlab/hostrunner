@@ -80,9 +80,27 @@ func TestResolveFailsOnAMissingNamedHostFile(t *testing.T) {
 }
 
 func TestHostFileSetsEveryKey(t *testing.T) {
-	path := writeFile(t, "# the host's settings\nstartup_timeout: 1h\ngrace: 1m30s\nreread: false\n")
-	got, err := parse(t, "--settings", path).Resolve(env(nil), noWorkspace)
-	want := settings.Settings{RulesFile: defaults.RulesFile, StartupTimeout: time.Hour, Grace: 90 * time.Second, Reread: false}
+	path := writeFile(t, `# the host's settings
+rules_file: /r/hostrun.yaml
+startup_timeout: 1h
+grace: 1m30s
+reread: false
+poll_interval: 5s
+ask_timeout: 20m
+request_timeout: 30s
+ready_timeout: 1m
+`)
+	got, err := parseUp(t, "--settings", path).Resolve(env(nil), noWorkspace)
+	want := settings.Settings{
+		RulesFile:      "/r/hostrun.yaml",
+		StartupTimeout: time.Hour,
+		Grace:          90 * time.Second,
+		Reread:         false,
+		PollInterval:   5 * time.Second,
+		AskTimeout:     20 * time.Minute,
+		RequestTimeout: 30 * time.Second,
+		ReadyTimeout:   time.Minute,
+	}
 	if err != nil || got != want {
 		t.Fatalf("got %+v, %v; want %+v", got, err, want)
 	}

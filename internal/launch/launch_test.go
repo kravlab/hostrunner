@@ -38,8 +38,8 @@ func TestMain(m *testing.M) {
 		os.Setenv(fakeDaemonEnv, "serve")
 		err := Up(context.Background(), Config{
 			Dir: dir, Workspace: "/w", ContainerWorkspace: "/c",
-			Daemon: os.Args[0], Client: client, ReadyTimeout: 5 * time.Second,
-			Settings: settings.Settings{RulesFile: filepath.Join(dir, "missing-rules.yaml"), Reread: true},
+			Daemon: os.Args[0], Client: client,
+			Settings: settings.Settings{RulesFile: filepath.Join(dir, "missing-rules.yaml"), Reread: true, ReadyTimeout: 5 * time.Second},
 		})
 		if err != nil {
 			os.Exit(1)
@@ -71,6 +71,9 @@ func runFakeDaemon(mode string) {
 	watch := fs.Bool("watch", false, "")
 	fs.Duration("startup-timeout", 0, "")
 	fs.Duration("grace", 0, "")
+	fs.Duration("poll-interval", 0, "")
+	fs.Duration("ask-timeout", 0, "")
+	fs.Duration("request-timeout", 0, "")
 	fs.Bool("reread", false, "")
 	noReread := fs.Bool("no-reread", false, "")
 	if len(os.Args) < 2 || os.Args[1] != "serve" || fs.Parse(os.Args[2:]) != nil || !*watch || *config == "" {
@@ -189,8 +192,7 @@ func fakeConfig(t *testing.T, mode string) Config {
 		ContainerWorkspace: "/workspaces/app",
 		Daemon:             os.Args[0],
 		Client:             mustStatic(t),
-		ReadyTimeout:       5 * time.Second,
-		Settings:           settings.Settings{RulesFile: filepath.Join(base, "hostrun.yaml"), Reread: true},
+		Settings:           settings.Settings{RulesFile: filepath.Join(base, "hostrun.yaml"), Reread: true, ReadyTimeout: 5 * time.Second},
 	}
 	t.Setenv(fakeDaemonEnv, mode)
 	t.Cleanup(func() {
@@ -543,6 +545,10 @@ func TestServeArgsGiveEverySetting(t *testing.T) {
 	}{
 		{"rereading", func(c *Config) { c.StartupTimeout, c.Grace, c.Reread = 30*time.Minute, 15*time.Second, true }, []string{"--startup-timeout", "30m0s", "--grace", "15s", "--reread"}},
 		{"not rereading", func(c *Config) { c.StartupTimeout, c.Grace = time.Hour, 90*time.Second }, []string{"--startup-timeout", "1h0m0s", "--grace", "1m30s", "--no-reread"}},
+		{"timings", func(c *Config) {
+			c.PollInterval, c.AskTimeout, c.RequestTimeout, c.Reread = 2*time.Second, 10*time.Minute, 10*time.Second, true
+		}, []string{"--poll-interval", "2s", "--ask-timeout", "10m0s", "--request-timeout", "10s", "--reread"}},
+		{"ready timeout is up's own", func(c *Config) { c.ReadyTimeout, c.Reread = time.Minute, true }, []string{"--reread"}},
 		{"durations unset", func(c *Config) { c.Reread = true }, []string{"--reread"}},
 	}
 	for _, tt := range tests {

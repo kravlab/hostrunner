@@ -16,17 +16,38 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 )
 
-// Settings are the resolved settings of a daemon.
+// Settings are the resolved settings of a daemon, and of the up that
+// starts it.
 type Settings struct {
-	RulesFile      string        // rules_file: the rules file, absolute when the workspace path is
-	StartupTimeout time.Duration // startup_timeout: with --watch, how long to wait for the container
-	Grace          time.Duration // grace: with --watch, how long the container may be gone
-	Reread         bool          // reread: reread the rules file by itself once it changes
+	// RulesFile (rules_file) is the rules file, absolute when the
+	// workspace path is.
+	RulesFile string
+	// StartupTimeout (startup_timeout) is, with --watch, how long to wait
+	// for the container to start.
+	StartupTimeout time.Duration
+	// Grace (grace) is, with --watch, how long the container may be gone.
+	Grace time.Duration
+	// Reread (reread) is whether to reread the rules file by itself once
+	// it changes.
+	Reread bool
+	// PollInterval (poll_interval) is how often the runtimes are asked
+	// (with --watch) and the rules file is looked at.
+	PollInterval time.Duration
+	// AskTimeout (ask_timeout) is how long an approval request waits when
+	// its client sets no limit.
+	AskTimeout time.Duration
+	// RequestTimeout (request_timeout) is how long a new connection may
+	// take to send its request.
+	RequestTimeout time.Duration
+	// ReadyTimeout (ready_timeout) is how long up waits for the daemon it
+	// starts to listen; up's own, not passed to the daemon.
+	ReadyTimeout time.Duration
 }
 
 // rulesPath is where a workspace keeps its rules file by default,
@@ -41,6 +62,10 @@ func defaults(workspace string) Settings {
 		StartupTimeout: 30 * time.Minute, // covers image builds, also after a rebuild's arm
 		Grace:          15 * time.Second, // how long a stopped container is tolerated
 		Reread:         true,
+		PollInterval:   2 * time.Second,  // how soon a stopped container or a changed rules file is seen
+		AskTimeout:     10 * time.Minute, // time for a human to come to the host and answer
+		RequestTimeout: 10 * time.Second, // so idle connections cannot pile up
+		ReadyTimeout:   10 * time.Second, // a daemon listens at once, unless something is wrong
 	}
 }
 
@@ -69,21 +94,84 @@ func (k kind) String() string {
 	return "duration"
 }
 
+// scope is the commands that take a key's flag.
+type scope int
+
+const (
+	scopeDaemon scope = iota // serve, and up, which resolves it and passes it to serve
+	scopeUp                  // up alone: it tunes up, not the daemon
+)
+
 // key is one setting: its name in a settings file, from which its
-// variable and flag are named, and the field of Settings it sets.
+// variable and flag are named, the commands that take its flag, and the
+// field of Settings it sets.
 type key struct {
 	name  string
 	kind  kind
+	scope scope
 	usage string                // the flag's help
 	field func(s *Settings) any // a *string, *time.Duration or *bool into s
 }
 
 // keys are every setting, in the order errors and flags follow.
 var keys = []key{
-	{"rules_file", path, "rules file (default <workspace>/.devcontainer/hostrun.yaml)", func(s *Settings) any { return &s.RulesFile }},
-	{"startup_timeout", duration, "with --watch: how long to wait for the container to start", func(s *Settings) any { return &s.StartupTimeout }},
-	{"grace", duration, "with --watch: how long the container may be gone before exiting", func(s *Settings) any { return &s.Grace }},
-	{"reread", boolean, "reread the rules file by itself once it changes", func(s *Settings) any { return &s.Reread }},
+	{
+		name: "rules_file", kind: path, scope: scopeDaemon,
+		usage: "rules file (default <workspace>/.devcontainer/hostrun.yaml)",
+		field: func(s *Settings) any { return &s.RulesFile },
+	},
+	{
+		name: "startup_timeout", kind: duration, scope: scopeDaemon,
+		usage: "with --watch: how long to wait for the container to start",
+		field: func(s *Settings) any { return &s.StartupTimeout },
+	},
+	{
+		name: "grace", kind: duration, scope: scopeDaemon,
+		usage: "with --watch: how long the container may be gone before exiting",
+		field: func(s *Settings) any { return &s.Grace },
+	},
+	{
+		name: "reread", kind: boolean, scope: scopeDaemon,
+		usage: "reread the rules file by itself once it changes",
+		field: func(s *Settings) any { return &s.Reread },
+	},
+	{
+		name: "poll_interval", kind: duration, scope: scopeDaemon,
+		usage: "how often to ask the runtimes (with --watch) and look at the rules file",
+		field: func(s *Settings) any { return &s.PollInterval },
+	},
+	{
+		name: "ask_timeout", kind: duration, scope: scopeDaemon,
+		usage: "how long an approval request waits when the client sets no limit",
+		field: func(s *Settings) any { return &s.AskTimeout },
+	},
+	{
+		name: "request_timeout", kind: duration, scope: scopeDaemon,
+		usage: "how long a new connection may take to send its request",
+		field: func(s *Settings) any { return &s.RequestTimeout },
+	},
+	{
+		name: "ready_timeout", kind: duration, scope: scopeUp,
+		usage: "how long to wait for the daemon to listen",
+		field: func(s *Settings) any { return &s.ReadyTimeout },
+	},
+}
+
+// scopes are the scopes of the keys one command takes.
+type scopes []scope
+
+// takes says whether the command takes k.
+func (in scopes) takes(k key) bool { return slices.Contains(in, k.scope) }
+
+// keysOf returns the keys whose flags the commands of in take.
+func keysOf(in ...scope) []key {
+	var out []key
+	for _, k := range keys {
+		if scopes(in).takes(k) {
+			out = append(out, k)
+		}
+	}
+	return out
 }
 
 // commonOnly are the keys only the common part of the host settings file
@@ -109,14 +197,21 @@ func lookup(name string) (key, bool) {
 	return key{}, false
 }
 
-// Usage is the usage of the settings' flags, as a command's usage line
-// shows them: [--settings <path>] [--workspace-settings <path>]
-// [--rules-file <path>] [--grace <duration>] [--reread | --no-reread]
-// and so on, one per key; --config, the synonym of --rules-file, is
-// left out.
-func Usage() string {
+// Usage is the usage of the settings' flags Register adds, as serve's
+// usage line shows them: [--settings <path>] [--workspace-settings
+// <path>] [--rules-file <path>] [--grace <duration>] [--reread |
+// --no-reread] and so on, one per key; --config, the synonym of
+// --rules-file, is left out.
+func Usage() string { return usage(scopeDaemon) }
+
+// UpUsage is Usage for the flags RegisterUp adds, as up's usage line
+// shows them: Usage and [--ready-timeout <duration>].
+func UpUsage() string { return usage(scopeDaemon, scopeUp) }
+
+// usage is the usage of the flags of the keys of scopes.
+func usage(scopes ...scope) string {
 	parts := []string{fileFlagsUsage}
-	for _, k := range keys {
+	for _, k := range keysOf(scopes...) {
 		parts = append(parts, k.usageOf())
 	}
 	return strings.Join(parts, " ")
@@ -198,16 +293,16 @@ func apply(s *Settings, l layer) {
 // --settings flag (see hostFile), each empty when not given. A path a
 // file or a variable gives is read against the workspace, after ~
 // expansion; flags gives its paths absolute already.
-func resolve(flags layer, hostNamed, workspaceNamed, workspace string, getenv func(string) string) (Settings, error) {
-	common, section, err := readHostFile(hostNamed, workspace, getenv)
+func resolve(in scopes, flags layer, hostNamed, workspaceNamed, workspace string, getenv func(string) string) (Settings, error) {
+	common, section, err := readHostFile(in, hostNamed, workspace, getenv)
 	if err != nil {
 		return Settings{}, err
 	}
-	wsFile, err := readWorkspaceFile(workspaceNamed, workspace, getenv)
+	wsFile, err := readWorkspaceFile(in, workspaceNamed, workspace, getenv)
 	if err != nil {
 		return Settings{}, err
 	}
-	vars, err := env(getenv)
+	vars, err := env(in, getenv)
 	if err != nil {
 		return Settings{}, err
 	}
@@ -236,12 +331,12 @@ func inWorkspace(l layer, workspace string, getenv func(string) string) layer {
 	return out
 }
 
-// env reads the HOSTRUNNER_* variables of every key through getenv; an
-// empty variable is unset. An invalid value is an error naming the
+// env reads the HOSTRUNNER_* variables of the keys of in through getenv;
+// an empty variable is unset. An invalid value is an error naming the
 // variable: `HOSTRUNNER_GRACE: invalid duration "abc"`.
-func env(getenv func(string) string) (layer, error) {
+func env(in scopes, getenv func(string) string) (layer, error) {
 	l := layer{}
-	for _, k := range keys {
+	for _, k := range keysOf(in...) {
 		raw := getenv(k.variable())
 		if raw == "" {
 			continue

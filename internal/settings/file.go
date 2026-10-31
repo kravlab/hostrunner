@@ -15,12 +15,12 @@ import (
 // part and its section for workspace (see workspaceSection), nil when it
 // has none. A missing default file sets nothing, a missing named one is
 // an error.
-func readHostFile(named, workspace string, getenv func(string) string) (common, section layer, err error) {
+func readHostFile(in scopes, named, workspace string, getenv func(string) string) (common, section layer, err error) {
 	path, required := hostFile(named, getenv)
 	if path == "" {
 		return nil, nil, nil
 	}
-	common, sections, err := readNamed(path, required, true)
+	common, sections, err := readNamed(in, path, required, true)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -33,8 +33,8 @@ func readHostFile(named, workspace string, getenv func(string) string) (common, 
 
 // readNamed reads the settings file at path as readFile does, except
 // that a missing file sets nothing unless it is required.
-func readNamed(path string, required, host bool) (layer, map[string]layer, error) {
-	l, sections, err := readFile(path, host)
+func readNamed(in scopes, path string, required, host bool) (layer, map[string]layer, error) {
+	l, sections, err := readFile(in, path, host)
 	if !required && errors.Is(err, fs.ErrNotExist) {
 		return nil, nil, nil
 	}
@@ -67,14 +67,15 @@ func hostFile(named string, getenv func(string) string) (path string, required b
 
 // readFile reads the settings file at path: a YAML mapping of snake_case
 // keys, durations as strings with a unit (`grace: 1m30s`), bools as YAML
-// bools. The host settings file (host) may also hold `workspaces`, a
-// mapping from a workspace path to a mapping of settings, returned as
-// sections by path as written. An empty file sets nothing. A file that
+// bools; only the keys of in are read, the others must be known keys.
+// The host settings file (host) may also hold `workspaces`, a mapping
+// from a workspace path to a mapping of settings, returned as sections
+// by path as written. An empty file sets nothing. A file that
 // cannot be read keeps its error (fs.ErrNotExist for a missing one); an
 // unknown key, a key given twice or an invalid value is an error naming
 // the file, the section if any, and the key: `settings file
 // /p/settings.yaml: workspaces./home/u/app: grase: unknown key`.
-func readFile(path string, host bool) (layer, map[string]layer, error) {
+func readFile(in scopes, path string, host bool) (layer, map[string]layer, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, nil, fmt.Errorf("settings file: %w", err)
@@ -87,20 +88,22 @@ func readFile(path string, host bool) (layer, map[string]layer, error) {
 	if len(doc.Content) == 0 { // empty, or comments only
 		return layer{}, nil, nil
 	}
-	return readSettings(doc.Content[0], where, host)
+	return readSettings(in, doc.Content[0], where, host)
 }
 
 // readSettings reads m, a mapping of settings, into a layer; where
 // begins its errors (`settings file P: ` or, in a section, `settings
 // file P: workspaces./home/u/app: `). The common part of the host
 // settings file (host) may hold `workspaces`, read into sections; any
-// other mapping refuses the keys of commonOnly.
-func readSettings(m *yaml.Node, where string, host bool) (layer, map[string]layer, error) {
+// other mapping refuses the keys of commonOnly. A key outside in, which
+// the command does not take, is neither read nor checked.
+func readSettings(in scopes, m *yaml.Node, where string, host bool) (layer, map[string]layer, error) {
 	if m.Kind != yaml.MappingNode {
 		return nil, nil, fmt.Errorf("%snot a mapping of settings (line %d)", where, m.Line)
 	}
 	fail := func(name, problem string) error { return fmt.Errorf("%s%s: %s", where, name, problem) }
 	l := layer{}
+	seen := map[string]bool{}
 	var sections map[string]layer
 	for i := 0; i+1 < len(m.Content); i += 2 {
 		name, value := m.Content[i].Value, m.Content[i+1]
@@ -108,7 +111,7 @@ func readSettings(m *yaml.Node, where string, host bool) (layer, map[string]laye
 			if sections != nil { // readSections never returns nil
 				return nil, nil, fail(name, "given twice")
 			}
-			s, err := readSections(value, where)
+			s, err := readSections(in, value, where)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -122,8 +125,12 @@ func readSettings(m *yaml.Node, where string, host bool) (layer, map[string]laye
 		if !ok {
 			return nil, nil, fail(name, "unknown key")
 		}
-		if _, dup := l[name]; dup {
+		if seen[name] {
 			return nil, nil, fail(name, "given twice")
+		}
+		seen[name] = true
+		if !in.takes(k) {
+			continue
 		}
 		v, err := nodeValue(k.kind, value)
 		if err != nil {
@@ -137,7 +144,7 @@ func readSettings(m *yaml.Node, where string, host bool) (layer, map[string]laye
 // readSections reads m, the `workspaces` of the host settings file whose
 // errors begin with where, into a layer per workspace path as written;
 // every section is read, whichever workspace it names.
-func readSections(m *yaml.Node, where string) (map[string]layer, error) {
+func readSections(in scopes, m *yaml.Node, where string) (map[string]layer, error) {
 	if m.Kind != yaml.MappingNode {
 		return nil, fmt.Errorf("%sworkspaces: not a mapping of workspaces (line %d)", where, m.Line)
 	}
@@ -147,7 +154,7 @@ func readSections(m *yaml.Node, where string) (map[string]layer, error) {
 		if _, dup := sections[path]; dup {
 			return nil, fmt.Errorf("%sworkspaces.%s: given twice", where, path)
 		}
-		l, _, err := readSettings(m.Content[i+1], where+"workspaces."+path+": ", false)
+		l, _, err := readSettings(in, m.Content[i+1], where+"workspaces."+path+": ", false)
 		if err != nil {
 			return nil, err
 		}

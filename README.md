@@ -196,6 +196,10 @@ Besides its rules, a daemon has settings:
 | `startup_timeout` | `HOSTRUNNER_STARTUP_TIMEOUT` | `--startup-timeout` | `30m` | how long it waits for its container to start |
 | `grace` | `HOSTRUNNER_GRACE` | `--grace` | `15s` | how long its container may be gone before it exits |
 | `reread` | `HOSTRUNNER_REREAD` | `--reread`, `--no-reread` | `true` | whether it rereads the rules file by itself once it changes |
+| `poll_interval` | `HOSTRUNNER_POLL_INTERVAL` | `--poll-interval` | `2s` | how often it asks the container runtimes about its container and looks at the rules file |
+| `ask_timeout` | `HOSTRUNNER_ASK_TIMEOUT` | `--ask-timeout` | `10m` | how long an `--ask` request waits for an answer when hostrun sets no limit |
+| `request_timeout` | `HOSTRUNNER_REQUEST_TIMEOUT` | `--request-timeout` | `10s` | how long a new connection may take to send its request |
+| `ready_timeout` | `HOSTRUNNER_READY_TIMEOUT` | `--ready-timeout` (`up` only) | `10s` | how long `up` waits for the daemon it starts to listen |
 
 Each comes from the first that gives it:
 
@@ -217,6 +221,10 @@ workspace host path with keys for that workspace alone:
 startup_timeout: 1h
 grace: 1m30s
 reread: false
+poll_interval: 5s
+ask_timeout: 30m
+request_timeout: 30s
+ready_timeout: 1m
 workspaces:
   ~/src/app:
     grace: 5m
@@ -252,10 +260,12 @@ and with it `devcontainer up`, naming the source and the key
 (`settings file /home/u/.config/hostrunner/settings.yaml: grase: unknown
 key`, `settings file /home/u/.config/hostrunner/settings.yaml:
 workspaces./home/u/other: grase: unknown key`, `HOSTRUNNER_GRACE:
-invalid duration "abc"`). `up` resolves the
-settings and starts the daemon with every one as a flag, so its command
-line shows them; `hostrunner serve` started by hand resolves them the
-same way. `--reread` and `--no-reread` exclude each other.
+invalid duration "abc"`). `up` resolves the settings and starts the
+daemon with every one as a flag but `ready_timeout`, its own, so its
+command line shows them; `hostrunner serve` started by hand resolves
+them the same way, without reading or checking `ready_timeout`.
+`hostrunner restart` waits 10 seconds for the new daemon, whatever
+`ready_timeout` says. `--reread` and `--no-reread` exclude each other.
 
 ### Approvals on the host
 
@@ -395,11 +405,13 @@ hostrun --ask git rebase -i main
   session serves this devcontainer`.
 - A refusal exits 126 with `refused on the host` and the human's note
   (`hostrun: refused on the host: use git rebase main`).
-- A request waits 10 minutes, or as long as `--ask=<duration>` says (a
-  Go duration: `--ask=3m`, `--ask=90s`); then it is refused with 126
-  `not approved: nobody answered on the host`. A limit that is not a
-  positive duration fails with 125 before connecting; the daemon refuses
-  one over 1 hour with 125. Set it within your tool's timeout.
+- A request waits as long as the daemon's `ask_timeout` (10 minutes
+  unless set, see [Settings](#settings)), or as long as
+  `--ask=<duration>` says (a Go duration: `--ask=3m`, `--ask=90s`);
+  then it is refused with 126 `not approved: nobody answered on the
+  host`. A limit that is not a positive duration fails with 125 before
+  connecting; the daemon refuses one over 1 hour with 125 (`ask_timeout`
+  may be longer). Set it within your tool's timeout.
 - Ctrl+C, or anything else that drops the connection, withdraws the
   request. A session that leaves refuses every request still waiting
   (126 `refused on the host`); a daemon that stops or steps aside

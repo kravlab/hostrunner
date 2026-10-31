@@ -15,7 +15,23 @@ import (
 )
 
 // defaults are the built-in settings of noWorkspace.
-var defaults = settings.Settings{RulesFile: rulesIn(noWorkspace), StartupTimeout: 30 * time.Minute, Grace: 15 * time.Second, Reread: true}
+var defaults = settings.Settings{
+	RulesFile:      rulesIn(noWorkspace),
+	StartupTimeout: 30 * time.Minute,
+	Grace:          15 * time.Second,
+	Reread:         true,
+	PollInterval:   2 * time.Second,
+	AskTimeout:     10 * time.Minute,
+	RequestTimeout: 10 * time.Second,
+	ReadyTimeout:   10 * time.Second,
+}
+
+// tuned is defaults with the keys most tests set given.
+func tuned(rulesFile string, startupTimeout, grace time.Duration, reread bool) settings.Settings {
+	s := defaults
+	s.RulesFile, s.StartupTimeout, s.Grace, s.Reread = rulesFile, startupTimeout, grace, reread
+	return s
+}
 
 // noWorkspace is a workspace where nothing lies: it has no workspace
 // settings file and no section of a host settings file names it.
@@ -40,14 +56,27 @@ func writeFile(t *testing.T, content string) string {
 	return path
 }
 
-// parse registers the settings' flags on a new flag set and parses args
-// with it.
+// parse registers the flags of the settings serve takes on a new flag
+// set and parses args with it.
 func parse(t *testing.T, args ...string) *settings.Flags {
+	t.Helper()
+	return parseWith(t, (*settings.Flags).Register, args...)
+}
+
+// parseUp is parse for the settings up takes, ready_timeout too.
+func parseUp(t *testing.T, args ...string) *settings.Flags {
+	t.Helper()
+	return parseWith(t, (*settings.Flags).RegisterUp, args...)
+}
+
+// parseWith registers flags with register on a new flag set and parses
+// args with it.
+func parseWith(t *testing.T, register func(*settings.Flags, *flag.FlagSet), args ...string) *settings.Flags {
 	t.Helper()
 	var f settings.Flags
 	fs := flag.NewFlagSet("test", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	f.Register(fs)
+	register(&f, fs)
 	if err := fs.Parse(args); err != nil {
 		t.Fatal(err)
 	}
@@ -75,10 +104,10 @@ func TestResolveTakesEachKeyFromTheHighestSourceSettingIt(t *testing.T) {
 		want  settings.Settings
 	}{
 		{"defaults", "", nil, nil, defaults},
-		{"file over defaults", file, nil, nil, settings.Settings{RulesFile: defaults.RulesFile, StartupTimeout: time.Hour, Grace: time.Minute, Reread: false}},
-		{"variables over file", file, vars, nil, settings.Settings{RulesFile: defaults.RulesFile, StartupTimeout: 2 * time.Hour, Grace: 2 * time.Minute, Reread: true}},
-		{"flags over variables", file, vars, flags, settings.Settings{RulesFile: defaults.RulesFile, StartupTimeout: 3 * time.Hour, Grace: 3 * time.Minute, Reread: false}},
-		{"one key per source", "grace: 1m\n", map[string]string{"HOSTRUNNER_REREAD": "false"}, []string{"--startup-timeout", "1h"}, settings.Settings{RulesFile: defaults.RulesFile, StartupTimeout: time.Hour, Grace: time.Minute, Reread: false}},
+		{"file over defaults", file, nil, nil, tuned(defaults.RulesFile, time.Hour, time.Minute, false)},
+		{"variables over file", file, vars, nil, tuned(defaults.RulesFile, 2*time.Hour, 2*time.Minute, true)},
+		{"flags over variables", file, vars, flags, tuned(defaults.RulesFile, 3*time.Hour, 3*time.Minute, false)},
+		{"one key per source", "grace: 1m\n", map[string]string{"HOSTRUNNER_REREAD": "false"}, []string{"--startup-timeout", "1h"}, tuned(defaults.RulesFile, time.Hour, time.Minute, false)},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -96,12 +125,26 @@ func TestResolveTakesEachKeyFromTheHighestSourceSettingIt(t *testing.T) {
 }
 
 func TestResolveReadsEveryVariable(t *testing.T) {
-	got, err := parse(t).Resolve(env(map[string]string{
+	got, err := parseUp(t).Resolve(env(map[string]string{
+		"HOSTRUNNER_RULES_FILE":      "/r/hostrun.yaml",
 		"HOSTRUNNER_STARTUP_TIMEOUT": "45m",
 		"HOSTRUNNER_GRACE":           "1m30s",
 		"HOSTRUNNER_REREAD":          "0",
+		"HOSTRUNNER_POLL_INTERVAL":   "5s",
+		"HOSTRUNNER_ASK_TIMEOUT":     "20m",
+		"HOSTRUNNER_REQUEST_TIMEOUT": "30s",
+		"HOSTRUNNER_READY_TIMEOUT":   "1m",
 	}), noWorkspace)
-	want := settings.Settings{RulesFile: defaults.RulesFile, StartupTimeout: 45 * time.Minute, Grace: 90 * time.Second, Reread: false}
+	want := settings.Settings{
+		RulesFile:      "/r/hostrun.yaml",
+		StartupTimeout: 45 * time.Minute,
+		Grace:          90 * time.Second,
+		Reread:         false,
+		PollInterval:   5 * time.Second,
+		AskTimeout:     20 * time.Minute,
+		RequestTimeout: 30 * time.Second,
+		ReadyTimeout:   time.Minute,
+	}
 	if err != nil || got != want {
 		t.Fatalf("got %+v, %v; want %+v", got, err, want)
 	}
@@ -123,10 +166,14 @@ func TestResolveRejectsAnInvalidVariable(t *testing.T) {
 		{"zero duration", "HOSTRUNNER_GRACE", "0s", `HOSTRUNNER_GRACE: must be positive`},
 		{"negative duration", "HOSTRUNNER_STARTUP_TIMEOUT", "-5m", `HOSTRUNNER_STARTUP_TIMEOUT: must be positive`},
 		{"unparsable bool", "HOSTRUNNER_REREAD", "maybe", `HOSTRUNNER_REREAD: invalid bool "maybe"`},
+		{"zero poll interval", "HOSTRUNNER_POLL_INTERVAL", "0s", `HOSTRUNNER_POLL_INTERVAL: must be positive`},
+		{"unparsable ask timeout", "HOSTRUNNER_ASK_TIMEOUT", "soon", `HOSTRUNNER_ASK_TIMEOUT: invalid duration "soon"`},
+		{"request timeout without unit", "HOSTRUNNER_REQUEST_TIMEOUT", "10", `HOSTRUNNER_REQUEST_TIMEOUT: invalid duration "10"`},
+		{"negative ready timeout", "HOSTRUNNER_READY_TIMEOUT", "-1s", `HOSTRUNNER_READY_TIMEOUT: must be positive`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := parse(t).Resolve(env(map[string]string{tt.variable: tt.value}), noWorkspace)
+			_, err := parseUp(t).Resolve(env(map[string]string{tt.variable: tt.value}), noWorkspace)
 			if err == nil || !strings.HasPrefix(err.Error(), tt.want) {
 				t.Fatalf("got %v, want an error starting with %q", err, tt.want)
 			}
@@ -140,8 +187,21 @@ func TestResolveRejectsAnInvalidVariable(t *testing.T) {
 // givenRules is the rules file everyKey gives.
 const givenRules = "/given/hostrun.yaml"
 
-// everyKey gives every setting as a flag.
-var everyKey = []string{"--rules-file", givenRules, "--startup-timeout", "1h", "--grace", "1m", "--no-reread"}
+// daemonFlags gives every setting but the rules file and reread that
+// serve takes as a flag; givenTimings is what they give.
+var daemonFlags = []string{"--startup-timeout", "1h", "--grace", "1m", "--poll-interval", "5s", "--ask-timeout", "20m", "--request-timeout", "30s"}
+
+// givenTimings is defaults with what daemonFlags gives, the rules file
+// given and reread off.
+func givenTimings(rulesFile string) settings.Settings {
+	s := tuned(rulesFile, time.Hour, time.Minute, false)
+	s.PollInterval, s.AskTimeout, s.RequestTimeout = 5*time.Second, 20*time.Minute, 30*time.Second
+	return s
+}
+
+// everyKey gives every setting serve takes as a flag: all but
+// ready_timeout, which is up's own.
+var everyKey = append([]string{"--rules-file", givenRules, "--no-reread"}, daemonFlags...)
 
 // Resolve reads every source even when the flags set every key: a
 // missing named file, a broken file or an invalid variable is an error.
@@ -173,12 +233,12 @@ func TestResolveAsGivenReadsNoOtherSourceWhenFlagsSetEveryKey(t *testing.T) {
 		return ""
 	}
 	got, err := parse(t, append(everyKey, "--settings", writeFile(t, "grase: [\n"))...).ResolveAsGiven(getenv, noWorkspace)
-	want := settings.Settings{RulesFile: givenRules, StartupTimeout: time.Hour, Grace: time.Minute, Reread: false}
+	want := givenTimings(givenRules)
 	if err != nil || got != want {
 		t.Fatalf("got %+v, %v; want %+v", got, err, want)
 	}
 	// --config gives rules_file as --rules-file does.
-	got, err = parse(t, "--config", givenRules, "--startup-timeout", "1h", "--grace", "1m", "--no-reread").ResolveAsGiven(getenv, noWorkspace)
+	got, err = parse(t, append([]string{"--config", givenRules, "--no-reread"}, daemonFlags...)...).ResolveAsGiven(getenv, noWorkspace)
 	if err != nil || got != want {
 		t.Fatalf("--config: got %+v, %v; want %+v", got, err, want)
 	}
@@ -188,15 +248,18 @@ func TestResolveAsGivenReadsNoOtherSourceWhenFlagsSetEveryKey(t *testing.T) {
 func TestResolveAsGivenReadsEverySourceWhenAFlagIsMissing(t *testing.T) {
 	path := writeFile(t, "grace: 2m\n")
 	got, err := parse(t, "--startup-timeout", "1h", "--reread").ResolveAsGiven(env(map[string]string{"HOSTRUNNER_SETTINGS": path}), noWorkspace)
-	want := settings.Settings{RulesFile: defaults.RulesFile, StartupTimeout: time.Hour, Grace: 2 * time.Minute, Reread: true}
+	want := tuned(defaults.RulesFile, time.Hour, 2*time.Minute, true)
 	if err != nil || got != want {
 		t.Fatalf("got %+v, %v; want %+v", got, err, want)
 	}
 	if _, err := parse(t, "--grace", "1m").ResolveAsGiven(env(map[string]string{"HOSTRUNNER_GRACE": "abc"}), noWorkspace); err == nil {
 		t.Fatal("got no error for an invalid variable")
 	}
-	if _, err := parse(t, "--startup-timeout", "1h", "--grace", "1m", "--reread").ResolveAsGiven(env(map[string]string{"HOSTRUNNER_GRACE": "abc"}), noWorkspace); err == nil {
+	if _, err := parse(t, append([]string{"--reread"}, daemonFlags...)...).ResolveAsGiven(env(map[string]string{"HOSTRUNNER_GRACE": "abc"}), noWorkspace); err == nil {
 		t.Fatal("without --rules-file: got no error for an invalid variable")
+	}
+	if _, err := parse(t, "--rules-file", givenRules, "--reread", "--startup-timeout", "1h", "--grace", "1m").ResolveAsGiven(env(map[string]string{"HOSTRUNNER_GRACE": "abc"}), noWorkspace); err == nil {
+		t.Fatal("without --poll-interval, --ask-timeout and --request-timeout: got no error for an invalid variable")
 	}
 }
 
@@ -242,9 +305,16 @@ func TestResolveTakesTheRulesFileFromEverySource(t *testing.T) {
 	}
 }
 
-func TestUsageNamesEveryFlag(t *testing.T) {
-	want := "[--settings <path>] [--workspace-settings <path>] [--rules-file <path>] [--startup-timeout <duration>] [--grace <duration>] [--reread | --no-reread]"
+func TestUsageNamesEveryFlagServeTakes(t *testing.T) {
+	want := "[--settings <path>] [--workspace-settings <path>] [--rules-file <path>] [--startup-timeout <duration>] [--grace <duration>] [--reread | --no-reread] [--poll-interval <duration>] [--ask-timeout <duration>] [--request-timeout <duration>]"
 	if got := settings.Usage(); got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestUpUsageAlsoNamesTheReadyTimeout(t *testing.T) {
+	want := settings.Usage() + " [--ready-timeout <duration>]"
+	if got := settings.UpUsage(); got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}
 }

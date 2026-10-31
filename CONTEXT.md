@@ -150,6 +150,10 @@ takes no new requests and finishes the running ones.
 How long a waiting daemon waits for its armed container
 before it exits.
 
+**Ready timeout**:
+How long `hostrunner up` waits for the daemon it starts to
+listen; it tunes `up`, not the daemon.
+
 **Runtime directory**:
 The host directory, one per devcontainer, that holds a
 daemon's socket, the hostrun client and the daemon log, and
@@ -190,6 +194,12 @@ its path is given; what it sets overrides the host settings file.
 A command the rules do not let through, sent with `--ask` and
 waiting for a human's answer.
 _Avoid_: prompt, confirmation
+
+**Ask timeout**:
+How long an approval request waits for a human's answer when
+hostrun sets no limit; the host chooses it, and it may exceed
+the longest limit hostrun may set.
+_Avoid_: approval timeout
 
 **Approval session**:
 The host terminal process, `hostrunner approve`, in which a

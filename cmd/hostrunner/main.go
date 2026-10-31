@@ -92,18 +92,18 @@ const (
 // The usages of the commands with settings, whose flags settings.Usage
 // names.
 var (
-	upUsage    = "usage: hostrunner up [--restart [--kill | --wait]] " + settings.Usage() + " --dir <runtime-dir> --workspace <host-path> --container-workspace <path>"
+	upUsage    = "usage: hostrunner up [--restart [--kill | --wait]] " + settings.UpUsage() + " --dir <runtime-dir> --workspace <host-path> --container-workspace <path>"
 	serveUsage = "usage: hostrunner serve --socket <path> --workspace <host-path> --container-workspace <path> [--watch] " + settings.Usage()
 	testUsage  = "usage: hostrunner test " + settings.RulesFileUsage() + " [--] <command> [args...]"
 )
 
-// Defaults for following the container (see internal/watch); the
-// startup timeout and the grace are settings (see internal/settings).
+// Timeouts that are not settings (see internal/settings). readyTimeout
+// is how long `restart` waits for the daemon it starts, the default
+// ready_timeout, until restart resolves the settings.
 const (
-	defaultPollInterval = 2 * time.Second
-	queryTimeout        = 10 * time.Second // one docker/podman ps call
-	readyTimeout        = 10 * time.Second // how long `up` waits for the daemon
-	updateTimeout       = 5 * time.Minute  // `update`'s version lookup and downloads
+	queryTimeout  = 10 * time.Second // one docker/podman ps call
+	readyTimeout  = 10 * time.Second // how long `restart` waits for the daemon
+	updateTimeout = 5 * time.Minute  // `update`'s version lookup and downloads
 )
 
 func main() {
@@ -278,7 +278,7 @@ func parseUp(args []string, exe string, getenv func(string) string, output io.Wr
 	fs.StringVar(&dir, "dir", "", "per-container runtime directory (mounted at /run/hostrunner)")
 	ws.register(fs)
 	fs.BoolVar(&restart, "restart", false, "replace the daemon serving the runtime directory, if any, with a new one")
-	sf.Register(fs)
+	sf.RegisterUp(fs)
 	registerAnswer(fs, &kill, &wait)
 	if err := parseFlags(fs, args, upUsage); err != nil {
 		return upConfig{}, err
@@ -304,13 +304,12 @@ func parseUp(args []string, exe string, getenv func(string) string, output io.Wr
 }
 
 // daemonBinaries is the part of a launch.Config that `up` and `restart`
-// share: the hostrunner at exe started as the daemon, the hostrun beside
-// it installed as the client, and how long the daemon may take to listen.
+// share: the hostrunner at exe started as the daemon and the hostrun
+// beside it installed as the client.
 func daemonBinaries(exe string) launch.Config {
 	return launch.Config{
-		Daemon:       exe,
-		Client:       filepath.Join(filepath.Dir(exe), launch.ClientName),
-		ReadyTimeout: readyTimeout,
+		Daemon: exe,
+		Client: filepath.Join(filepath.Dir(exe), launch.ClientName),
 	}
 }
 
@@ -391,7 +390,7 @@ func parseStop(name string, args []string, exe string, output io.Writer) (stop.C
 	}
 	if name == "restart" {
 		b := daemonBinaries(exe)
-		cfg.Restart = &stop.Restart{Daemon: b.Daemon, Client: b.Client, ReadyTimeout: b.ReadyTimeout}
+		cfg.Restart = &stop.Restart{Daemon: b.Daemon, Client: b.Client, ReadyTimeout: readyTimeout}
 	}
 	return cfg, nil
 }
@@ -416,9 +415,8 @@ func stopCommands(answer stop.Answer) (ctx context.Context, commands stop.Comman
 type serveConfig struct {
 	socket string // Unix socket to listen on
 	workspaceFlags
-	watch             bool          // exit once the armed container stops
-	pollInterval      time.Duration // how often runtimes are asked (with watch) and the rules file is looked at (not a flag)
-	settings.Settings               // rules file, startup timeout and grace (with watch), reread
+	watch             bool // exit once the armed container stops
+	settings.Settings      // the daemon's settings
 }
 
 // parseServe parses the flags of `hostrunner serve`; the socket and both
@@ -427,7 +425,7 @@ type serveConfig struct {
 // serve runs like one `up` starts; given all of them, as `up` does, it
 // reads no other source.
 func parseServe(args []string, getenv func(string) string, output io.Writer) (serveConfig, error) {
-	cfg := serveConfig{pollInterval: defaultPollInterval}
+	var cfg serveConfig
 	var sf settings.Flags
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	fs.SetOutput(output)
@@ -638,7 +636,7 @@ func isTerminal(f *os.File) bool {
 // The rules file is read here: an invalid file stops the daemon from
 // starting (fail closed), a missing one makes it deny every command. Later
 // edits, e.g. by a `git pull` on the host, are reread once the daemon sees
-// the file changed (every pollInterval); without Reread they take effect
+// the file changed (every PollInterval); without Reread they take effect
 // only in a new daemon, except that an approval session which adds a rule
 // makes the daemon reread the file. The digest of the rules reread is the
 // one arms compare.
@@ -675,7 +673,7 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 	if cfg.watch {
 		watcher = watch.New(runtimes, watch.Config{
 			Workspace:      cfg.workspace,
-			PollInterval:   cfg.pollInterval,
+			PollInterval:   cfg.PollInterval,
 			QueryTimeout:   queryTimeout,
 			StartupTimeout: cfg.StartupTimeout,
 			Grace:          cfg.Grace,
@@ -694,9 +692,15 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 		}
 		return p, p.Digest(), nil
 	}
-	opts := []daemon.Option{daemon.WithArmHandler(armHandler(cfg.RulesFile, cfg.Reread, watcher, log)), daemon.WithApprovals(al, cfg.RulesFile), daemon.WithReread(policy.Digest(), reread)}
+	opts := []daemon.Option{
+		daemon.WithArmHandler(armHandler(cfg.RulesFile, cfg.Reread, watcher, log)),
+		daemon.WithApprovals(al, cfg.RulesFile),
+		daemon.WithReread(policy.Digest(), reread),
+		daemon.WithAskTimeout(cfg.AskTimeout),
+		daemon.WithRequestTimeout(cfg.RequestTimeout),
+	}
 	if cfg.Reread {
-		opts = append(opts, daemon.WithRereadEvery(cfg.pollInterval))
+		opts = append(opts, daemon.WithRereadEvery(cfg.PollInterval))
 	}
 	if watcher != nil {
 		opts = append(opts, daemon.WithContainerStopped(watcher.ContainerStopped))

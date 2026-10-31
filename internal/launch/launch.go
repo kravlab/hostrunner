@@ -68,14 +68,15 @@ const logTailSize = 2048
 
 // Config describes one `hostrunner up` invocation.
 type Config struct {
-	Dir                string        // runtime directory, e.g. $XDG_RUNTIME_DIR/hostrunner/<devcontainerId>
-	Workspace          string        // workspace folder on the host
-	ContainerWorkspace string        // the same folder inside the container
-	Daemon             string        // hostrunner executable to start as the daemon
-	Client             string        // hostrun binary to install into Dir
-	ReadyTimeout       time.Duration // how long to wait for the daemon's socket
-	// Settings are the daemon's settings, each given as its flag; a
-	// duration left zero leaves it to the daemon.
+	Dir                string // runtime directory, e.g. $XDG_RUNTIME_DIR/hostrunner/<devcontainerId>
+	Workspace          string // workspace folder on the host
+	ContainerWorkspace string // the same folder inside the container
+	Daemon             string // hostrunner executable to start as the daemon
+	Client             string // hostrun binary to install into Dir
+	// Settings are the settings up resolved. Each the daemon takes is
+	// given to it as its flag, a duration left zero leaving it to the
+	// daemon; ReadyTimeout, up's own, is how long to wait for the
+	// daemon's socket and is not passed on.
 	settings.Settings
 }
 
@@ -350,10 +351,11 @@ func startDaemon(ctx context.Context, cfg Config, socket, digest string) error {
 }
 
 // serveArgs is the command line of the daemon cfg describes, listening
-// on socket. Every setting is an explicit flag, so the daemon's argv shows
-// what it runs with and it resolves none again; rereading is given both
-// ways (--reread or --no-reread). A duration left zero, by a restart that
-// resolves no settings, is no flag: the daemon resolves it itself.
+// on socket. Every setting serve takes is an explicit flag, so the
+// daemon's argv shows what it runs with and it resolves none again;
+// rereading is given both ways (--reread or --no-reread). A duration left
+// zero, by a restart that resolves no settings, is no flag: the daemon
+// resolves it itself.
 func serveArgs(cfg Config, socket string) []string {
 	args := []string{"serve",
 		"--socket", socket,
@@ -366,6 +368,15 @@ func serveArgs(cfg Config, socket string) []string {
 	}
 	if cfg.Grace > 0 {
 		args = append(args, "--grace", cfg.Grace.String())
+	}
+	if cfg.PollInterval > 0 {
+		args = append(args, "--poll-interval", cfg.PollInterval.String())
+	}
+	if cfg.AskTimeout > 0 {
+		args = append(args, "--ask-timeout", cfg.AskTimeout.String())
+	}
+	if cfg.RequestTimeout > 0 {
+		args = append(args, "--request-timeout", cfg.RequestTimeout.String())
 	}
 	if cfg.Reread {
 		return append(args, "--reread")

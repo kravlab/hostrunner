@@ -11,9 +11,9 @@ import (
 // readWorkspaceFile reads the workspace settings file workspaceFile
 // names, which holds the keys at its top level and no sections. A missing
 // default file sets nothing, a missing named one is an error.
-func readWorkspaceFile(named, workspace string, getenv func(string) string) (layer, error) {
+func readWorkspaceFile(in scopes, named, workspace string, getenv func(string) string) (layer, error) {
 	path, required := workspaceFile(named, workspace, getenv)
-	l, _, err := readNamed(path, required, false)
+	l, _, err := readNamed(in, path, required, false)
 	return l, err
 }
 
