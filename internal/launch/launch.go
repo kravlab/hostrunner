@@ -75,8 +75,9 @@ type Config struct {
 	Client             string // hostrun binary to install into Dir
 	// Settings are the settings up resolved. Each the daemon takes is
 	// given to it as its flag, a duration left zero leaving it to the
-	// daemon; ReadyTimeout, up's own, is how long to wait for the
-	// daemon's socket and is not passed on.
+	// daemon, and carried in every arm, but such a duration;
+	// ReadyTimeout, up's own, is how long to wait for the daemon's socket
+	// and is not passed on.
 	settings.Settings
 }
 
@@ -130,7 +131,7 @@ func Prepare(cfg Config) (*Prepared, error) {
 // (see LockDir): restart, which stopped the daemon under it.
 func (p *Prepared) UpLocked(ctx context.Context) error {
 	cfg, socket, digest := p.cfg, p.socket, p.digest
-	stepAside, err := arm(ctx, socket, digest, cfg.Reread)
+	stepAside, err := arm(ctx, socket, digest, cfg.Settings)
 	switch {
 	case err == nil && !stepAside:
 		return nil
@@ -210,13 +211,15 @@ func lockDir(dir string, how int) (unlock func(), busy bool, err error) {
 }
 
 // arm asks the daemon on socket to wait for its devcontainer again, telling
-// it the digest of the current rules and whether it is to reread them by
-// itself. stepAside reports that the daemon will not follow the arm (it
-// runs other rules or the other setting, or its watch has ended) and is
-// stopping. err wraps errNotListening when nothing
-// accepts connections, and is another error when something listens but does
-// not arm.
-func arm(ctx context.Context, socket, digest string, reread bool) (stepAside bool, err error) {
+// it the digest of the current rules, the daemon settings of s (see
+// settings.Settings.Daemon; a setting left out of them is not compared)
+// and, for a daemon that predates the settings, whether it is to reread
+// the rules by itself. stepAside reports that the daemon will not follow
+// the arm (it runs other rules or other settings, or its watch has ended)
+// and is stopping. err wraps errNotListening when nothing accepts
+// connections, and is another error when something listens but does not
+// arm.
+func arm(ctx context.Context, socket, digest string, s settings.Settings) (stepAside bool, err error) {
 	ctx, cancel := context.WithTimeout(ctx, armTimeout)
 	defer cancel()
 	c, err := transport.Unix{Path: socket}.Dial(ctx)
@@ -227,7 +230,7 @@ func arm(ctx context.Context, socket, digest string, reread bool) (stepAside boo
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = c.SetDeadline(deadline)
 	}
-	if err := protocol.WriteJSON(c, protocol.FrameArm, protocol.Arm{Version: protocol.Version, ConfigDigest: digest, NoReread: !reread}); err != nil {
+	if err := protocol.WriteJSON(c, protocol.FrameArm, protocol.Arm{Version: protocol.Version, ConfigDigest: digest, NoReread: !s.Reread, Settings: s.Daemon()}); err != nil {
 		return false, fmt.Errorf("daemon on %s did not accept the arm request: %w", socket, err)
 	}
 	f, err := protocol.ReadFrame(c)
@@ -335,7 +338,7 @@ func startDaemon(ctx context.Context, cfg Config, socket, digest string) error {
 			_ = cmd.Process.Kill()
 			return ctx.Err()
 		case <-ticker.C:
-			stepAside, err := arm(ctx, socket, digest, cfg.Reread)
+			stepAside, err := arm(ctx, socket, digest, cfg.Settings)
 			if err == nil && !stepAside {
 				return nil
 			}

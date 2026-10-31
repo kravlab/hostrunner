@@ -150,11 +150,18 @@ type Request struct {
 // `hostrunner up` does on every container start. ConfigDigest identifies the
 // rules file `up` just validated (rules.Policy.Digest), so a daemon running
 // older rules can step aside; NoReread is the `up`'s --no-reread, so a
-// daemon that rereads its rules file otherwise can too.
+// daemon that rereads its rules file otherwise can too. Settings are the
+// daemon settings `up` resolved, key to value text, as
+// settings.Settings.Daemon writes them, so a daemon running with others
+// steps aside too. A daemon that predates them ignores the field and
+// still reads NoReread, which Settings' reread then repeats; an arm
+// without the field, from an `up` that predates it, has the daemon
+// compare no setting.
 type Arm struct {
-	Version      int    `json:"version"`
-	ConfigDigest string `json:"config_digest"`
-	NoReread     bool   `json:"no_reread,omitempty"`
+	Version      int               `json:"version"`
+	ConfigDigest string            `json:"config_digest"`
+	NoReread     bool              `json:"no_reread,omitempty"`
+	Settings     map[string]string `json:"settings,omitempty"`
 }
 
 // Armed answers Arm. Restart means the daemon steps aside: it will not

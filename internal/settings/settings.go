@@ -89,6 +89,32 @@ func flagDefaults() Settings {
 	return s
 }
 
+// Daemon returns the settings serve takes, keyed by their names, each
+// value written as a settings file writes it (`1m30s`, `true`, a path):
+// what an arm of up carries to the daemon, and what the daemon compares
+// it with. A duration of zero, which no source gives, is not set
+// (restart's, until it resolves the settings) and is left out; a string
+// is always kept, even an empty one.
+func (s Settings) Daemon() map[string]string {
+	daemonKeys := keysOf(scopeDaemon)
+	out := make(map[string]string, len(daemonKeys))
+	for _, k := range daemonKeys {
+		switch p := k.field(&s).(type) {
+		case *string:
+			out[k.name] = *p
+		case *time.Duration:
+			if *p != 0 {
+				out[k.name] = p.String()
+			}
+		case *bool:
+			out[k.name] = strconv.FormatBool(*p)
+		default:
+			panic(fmt.Sprintf("settings: key %s has a field of type %T", k.name, p))
+		}
+	}
+	return out
+}
+
 // layer is what one source sets: values by key name (as in a settings
 // file), each a string, a time.Duration or a bool as its key's kind
 // says. A key the source does not set is absent.

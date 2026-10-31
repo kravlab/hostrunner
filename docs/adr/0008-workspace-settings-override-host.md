@@ -29,3 +29,7 @@ settings file.
 - `ready_timeout` tunes `up`, not the daemon: `up` reads it from every
   source like the daemon's settings, while `serve` neither reads nor
   checks it.
+- As the workspace settings file can change a daemon's settings between
+  two container starts, the arm of `up` carries the daemon settings it
+  resolved, and a daemon running with others steps aside: a settings
+  edit applies on the next container start.

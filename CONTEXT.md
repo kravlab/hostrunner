@@ -103,7 +103,9 @@ lives as long as its armed container.
 
 **Arm**:
 The signal `hostrunner up` gives the daemon each time the
-devcontainer tooling brings a container of its workspace up.
+devcontainer tooling brings a container of its workspace up,
+carrying the digest of the rules and the daemon settings it
+resolved.
 _Avoid_: rearm
 
 **Armed container**:

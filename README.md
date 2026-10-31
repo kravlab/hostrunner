@@ -102,12 +102,13 @@ not checked: use the manual steps above for `gh attestation verify`.
 
 A running daemon keeps the old version until it exits after its
 container stops; a container restart or rebuild before that reuses it
-with the old `hostrun`, unless the rules changed while it ran with
-`--no-reread` (it rereads them otherwise): then the new version takes
-over. The first `hostrunner up` after it has exited runs the new
-version, and `hostrunner restart` (see
-[Stop and restart](#stop-and-restart)) switches a running daemon at once. A `hostrunner up` already in progress during the update may
-fail; run it again.
+with the old `hostrun`, unless the next `hostrunner up` resolves other
+settings or, when it ran with `--no-reread`, the rules changed (it
+rereads them otherwise): then the new version takes over. The first
+`hostrunner up` after it has exited runs the new version, and
+`hostrunner restart` (see [Stop and restart](#stop-and-restart))
+switches a running daemon at once. A `hostrunner up` already in progress
+during the update may fail; run it again.
 
 ## Use in a devcontainer
 
@@ -286,7 +287,11 @@ workspaces./home/u/other: grase: unknown key`, `HOSTRUNNER_GRACE:
 invalid duration "abc"`). `up` resolves the settings and starts the
 daemon with every one as a flag but `ready_timeout`, its own, so its
 command line shows them; `hostrunner serve` started by hand resolves
-them the same way, without reading or checking `ready_timeout`.
+them the same way, without reading or checking `ready_timeout`. A
+settings edit applies on the next container start (reopen, container
+restart or rebuild): `up` tells the running daemon the settings it
+resolved, and a daemon running with others steps aside for a new one,
+as for changed rules; it compares only the settings the arm carries.
 `hostrunner restart` waits 10 seconds for the new daemon, whatever
 `ready_timeout` says. `--reread` and `--no-reread` exclude each other.
 

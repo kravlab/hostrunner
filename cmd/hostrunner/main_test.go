@@ -149,6 +149,25 @@ func TestParseUpBuildsLaunchConfig(t *testing.T) {
 	}
 }
 
+// up and serve make a relative --workspace absolute against the current
+// directory, so both resolve the same rules file, and their settings
+// match on every arm.
+func TestUpAndServeMakeTheWorkspaceAbsolute(t *testing.T) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ws := filepath.Join(cwd, "app")
+	up, err := parseUp([]string{"--dir", "/d", "--workspace", "app", "--container-workspace", "/c"}, "/bin/hostrunner", noEnv, io.Discard)
+	if err != nil || up.launch.Workspace != ws || up.launch.RulesFile != filepath.Join(ws, ".devcontainer", "hostrun.yaml") {
+		t.Fatalf("up: got %q and %q, %v; want %q", up.launch.Workspace, up.launch.RulesFile, err, ws)
+	}
+	serve, err := parseServe([]string{"--socket", "/run/h.sock", "--workspace", "app", "--container-workspace", "/c"}, noEnv, io.Discard)
+	if err != nil || serve.workspace != ws || serve.RulesFile != filepath.Join(ws, ".devcontainer", "hostrun.yaml") {
+		t.Fatalf("serve: got %q and %q, %v; want %q", serve.workspace, serve.RulesFile, err, ws)
+	}
+}
+
 func TestParseUpRequiresEveryFlag(t *testing.T) {
 	full := map[string]string{"--dir": "/d", "--workspace": "/w", "--container-workspace": "/c"}
 	for missing := range full {
@@ -748,12 +767,19 @@ func rulesDigest(t *testing.T, cfg serveConfig) string {
 // stepped aside.
 func armServe(t *testing.T, cfg serveConfig, digest string) bool {
 	t.Helper()
+	return armServeWith(t, cfg, digest, nil)
+}
+
+// armServeWith is armServe for an arm that carries the given daemon
+// settings.
+func armServeWith(t *testing.T, cfg serveConfig, digest string, carried map[string]string) bool {
+	t.Helper()
 	c, err := transport.Unix{Path: cfg.socket}.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	if err := protocol.WriteJSON(c, protocol.FrameArm, protocol.Arm{Version: protocol.Version, ConfigDigest: digest}); err != nil {
+	if err := protocol.WriteJSON(c, protocol.FrameArm, protocol.Arm{Version: protocol.Version, ConfigDigest: digest, Settings: carried}); err != nil {
 		t.Fatal(err)
 	}
 	f, err := protocol.ReadFrame(c)
@@ -775,7 +801,7 @@ func TestArmHandlerStepsAsideOnceTheWatchEnded(t *testing.T) {
 		go func() { done <- w.Run(ctx) }()
 		synctest.Wait() // the watch runs, waiting for its next poll
 
-		onArm := armHandler("rules.yaml", true, w, discard)
+		onArm := armHandler("rules.yaml", true, noSettings, w, discard)
 		if onArm(protocol.Arm{ConfigDigest: "digest"}, "digest") {
 			t.Fatal("stepped aside while the watch runs")
 		}
@@ -793,7 +819,7 @@ func TestArmHandlerStepsAsideOnceTheWatchEnded(t *testing.T) {
 // step aside, so the new setting takes effect.
 func TestArmHandlerStepsAsideWhenRereadingDiffers(t *testing.T) {
 	for _, noReread := range []bool{false, true} {
-		onArm := armHandler("rules.yaml", !noReread, nil, slog.New(slog.DiscardHandler))
+		onArm := armHandler("rules.yaml", !noReread, noSettings, nil, slog.New(slog.DiscardHandler))
 		if !onArm(protocol.Arm{ConfigDigest: "digest", NoReread: !noReread}, "digest") {
 			t.Errorf("daemon noReread=%v kept running for an arm with the other setting", noReread)
 		}
@@ -829,8 +855,46 @@ func TestServeSaysWhetherItRereads(t *testing.T) {
 	}
 }
 
+// noSettings are the daemon settings of an armHandler whose tests carry
+// none in their arms.
+var noSettings map[string]string
+
+// with is m with key set to value, m unchanged.
+func with(m map[string]string, key, value string) map[string]string {
+	out := maps.Clone(m)
+	out[key] = value
+	return out
+}
+
+// An arm carrying daemon settings other than the daemon's makes it step
+// aside, so a settings edit applies on the next container start; the
+// daemon compares only the settings the arm carries, and an arm with
+// none, from an up that predates them, compares nothing.
+func TestArmHandlerStepsAsideWhenSettingsDiffer(t *testing.T) {
+	own := map[string]string{"rules_file": "/w/rules.yaml", "grace": "15s", "reread": "true"}
+	onArm := armHandler("rules.yaml", true, own, nil, slog.New(slog.DiscardHandler))
+	for _, tt := range []struct {
+		name      string
+		carried   map[string]string
+		stepAside bool
+	}{
+		{"same settings", own, false},
+		{"a subset of the same", map[string]string{"rules_file": "/w/rules.yaml"}, false},
+		{"none", nil, false},
+		{"another duration", with(own, "grace", "1m0s"), true},
+		{"another path", with(own, "rules_file", "/w/other.yaml"), true},
+		{"another bool", with(own, "reread", "false"), true},
+		{"an unknown key", with(own, "new_key", "x"), true},
+		{"an empty unknown key", with(own, "new_key", ""), true},
+	} {
+		if got := onArm(protocol.Arm{ConfigDigest: "digest", Settings: tt.carried}, "digest"); got != tt.stepAside {
+			t.Errorf("%s: stepped aside %v, want %v", tt.name, got, tt.stepAside)
+		}
+	}
+}
+
 func TestArmHandlerStepsAsideWhenRulesChanged(t *testing.T) {
-	onArm := armHandler("rules.yaml", true, nil, slog.New(slog.DiscardHandler))
+	onArm := armHandler("rules.yaml", true, noSettings, nil, slog.New(slog.DiscardHandler))
 	if !onArm(protocol.Arm{ConfigDigest: "other"}, "digest") {
 		t.Fatal("kept running with other rules")
 	}
@@ -848,6 +912,33 @@ func TestServeStepsAsideWhenRulesChanged(t *testing.T) {
 		t.Fatal("serve kept running with stale rules")
 	}
 	expectServeExit(t, done, cfg.socket)
+}
+
+// serve keeps running for an arm carrying its own settings and steps
+// aside for one carrying another duration, path or bool.
+func TestServeStepsAsideWhenSettingsDiffer(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		change func(*settings.Settings)
+	}{
+		{"another duration", func(s *settings.Settings) { s.Grace += time.Second }},
+		{"another path", func(s *settings.Settings) { s.RulesFile += ".other" }},
+		{"another bool", func(s *settings.Settings) { s.Reread = !s.Reread }},
+	} {
+		cfg := watchConfig(t)
+		rt := &watchtest.Runtime{}
+		rt.Start("c")
+		done := startServe(t, cfg, rt)
+		if stepAside := armServeWith(t, cfg, rulesDigest(t, cfg), cfg.Settings.Daemon()); stepAside {
+			t.Fatalf("%s: serve stepped aside for its own settings", tt.name)
+		}
+		other := cfg.Settings
+		tt.change(&other)
+		if stepAside := armServeWith(t, cfg, rulesDigest(t, cfg), other.Daemon()); !stepAside {
+			t.Fatalf("%s: serve kept running with other settings", tt.name)
+		}
+		expectServeExit(t, done, cfg.socket)
+	}
 }
 
 // TestParseUpdateFlags checks that --check is the only flag of update.

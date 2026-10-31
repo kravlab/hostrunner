@@ -65,6 +65,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"slices"
 	"syscall"
 	"time"
 
@@ -259,6 +260,18 @@ func (w *workspaceFlags) register(fs *flag.FlagSet) {
 	fs.StringVar(&w.containerWorkspace, "container-workspace", "", "workspace directory inside the container")
 }
 
+// absolute makes the host workspace path absolute against the current
+// directory, so that `up` and the daemon it starts, which may run
+// elsewhere, resolve the same rules file from it.
+func (w *workspaceFlags) absolute() error {
+	abs, err := filepath.Abs(w.workspace)
+	if err != nil {
+		return fmt.Errorf("--workspace: %w", err)
+	}
+	w.workspace = abs
+	return nil
+}
+
 // parseFlags parses args with fs and rejects positional arguments.
 func parseFlags(fs *flag.FlagSet, args []string, usage string) error {
 	if err := fs.Parse(args); err != nil {
@@ -298,6 +311,9 @@ func parseUp(args []string, exe string, getenv func(string) string, output io.Wr
 	}
 	answer, err := parseAnswer(kill, wait, upUsage)
 	if err != nil {
+		return upConfig{}, err
+	}
+	if err := ws.absolute(); err != nil {
 		return upConfig{}, err
 	}
 	s, err := sf.Resolve(getenv, ws.workspace)
@@ -457,6 +473,9 @@ func parseServe(args []string, getenv func(string) string, output io.Writer) (se
 	}
 	if cfg.socket == "" || cfg.workspace == "" || cfg.containerWorkspace == "" {
 		return cfg, errors.New(serveUsage)
+	}
+	if err := cfg.workspaceFlags.absolute(); err != nil {
+		return cfg, err
 	}
 	s, err := sf.ResolveAsGiven(getenv, cfg.workspace)
 	if _, ok := errors.AsType[*settings.FlagError](err); ok {
@@ -731,7 +750,7 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 		return p, p.Digest(), nil
 	}
 	opts := []daemon.Option{
-		daemon.WithArmHandler(armHandler(cfg.RulesFile, cfg.Reread, watcher, log)),
+		daemon.WithArmHandler(armHandler(cfg.RulesFile, cfg.Reread, cfg.Settings.Daemon(), watcher, log)),
 		daemon.WithApprovals(al, cfg.RulesFile),
 		daemon.WithReread(policy.Digest(), reread),
 		daemon.WithAskTimeout(cfg.AskTimeout),
@@ -768,13 +787,16 @@ func checkApprovalSocket(workspace, socket string) error {
 }
 
 // armHandler answers the arms of `hostrunner up`, which arms the daemon on
-// every container start with the digest of the rules it validated; digest
-// is that of the rules the daemon serves from config, which a reread
-// changes. The daemon steps aside for a new one when the digests differ,
-// when the arm's rereading is not the daemon's, reread, or when watcher
-// has ended and will not follow the arm; otherwise watcher, if any, waits
-// for the container of this arm.
-func armHandler(config string, reread bool, watcher *watch.Watcher, log *slog.Logger) func(a protocol.Arm, digest string) (stepAside bool) {
+// every container start with the digest of the rules it validated and
+// the daemon settings it resolved. digest is that of the rules the daemon
+// serves from config, which a reread changes; ownSettings are the
+// daemon's settings (settings.Settings.Daemon). The daemon steps aside
+// for a new one when the digests differ, when the arm's rereading is not
+// the daemon's, reread, when a setting the arm carries is not its own, or
+// when watcher has ended and will not follow the arm; otherwise watcher,
+// if any, waits for the container of this arm. A current `up` carries
+// reread both ways, so a change of it is logged as --no-reread's.
+func armHandler(config string, reread bool, ownSettings map[string]string, watcher *watch.Watcher, log *slog.Logger) func(a protocol.Arm, digest string) (stepAside bool) {
 	return func(a protocol.Arm, digest string) bool {
 		if a.ConfigDigest != digest {
 			log.Info("stepping aside: the rules file changed", "rules_file", config)
@@ -782,6 +804,18 @@ func armHandler(config string, reread bool, watcher *watch.Watcher, log *slog.Lo
 		}
 		if rereads := !a.NoReread; rereads != reread {
 			log.Info("stepping aside: --no-reread changed", "no_reread", a.NoReread)
+			return true
+		}
+		if changed := changedSettings(ownSettings, a.Settings); len(changed) > 0 {
+			var args []any // each key changed, with the daemon's value and the arm's
+			for _, name := range changed {
+				own, ok := ownSettings[name]
+				if !ok {
+					own = "(none)"
+				}
+				args = append(args, name, own+" → "+a.Settings[name])
+			}
+			log.Info("stepping aside: the settings changed", args...)
 			return true
 		}
 		if watcher == nil {
@@ -793,4 +827,18 @@ func armHandler(config string, reread bool, watcher *watch.Watcher, log *slog.Lo
 		}
 		return false
 	}
+}
+
+// changedSettings returns the keys, sorted, of the settings in armed
+// whose value differs from own; a key own lacks differs, whatever its
+// value.
+func changedSettings(own, armed map[string]string) []string {
+	var changed []string
+	for name, v := range armed {
+		if got, ok := own[name]; !ok || got != v {
+			changed = append(changed, name)
+		}
+	}
+	slices.Sort(changed)
+	return changed
 }
