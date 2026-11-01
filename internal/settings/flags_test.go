@@ -32,7 +32,7 @@ func TestFlagsSetOnlyTheKeysGiven(t *testing.T) {
 	}
 	for _, tt := range tests {
 		got, err := parse(t, append(tt.args, "--settings", file)...).Resolve(env(nil), noWorkspace)
-		if err != nil || got != tt.want {
+		if err != nil || got.Settings != tt.want {
 			t.Errorf("%q: got %+v, %v; want %+v", tt.args, got, err, tt.want)
 		}
 	}
@@ -107,7 +107,7 @@ func TestRegisterRulesFileAddsTheFlagsThatChooseTheRulesFile(t *testing.T) {
 	}
 	got, err := f.Resolve(env(map[string]string{"HOSTRUNNER_REREAD": "false"}), noWorkspace)
 	want := tuned("/r.yaml", defaults.StartupTimeout, time.Minute, false)
-	if err != nil || got != want {
+	if err != nil || got.Settings != want {
 		t.Fatalf("got %+v, %v; want %+v", got, err, want)
 	}
 }
@@ -146,7 +146,7 @@ func TestRegisterUpAddsTheReadyTimeout(t *testing.T) {
 	got, err := f.Resolve(env(nil), noWorkspace)
 	want := defaults
 	want.ReadyTimeout = time.Minute
-	if err != nil || got != want {
+	if err != nil || got.Settings != want {
 		t.Fatalf("got %+v, %v; want %+v", got, err, want)
 	}
 }

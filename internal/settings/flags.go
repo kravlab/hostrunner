@@ -54,7 +54,7 @@ func (f *Flags) RegisterUp(fs *flag.FlagSet) {
 // a command that uses no other setting; the other keys serve takes still
 // come from the variables and the files, as for serve.
 func (f *Flags) RegisterRulesFile(fs *flag.FlagSet) {
-	f.register(fs, []key{mustLookup("rules_file")}, scopeDaemon)
+	f.register(fs, []key{mustLookup(rulesFileKey)}, scopeDaemon)
 }
 
 // RegisterStop adds to fs the flags of the settings stop and restart
@@ -121,18 +121,19 @@ func (f *Flags) register(fs *flag.FlagSet, flagged []key, in ...scope) {
 // $HOME/.config/hostrunner/settings.yaml), then the default. Every source
 // is read, even when the flags set every key. A flag that cannot be
 // applied is a *FlagError.
-func (f *Flags) Resolve(getenv func(string) string, workspace string) (Settings, error) {
+func (f *Flags) Resolve(getenv func(string) string, workspace string) (Resolved, error) {
 	in := f.scopes.workspaceSettable()
 	flags, err := f.given(in)
 	if err != nil {
-		return Settings{}, err
+		return Resolved{}, err
 	}
 	return resolve(in, flags, f.file, f.workspaceFile, workspace, getenv)
 }
 
 // ResolveAsGiven is Resolve, except that when the flags set every key
 // serve takes neither the variables nor any file is read: a daemon its
-// `up` started with every setting as a flag runs with them as given.
+// `up` started with every setting as a flag runs with them as given. It
+// returns the Settings alone: serve warns of no ignored rules file.
 func (f *Flags) ResolveAsGiven(getenv func(string) string, workspace string) (Settings, error) {
 	in := f.scopes.workspaceSettable()
 	flags, err := f.given(in)
@@ -141,7 +142,8 @@ func (f *Flags) ResolveAsGiven(getenv func(string) string, workspace string) (Se
 	}
 	for _, k := range keysOf(scopeDaemon) {
 		if _, given := flags[k.name]; !given {
-			return resolve(in, flags, f.file, f.workspaceFile, workspace, getenv)
+			r, err := resolve(in, flags, f.file, f.workspaceFile, workspace, getenv)
+			return r.Settings, err
 		}
 	}
 	s := defaults(workspace)

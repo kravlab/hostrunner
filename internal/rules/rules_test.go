@@ -325,7 +325,7 @@ func TestDigestIdentifiesTheLoadedFile(t *testing.T) {
 // TestExampleConfig keeps the shipped example valid and checks that it
 // blocks the git flags that run arbitrary commands.
 func TestExampleConfig(t *testing.T) {
-	p, err := Load("../../examples/devcontainer/.devcontainer/hostrun.yaml")
+	p, err := Load("../../examples/devcontainer/.devcontainer/hostrunner-rules.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}

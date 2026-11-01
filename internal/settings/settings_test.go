@@ -38,7 +38,7 @@ func tuned(rulesFile string, startupTimeout, grace time.Duration, reread bool) s
 const noWorkspace = "/nonexistent/workspace"
 
 // rulesIn is the default rules file of the workspace at ws.
-func rulesIn(ws string) string { return filepath.Join(ws, ".devcontainer", "hostrun.yaml") }
+func rulesIn(ws string) string { return filepath.Join(ws, ".devcontainer", "hostrunner-rules.yaml") }
 
 // env is a getenv over vars; every other variable is empty.
 func env(vars map[string]string) func(string) string {
@@ -85,7 +85,7 @@ func parseWith(t *testing.T, register func(*settings.Flags, *flag.FlagSet), args
 
 func TestResolveGivesTheDefaultsWhenNoSourceSetsAKey(t *testing.T) {
 	got, err := parse(t).Resolve(env(nil), noWorkspace)
-	if err != nil || got != defaults {
+	if err != nil || got.Settings != defaults {
 		t.Fatalf("got %+v, %v; want %+v", got, err, defaults)
 	}
 }
@@ -117,7 +117,7 @@ func TestResolveTakesEachKeyFromTheHighestSourceSettingIt(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got != tt.want {
+			if got.Settings != tt.want {
 				t.Fatalf("got %+v, want %+v", got, tt.want)
 			}
 		})
@@ -145,14 +145,14 @@ func TestResolveReadsEveryVariable(t *testing.T) {
 		RequestTimeout: 30 * time.Second,
 		ReadyTimeout:   time.Minute,
 	}
-	if err != nil || got != want {
+	if err != nil || got.Settings != want {
 		t.Fatalf("got %+v, %v; want %+v", got, err, want)
 	}
 }
 
 func TestResolveTreatsAnEmptyVariableAsUnset(t *testing.T) {
 	got, err := parse(t).Resolve(env(map[string]string{"HOSTRUNNER_GRACE": "", "HOSTRUNNER_REREAD": ""}), noWorkspace)
-	if err != nil || got != defaults {
+	if err != nil || got.Settings != defaults {
 		t.Fatalf("got %+v, %v; want the defaults", got, err)
 	}
 }

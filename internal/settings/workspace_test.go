@@ -75,7 +75,7 @@ func TestResolveTakesEachKeyFromTheHighestOfFiveSources(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got != tt.want {
+			if got.Settings != tt.want {
 				t.Fatalf("got %+v, want %+v", got, tt.want)
 			}
 		})
@@ -146,7 +146,7 @@ func TestNoSectionAppliesToAMissingWorkspace(t *testing.T) {
 	got, err := parse(t, "--settings", path).Resolve(env(nil), ws)
 	want := defaults
 	want.RulesFile = rulesIn(ws)
-	if err != nil || got != want {
+	if err != nil || got.Settings != want {
 		t.Fatalf("got %+v, %v; want the defaults", got, err)
 	}
 }
@@ -228,7 +228,7 @@ func TestMissingDefaultWorkspaceFileSetsNothing(t *testing.T) {
 	got, err := parse(t).Resolve(env(nil), ws)
 	want := defaults
 	want.RulesFile = rulesIn(ws)
-	if err != nil || got != want {
+	if err != nil || got.Settings != want {
 		t.Fatalf("got %+v, %v; want the defaults", got, err)
 	}
 }

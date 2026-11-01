@@ -100,7 +100,7 @@ type Restart struct {
 	// Settings resolves the new daemon's settings, those of up, for the
 	// host workspace workspace (ready_timeout bounding the wait for its
 	// socket); an error names the source.
-	Settings func(workspace string) (settings.Settings, error)
+	Settings func(workspace string) (settings.Resolved, error)
 	// Runtimes are asked whether the container of a daemon of an older
 	// hostrunner, which does not say, is running.
 	Runtimes []watch.Runtime
@@ -340,7 +340,8 @@ func (t *term) stopDaemon(ctx context.Context, cfg Config, socket string) error 
 // nothing would use them. A daemon still waiting
 // for its container (after an arm, during a rebuild) is replaced by one
 // that waits for it the same way. Not knowing what to start, or whether
-// the container runs, is an error.
+// the container runs, is an error. A restart warns when the new settings
+// leave an older default rules file unread (see warnIgnoredRules).
 func (t *term) ending(ctx context.Context, cfg Config, dir string, info *protocol.DaemonInfo) (ending, error) {
 	if cfg.up != nil {
 		return ending{kind: startNew, up: cfg.up}, nil
@@ -368,18 +369,33 @@ func (t *term) ending(ctx context.Context, cfg Config, dir string, info *protoco
 	if err != nil {
 		return ending{}, fmt.Errorf("%s: %w; the daemon keeps running", name, err)
 	}
+	t.warnIgnoredRules(s)
 	p, err := launch.Prepare(launch.Config{
 		Dir:                dir,
 		Workspace:          info.Workspace,
 		ContainerWorkspace: info.ContainerWorkspace,
 		Daemon:             r.Daemon,
 		Client:             r.Client,
-		Settings:           s,
+		Settings:           s.Settings,
 	})
 	if err != nil {
 		return ending{}, fmt.Errorf("%s: %w; the daemon keeps running", name, err)
 	}
-	return ending{kind: startNew, up: p, changes: changes(info, s)}, nil
+	return ending{kind: startNew, up: p, changes: changes(info, s.Settings)}, nil
+}
+
+// warnIgnoredRules warns that the settings s leave an older default rules
+// file unread, unless this run has warned of that file already: several
+// daemons can serve one workspace, and so share the file.
+func (t *term) warnIgnoredRules(s settings.Resolved) {
+	if s.IgnoredRules == "" || t.warned[s.IgnoredRules] {
+		return
+	}
+	if t.warned == nil {
+		t.warned = map[string]bool{}
+	}
+	t.warned[s.IgnoredRules] = true
+	hostterm.WarnIgnoredRules(t.out, s.IgnoredRules, s.RulesFile)
 }
 
 // changes names, as `<key> <old> → <new>`, what the settings s change of
@@ -650,13 +666,14 @@ func (t *term) stopped(ctx context.Context, cfg Config, dir string, e ending) er
 	return nil
 }
 
-// term is the human's side of a stop: where it prints, and the lines
-// typed, read only once a question needs them.
+// term is the human's side of a stop: where it prints, the lines typed,
+// read only once a question needs them, and the warnings it has given.
 type term struct {
 	in         io.Reader
 	out        io.Writer
 	interrupts <-chan os.Signal
 	input      *hostterm.Input // nil until the first question
+	warned     map[string]bool // the ignored rules files warned of, by path
 }
 
 // ask prints prompt and returns the line typed after it, trimmed. It

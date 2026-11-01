@@ -1,5 +1,5 @@
 // Package rules decides which host commands a container may run, from the
-// allowlist in .devcontainer/hostrun.yaml.
+// allowlist in .devcontainer/hostrunner-rules.yaml.
 //
 // A rule is keyed by an argv prefix (`command: git push`); the rule with the
 // longest matching prefix decides, and a command no rule matches is denied.

@@ -227,3 +227,31 @@ func TestListHideServedLeavesOutTheServingSession(t *testing.T) {
 		t.Errorf("list:\n%s", out.String())
 	}
 }
+
+// The warning names both files, shows an unsafe path quoted, and is
+// silent when nothing is ignored.
+func TestWarnIgnoredRules(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		ignored, used string
+		want          string
+	}{
+		{"nothing ignored", "", "/home/u/app/.devcontainer/hostrunner-rules.yaml", ""},
+		{
+			"an older file", "/home/u/app/.devcontainer/hostrun.yaml", "/home/u/app/.devcontainer/hostrunner-rules.yaml",
+			"hostrunner: warning: /home/u/app/.devcontainer/hostrun.yaml is ignored: /home/u/app/.devcontainer/hostrunner-rules.yaml is used; remove it\n",
+		},
+		{
+			"a path with an escape", "/w/a\x1b[2J", "/w/b",
+			`hostrunner: warning: "/w/a\x1b[2J" is ignored: /w/b is used; remove it` + "\n",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			hostterm.WarnIgnoredRules(&buf, tt.ignored, tt.used)
+			if buf.String() != tt.want {
+				t.Errorf("got %q, want %q", buf.String(), tt.want)
+			}
+		})
+	}
+}
