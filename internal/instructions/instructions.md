@@ -2,15 +2,15 @@
 ## Host commands (hostrun)
 
 When `hostrun` is in `PATH` (a devcontainer wired to hostrunner),
-`.devcontainer/hostrun.yaml` (read-only in the container) lists the
-commands that run on the host, where the host's credentials, tools and
-network are. A command matched by one of its rules runs as
-`hostrun <cmd> [args…]`: on the host, in the directory matching your
-current one or in a host directory its rule names (`dir`; relative file
-arguments still name files next to you), with the host's environment
-(not the container's); stdin,
-stdout, stderr and the exit code pass through. Every other command runs
-in the container.
+`.devcontainer/hostrunner-rules.yaml` (`.devcontainer/hostrun.yaml` in
+older workspaces; read-only in the container) lists the commands that
+run on the host, where the host's credentials, tools and network are. A
+command matched by one of its rules runs as `hostrun <cmd> [args…]`: on
+the host, in the directory matching your current one or in a host
+directory its rule names (`dir`; relative file arguments still name
+files next to you), with the host's environment (not the container's);
+stdin, stdout, stderr and the exit code pass through. Every other
+command runs in the container.
 
 - A rule matches an argv prefix literally: write the program and the
   words after it exactly as the rule does, with no flags in between

@@ -59,7 +59,7 @@ func TestNoDefaultHostFileWithoutXDGOrHome(t *testing.T) {
 	writeHostFile(t, filepath.Join(dir, ".config"), "4m")
 	t.Chdir(dir)
 	got, err := parse(t).Resolve(env(nil), noWorkspace)
-	if err != nil || got != defaults {
+	if err != nil || got.Settings != defaults {
 		t.Fatalf("got %+v, %v; want the defaults", got, err)
 	}
 }
@@ -101,7 +101,7 @@ ready_timeout: 1m
 		RequestTimeout: 30 * time.Second,
 		ReadyTimeout:   time.Minute,
 	}
-	if err != nil || got != want {
+	if err != nil || got.Settings != want {
 		t.Fatalf("got %+v, %v; want %+v", got, err, want)
 	}
 }
@@ -109,7 +109,7 @@ ready_timeout: 1m
 func TestHostFileWithoutSettingsSetsNothing(t *testing.T) {
 	for _, content := range []string{"", "# nothing set\n"} {
 		got, err := parse(t, "--settings", writeFile(t, content)).Resolve(env(nil), noWorkspace)
-		if err != nil || got != defaults {
+		if err != nil || got.Settings != defaults {
 			t.Errorf("%q: got %+v, %v; want the defaults", content, got, err)
 		}
 	}

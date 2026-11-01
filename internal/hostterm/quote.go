@@ -1,5 +1,6 @@
 // Package hostterm shows what a daemon reports on the human's terminal,
-// so that no text from a request can steer the terminal, and reads the
+// so that no text from a request can steer the terminal, and what a
+// command itself found, such as a warning naming a file, and reads the
 // human's answers line by line: approval sessions and `hostrunner stop`
 // share it.
 package hostterm

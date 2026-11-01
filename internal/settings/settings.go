@@ -20,6 +20,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/kravlab/hostrunner/internal/rulesfile"
 )
 
 // Settings are the resolved settings of a daemon, of the up that starts
@@ -58,15 +60,28 @@ type Settings struct {
 	StopTimeout time.Duration
 }
 
-// rulesPath is where a workspace keeps its rules file by default,
-// relative to the workspace.
-var rulesPath = filepath.Join(".devcontainer", "hostrun.yaml")
+// Resolved is what resolving settings found: the Settings and, besides
+// them, what no key holds, which a daemon is not passed and an arm does
+// not compare.
+type Resolved struct {
+	Settings
+	// IgnoredRules is the older rules file left unread because the default
+	// RulesFile exists beside it, else empty.
+	IgnoredRules string
+}
+
+// rulesFileKey is the name of the key rules_file, which resolve treats
+// apart from the others: only it has a default that depends on files.
+const rulesFileKey = "rules_file"
 
 // defaults are the settings no source sets, for the workspace at the
-// host path workspace.
+// host path workspace. Its rules file is the default name, which looks at
+// no file: the value where nothing chooses (flagDefaults, and
+// ResolveAsGiven, which reads no file). Only resolve chooses the file (see
+// rulesfile.Choose).
 func defaults(workspace string) Settings {
 	return Settings{
-		RulesFile:      filepath.Join(workspace, rulesPath),
+		RulesFile:      filepath.Join(workspace, rulesfile.Dir, rulesfile.Name),
 		StartupTimeout: 30 * time.Minute, // covers image builds, also after a rebuild's arm
 		Grace:          15 * time.Second, // how long a stopped container is tolerated
 		Reread:         true,
@@ -189,8 +204,8 @@ func (k key) set(s *Settings, v any) {
 // keys are every setting, in the order errors and flags follow.
 var keys = []key{
 	{
-		name: "rules_file", kind: kindPath, scope: scopeDaemon,
-		usage: "rules file (default <workspace>/.devcontainer/hostrun.yaml)",
+		name: rulesFileKey, kind: kindPath, scope: scopeDaemon,
+		usage: "rules file (default <workspace>/.devcontainer/hostrunner-rules.yaml, else hostrun.yaml there)",
 		field: func(s *Settings) any { return &s.RulesFile },
 	},
 	{
@@ -274,7 +289,7 @@ var restartScopes = []scope{scopeRuntimeRoot, scopeStop, scopeDaemon, scopeUp}
 // restartKeys are the keys restart has flags for: the rules file of the
 // new daemon and the keys of stop.
 func restartKeys() []key {
-	return append([]key{mustLookup("rules_file")}, keysOf(scopeRuntimeRoot, scopeStop)...)
+	return append([]key{mustLookup(rulesFileKey)}, keysOf(scopeRuntimeRoot, scopeStop)...)
 }
 
 // keysOf returns the keys whose flags the commands of in take.
@@ -352,7 +367,7 @@ func usageOf(flagged []key) string {
 
 // RulesFileUsage is the usage of the flags RegisterRulesFile adds, those
 // that choose the rules file.
-func RulesFileUsage() string { return usageOf([]key{mustLookup("rules_file")}) }
+func RulesFileUsage() string { return usageOf([]key{mustLookup(rulesFileKey)}) }
 
 // settingsFlagUsage and workspaceFlagUsage are the usages of the flags
 // that name the host settings file and the workspace settings file.
@@ -441,25 +456,37 @@ func apply(s *Settings, l layer) {
 // is the --workspace-settings flag (see workspaceFile) and hostNamed the
 // --settings flag (see hostFile), each empty when not given. A path a
 // file or a variable gives is read against the workspace, after ~
-// expansion; flags gives its paths absolute already.
-func resolve(in scopes, flags layer, hostNamed, workspaceNamed, workspace string, getenv func(string) string) (Settings, error) {
+// expansion; flags gives its paths absolute already. The default rules
+// file is chosen (see rulesfile.Choose) only when no source sets
+// rules_file, whatever path it names; the older file it leaves unread is
+// IgnoredRules of the result.
+func resolve(in scopes, flags layer, hostNamed, workspaceNamed, workspace string, getenv func(string) string) (Resolved, error) {
 	common, section, err := readHostFile(in, hostNamed, workspace, getenv)
 	if err != nil {
-		return Settings{}, err
+		return Resolved{}, err
 	}
 	wsFile, err := readWorkspaceFile(in, workspaceNamed, workspace, getenv)
 	if err != nil {
-		return Settings{}, err
+		return Resolved{}, err
 	}
 	vars, err := env(in, getenv)
 	if err != nil {
-		return Settings{}, err
+		return Resolved{}, err
 	}
 	s := defaults(workspace)
 	if err := stack(&s, workspace, getenv, flags, common, section, wsFile, sourced{vars, key.variable}); err != nil {
-		return Settings{}, err
+		return Resolved{}, err
 	}
-	return s, nil
+	r := Resolved{Settings: s}
+	if !sets(rulesFileKey, flags, common.layer, section.layer, wsFile.layer, vars) {
+		r.RulesFile, r.IgnoredRules = rulesfile.Choose(filepath.Join(workspace, rulesfile.Dir))
+	}
+	return r, nil
+}
+
+// sets says whether any of layers sets the key named name.
+func sets(name string, layers ...layer) bool {
+	return slices.ContainsFunc(layers, func(l layer) bool { _, ok := l[name]; return ok })
 }
 
 // sourced is a layer read from one source, with how errors name a key

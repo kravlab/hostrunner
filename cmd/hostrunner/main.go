@@ -24,8 +24,8 @@
 // becomes of the commands it runs unless --kill or --wait says; `restart`
 // then starts a new one for it (see internal/stop). `test` runs the Rules
 // test: whether the rules file `up` would use with the current directory
-// as the workspace (default .devcontainer/hostrun.yaml) allows a
-// command; it exits 0 when it does, 126 when it does not, and 1 on any
+// as the workspace (default .devcontainer/hostrunner-rules.yaml) allows
+// a command; it exits 0 when it does, 126 when it does not, and 1 on any
 // error. `update` switches the versioned install
 // of hostrunner and hostrun to the latest release (see internal/update).
 // `version` prints the module version Go stamped into the binary (see
@@ -76,6 +76,7 @@ import (
 
 	"github.com/kravlab/hostrunner/internal/approval"
 	"github.com/kravlab/hostrunner/internal/daemon"
+	"github.com/kravlab/hostrunner/internal/hostterm"
 	"github.com/kravlab/hostrunner/internal/instructions"
 	"github.com/kravlab/hostrunner/internal/launch"
 	"github.com/kravlab/hostrunner/internal/protocol"
@@ -168,6 +169,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 		if err != nil {
 			return err
 		}
+		hostterm.WarnIgnoredRules(stderr, cfg.ignored, cfg.launch.RulesFile)
 		if !cfg.restart {
 			return launch.Up(ctx, cfg.launch)
 		}
@@ -325,8 +327,8 @@ func parseUp(args []string, exe string, getenv func(string) string, output io.Wr
 	}
 	cfg := daemonBinaries(exe)
 	cfg.Dir, cfg.Workspace, cfg.ContainerWorkspace = dir, ws.workspace, ws.containerWorkspace
-	cfg.Settings = s
-	return upConfig{launch: cfg, restart: restart, answer: answer}, nil
+	cfg.Settings = s.Settings
+	return upConfig{launch: cfg, ignored: s.IgnoredRules, restart: restart, answer: answer}, nil
 }
 
 // daemonBinaries is the part of a launch.Config that `up` and `restart`
@@ -343,6 +345,7 @@ func daemonBinaries(exe string) launch.Config {
 // the runtime directory is replaced, its commands treated as answer says.
 type upConfig struct {
 	launch  launch.Config
+	ignored string // older default rules file left unread, if any
 	restart bool
 	answer  stop.Answer
 }
@@ -440,7 +443,7 @@ func parseStop(name string, args []string, exe string, getenv func(string) strin
 	}
 	if name == "restart" {
 		b := daemonBinaries(exe)
-		cfg.Restart = &stop.Restart{Daemon: b.Daemon, Client: b.Client, Settings: func(workspace string) (settings.Settings, error) {
+		cfg.Restart = &stop.Restart{Daemon: b.Daemon, Client: b.Client, Settings: func(workspace string) (settings.Resolved, error) {
 			return sf.Resolve(getenv, workspace)
 		}}
 	}

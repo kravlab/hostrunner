@@ -90,7 +90,7 @@ var staticClient = sync.OnceValues(func() (string, error) {
 // resolving returns how a test's restart resolves the new daemon's
 // settings: from restart's flags args and the variables vars alone, as
 // the terminal running restart would give them.
-func resolving(t *testing.T, vars map[string]string, args ...string) func(workspace string) (settings.Settings, error) {
+func resolving(t *testing.T, vars map[string]string, args ...string) func(workspace string) (settings.Resolved, error) {
 	t.Helper()
 	var f settings.Flags
 	fs := flag.NewFlagSet("restart", flag.ContinueOnError)
@@ -98,7 +98,7 @@ func resolving(t *testing.T, vars map[string]string, args ...string) func(worksp
 	if err := fs.Parse(args); err != nil {
 		t.Fatal(err)
 	}
-	return func(workspace string) (settings.Settings, error) {
+	return func(workspace string) (settings.Resolved, error) {
 		return f.Resolve(func(name string) string { return vars[name] }, workspace)
 	}
 }
@@ -166,6 +166,14 @@ func startCurrentDaemon(t *testing.T, rulesText string, containerStopped bool, o
 	if err != nil {
 		t.Fatal(err)
 	}
+	return startCurrentDaemonAt(t, dir, ws, rulesText, containerStopped, opts...)
+}
+
+// startCurrentDaemonAt is startCurrentDaemon for the existing runtime
+// directory dir and the host workspace ws, which another daemon may
+// serve too.
+func startCurrentDaemonAt(t *testing.T, dir, ws, rulesText string, containerStopped bool, opts ...daemon.Option) *currentDaemon {
+	t.Helper()
 	rulesFile := filepath.Join(ws, "hostrun.yaml")
 	if err := os.WriteFile(rulesFile, []byte(rulesText), 0o600); err != nil {
 		t.Fatal(err)
@@ -471,4 +479,103 @@ func TestRestartOfADaemonFromBeforeApprovalsFails(t *testing.T) {
 	if !d.running() {
 		t.Fatal("the daemon was stopped")
 	}
+}
+
+// devcontainerWith puts hostrunner-rules.yaml and, with older, hostrun.yaml
+// into .devcontainer of the daemon's workspace and returns its path.
+func (d *currentDaemon) devcontainerWith(t *testing.T, older bool) string {
+	t.Helper()
+	dir := filepath.Join(d.workspace, ".devcontainer")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	names := []string{"hostrunner-rules.yaml"}
+	if older {
+		names = append(names, "hostrun.yaml")
+	}
+	for _, n := range names {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte(validRules), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
+}
+
+// A restart whose new daemon takes the default rules file warns, once, when
+// the older name lies beside it, and goes on; it is silent without it.
+func TestRestartWarnsOfAnIgnoredRulesFile(t *testing.T) {
+	for _, older := range []bool{true, false} {
+		d := startCurrentDaemon(t, validRules, false, rereading...)
+		dir := d.devcontainerWith(t, older)
+		r := restartConfig(t)
+		r.Settings = resolving(t, nil)
+		out, err := runStop(t, stop.Config{Dir: d.dir, Restart: r}, "")
+		if err != nil {
+			t.Fatalf("restart: %v; printed %q", err, out)
+		}
+		warning := "hostrunner: warning: " + filepath.Join(dir, "hostrun.yaml") + " is ignored: " + filepath.Join(dir, "hostrunner-rules.yaml") + " is used; remove it\n"
+		want := 0
+		if older {
+			want = 1
+		}
+		if got := strings.Count(out, warning); got != want || strings.Count(out, "warning") != want {
+			t.Errorf("older file %t: printed %q, want the warning %d times", older, out, want)
+		}
+		if !strings.Contains(out, "hostrunner: restarted "+d.dir) {
+			t.Errorf("older file %t: the restart did not go on: %q", older, out)
+		}
+		d.waitStopped(t)
+	}
+}
+
+// A restart --all warns once per ignored file within one run, also when
+// several daemons serve the workspace that holds it.
+func TestRestartAllWarnsOnceForDaemonsOfOneWorkspace(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ws, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var daemons []*currentDaemon
+	for _, name := range []string{"a", "b"} {
+		dir := filepath.Join(root, name)
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		daemons = append(daemons, startCurrentDaemonAt(t, dir, ws, validRules, false, rereading...))
+	}
+	devcontainer := daemons[0].devcontainerWith(t, true)
+	r := restartConfig(t)
+	r.Settings = resolving(t, nil)
+	out, err := runStop(t, stop.Config{Root: root, All: true, Restart: r}, "")
+	if err != nil {
+		t.Fatalf("restart --all: %v; printed %q", err, out)
+	}
+	warning := "hostrunner: warning: " + filepath.Join(devcontainer, "hostrun.yaml") + " is ignored: " + filepath.Join(devcontainer, "hostrunner-rules.yaml") + " is used; remove it\n"
+	if got := strings.Count(out, warning); got != 1 || strings.Count(out, "warning") != 1 {
+		t.Errorf("printed %q, want the warning once", out)
+	}
+	for _, d := range daemons {
+		if !strings.Contains(out, "hostrunner: restarted "+d.dir) {
+			t.Errorf("the restart of %s did not go on: %q", d.dir, out)
+		}
+		d.waitStopped(t)
+	}
+}
+
+// An explicit rules_file is used as given: no warning, whatever lies
+// beside the default.
+func TestRestartWithAGivenRulesFileDoesNotWarn(t *testing.T) {
+	d := startCurrentDaemon(t, validRules, false, rereading...)
+	dir := d.devcontainerWith(t, true)
+	r := restartConfig(t)
+	r.Settings = resolving(t, map[string]string{"HOSTRUNNER_RULES_FILE": filepath.Join(dir, "hostrunner-rules.yaml")})
+	out, err := runStop(t, stop.Config{Dir: d.dir, Restart: r}, "")
+	if err != nil || strings.Contains(out, "warning") {
+		t.Fatalf("restart: %v; printed %q", err, out)
+	}
+	d.waitStopped(t)
 }

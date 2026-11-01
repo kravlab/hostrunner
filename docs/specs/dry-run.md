@@ -59,7 +59,8 @@ command without restarting the container.
 on the host.
 
 - Reads the rules file `up` would use, the current directory being the
-  workspace: `.devcontainer/hostrun.yaml` under it unless `--rules-file`
+  workspace: `.devcontainer/hostrunner-rules.yaml` under it (else
+  `hostrun.yaml`) unless `--rules-file`
   (`--config`, its synonym), `HOSTRUNNER_RULES_FILE` or a settings file
   names another.
 - Its flags end at the first argument that is not one of them, or at
