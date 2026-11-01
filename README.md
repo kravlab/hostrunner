@@ -6,9 +6,9 @@ the container's current directory, with the host's environment and
 credentials. Stdin, stdout and stderr are streamed; the exit code is
 propagated.
 
-Only commands allowed by `.devcontainer/hostrun.yaml` run. The host side
-(`hostrunner`) starts with the devcontainer and exits after the container
-stops. Linux hosts; Docker and Podman.
+Only commands allowed by `.devcontainer/hostrunner-rules.yaml` run. The
+host side (`hostrunner`) starts with the devcontainer and exits after the
+container stops. Linux hosts; Docker and Podman.
 
 > **Rules restrict argv only.** A host tool that reads configuration or
 > hooks from the workspace — git (`.git/config`, `.git/hooks`), fakehost
@@ -142,15 +142,31 @@ when it changes; a running daemon started without it, or with it when
 also come from variables or a host settings file (see
 [Settings](#settings)).
 
-Add the rules as `.devcontainer/hostrun.yaml` (start from
-[the example](examples/devcontainer/.devcontainer/hostrun.yaml)), then,
-inside the container:
+Add the rules as `.devcontainer/hostrunner-rules.yaml` (start from
+[the example](examples/devcontainer/.devcontainer/hostrunner-rules.yaml)),
+then, inside the container:
 
 ```sh
 hostrun git push
 hostrun git push --force   # hostrun: denied by rule "git push": flag --force is not allowed
 hostrun --dry-run git push # hostrun: dry run: allowed by rule "git push"
 ```
+
+Without a `rules_file` setting, `up` uses `.devcontainer/hostrunner-rules.yaml`
+and, only while that file is absent, `.devcontainer/hostrun.yaml`, so a
+workspace with the older name needs no change. With both files, `up`,
+`restart` and `hostrunner test` warn on stderr that the older one is
+ignored and go on with `hostrunner-rules.yaml`. A `rules_file` from a
+flag, a variable or a settings file is used as given, with no fallback
+and no warning.
+
+To move an older workspace to the new name, rename the file, then run
+`hostrunner restart`. A running daemon follows the path it started with,
+so once that file is gone it denies every command until the restart
+(with `reread` off it does not look at the file, and keeps serving the
+rules it loaded until the restart); the new daemon has another
+`rules_file`, so it replaces the old one and the old daemon's approvals
+end with it, as with any change of `rules_file`.
 
 A dry run (`--dry-run` as hostrun's first argument) asks the daemon
 whether the command would run, without running it: the daemon checks the
@@ -193,7 +209,7 @@ Besides its rules, a daemon has settings:
 
 | Key | Variable | Flag | Default | What it sets |
 |---|---|---|---|---|
-| `rules_file` | `HOSTRUNNER_RULES_FILE` | `--rules-file`, `--config` | `.devcontainer/hostrun.yaml` in the workspace | its rules file |
+| `rules_file` | `HOSTRUNNER_RULES_FILE` | `--rules-file`, `--config` | `.devcontainer/hostrunner-rules.yaml` in the workspace, else `hostrun.yaml` there | its rules file |
 | `startup_timeout` | `HOSTRUNNER_STARTUP_TIMEOUT` | `--startup-timeout` | `30m` | how long it waits for its container to start |
 | `grace` | `HOSTRUNNER_GRACE` | `--grace` | `15s` | how long its container may be gone before it exits |
 | `reread` | `HOSTRUNNER_REREAD` | `--reread`, `--no-reread` | `true` | whether it rereads the rules file by itself once it changes |
@@ -811,8 +827,8 @@ hostrunner test --rules-file draft.yaml -- tix pr list
 ```
 
 It reads the rules file `up` would use with the current directory as
-the workspace (`.devcontainer/hostrun.yaml` there unless `rules_file`
-names another; see [Settings](#settings)), or the `--rules-file` file
+the workspace (`.devcontainer/hostrunner-rules.yaml` there, else `hostrun.yaml`,
+unless `rules_file` names another; see [Settings](#settings)), or the `--rules-file` file
 (`--config` is its synonym; `--settings` and `--workspace-settings`
 name the settings files), and tests the command against the rules alone: not the
 working directory, path checks or the host's programs. It reports the
@@ -853,8 +869,8 @@ How it works:
 - `.devcontainer/` is read-only inside the container, so the container
   cannot rewrite the rules that govern it. `hostrun` warns on stderr when
   the nearest `.devcontainer/` above its working directory, or the
-  `hostrun.yaml` in it, is writable (the default location only, not a
-  `--rules-file` file).
+  rules file in it (`hostrunner-rules.yaml`, else `hostrun.yaml`), is
+  writable (the default location only, not a `--rules-file` file).
 - The working directory (the mirrored directory, or the rule's `dir`) is
   opened, not re-resolved, when the command starts, so a symlink swapped
   in by the container cannot redirect it.

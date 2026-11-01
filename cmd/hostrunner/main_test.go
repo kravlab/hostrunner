@@ -89,7 +89,7 @@ func TestParseServeAcceptsAllFlags(t *testing.T) {
 	want := serveConfig{
 		socket:         "/run/h.sock",
 		workspaceFlags: workspaceFlags{workspace: "/home/u/app", containerWorkspace: "/workspaces/app"},
-		Settings:       tuned("/home/u/app/.devcontainer/hostrun.yaml", 30*time.Minute, 15*time.Second, true),
+		Settings:       tuned("/home/u/app/.devcontainer/hostrunner-rules.yaml", 30*time.Minute, 15*time.Second, true),
 	}
 	if got != want {
 		t.Fatalf("got %+v, want %+v", got, want)
@@ -143,7 +143,7 @@ func TestParseUpBuildsLaunchConfig(t *testing.T) {
 		ContainerWorkspace: "/workspaces/app",
 		Daemon:             exe,
 		Client:             filepath.Join("/home/u/.local/bin", "hostrun"),
-		Settings:           tuned("/home/u/app/.devcontainer/hostrun.yaml", 30*time.Minute, 15*time.Second, true),
+		Settings:           tuned("/home/u/app/.devcontainer/hostrunner-rules.yaml", 30*time.Minute, 15*time.Second, true),
 	}
 	if got.launch != want || got.restart || got.answer != stop.Ask {
 		t.Fatalf("got %+v, want %+v without --restart", got, want)
@@ -160,11 +160,11 @@ func TestUpAndServeMakeTheWorkspaceAbsolute(t *testing.T) {
 	}
 	ws := filepath.Join(cwd, "app")
 	up, err := parseUp([]string{"--dir", "/d", "--workspace", "app", "--container-workspace", "/c"}, "/bin/hostrunner", noEnv, io.Discard)
-	if err != nil || up.launch.Workspace != ws || up.launch.RulesFile != filepath.Join(ws, ".devcontainer", "hostrun.yaml") {
+	if err != nil || up.launch.Workspace != ws || up.launch.RulesFile != filepath.Join(ws, ".devcontainer", "hostrunner-rules.yaml") {
 		t.Fatalf("up: got %q and %q, %v; want %q", up.launch.Workspace, up.launch.RulesFile, err, ws)
 	}
 	serve, err := parseServe([]string{"--socket", "/run/h.sock", "--workspace", "app", "--container-workspace", "/c"}, noEnv, io.Discard)
-	if err != nil || serve.workspace != ws || serve.RulesFile != filepath.Join(ws, ".devcontainer", "hostrun.yaml") {
+	if err != nil || serve.workspace != ws || serve.RulesFile != filepath.Join(ws, ".devcontainer", "hostrunner-rules.yaml") {
 		t.Fatalf("serve: got %q and %q, %v; want %q", serve.workspace, serve.RulesFile, err, ws)
 	}
 }
@@ -256,7 +256,7 @@ var commands = map[string]func([]string, func(string) string) (settings.Settings
 // default.
 func TestUpAndServeResolveEachSettingFromTheHighestSource(t *testing.T) {
 	file := "startup_timeout: 1h\ngrace: 1m\nreread: false\n"
-	defaultRules := filepath.Join("/w", ".devcontainer", "hostrun.yaml")
+	defaultRules := filepath.Join("/w", ".devcontainer", "hostrunner-rules.yaml")
 	vars := map[string]string{"HOSTRUNNER_STARTUP_TIMEOUT": "2h", "HOSTRUNNER_GRACE": "2m", "HOSTRUNNER_REREAD": "true"}
 	tests := []struct {
 		name  string
@@ -499,7 +499,7 @@ func TestUpAndServeResolveTheTimings(t *testing.T) {
 	vars := map[string]string{"HOSTRUNNER_POLL_INTERVAL": "4s", "HOSTRUNNER_ASK_TIMEOUT": "4m", "HOSTRUNNER_REQUEST_TIMEOUT": "4s", "HOSTRUNNER_READY_TIMEOUT": "4s"}
 	flags := []string{"--poll-interval", "5s", "--ask-timeout", "5m", "--request-timeout", "5s"}
 	timings := func(d time.Duration) settings.Settings {
-		s := tuned(filepath.Join("/w", ".devcontainer", "hostrun.yaml"), 30*time.Minute, 15*time.Second, true)
+		s := tuned(filepath.Join("/w", ".devcontainer", "hostrunner-rules.yaml"), 30*time.Minute, 15*time.Second, true)
 		s.PollInterval, s.AskTimeout, s.RequestTimeout, s.ReadyTimeout = d, time.Duration(d.Seconds())*time.Minute, d, d
 		return s
 	}
@@ -700,7 +700,7 @@ func TestUpAndServeResolveTheRulesFile(t *testing.T) {
 		flags []string
 		want  string
 	}{
-		{"default", nil, nil, filepath.Join(ws, ".devcontainer", "hostrun.yaml")},
+		{"default", nil, nil, filepath.Join(ws, ".devcontainer", "hostrunner-rules.yaml")},
 		{"host settings file", map[string]string{"HOSTRUNNER_SETTINGS": host}, nil, filepath.Join(ws, "common.yaml")},
 		{"variable", map[string]string{"HOSTRUNNER_SETTINGS": host, "HOSTRUNNER_RULES_FILE": "var.yaml"}, nil, filepath.Join(ws, "var.yaml")},
 		{"--rules-file", map[string]string{"HOSTRUNNER_RULES_FILE": "var.yaml"}, []string{"--rules-file", "flag.yaml"}, filepath.Join(cwd, "flag.yaml")},

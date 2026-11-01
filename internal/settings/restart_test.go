@@ -44,7 +44,7 @@ func TestRestartResolvesItsSettingsAndTheNewDaemonsApart(t *testing.T) {
 	got, err := f.Resolve(vars, ws)
 	want := defaults
 	want.RulesFile, want.Grace, want.PollInterval, want.AskTimeout, want.ReadyTimeout = "/r/hostrun.yaml", 2*time.Minute, 3*time.Second, 4*time.Minute, 5*time.Second
-	if err != nil || got != want {
+	if err != nil || got.Settings != want {
 		t.Fatalf("Resolve: got %+v, %v; want %+v", got, err, want)
 	}
 }

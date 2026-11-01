@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 
+	"github.com/kravlab/hostrunner/internal/hostterm"
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
 	"github.com/kravlab/hostrunner/internal/settings"
@@ -14,8 +15,8 @@ import (
 
 // testConfig holds the settings of `hostrunner test`.
 type testConfig struct {
-	rulesFile string   // rules file
-	argv      []string // the command to test
+	resolved settings.Resolved // the rules file, and the older one left unread
+	argv     []string          // the command to test
 }
 
 // parseTest parses the arguments of `hostrunner test`: its flags end at
@@ -48,20 +49,22 @@ func parseTest(args []string, getenv func(string) string, output io.Writer) (tes
 	if err != nil {
 		return cfg, err
 	}
-	cfg.rulesFile = s.RulesFile
+	cfg.resolved = s
 	return cfg, nil
 }
 
 // rulesTest runs the Rules test: it tests cfg.argv against the rules file
 // alone, with no daemon or container, and reports the allowing rule and
-// its fixed directory on stderr. A denied command is an exitError with
-// protocol.ExitRejected, as hostrun exits when the daemon denies it; its
-// message lists every reason, not only the first a refusal reports, and
-// the class an approval session would put it in (see denialClass).
-// Unlike the daemon, it takes a missing file for an error; an invalid one
-// fails as in `hostrunner up`.
+// its fixed directory on stderr, after a warning of an older default
+// rules file left unread (see hostterm.WarnIgnoredRules). A denied
+// command is an exitError with protocol.ExitRejected, as hostrun exits
+// when the daemon denies it; its message lists every reason, not only the
+// first a refusal reports, and the class an approval session would put it
+// in (see denialClass). Unlike the daemon, it takes a missing file for an
+// error; an invalid one fails as in `hostrunner up`.
 func rulesTest(cfg testConfig, stderr io.Writer) error {
-	policy, err := rules.Read(cfg.rulesFile)
+	hostterm.WarnIgnoredRules(stderr, cfg.resolved.IgnoredRules, cfg.resolved.RulesFile)
+	policy, err := rules.Read(cfg.resolved.RulesFile)
 	if err != nil {
 		return fmt.Errorf("rules file: %w", err)
 	}

@@ -252,7 +252,7 @@ func TestRulesTestReadsTheRulesFileUnderTheCurrentDirectory(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(dir, ".devcontainer"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, ".devcontainer", "hostrun.yaml"), []byte(testRules), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, ".devcontainer", "hostrunner-rules.yaml"), []byte(testRules), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	t.Chdir(dir)

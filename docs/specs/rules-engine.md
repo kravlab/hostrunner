@@ -6,20 +6,21 @@ Rule model: [Rule model and config format](https://github.com/kravlab/hostrunner
 
 ## Goal
 
-The daemon runs a command only if `.devcontainer/hostrun.yaml` allows it.
+The daemon runs a command only if `.devcontainer/hostrunner-rules.yaml` allows it.
 Denied calls exit 126 with a message naming the rule and the reason.
 
 ## Config loading
 
 - `hostrunner serve --rules-file <path>` (`--config`, its synonym);
-  default `<workspace>/.devcontainer/hostrun.yaml` (read on the host). It
+  default `<workspace>/.devcontainer/hostrunner-rules.yaml`, else
+  `hostrun.yaml` there (read on the host). It
   is the `rules_file` setting, which the settings files and
   `HOSTRUNNER_RULES_FILE` give too (README, Settings); `up` passes the
   one it resolves.
 - Read once at startup. Invalid file → the daemon does not start (so
   `hostrunner up`, and with it `devcontainer up`, fails with the error).
 - Missing file → the daemon starts with no rules; every call is denied
-  with `no .devcontainer/hostrun.yaml: every command is denied`.
+  with `no rules file: every command is denied`.
 - YAML via `go.yaml.in/yaml/v3`, strict (`KnownFields`): unknown keys are
   errors with line numbers.
 
@@ -118,7 +119,7 @@ name container paths anyway, so only relative symlinks are followed.
 
 ## Example config and docs
 
-- `examples/devcontainer/.devcontainer/hostrun.yaml`:
+- `examples/devcontainer/.devcontainer/hostrunner-rules.yaml`:
 
   ```yaml
   rules:

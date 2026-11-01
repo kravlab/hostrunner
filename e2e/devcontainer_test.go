@@ -89,7 +89,7 @@ func newWorkspace(t *testing.T) string {
 	if out, err := exec.Command("git", "init", "-q", ws).CombinedOutput(); err != nil {
 		t.Fatalf("git init: %v: %s", err, out)
 	}
-	rules, err := os.ReadFile("../examples/devcontainer/.devcontainer/hostrun.yaml")
+	rules, err := os.ReadFile("../examples/devcontainer/.devcontainer/hostrunner-rules.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +103,7 @@ func newWorkspace(t *testing.T) string {
 		t.Fatalf("example devcontainer.json no longer contains %s", image)
 	}
 	cfg = bytes.Replace(cfg, []byte(image), []byte(`"build": { "dockerfile": "Dockerfile" },`), 1)
-	for name, data := range map[string][]byte{"devcontainer.json": cfg, "Dockerfile": []byte(slowBuild), "hostrun.yaml": rules} {
+	for name, data := range map[string][]byte{"devcontainer.json": cfg, "Dockerfile": []byte(slowBuild), "hostrunner-rules.yaml": rules} {
 		if err := os.WriteFile(filepath.Join(ws, ".devcontainer", name), data, 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -376,7 +376,7 @@ func testLifecycle(t *testing.T, e env) {
 		if _, err := e.exec(t, "hostrun", "echo", "hi"); err == nil {
 			t.Fatal("echo allowed before the rule was added")
 		}
-		rulesFile := filepath.Join(e.ws, ".devcontainer", "hostrun.yaml")
+		rulesFile := filepath.Join(e.ws, ".devcontainer", "hostrunner-rules.yaml")
 		data, err := os.ReadFile(rulesFile)
 		if err != nil {
 			t.Fatal(err)
@@ -408,7 +408,7 @@ func testLifecycle(t *testing.T, e env) {
 		if _, err := e.exec(t, "hostrun", "printf", "hi"); err == nil {
 			t.Fatal("printf allowed before the rule was added")
 		}
-		rulesFile := filepath.Join(e.ws, ".devcontainer", "hostrun.yaml")
+		rulesFile := filepath.Join(e.ws, ".devcontainer", "hostrunner-rules.yaml")
 		data, err := os.ReadFile(rulesFile)
 		if err != nil {
 			t.Fatal(err)
@@ -439,7 +439,7 @@ func testLifecycle(t *testing.T, e env) {
 			t.Fatal("uname allowed before the settings named rules allowing it")
 		}
 		dotDir := filepath.Join(e.ws, ".devcontainer")
-		data, err := os.ReadFile(filepath.Join(dotDir, "hostrun.yaml"))
+		data, err := os.ReadFile(filepath.Join(dotDir, "hostrunner-rules.yaml"))
 		if err != nil {
 			t.Fatal(err)
 		}
