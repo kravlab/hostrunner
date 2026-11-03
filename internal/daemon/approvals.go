@@ -817,7 +817,7 @@ func (s *Server) ask(ctx context.Context, x exchange, f protocol.Frame) {
 			s.reject(x.out, r.code, r.message, r.err)
 			return
 		}
-		s.start(ctx, x, req, p, func() (protocol.Frame, error) { return protocol.ReadFrame(x.conn) }, nil)
+		s.startUnasked(ctx, x, req, p)
 		return
 	}
 	// From here on the daemon stopping does not close the connection: a

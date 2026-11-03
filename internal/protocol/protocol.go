@@ -308,8 +308,10 @@ type Serve struct {
 // began: Run, the daemon's number for it, names it in the run's later
 // frames; Argv ran from the container directory Cwd, let through by
 // Approval, the scope of the answer to request Request, which the session
-// is told it took with FrameAnswered, perhaps after this frame. A run
-// that does not start after all ends at once, with RunEnded.Error.
+// is told it took with FrameAnswered, perhaps after this frame. A repeat
+// a standing or session approval let through without asking has Request
+// 0 and that approval's kind, ScopeStanding or ScopeSession. A run that
+// does not start after all ends at once, with RunEnded.Error.
 type RunStarted struct {
 	Run      uint64   `json:"run"`
 	Argv     []string `json:"argv"`

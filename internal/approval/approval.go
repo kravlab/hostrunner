@@ -122,13 +122,14 @@ const helpWidth = 65
 const maxNoteBytes = 4096
 
 // scopeTexts are what the session says of an approval, by its scope: the
-// outcome once the daemon has taken it, and the prompt confirming one for
-// a guarded request.
-var scopeTexts = map[protocol.Scope]struct{ outcome, confirm string }{
-	protocol.ScopeOnce:     {"approved once", `Type "yes" to run it once: `},
-	protocol.ScopeSession:  {"approved for this session (until it ends)", `Type "yes" to approve it for this session: `},
-	protocol.ScopeStanding: {"approved as standing (until the daemon stops)", `Type "yes" to approve it as standing (until the daemon stops): `},
-	protocol.ScopeRule:     {"approved under the new rule", ""},
+// outcome once the daemon has taken it, the prompt confirming one for a
+// guarded request, and, for an approval that lets repeats through, what a
+// repeat's start line says let it through (see byApproval).
+var scopeTexts = map[protocol.Scope]struct{ outcome, confirm, by string }{
+	protocol.ScopeOnce:     {"approved once", `Type "yes" to run it once: `, ""},
+	protocol.ScopeSession:  {"approved for this session (until it ends)", `Type "yes" to approve it for this session: `, "by session approval"},
+	protocol.ScopeStanding: {"approved as standing (until the daemon stops)", `Type "yes" to approve it as standing (until the daemon stops): `, "by standing approval"},
+	protocol.ScopeRule:     {"approved under the new rule", "", ""},
 }
 
 // Run serves the daemon on cfg.Socket until ctx ends, in ends, or the

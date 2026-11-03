@@ -208,9 +208,9 @@ func TestARunFeedDropsOutputBeyondItsBoundAndCountsIt(t *testing.T) {
 	}
 }
 
-// approvalsServer returns a Server with approvals whose serving session
-// asked for runs, its frames going to the peer it returns.
-func approvalsServer(t *testing.T) (*Server, *sessionConn, net.Conn) {
+// newApprovalsServer returns a Server with approvals, which no session
+// serves, whose rules allow echo alone, its workspace /workspaces/app.
+func newApprovalsServer(t *testing.T) *Server {
 	t.Helper()
 	mapper, err := workspace.NewMapper(t.TempDir(), "/workspaces/app")
 	if err != nil {
@@ -220,7 +220,14 @@ func approvalsServer(t *testing.T) (*Server, *sessionConn, net.Conn) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := New(mapper, p, slog.New(slog.DiscardHandler), WithApprovals(nil, ""))
+	return New(mapper, p, slog.New(slog.DiscardHandler), WithApprovals(nil, ""))
+}
+
+// approvalsServer returns a Server with approvals whose serving session
+// asked for runs, its frames going to the peer it returns.
+func approvalsServer(t *testing.T) (*Server, *sessionConn, net.Conn) {
+	t.Helper()
+	s := newApprovalsServer(t)
 	daemonEnd, peer := net.Pipe()
 	t.Cleanup(func() {
 		daemonEnd.Close()

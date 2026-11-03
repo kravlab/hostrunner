@@ -514,10 +514,15 @@ revoked 1
 - An approved run is one run of a command an approval let through (see
   [CONTEXT.md](../../CONTEXT.md)). The session reports the runs a human
   approved when asked: once, for this session, standing, and the run of
-  an "add a rule" answer (under the new rule, or once). Commands the
-  rules allow and dry runs are not approved runs. The repeats a standing
-  or session approval lets through are approved runs this version does
-  not report yet.
+  an "add a rule" answer (under the new rule, or once); and the repeats
+  a standing or session approval lets through without asking, with or
+  without `--ask`, so the human sees the commands that run without
+  asking them. Commands the rules allow, later runs of a rule added by
+  "add a rule" included (also of a command an approval is held for),
+  and dry runs are not approved runs. A run the rules allow but whose
+  argument fails its path check is let through by the approval held
+  for it, which passes that failure as given: it is a repeat, and is
+  shown.
 - Asking: the session sends `Serve{runs: true}`; a daemon that reports
   approved runs says so in its hello (`DaemonInfo.runs`) and sends their
   frames to the serving session only when it asked. An older session
@@ -531,7 +536,10 @@ revoked 1
     `approval` the scope that let it through (`once`, `session`,
     `standing`, `rule`), `request` the id of the request answered. Sent
     once the answer is taken, before the checks starting the command
-    runs again.
+    runs again. A repeat has no `request` (0) and the kind of the
+    approval that let it through (`standing`, `session`); it is sent
+    once its checks have passed, from the plain run path and the
+    `--ask` path alike.
   - `RunOutput{run, stderr, data}`: a chunk of stdout, or of stderr with
     `stderr`, of at most 4 KiB, exactly as the container gets it, after
     the mask of the rule's secrets (`data` base64 in the JSON).
@@ -565,6 +573,19 @@ revoked 1
   it ends) · run 3`, …). The run's frames come from another goroutine of
   the daemon than `Answered`, in either order: frames that arrive first
   wait for it.
+- Start line: a repeat is numbered as it starts, and the session prints
+  one line naming the approval that let it through, the command shown as
+  on the `cmd` line, cut alike:
+
+  ```
+  run 4 · git push origin main · by standing approval
+  run 5 · make test · by session approval
+  ```
+
+  It is printed below what is shown, and the prompt shown is shown
+  again, keeping what the human typed after it. Its summary follows when
+  it ends. A fresh approval prints no start line: its answer line names
+  its run.
 - Summary: once a numbered run ends, one line:
 
   ```

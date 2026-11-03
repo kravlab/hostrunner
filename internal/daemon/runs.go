@@ -79,6 +79,18 @@ func (a *approvals) startRun(m protocol.RunStarted) *approvedRun {
 	return &approvedRun{a: a, id: m.Run, begun: time.Now()}
 }
 
+// startRepeat starts the approved run of p, the prepared command of req,
+// when a standing or session approval lets it through without asking (a
+// repeat): it records it as going, tells the session of it and returns
+// it. It returns nil when the rules let the command through, which is no
+// approved run.
+func (a *approvals) startRepeat(req protocol.Request, p *prepared) *approvedRun {
+	if p.approval == "" {
+		return nil
+	}
+	return a.startRun(protocol.RunStarted{Argv: req.Argv, Cwd: req.Cwd, Approval: p.approval})
+}
+
 // runFeed returns the run feed of the session serving the daemon, or nil
 // when none does or it did not ask for runs.
 func (a *approvals) runFeed() *runFeed {

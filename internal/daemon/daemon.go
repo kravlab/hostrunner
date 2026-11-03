@@ -534,7 +534,15 @@ func (s *Server) run(ctx context.Context, x exchange, req protocol.Request) {
 		s.reject(x.out, r.code, r.message, r.err)
 		return
 	}
-	s.start(ctx, x, req, p, func() (protocol.Frame, error) { return protocol.ReadFrame(x.conn) }, nil)
+	s.startUnasked(ctx, x, req, p)
+}
+
+// startUnasked starts p, the prepared command of req, on x, reading the
+// client's frames from its connection, when no human is asked about it:
+// the rules allow it, or a standing or session approval lets it through,
+// a repeat, which is an approved run (see approvals.startRepeat).
+func (s *Server) startUnasked(ctx context.Context, x exchange, req protocol.Request, p *prepared) {
+	s.start(ctx, x, req, p, func() (protocol.Frame, error) { return protocol.ReadFrame(x.conn) }, s.approvals.startRepeat(req, p))
 }
 
 // frameSource returns the client's next frame, or an error once the

@@ -119,7 +119,9 @@ func (s *session) numberRun(id uint64) (uint64, *sessionRun) {
 
 // runStarted takes the start of approved run m: numbered already when its
 // answer was confirmed, numbered then otherwise. A run no request
-// approved is numbered at once.
+// approved, a repeat, is numbered at once, and its start line is printed
+// below what is shown (see printBelow), as a summary is: no answer line
+// names it.
 func (s *session) runStarted(m protocol.RunStarted) {
 	r := &sessionRun{argv: m.Argv, tail: tail{max: s.tailLines}}
 	s.runs.going[m.Run] = r
@@ -129,9 +131,27 @@ func (s *session) runStarted(m protocol.RunStarted) {
 		r.n = n
 	case m.Request == 0:
 		r.n = s.nextRun()
+		s.printBelow(startLine(r, m.Approval) + "\n")
 	default:
 		s.runs.startedEarly[m.Request] = r
 	}
+}
+
+// startLine returns the line that tells of run r, a repeat that approval
+// let through, as it starts: `run N · <cmd> · by standing approval` or
+// `by session approval`, the command shown as its summary shows it.
+func startLine(r *sessionRun, approval protocol.Scope) string {
+	return fmt.Sprintf("run %d · %s · %s", r.n, hostterm.ArgvLine(r.argv), byApproval(approval))
+}
+
+// byApproval returns what a start line says let a repeat through: the
+// scope's by text (see scopeTexts) for a standing or session approval,
+// its kind as the daemon names it, shown escaped, for a scope with none.
+func byApproval(approval protocol.Scope) string {
+	if by := scopeTexts[approval].by; by != "" {
+		return by
+	}
+	return "by " + hostterm.Display(string(approval))
 }
 
 // runOutput takes a chunk of an approved run's output: it counts its
@@ -180,7 +200,15 @@ func (s *session) runEnded(m protocol.RunEnded) {
 		return
 	}
 	delete(s.runs.going, m.Run)
-	fmt.Fprintf(s.out, "\n%s", report(r))
+	s.printBelow(report(r))
+}
+
+// printBelow prints text, ending with a newline, below what is shown,
+// then the prompt shown, if any, again, keeping what the human typed
+// after it; no prompt is shown again while the session waits for the
+// daemon to take an answer.
+func (s *session) printBelow(text string) {
+	fmt.Fprintf(s.out, "\n%s", text)
 	if !s.awaiting.waitsForDaemon() {
 		fmt.Fprint(s.out, s.asking)
 	}
