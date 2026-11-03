@@ -251,6 +251,11 @@ it through until the approval session that granted it stops
 serving its daemon, or the human revokes it.
 _Avoid_: temporary approval
 
+**Approved run**:
+One run of a command that an approval let through: one a human
+approved when asked, or a repeat a standing or session approval
+let through. Runs the rules allow are not approved runs.
+
 **Approval socket**:
 The daemon's socket for approval sessions, beside its runtime
 directory and outside the container's reach.
