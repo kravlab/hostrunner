@@ -26,16 +26,20 @@ const outUsage = "usage: out [n], n from runs"
 
 // sessionRun is an approved run the daemon told the session of: its
 // number in the session (0 until the answer that approved it is
-// confirmed), its command, when the session was told of its start, the
-// lines of output it got (see outputLines), the output kept for out
-// (see outputKept), and its end, once that came, or when the session
-// stopped serving its daemon before it came (left). The session holds
-// it until it has reported how the run ended, and keeps it for out and
-// runs while it is one of the last runs (see term.keep).
+// confirmed), its command, when it started (when the session was told
+// of its start, or as the daemon counts it for a run that started
+// earlier), whether it started before the session served its daemon
+// (earlier), its output from before then not received, the lines of
+// output it got (see outputLines), the output kept for out (see
+// outputKept), and its end, once that came, or when the session stopped
+// serving its daemon before it came (left). The session holds it until
+// it has reported how the run ended, and keeps it for out and runs while
+// it is one of the last runs (see term.keep).
 type sessionRun struct {
 	n       uint64
 	argv    []string
 	started time.Time
+	earlier bool
 	outputLines
 	output *keptOutput
 	ended  *protocol.RunEnded
@@ -135,42 +139,63 @@ func (s *session) numberRun(id uint64) (uint64, *sessionRun) {
 
 // runStarted takes the start of approved run m: numbered already when its
 // answer was confirmed, numbered then otherwise. A run no request
-// approved, a repeat, is numbered at once, and its start line is a
-// notice (see notify), as a summary is: no answer line names it. A run
-// is kept for out from the start, its output held before it is numbered
-// too.
+// approved, a repeat, and a run that started before the session served
+// its daemon (m.Earlier), whose answer, if any, was confirmed to another
+// session, are numbered at once, and their start line is a notice (see
+// notify), as a summary is: no answer line names them. A run that
+// started before is dated back by m.ElapsedMs, how long it had gone. A
+// run is kept for out from the start, its output held before it is
+// numbered too.
 func (s *session) runStarted(m protocol.RunStarted) {
-	r := &sessionRun{argv: m.Argv, started: time.Now(), outputLines: outputLines{tail: tail{max: s.tailLines}}, output: &keptOutput{}}
+	started := time.Now()
+	if m.Earlier {
+		started = started.Add(-time.Duration(m.ElapsedMs) * time.Millisecond)
+	}
+	r := &sessionRun{argv: m.Argv, started: started, earlier: m.Earlier, outputLines: outputLines{tail: tail{max: s.tailLines}}, output: &keptOutput{}}
 	s.runs.going[m.Run] = r
 	switch n, ok := s.runs.numberByRequest[m.Request]; {
+	case m.Repeat() || m.Earlier:
+		r.n = s.nextRun()
+		s.keep(r)
+		s.notify(startLine(r, m))
 	case ok:
 		delete(s.runs.numberByRequest, m.Request)
 		r.n = n
 		s.keep(r)
-	case m.Request == 0:
-		r.n = s.nextRun()
-		s.keep(r)
-		s.notify(startLine(r, m.Approval))
 	default:
 		s.runs.startedEarly[m.Request] = r
 	}
 }
 
-// startLine returns the line that tells of run r, a repeat that approval
-// let through, as it starts: `run N · <cmd> · by standing approval` or
-// `by session approval`, the command shown as its summary shows it.
-func startLine(r *sessionRun, approval protocol.Scope) string {
-	return fmt.Sprintf("run %d · %s · %s", r.n, hostterm.ArgvLine(r.argv), byApproval(approval))
+// startLine returns the line that tells of run r, started as m says, as
+// the session learns of it: `run N · <cmd> · by standing approval` or
+// `by session approval` for a repeat, and for a run that started before
+// the session served its daemon the approval that let it through (see
+// approvedBy), then `· started before this session`, the command shown
+// as its summary shows it.
+func startLine(r *sessionRun, m protocol.RunStarted) string {
+	line := fmt.Sprintf("run %d · %s · %s", r.n, hostterm.ArgvLine(r.argv), approvedBy(m))
+	if m.Earlier {
+		line += " · started before this session"
+	}
+	return line
 }
 
-// byApproval returns what a start line says let a repeat through: the
-// scope's by text (see scopeTexts) for a standing or session approval,
-// its kind as the daemon names it, shown escaped, for a scope with none.
-func byApproval(approval protocol.Scope) string {
-	if by := scopeTexts[approval].by; by != "" {
-		return by
+// approvedBy returns what a start line says let the run m through: for a
+// fresh approval, the answer to request m.Request, the scope's earlier
+// text (see scopeTexts); for a repeat, the scope's by text; and for a
+// scope without that text, its kind as the daemon names it, shown
+// escaped.
+func approvedBy(m protocol.RunStarted) string {
+	texts := scopeTexts[m.Approval]
+	text := texts.earlier
+	if m.Repeat() {
+		text = texts.by
 	}
-	return "by " + hostterm.Display(string(approval))
+	if text != "" {
+		return text
+	}
+	return "by " + hostterm.Display(string(m.Approval))
 }
 
 // runOutput takes a chunk of an approved run's output: its lines (see
@@ -343,9 +368,15 @@ func summary(r *sessionRun) string {
 // statusLine returns the line of run r that says how it went, outcome, in
 // duration d, and the bytes of its output the daemon dropped, not
 // received: `── run N · <cmd> · <outcome> · <duration> · <lines> lines ──`,
-// `· <N> bytes not received` before the end when it dropped any.
+// `· earlier output not received` before the end for a run that started
+// before the session served its daemon, whose lines count only the
+// output since, then `· <N> bytes not received` when the daemon dropped
+// any.
 func statusLine(r *sessionRun, outcome string, d time.Duration, dropped int) string {
 	line := fmt.Sprintf("── run %d · %s · %s · %s · %s", r.n, hostterm.ArgvLine(r.argv), outcome, shownDuration(d), counted(r.lines(), "line"))
+	if r.earlier {
+		line += " · earlier output not received"
+	}
 	if dropped > 0 {
 		line += " · " + counted(dropped, "byte") + " not received"
 	}

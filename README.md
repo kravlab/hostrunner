@@ -337,7 +337,9 @@ is marked `*` and is chosen with Enter, one another session serves is
 marked, and one of another approval protocol version cannot be chosen
 (restart its container). Choosing a served daemon asks
 `Take over? [y/N]`: the other session says it was taken over and ends,
-and the requests waiting pass to this one with the rest of their limit.
+and the requests waiting pass to this one with the rest of their limit;
+the approved runs going are announced to it, as to any session that
+starts serving a daemon, marked `started before this session`.
 `--dir` serves the daemon of that runtime directory, the `--dir` its
 `initializeCommand` gives `hostrunner up`; a directory without an
 approval socket has no approvals; a session given `--dir` serves that

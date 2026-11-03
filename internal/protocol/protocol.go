@@ -311,13 +311,27 @@ type Serve struct {
 // is told it took with FrameAnswered, perhaps after this frame. A repeat
 // a standing or session approval let through without asking has Request
 // 0 and that approval's kind, ScopeStanding or ScopeSession. A run that
-// does not start after all ends at once, with RunEnded.Error.
+// does not start after all ends at once, with RunEnded.Error. Earlier
+// says the run started before the session served the daemon: the daemon
+// announces each run still going as the session starts serving it,
+// right after FrameServing, and the run's output from then on and its
+// end follow; the answer to its request, if any, went to another
+// session, or to an earlier connection of this one. ElapsedMs, with
+// Earlier, is how long the run had gone when the daemon announced it.
 type RunStarted struct {
-	Run      uint64   `json:"run"`
-	Argv     []string `json:"argv"`
-	Cwd      string   `json:"cwd"`
-	Approval Scope    `json:"approval"`
-	Request  uint64   `json:"request,omitempty"`
+	Run       uint64   `json:"run"`
+	Argv      []string `json:"argv"`
+	Cwd       string   `json:"cwd"`
+	Approval  Scope    `json:"approval"`
+	Request   uint64   `json:"request,omitempty"`
+	Earlier   bool     `json:"earlier,omitempty"`
+	ElapsedMs int64    `json:"elapsed_ms,omitempty"`
+}
+
+// Repeat reports whether m is the start of a repeat, a run a standing or
+// session approval let through without asking: one with Request 0.
+func (m RunStarted) Repeat() bool {
+	return m.Request == 0
 }
 
 // RunOutput is a chunk of approved run Run's output, as the container

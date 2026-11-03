@@ -14,10 +14,12 @@ import (
 // An approved run is a run of a command a human approved; the session
 // serving the daemon learns how it goes when it asked for runs
 // (protocol.Serve.Runs): its start, its output as the container gets it,
-// and its end. The frames reach the session through its runFeed, apart
-// from the container's stream: a session that falls behind loses output,
-// counted, but neither slows the command nor is dropped for it. The daemon
-// log gets none of the output.
+// and its end. A session that starts serving while the run goes learns
+// of its start as it does, marked earlier (see approvals.serve), and of
+// its output from then on and its end. The frames reach the session
+// through its runFeed, apart from the container's stream: a session that
+// falls behind loses output, counted, but neither slows the command nor
+// is dropped for it. The daemon log gets none of the output.
 
 // runFeedBytes bounds the output a session's run feed holds while the
 // session does not take it; output beyond it is dropped and counted.
@@ -54,10 +56,12 @@ func cancelReason(ctx context.Context) protocol.CancelReason {
 
 // approvedRun is an approved run the daemon reports to the session serving
 // it, whichever session that is when each frame goes; a nil one reports
-// nothing (a run the rules allowed).
+// nothing (a run the rules allowed). start is its start as the session
+// serving the daemon was told of it, begun when it began.
 type approvedRun struct {
 	a     *approvals
 	id    uint64
+	start protocol.RunStarted
 	begun time.Time
 }
 
@@ -67,7 +71,8 @@ func (a *approvals) startRun(m protocol.RunStarted) *approvedRun {
 	a.mu.Lock()
 	a.lastRun++
 	m.Run = a.lastRun
-	a.going[m.Run] = m
+	r := &approvedRun{a: a, id: m.Run, start: m, begun: time.Now()}
+	a.going[m.Run] = r
 	if len(a.going) == 1 {
 		a.noRuns = make(chan struct{})
 	}
@@ -76,7 +81,15 @@ func (a *approvals) startRun(m protocol.RunStarted) *approvedRun {
 	if feed != nil {
 		feed.started(m)
 	}
-	return &approvedRun{a: a, id: m.Run, begun: time.Now()}
+	return r
+}
+
+// announced returns r's start as told to a session that starts serving
+// the daemon while r goes: marked earlier, with how long r has gone.
+func (r *approvedRun) announced() protocol.RunStarted {
+	m := r.start
+	m.Earlier, m.ElapsedMs = true, time.Since(r.begun).Milliseconds()
+	return m
 }
 
 // startRepeat starts the approved run of p, the prepared command of req,
@@ -124,7 +137,8 @@ func (a *approvals) awaitRuns(deadline time.Time) {
 }
 
 // feed returns where r's frames go: nil for a nil r, a run the rules
-// allowed, and while no session serving the daemon asked for runs.
+// allowed, and while no session serving the daemon asked for runs. end
+// takes the feed itself, under a.mu (see end).
 func (r *approvedRun) feed() *runFeed {
 	if r == nil {
 		return nil
@@ -156,18 +170,22 @@ func (r *approvedRun) cancelled(ctx context.Context) {
 	r.end(protocol.RunEnded{Cancelled: cancelReason(ctx)})
 }
 
-// end tells the session that r ended as m says, then forgets r: a daemon
-// that stops waits for that (see awaitRuns).
+// end tells the session that r ended as m says and forgets r, both under
+// a.mu, which a session that starts serving the daemon takes the runs
+// going under (see approvals.serve): that session is told either of r
+// and its end, or of neither. Queuing the end takes the run feed's lock
+// under a.mu; nothing takes them the other way round. A daemon that
+// stops waits for the end (see awaitRuns).
 func (r *approvedRun) end(m protocol.RunEnded) {
 	if r == nil {
 		return
 	}
 	m.Run, m.DurationMs = r.id, time.Since(r.begun).Milliseconds()
-	if feed := r.feed(); feed != nil {
-		feed.ended(m)
-	}
 	r.a.mu.Lock()
 	defer r.a.mu.Unlock()
+	if feed := r.a.runFeedLocked(); feed != nil {
+		feed.ended(m)
+	}
 	delete(r.a.going, r.id)
 	if len(r.a.going) == 0 && r.a.noRuns != nil {
 		close(r.a.noRuns)
@@ -199,6 +217,8 @@ func (t runTee) Write(p []byte) (int, error) {
 type runFeed struct {
 	out *frameWriter
 
+	// mu may be taken under approvals.mu (approvedRun.end does);
+	// approvals.mu is never taken under it.
 	mu      sync.Mutex
 	queue   []runFrame
 	held    int              // the output bytes in queue

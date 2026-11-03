@@ -58,7 +58,7 @@ var (
 // stops. Without it, nothing is approved.
 func WithApprovals(l net.Listener, rulesFile string) Option {
 	return func(s *Server) {
-		s.approvals = &approvals{listener: l, rulesFile: rulesFile, waiting: map[uint64]*approvalRequest{}, telling: map[uint64]protocol.EndReason{}, going: map[uint64]protocol.RunStarted{}}
+		s.approvals = &approvals{listener: l, rulesFile: rulesFile, waiting: map[uint64]*approvalRequest{}, telling: map[uint64]protocol.EndReason{}, going: map[uint64]*approvedRun{}}
 	}
 }
 
@@ -83,9 +83,11 @@ type approvals struct {
 	// granted them serves the daemon.
 	held     []heldApproval
 	lastHeld uint64
-	// going holds the approved runs that have not ended, by number (see
-	// startRun); noRuns, while one goes, is closed once none does.
-	going   map[uint64]protocol.RunStarted
+	// going holds the approved runs that have not ended, by number, as
+	// they started (see startRun), for a session that starts serving the
+	// daemon (see serve); noRuns, while one goes, is closed once none
+	// does.
+	going   map[uint64]*approvedRun
 	lastRun uint64
 	noRuns  chan struct{}
 }
@@ -279,20 +281,28 @@ func (a *approvals) answer(c *sessionConn, ans protocol.Answer) (string, protoco
 	return "", ""
 }
 
-// handover is what a session that takes the daemon over gets from the one
-// it replaces, old: the requests waiting for old's answer, now waiting for
-// the new session's, and how many session approvals old granted, which
-// ended with it.
+// handover is what a session that starts serving the daemon gets: when
+// it asked for runs, the approved runs going, as they started, marked as
+// started earlier (see approvedRun.announced), in the order of their
+// numbers; and, from the session it takes the daemon over from, old, the
+// requests waiting for old's answer, now waiting for the new session's,
+// and how many session approvals old granted, which ended with it.
 type handover struct {
-	old   *sessionConn
-	moved []*approvalRequest
-	ended int
+	earlier []protocol.RunStarted
+	old     *sessionConn
+	moved   []*approvalRequest
+	ended   int
 }
 
-// serve makes c the session that serves the daemon and returns why not, or
-// "". With takeOver it replaces the session serving it and returns the
-// handover from it: the caller sends the requests moved to c and tells
-// the old session (see serveSession).
+// serve makes c the session that serves the daemon, taking it over from
+// the session serving it with takeOver, and returns why not, or "", and
+// the handover to c: the caller announces the runs going to c, sends it
+// the requests moved to it and tells the session it replaced (see
+// serveSession). The runs going are taken as c starts serving, under the
+// same lock, when c asked for runs (its feed is set before it asks to
+// serve): their frames go to c from then on (see startRun and
+// approvedRun.end), none before. A session already serving starts
+// nothing, and gets an empty handover.
 func (a *approvals) serve(c *sessionConn, takeOver bool) (string, handover) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -305,6 +315,12 @@ func (a *approvals) serve(c *sessionConn, takeOver bool) (string, handover) {
 	}
 	a.serving = c
 	h := handover{old: old, ended: a.endSessionApprovals(old)}
+	if c.runs.Load() != nil {
+		for _, r := range a.going {
+			h.earlier = append(h.earlier, r.announced())
+		}
+		slices.SortFunc(h.earlier, func(x, y protocol.RunStarted) int { return cmp.Compare(x.Run, y.Run) })
+	}
 	for _, r := range a.waiting {
 		if r.session == old {
 			r.session = c
@@ -711,10 +727,12 @@ func (a *approvals) waitingMsg(id uint64) (protocol.ApprovalRequest, bool) {
 
 // serveSession makes c the session that serves the daemon, taking it over
 // from the one serving it with takeOver, and returns why not, or "". It
-// confirms with FrameServing and sends c the requests a take-over passed
-// to it, each with the rest of its limit, holding c's writer from before
-// c serves: no request or end of one reaches c before them. It then tells
-// the session it replaced, which it drops. Take-overs run one at a time.
+// confirms with FrameServing, announces to c the approved runs going
+// that the handover holds (see serve), and sends it the requests a
+// take-over passed to it, each with the rest of its limit, holding c's
+// writer from before c serves: no request, end of one or frame of a run
+// reaches c before them. It then tells the session it replaced, which it
+// drops. Take-overs run one at a time.
 func (s *Server) serveSession(c *sessionConn, takeOver bool) string {
 	s.approvals.takeovers.Lock()
 	defer s.approvals.takeovers.Unlock()
@@ -728,6 +746,11 @@ func (s *Server) serveSession(c *sessionConn, takeOver bool) string {
 		}
 		if err := send(protocol.FrameServing, nil); err != nil {
 			return err
+		}
+		for _, m := range h.earlier {
+			if err := send(protocol.FrameRunStarted, m); err != nil {
+				return err
+			}
 		}
 		for _, r := range h.moved {
 			msg := r.msg
