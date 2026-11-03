@@ -159,6 +159,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 	}
 	ctx, release := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer release()
+	version := buildVersion(debug.ReadBuildInfo())
 	switch args[0] {
 	case "up":
 		exe, err := os.Executable()
@@ -188,6 +189,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 		if cfg.Restart != nil {
 			cfg.Restart.Runtimes = watch.Detect()
 		}
+		cfg.Version = version
 		sctx, commands, releaseSignals := stopCommands(cfg.Commands)
 		defer releaseSignals()
 		cfg.Commands = commands
@@ -203,6 +205,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 				return errors.New("--watch needs docker or podman in PATH")
 			}
 		}
+		cfg.version = version
 		return serve(ctx, cfg, slog.New(slog.NewTextHandler(stderr, nil)), runtimes)
 	case "test":
 		cfg, err := parseTest(args[1:], os.Getenv, stderr)
@@ -215,13 +218,14 @@ func run(args []string, stdout, stderr io.Writer) error {
 		if err != nil {
 			return err
 		}
+		cfg.Version = version
 		return approval.Run(ctx, cfg, os.Stdin, stdout)
 	case "update":
 		check, err := parseUpdate(args[1:], stderr)
 		if err != nil {
 			return err
 		}
-		return runUpdate(ctx, check, buildVersion(debug.ReadBuildInfo()), stdout)
+		return runUpdate(ctx, check, version, stdout)
 	case "instructions":
 		cfg, err := parseInstructions(args[1:], stderr)
 		if err != nil {
@@ -232,7 +236,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 		if err := parseVersion(args[1:], stderr); err != nil {
 			return err
 		}
-		_, err := fmt.Fprintln(stdout, buildVersion(debug.ReadBuildInfo()))
+		_, err := fmt.Fprintln(stdout, version)
 		return err
 	default:
 		return errors.New(usage)
@@ -472,8 +476,9 @@ func stopCommands(parsed stop.Commands) (ctx context.Context, commands stop.Comm
 type serveConfig struct {
 	socket string // Unix socket to listen on
 	workspaceFlags
-	watch             bool // exit once the armed container stops
-	settings.Settings      // the daemon's settings
+	watch             bool   // exit once the armed container stops
+	version           string // the build version the daemon reports (see buildVersion)
+	settings.Settings        // the daemon's settings
 }
 
 // parseServe parses the flags of `hostrunner serve`; the socket and both
@@ -777,6 +782,7 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 		daemon.WithReread(policy.Digest(), reread),
 		daemon.WithAskTimeout(cfg.AskTimeout),
 		daemon.WithRequestTimeout(cfg.RequestTimeout),
+		daemon.WithBuildVersion(cfg.version),
 	}
 	if cfg.Reread {
 		opts = append(opts, daemon.WithRereadEvery(cfg.PollInterval))

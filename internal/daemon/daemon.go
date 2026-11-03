@@ -61,6 +61,7 @@ type Server struct {
 	approvals        *approvals                                           // nil: no approval socket, so nothing is approved
 	containerStopped func() bool                                          // nil: the armed container is not known to have stopped
 	rereadEvery      time.Duration                                        // 0: the rules file is not watched; see WithRereadEvery
+	buildVersion     string                                               // "": unknown; see WithBuildVersion
 
 	// rereading makes rereads one at a time, so a slower one never
 	// replaces the rules a later one served.
@@ -100,6 +101,14 @@ func WithRequestTimeout(d time.Duration) Option {
 // limit, it may exceed an hour: the host chose it.
 func WithAskTimeout(d time.Duration) Option {
 	return func(s *Server) { s.askTimeout = d }
+}
+
+// WithBuildVersion sets the build version of the hostrunner the Server
+// runs in, as `hostrunner version` prints it, which it tells approval
+// sessions and stops (protocol.DaemonInfo.BuildVersion); without it the
+// Server reports none, as a daemon older than the field does.
+func WithBuildVersion(v string) Option {
+	return func(s *Server) { s.buildVersion = v }
 }
 
 // WithReread lets an approval session make the Server reread its rules

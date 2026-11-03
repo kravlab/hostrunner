@@ -327,6 +327,10 @@ type Hello struct {
 // a daemon older than both reports neither, so a session asks before
 // having it reread a file changed by hand, and `hostrunner restart`
 // names no change of rereading.
+// BuildVersion is the build version of the daemon's hostrunner, as
+// `hostrunner version` prints it, apart from the approval protocol
+// version: a daemon older than the field reports none, which reads as an
+// unknown version. An older session ignores it.
 type DaemonInfo struct {
 	Version            int    `json:"version"`
 	Workspace          string `json:"workspace"`
@@ -338,6 +342,7 @@ type DaemonInfo struct {
 	ContainerStopped   bool   `json:"container_stopped,omitempty"`
 	Rereads            bool   `json:"rereads,omitempty"`
 	NoReread           bool   `json:"no_reread,omitempty"`
+	BuildVersion       string `json:"build_version,omitempty"`
 }
 
 // RunningList answers FrameRunning: the commands the daemon runs, and

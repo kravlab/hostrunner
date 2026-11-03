@@ -199,6 +199,18 @@ func TestStopChooseStopsTheChosenDaemon(t *testing.T) {
 	kept.stillServes(t)
 }
 
+// The list of stop --choose shows every daemon's version, marking those
+// other than stop's own or unknown.
+func TestStopChooseShowsTheDaemonsVersions(t *testing.T) {
+	d := startVersionedDaemons(t)
+	s := launchStop(t, stop.Config{Root: d.root, Choose: true, Cwd: t.TempDir(), Version: "v1.2.0", Commands: stop.Commands{Terminal: true}})
+	d.checkListed(t, s.waitFor(t, "choose [1-3, q quit] ? "))
+	s.answer(t, "q")
+	waitEnded(t, s)
+	d.same.stillServes(t)
+	d.older.stillServes(t)
+}
+
 func TestStopChooseQuitStopsNothing(t *testing.T) {
 	base, root := newBase(t)
 	h := startEchoDaemon(t, slog.New(slog.DiscardHandler), base)

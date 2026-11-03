@@ -74,6 +74,9 @@ type Config struct {
 	All    bool   // stop every daemon under Root
 	Choose bool   // let the human choose from the daemons under Root
 	Cwd    string // the directory the human runs stop in
+	// Version is this hostrunner's build version, as `hostrunner version`
+	// prints it: Choose's list marks the daemons of another one.
+	Version string
 	Commands
 	// Restart, when set, makes it `hostrunner restart`: each daemon
 	// stopped is replaced by a new one.
@@ -211,7 +214,7 @@ func (t *term) choose(ctx context.Context, cfg Config) ([]daemonlist.Daemon, err
 	case len(found) == 0:
 		return nil, fmt.Errorf("no daemons run under %s", hostterm.Display(cfg.Root))
 	case cfg.Choose:
-		l := hostterm.List{Daemons: found, Cwd: cfg.Cwd, AnyVersion: true, HideServed: true}
+		l := hostterm.List{Daemons: found, Cwd: cfg.Cwd, AnyVersion: true, HideServed: true, Version: cfg.Version}
 		prompt := l.Print(t.out)
 		for {
 			text, err := t.ask(ctx, prompt, nil)

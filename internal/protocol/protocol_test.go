@@ -220,3 +220,43 @@ func TestOlderDaemonIgnoresArmSettings(t *testing.T) {
 		t.Fatalf("got %+v, %v", got, err)
 	}
 }
+
+// A DaemonInfo carrying a build version still decodes into the DaemonInfo
+// an older session declares, its other fields unchanged, and the approval
+// protocol version stays 1: the build version needs no new protocol.
+// olderDaemonInfo copies the fields of the DaemonInfo before BuildVersion
+// by hand.
+func TestOlderSessionIgnoresTheBuildVersion(t *testing.T) {
+	if ApprovalVersion != 1 {
+		t.Fatalf("ApprovalVersion = %d, want 1", ApprovalVersion)
+	}
+	type olderDaemonInfo struct {
+		Version            int    `json:"version"`
+		Workspace          string `json:"workspace"`
+		ContainerWorkspace string `json:"container_workspace"`
+		RulesFile          string `json:"rules_file"`
+		RulesDigest        string `json:"rules_digest,omitempty"`
+		Served             bool   `json:"served,omitempty"`
+		Stops              bool   `json:"stops,omitempty"`
+		ContainerStopped   bool   `json:"container_stopped,omitempty"`
+		Rereads            bool   `json:"rereads,omitempty"`
+		NoReread           bool   `json:"no_reread,omitempty"`
+	}
+	var buf bytes.Buffer
+	sent := DaemonInfo{Version: ApprovalVersion, Workspace: "/home/u/app", ContainerWorkspace: "/workspaces/app", RulesFile: "/home/u/app/rules.yaml", RulesDigest: "digest", Served: true, Stops: true, Rereads: true, BuildVersion: "v1.2.0"}
+	if err := WriteJSON(&buf, FrameDaemonInfo, sent); err != nil {
+		t.Fatal(err)
+	}
+	f, err := ReadFrame(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(f.Payload, []byte(`"build_version":"v1.2.0"`)) {
+		t.Fatalf("payload %s lacks the build version", f.Payload)
+	}
+	var got olderDaemonInfo
+	want := olderDaemonInfo{Version: 1, Workspace: "/home/u/app", ContainerWorkspace: "/workspaces/app", RulesFile: "/home/u/app/rules.yaml", RulesDigest: "digest", Served: true, Stops: true, Rereads: true}
+	if err := DecodeJSON(f, &got); err != nil || got != want {
+		t.Fatalf("got %+v, %v; want %+v", got, err, want)
+	}
+}

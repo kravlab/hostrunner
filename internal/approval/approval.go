@@ -43,7 +43,15 @@ type Config struct {
 	// Cwd is the directory the session runs in: the daemon whose host
 	// workspace holds it is marked and chosen by default.
 	Cwd string
+	// Version is this hostrunner's build version, as `hostrunner version`
+	// prints it: the session says it as it starts and marks the daemons
+	// of another one. "" is devVersion, as for a build without one.
+	Version string
 }
+
+// devVersion is the version of a session given none, what `hostrunner
+// version` prints for a build without one.
+const devVersion = "dev"
 
 // errNoEditor is what editInEditor returns when neither $VISUAL nor
 // $EDITOR names an editor.
@@ -133,7 +141,9 @@ var scopeTexts = map[protocol.Scope]struct{ outcome, confirm string }{
 // asks. While no request is shown, the idle prompt takes commands:
 // standing lists the daemon's standing and session approvals, revoke <n>
 // revokes one, daemons leaves the daemon for the list, quit ends the
-// session.
+// session. It says its own version as it starts (see Config.Version) and
+// the daemon's on each serving line, followed by a warning whenever that
+// is another or unknown, so the human can restart the daemon.
 //
 // Without cfg.Socket it lists the daemons under cfg.Root to choose from
 // (see choose), and a daemon another session serves can be taken over:
@@ -145,8 +155,9 @@ var scopeTexts = map[protocol.Scope]struct{ outcome, confirm string }{
 // approvals, and one another session serves is left to it unless taken
 // over.
 func Run(ctx context.Context, cfg Config, in io.Reader, out io.Writer) error {
-	t := &term{out: out, Input: hostterm.NewInput(in)}
+	t := &term{out: out, Input: hostterm.NewInput(in), version: cmp.Or(cfg.Version, devVersion)}
 	defer t.Close()
+	fmt.Fprintf(out, "hostrunner approve %s\n", hostterm.Display(t.version))
 	socket, takeOver := cfg.Socket, false
 	first := socket != ""
 	for {
@@ -229,7 +240,8 @@ const (
 // right after shows the daemon unserved; an interruption (ctx) hangs up
 // alike. When the daemon has gone (nextAwait), it also returns what the
 // session said of that, the prompt of the wait for the next one (see
-// awaitDaemon).
+// awaitDaemon). Serving it, it says the daemon's build version and warns
+// when it is not the session's (see hostterm.OtherVersion).
 // Without takeOver, a daemon another session serves is not served
 // (nextServedElsewhere, errServed).
 func (t *term) serveDaemon(ctx context.Context, socket string, takeOver, canList bool) (next, string, error) {
@@ -259,7 +271,12 @@ func (t *term) serveDaemon(ctx context.Context, socket string, takeOver, canList
 		}
 		return nextFailed, "", err
 	}
-	fmt.Fprintf(t.out, "serving %s (container %s)\nwaiting for requests · %s\n", hostterm.Display(info.Workspace), hostterm.Display(info.ContainerWorkspace), idleCommands)
+	daemonVersion := "daemon " + hostterm.ShownVersion(info, "version unknown")
+	fmt.Fprintf(t.out, "serving %s (container %s) · %s\n", hostterm.Display(info.Workspace), hostterm.Display(info.ContainerWorkspace), daemonVersion)
+	if hostterm.OtherVersion(info, t.version) {
+		fmt.Fprintf(t.out, "⚠ %s, this session %s: run hostrunner restart to update\n", daemonVersion, hostterm.Display(t.version))
+	}
+	fmt.Fprintf(t.out, "waiting for requests · %s\n", idleCommands)
 
 	done := make(chan struct{})
 	defer close(done)
@@ -333,6 +350,9 @@ type term struct {
 	*hostterm.Input
 	// asking is the current prompt.
 	asking string
+	// version is the session's build version (Config.Version, or
+	// devVersion), against which a daemon of another one is marked.
+	version string
 }
 
 // session is the state of a session serving one daemon: the requests

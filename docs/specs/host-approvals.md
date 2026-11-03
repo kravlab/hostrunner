@@ -140,8 +140,9 @@ from `protocol.Version` of the container's socket.
   take over) are accepted only there and refused on the container's
   socket; the approval socket accepts no container frames.
 - Hello: the daemon answers with its approval protocol version, the host
-  and container workspaces, the rules file path, and whether a session
-  serves it. A session does not serve a daemon of another approval
+  and container workspaces, the rules file path, whether a session
+  serves it, and its build version (`build_version`, optional; see
+  Approval session). A session does not serve a daemon of another approval
   protocol version; there is no backward compatibility.
 - Each approval request has an id (a counter in the daemon), sent with its
   content. The session answers by id; only the serving session is heard;
@@ -320,12 +321,13 @@ without an alternate screen. The agreed screens:
 
 ```
 $ hostrunner approve
+hostrunner approve v1.2.0
 daemons:
-  1 * /home/u/app        (container /workspaces/app)       ← current directory
-  2   /home/u/tools      (container /workspaces/tools)     served by another session
-  3   /home/u/legacy     another version: restart its container
+  1 * /home/u/app        v1.2.0      (container /workspaces/app)       ← current directory
+  2   /home/u/tools      v1.1.0 ⚠    (container /workspaces/tools)     served by another session
+  3   /home/u/legacy     unknown ⚠   another version: restart its container
 choose [1-3, Enter = 1, q quit] ? 1
-serving /home/u/app (container /workspaces/app)
+serving /home/u/app (container /workspaces/app) · daemon v1.2.0
 waiting for requests · commands: standing, revoke <n>, daemons, quit
 >
 
@@ -371,6 +373,23 @@ refused
 revoked 1
 ```
 
+- Versions: the session says its own build version as it starts,
+  `hostrunner approve <version>`, as `hostrunner version` prints it
+  (`dev` without build information). The daemon reports its build version
+  in `DaemonInfo` (`build_version`), apart from the approval protocol
+  version (`version`, which stays 1); a daemon older than the field
+  reports none, which reads as unknown, and an older session ignores it.
+  The serving line ends `· daemon <version>`, or `· daemon version
+  unknown`. A daemon of another or an unknown version is served all the
+  same, after one warning line naming both versions: `⚠ daemon v1.1.0,
+  this session v1.2.0: run hostrunner restart to update` (`⚠ daemon
+  version unknown, this session v1.2.0: …`). The list of daemons, when
+  choosing and after `daemons`, shows every daemon's version, `unknown`
+  for none, followed by `⚠` when it is not the session's; the note for
+  another approval protocol version stays. A daemon whose version changes
+  shows the list again. `hostrunner stop --choose` and `hostrunner
+  restart --choose` show the same column and marks, against their own
+  version.
 - Answers are a letter and Enter: `r` refuse (then an optional note for
   the agent), `o` this request only, `s` for this session (until it
   ends), `d` standing (until the daemon stops), `a` add a rule, `c` the
@@ -533,6 +552,9 @@ revoked 1
 - A daemon older than `--ask`: 125, nothing runs. A client older than
   `--ask` never sends it and works as before.
 - A daemon of another approval protocol version: listed, cannot be served.
+- A daemon of another build version, or one too old to report it: listed
+  marked, served after a warning that names both versions and `hostrunner
+  restart`.
 - `--ask=0`, `--ask=-1m`, `--ask=soon`: 125 before connecting; `--ask=2h`:
   125 from the daemon.
 - `--dry-run --ask` or `--ask --dry-run`: 125; `hostrun git --ask` passes

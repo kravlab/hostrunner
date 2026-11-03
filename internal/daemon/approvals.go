@@ -549,7 +549,7 @@ func (s *Server) handleSession(ctx context.Context, conn net.Conn) {
 		Version: protocol.ApprovalVersion, Workspace: host, ContainerWorkspace: container,
 		RulesFile: s.approvals.rulesFile, RulesDigest: s.rulesDigest(), Served: s.approvals.served(),
 		Stops: true, ContainerStopped: s.containerStopped != nil && s.containerStopped(),
-		Rereads: s.rereadsByItself(), NoReread: !s.rereadsByItself(),
+		Rereads: s.rereadsByItself(), NoReread: !s.rereadsByItself(), BuildVersion: s.buildVersion,
 	})
 	defer func() {
 		// The daemon stopping closes the connection too: its requests end

@@ -65,6 +65,78 @@ func TestRunVersionPrintsTheVersion(t *testing.T) {
 	}
 }
 
+// emptyStdin makes os.Stdin, which run reads the human from, an input
+// that ends at once, until the test ends.
+func emptyStdin(t *testing.T) {
+	t.Helper()
+	f, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdin := os.Stdin
+	os.Stdin = f
+	t.Cleanup(func() {
+		os.Stdin = stdin
+		f.Close()
+	})
+}
+
+// fakeVersionedDaemon answers every hello on the approval socket of the
+// runtime directory dir, under a runtime root, as a daemon serving
+// workspace of the build version version.
+func fakeVersionedDaemon(t *testing.T, dir, workspace, version string) {
+	t.Helper()
+	l, err := transport.Unix{Path: launch.ApprovalSocket(dir)}.Listen()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				if f, err := protocol.ReadFrame(c); err == nil && f.Type == protocol.FrameHello {
+					_ = protocol.WriteJSON(c, protocol.FrameDaemonInfo, protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: workspace, Stops: true, BuildVersion: version})
+				}
+			}(c)
+		}
+	}()
+}
+
+// approve and stop --choose get the build version version prints, "dev"
+// in a test binary: approve says it as it starts, and the list of stop
+// --choose marks a daemon of another version but not one of dev.
+func TestRunPassesTheBuildVersion(t *testing.T) {
+	t.Setenv("HOSTRUNNER_SETTINGS", "")
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	emptyStdin(t)
+	var out strings.Builder
+	if err := run([]string{"approve", "--dir", filepath.Join(t.TempDir(), "none")}, &out, io.Discard); err == nil {
+		t.Fatal("approve served a runtime directory without a daemon")
+	}
+	if got := out.String(); !strings.HasPrefix(got, "hostrunner approve dev\n") {
+		t.Errorf("approve printed %q, want it to start with its version", got)
+	}
+
+	root := t.TempDir()
+	t.Setenv("HOSTRUNNER_RUNTIME_ROOT", root)
+	fakeVersionedDaemon(t, filepath.Join(root, "a"), "/home/u/dev", "dev")
+	fakeVersionedDaemon(t, filepath.Join(root, "b"), "/home/u/other", "v1.2.0")
+	var list strings.Builder
+	if err := run([]string{"stop", "--choose"}, io.Discard, &list); err == nil {
+		t.Fatal("stop --choose stopped without a choice")
+	}
+	for _, want := range []string{"/home/u/dev     dev        ", "/home/u/other   v1.2.0 ⚠   "} {
+		if !strings.Contains(list.String(), want) {
+			t.Errorf("stop --choose printed %q, lacking %q", list.String(), want)
+		}
+	}
+}
+
 func TestRunVersionRejectsArguments(t *testing.T) {
 	var out strings.Builder
 	if err := run([]string{"version", "extra"}, &out, io.Discard); err == nil {
@@ -1057,11 +1129,13 @@ func TestUpdateMessage(t *testing.T) {
 
 // serve listens for approval sessions beside its socket's directory, the
 // runtime directory, which the container mounts, so the container cannot
-// reach it; it removes the socket when it stops.
+// reach it; it removes the socket when it stops. Its hello reports the
+// build version it is given.
 func TestServeListensOnTheApprovalSocket(t *testing.T) {
 	cfg := watchConfig(t)
 	cfg.watch = false
 	cfg.RulesFile = filepath.Join(cfg.workspace, "hostrun.yaml")
+	cfg.version = "v1.2.0"
 	approvalSocket := launch.ApprovalSocket(filepath.Dir(cfg.socket))
 	t.Cleanup(func() { os.Remove(approvalSocket) })
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1090,7 +1164,7 @@ func TestServeListensOnTheApprovalSocket(t *testing.T) {
 	if err != nil || f.Type != protocol.FrameDaemonInfo || protocol.DecodeJSON(f, &got) != nil {
 		t.Fatalf("hello: frame %v, err %v", f.Type, err)
 	}
-	want := protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: cfg.workspace, ContainerWorkspace: cfg.containerWorkspace, RulesFile: cfg.RulesFile, RulesDigest: "missing", Stops: true, Rereads: true}
+	want := protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: cfg.workspace, ContainerWorkspace: cfg.containerWorkspace, RulesFile: cfg.RulesFile, RulesDigest: "missing", Stops: true, Rereads: true, BuildVersion: "v1.2.0"}
 	if real, err := filepath.EvalSymlinks(cfg.workspace); err == nil {
 		want.Workspace = real
 	}
