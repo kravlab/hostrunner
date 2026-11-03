@@ -379,7 +379,7 @@ func TestSessionEscapesTheServedWorkspace(t *testing.T) {
 	})
 	s := h.startSession(t)
 	out := s.out.String()
-	if want := "serving " + strconv.Quote(h.hostRoot) + " (container " + containerRoot + ")\n"; !strings.Contains(out, want) {
+	if want := "serving " + strconv.Quote(h.hostRoot) + " (container " + containerRoot + ") · "; !strings.Contains(out, want) {
 		t.Errorf("the session printed %q, lacking %q", out, want)
 	}
 	if strings.Contains(out, "\x1b") {

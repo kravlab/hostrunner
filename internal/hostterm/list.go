@@ -23,6 +23,31 @@ type List struct {
 	// HideServed leaves out which daemons another approval session
 	// serves, for a list where that does not matter.
 	HideServed bool
+	// BuildVersion is this hostrunner's build version: every daemon's is
+	// shown, one of another or an unknown version marked (see
+	// OtherVersion).
+	BuildVersion string
+}
+
+// DevVersion is the build version of a hostrunner built without one, as
+// `hostrunner version` prints it; it also stands for a build version left
+// unset.
+const DevVersion = "dev"
+
+// OtherVersion reports whether info is of a daemon whose build version
+// is not version: another one, or none reported (a daemon older than
+// protocol.DaemonInfo.BuildVersion), which reads as unknown.
+func OtherVersion(info protocol.DaemonInfo, version string) bool {
+	return info.BuildVersion == "" || info.BuildVersion != version
+}
+
+// ShownVersion returns info's build version as Display shows it, or
+// unknown when the daemon reports none (see OtherVersion).
+func ShownVersion(info protocol.DaemonInfo, unknown string) string {
+	if info.BuildVersion == "" {
+		return unknown
+	}
+	return Display(info.BuildVersion)
 }
 
 // Default returns the index of the daemon chosen by default: the first
@@ -50,9 +75,10 @@ func (l List) Pick(text string) (int, bool) {
 // Print prints the daemons, of which there is at least one, to w and
 // returns the prompt that asks to choose one, for the caller to print.
 func (l List) Print(w io.Writer) (prompt string) {
-	width, cwidth := 0, 0
+	width, vwidth, cwidth := 0, 0, 0
 	for _, d := range l.Daemons {
 		width = max(width, len([]rune(Display(d.Info.Workspace))))
+		vwidth = max(vwidth, len([]rune(l.version(d))))
 		cwidth = max(cwidth, len([]rune(Display(d.Info.ContainerWorkspace))))
 	}
 	def := l.Default()
@@ -64,6 +90,8 @@ func (l List) Print(w io.Writer) (prompt string) {
 		}
 		ws := Display(d.Info.Workspace)
 		ws += strings.Repeat(" ", width-len([]rune(ws)))
+		v := l.version(d)
+		v += strings.Repeat(" ", vwidth-len([]rune(v)))
 		var note string
 		switch {
 		case !l.choosable(d):
@@ -82,13 +110,23 @@ func (l List) Print(w io.Writer) (prompt string) {
 				note += "   " + strings.Join(marks, ", ")
 			}
 		}
-		fmt.Fprintf(w, "  %d %s %s   %s\n", i+1, mark, ws, strings.TrimRight(note, " "))
+		fmt.Fprintf(w, "  %d %s %s   %s   %s\n", i+1, mark, ws, v, strings.TrimRight(note, " "))
 	}
 	choices := fmt.Sprintf("1-%d", len(l.Daemons))
 	if def >= 0 {
 		choices += fmt.Sprintf(", Enter = %d", def+1)
 	}
 	return "choose [" + choices + ", q quit] ? "
+}
+
+// version returns d's build version as the list shows it, "unknown"
+// when it reports none, followed by " ⚠" when it is not l.BuildVersion.
+func (l List) version(d daemonlist.Daemon) string {
+	v := ShownVersion(d.Info, "unknown")
+	if OtherVersion(d.Info, l.BuildVersion) {
+		v += " ⚠"
+	}
+	return v
 }
 
 // choosable reports whether d can be chosen from the list.

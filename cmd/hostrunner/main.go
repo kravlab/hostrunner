@@ -48,10 +48,10 @@
 // them and starts the daemon with every one as a flag. The settings of
 // `stop` and `restart` are [--settings <path>] [--runtime-root <path>]
 // [--stop-timeout <duration>], those of `approve` [--settings <path>]
-// [--runtime-root <path>]; a setting no flag gives comes from its
-// HOSTRUNNER_* variable, the common part of the host settings file or
-// the default. `restart` resolves the new daemon's settings as `up`
-// does, for the old daemon's workspace, also taking
+// [--runtime-root <path>] [--approve-tail-lines <integer>]; a setting no
+// flag gives comes from its HOSTRUNNER_* variable, the common part of the
+// host settings file or the default. `restart` resolves the new daemon's
+// settings as `up` does, for the old daemon's workspace, also taking
 // [--workspace-settings <path>] and [--rules-file <path>] (not with
 // --all).
 package main
@@ -159,6 +159,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 	}
 	ctx, release := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer release()
+	version := buildVersion(debug.ReadBuildInfo())
 	switch args[0] {
 	case "up":
 		exe, err := os.Executable()
@@ -188,6 +189,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 		if cfg.Restart != nil {
 			cfg.Restart.Runtimes = watch.Detect()
 		}
+		cfg.BuildVersion = version
 		sctx, commands, releaseSignals := stopCommands(cfg.Commands)
 		defer releaseSignals()
 		cfg.Commands = commands
@@ -203,6 +205,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 				return errors.New("--watch needs docker or podman in PATH")
 			}
 		}
+		cfg.version = version
 		return serve(ctx, cfg, slog.New(slog.NewTextHandler(stderr, nil)), runtimes)
 	case "test":
 		cfg, err := parseTest(args[1:], os.Getenv, stderr)
@@ -215,13 +218,14 @@ func run(args []string, stdout, stderr io.Writer) error {
 		if err != nil {
 			return err
 		}
+		cfg.BuildVersion = version
 		return approval.Run(ctx, cfg, os.Stdin, stdout)
 	case "update":
 		check, err := parseUpdate(args[1:], stderr)
 		if err != nil {
 			return err
 		}
-		return runUpdate(ctx, check, buildVersion(debug.ReadBuildInfo()), stdout)
+		return runUpdate(ctx, check, version, stdout)
 	case "instructions":
 		cfg, err := parseInstructions(args[1:], stderr)
 		if err != nil {
@@ -232,7 +236,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 		if err := parseVersion(args[1:], stderr); err != nil {
 			return err
 		}
-		_, err := fmt.Fprintln(stdout, buildVersion(debug.ReadBuildInfo()))
+		_, err := fmt.Fprintln(stdout, version)
 		return err
 	default:
 		return errors.New(usage)
@@ -242,10 +246,11 @@ func run(args []string, stdout, stderr io.Writer) error {
 // buildVersion is the main module version the Go toolchain stamped into the
 // binary, as returned by debug.ReadBuildInfo: the tag for a release or
 // `go install …@vX.Y.Z`, a pseudo-version between tags. A build without
-// VCS data reports "(devel)" or nothing, which becomes "dev".
+// VCS data reports "(devel)" or nothing, which becomes
+// hostterm.DevVersion.
 func buildVersion(info *debug.BuildInfo, ok bool) string {
 	if !ok || info.Main.Version == "" || info.Main.Version == "(devel)" {
-		return "dev"
+		return hostterm.DevVersion
 	}
 	return info.Main.Version
 }
@@ -472,8 +477,9 @@ func stopCommands(parsed stop.Commands) (ctx context.Context, commands stop.Comm
 type serveConfig struct {
 	socket string // Unix socket to listen on
 	workspaceFlags
-	watch             bool // exit once the armed container stops
-	settings.Settings      // the daemon's settings
+	watch             bool   // exit once the armed container stops
+	version           string // the build version the daemon reports (see buildVersion)
+	settings.Settings        // the daemon's settings
 }
 
 // parseServe parses the flags of `hostrunner serve`; the socket and both
@@ -516,7 +522,8 @@ func parseServe(args []string, getenv func(string) string, output io.Writer) (se
 // $XDG_RUNTIME_DIR/hostrunner (where `hostrunner up` puts their runtime
 // directories) unless a setting says, and the current directory chooses
 // the default; with it, the session serves that daemon alone. The
-// settings are resolved with getenv reading the environment.
+// settings are resolved with getenv reading the environment; the number
+// of tail lines applies with --dir or without.
 func parseApprove(args []string, getenv func(string) string, output io.Writer) (approval.Config, error) {
 	var (
 		dir string
@@ -537,13 +544,16 @@ func parseApprove(args []string, getenv func(string) string, output io.Writer) (
 	if err != nil {
 		return approval.Config{}, err
 	}
+	c := approval.Config{Cwd: cwd, TailLines: s.ApproveTailLines}
 	if dir != "" {
-		return approval.Config{Socket: launch.ApprovalSocket(dir), Cwd: cwd}, nil
+		c.Socket = launch.ApprovalSocket(dir)
+		return c, nil
 	}
 	if s.RuntimeRoot == "" {
 		return approval.Config{}, errNoRuntimeRoot
 	}
-	return approval.Config{Root: s.RuntimeRoot, Cwd: cwd}, nil
+	c.Root = s.RuntimeRoot
+	return c, nil
 }
 
 // hostSettings resolves the settings of stop, restart or approve that sf
@@ -777,6 +787,7 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 		daemon.WithReread(policy.Digest(), reread),
 		daemon.WithAskTimeout(cfg.AskTimeout),
 		daemon.WithRequestTimeout(cfg.RequestTimeout),
+		daemon.WithBuildVersion(cfg.version),
 	}
 	if cfg.Reread {
 		opts = append(opts, daemon.WithRereadEvery(cfg.PollInterval))

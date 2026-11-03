@@ -77,10 +77,11 @@ func hostFile(named string, getenv func(string) string) (path string, required b
 
 // readFile reads the settings file at path: a YAML mapping of snake_case
 // keys, durations as strings with a unit (`grace: 1m30s`), bools as YAML
-// bools; only the keys of in are read, the others must be known keys.
-// The host settings file (host) may also hold `workspaces`, a mapping
-// from a workspace path to a mapping of settings, returned as sections
-// by path as written. An empty file sets nothing. A file that
+// bools, integers as YAML integers; only the keys of in are read, the
+// others must be known keys. The host settings file (host) may also hold
+// `workspaces`, a mapping from a workspace path to a mapping of
+// settings, returned as sections by path as written. An empty file sets
+// nothing. A file that
 // cannot be read keeps its error (fs.ErrNotExist for a missing one); an
 // unknown key, a key given twice or an invalid value is an error naming
 // the file, the section if any, and the key: `settings file
@@ -181,11 +182,15 @@ func readSections(in scopes, m *yaml.Node, where string) (map[string]layer, erro
 
 // nodeValue reads n as a value of kind k. YAML would read a bare number
 // into a time.Duration as nanoseconds and `yes` into a bool, so the node's
-// tag must match: a string for a duration, a bool for a bool.
+// tag must match: a string for a duration, a bool for a bool, an integer
+// for an integer.
 func nodeValue(k kind, n *yaml.Node) (any, error) {
 	want := "!!str" // a duration or a path
-	if k == kindBool {
+	switch k {
+	case kindBool:
 		want = "!!bool"
+	case kindCount:
+		want = "!!int"
 	}
 	switch {
 	case n.Kind != yaml.ScalarNode:

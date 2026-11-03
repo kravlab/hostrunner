@@ -44,8 +44,9 @@ the daemon rereads the file by itself once it changes, without stopping.
   unknown frame for an error, gets none.
 - The session prints `the rules file changed; the daemon reread it` or
   `the rules file changed, but the daemon cannot reread it, so the old
-  rules stay: <error>`, and shows its prompt again unless it awaits the
-  daemon. It keeps the new digest for later proposals.
+  rules stay: <error>`, a notice, printed as the host approvals spec
+  says (held while a request is shown, at once at the idle prompt). It
+  keeps the new digest for later proposals at once.
 - `DaemonInfo` says `rereads` (the daemon rereads by itself) or
   `no_reread` (it was started with `--no-reread`); an older daemon says
   neither.

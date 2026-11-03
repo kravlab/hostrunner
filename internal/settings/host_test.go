@@ -1,6 +1,7 @@
 package settings_test
 
 import (
+	"errors"
 	"flag"
 	"maps"
 	"os"
@@ -27,7 +28,8 @@ func withXDG(vars map[string]string) map[string]string {
 }
 
 // stop and restart take --settings, --runtime-root and --stop-timeout,
-// approve the first two; up and serve take neither of the last two.
+// approve the first two and --approve-tail-lines; up and serve take none
+// of the last three.
 func TestRegisterStopAndRegisterApproveAddTheirFlagsAlone(t *testing.T) {
 	names := func(register func(*settings.Flags, *flag.FlagSet)) []string {
 		var f settings.Flags
@@ -40,12 +42,12 @@ func TestRegisterStopAndRegisterApproveAddTheirFlagsAlone(t *testing.T) {
 	if got, want := names((*settings.Flags).RegisterStop), []string{"runtime-root", "settings", "stop-timeout"}; !slices.Equal(got, want) {
 		t.Errorf("RegisterStop: got %q, want %q", got, want)
 	}
-	if got, want := names((*settings.Flags).RegisterApprove), []string{"runtime-root", "settings"}; !slices.Equal(got, want) {
+	if got, want := names((*settings.Flags).RegisterApprove), []string{"approve-tail-lines", "runtime-root", "settings"}; !slices.Equal(got, want) {
 		t.Errorf("RegisterApprove: got %q, want %q", got, want)
 	}
 	for _, register := range []func(*settings.Flags, *flag.FlagSet){(*settings.Flags).Register, (*settings.Flags).RegisterUp} {
 		for _, name := range names(register) {
-			if name == "runtime-root" || name == "stop-timeout" {
+			if name == "runtime-root" || name == "stop-timeout" || name == "approve-tail-lines" {
 				t.Errorf("up or serve takes --%s", name)
 			}
 		}
@@ -63,13 +65,20 @@ func TestStopTimeoutFlagShowsItsDefault(t *testing.T) {
 	}
 }
 
-// The usages of stop and approve name their flags.
+// The usages of stop and approve name their flags, and
+// --approve-tail-lines shows its default in the help.
 func TestStopAndApproveUsages(t *testing.T) {
 	if got, want := settings.StopUsage(), "[--settings <path>] [--runtime-root <path>] [--stop-timeout <duration>]"; got != want {
 		t.Errorf("StopUsage: got %q, want %q", got, want)
 	}
-	if got, want := settings.ApproveUsage(), "[--settings <path>] [--runtime-root <path>]"; got != want {
+	if got, want := settings.ApproveUsage(), "[--settings <path>] [--runtime-root <path>] [--approve-tail-lines <integer>]"; got != want {
 		t.Errorf("ApproveUsage: got %q, want %q", got, want)
+	}
+	var f settings.Flags
+	fs := flag.NewFlagSet("approve", flag.ContinueOnError)
+	f.RegisterApprove(fs)
+	if got := fs.Lookup("approve-tail-lines").DefValue; got != "3" {
+		t.Errorf("--approve-tail-lines: default %q, want 3", got)
 	}
 }
 
@@ -99,6 +108,91 @@ func TestResolveHostTakesEachKeyFromTheHighestSource(t *testing.T) {
 		if err != nil || got != want {
 			t.Errorf("%s: got %+v, %v; want %+v", tt.name, got, err, want)
 		}
+	}
+}
+
+// approve takes the number of tail lines from the flag, the variable, the
+// common part of the host settings file, then the default, 3; 0 is a
+// number like any other, not the default.
+func TestResolveHostTakesTheApproveTailLinesFromTheHighestSource(t *testing.T) {
+	file := writeFile(t, "approve_tail_lines: 5\n")
+	vars := map[string]string{"HOSTRUNNER_SETTINGS": file, "HOSTRUNNER_APPROVE_TAIL_LINES": "7"}
+	tests := []struct {
+		name  string
+		vars  map[string]string
+		flags []string
+		want  int
+	}{
+		{"default", nil, nil, 3},
+		{"common part", map[string]string{"HOSTRUNNER_SETTINGS": file}, nil, 5},
+		{"zero in the common part", map[string]string{"HOSTRUNNER_SETTINGS": writeFile(t, "approve_tail_lines: 0\n")}, nil, 0},
+		{"variable over the file", vars, nil, 7},
+		{"zero variable", map[string]string{"HOSTRUNNER_SETTINGS": file, "HOSTRUNNER_APPROVE_TAIL_LINES": "0"}, nil, 0},
+		{"flag over the variable", vars, []string{"--approve-tail-lines", "9"}, 9},
+		{"zero flag", vars, []string{"--approve-tail-lines", "0"}, 0},
+		{"signed in the common part", map[string]string{"HOSTRUNNER_SETTINGS": writeFile(t, "approve_tail_lines: +3\n")}, nil, 3},
+		{"signed variable", map[string]string{"HOSTRUNNER_SETTINGS": file, "HOSTRUNNER_APPROVE_TAIL_LINES": "+3"}, nil, 3},
+		{"signed flag", vars, []string{"--approve-tail-lines", "+3"}, 3},
+		{"leading zero flag", vars, []string{"--approve-tail-lines", "010"}, 10},
+		{"--settings", nil, []string{"--settings", file}, 5},
+	}
+	for _, tt := range tests {
+		got, err := parseWith(t, (*settings.Flags).RegisterApprove, tt.flags...).ResolveHost(env(withXDG(tt.vars)))
+		if err != nil || got.ApproveTailLines != tt.want {
+			t.Errorf("%s: got %d, %v; want %d", tt.name, got.ApproveTailLines, err, tt.want)
+		}
+	}
+}
+
+// A negative or non-numeric number of tail lines is an error naming its
+// source; a flag's is a *FlagError, which the command adds its usage to.
+func TestResolveHostRefusesAnInvalidApproveTailLines(t *testing.T) {
+	inFile := func(content string) (map[string]string, string) {
+		path := writeFile(t, content)
+		return map[string]string{"HOSTRUNNER_SETTINGS": path}, "settings file " + path + ": approve_tail_lines: "
+	}
+	negative, negativeIn := inFile("approve_tail_lines: -2\n")
+	word, wordIn := inFile("approve_tail_lines: abc\n")
+	fraction, fractionIn := inFile("approve_tail_lines: 2.5\n")
+	quoted, quotedIn := inFile("approve_tail_lines: \"3\"\n")
+	empty, emptyIn := inFile("approve_tail_lines:\n")
+	list, listIn := inFile("approve_tail_lines: [3]\n")
+	tests := []struct {
+		name  string
+		vars  map[string]string
+		flags []string
+		want  string
+	}{
+		{"negative variable", map[string]string{"HOSTRUNNER_APPROVE_TAIL_LINES": "-1"}, nil, "HOSTRUNNER_APPROVE_TAIL_LINES: must not be negative, got -1"},
+		{"non-numeric variable", map[string]string{"HOSTRUNNER_APPROVE_TAIL_LINES": "abc"}, nil, `HOSTRUNNER_APPROVE_TAIL_LINES: invalid integer "abc"`},
+		{"negative in the file", negative, nil, negativeIn + "must not be negative, got -2"},
+		{"non-numeric in the file", word, nil, wordIn + `invalid integer "abc"`},
+		{"fraction in the file", fraction, nil, fractionIn + "invalid integer 2.5"},
+		{"string in the file", quoted, nil, quotedIn + `invalid integer "3"`},
+		{"no value in the file", empty, nil, emptyIn + "invalid integer: no value (line 1)"},
+		{"list in the file", list, nil, listIn + "invalid integer: not a single value (line 1)"},
+		{"negative flag", nil, []string{"--approve-tail-lines", "-1"}, "--approve-tail-lines: must not be negative"},
+	}
+	for _, tt := range tests {
+		_, err := parseWith(t, (*settings.Flags).RegisterApprove, tt.flags...).ResolveHost(env(withXDG(tt.vars)))
+		if err == nil || err.Error() != tt.want {
+			t.Errorf("%s: got %v, want %q", tt.name, err, tt.want)
+		}
+		if _, isFlag := errors.AsType[*settings.FlagError](err); isFlag != (tt.flags != nil) {
+			t.Errorf("%s: got a *FlagError %v, want one only for a flag", tt.name, isFlag)
+		}
+	}
+}
+
+// stop and restart take no tail lines: they neither read nor check them.
+func TestResolveHostForStopIgnoresTheApproveTailLines(t *testing.T) {
+	file := writeFile(t, "approve_tail_lines: abc\n")
+	got, err := parseWith(t, (*settings.Flags).RegisterStop).ResolveHost(env(withXDG(map[string]string{
+		"HOSTRUNNER_SETTINGS":           file,
+		"HOSTRUNNER_APPROVE_TAIL_LINES": "-1",
+	})))
+	if want := stopDefaults(); err != nil || got != want {
+		t.Fatalf("got %+v, %v; want %+v", got, err, want)
 	}
 }
 
@@ -178,11 +272,11 @@ func TestResolveHostForApproveIgnoresTheStopTimeout(t *testing.T) {
 // up and serve neither read nor check the keys of stop, restart and
 // approve in the common part or their variables.
 func TestDaemonCommandsIgnoreTheHostKeys(t *testing.T) {
-	file := writeFile(t, "runtime_root: rt\nstop_timeout: soon\n")
-	vars := map[string]string{"HOSTRUNNER_SETTINGS": file, "HOSTRUNNER_RUNTIME_ROOT": "rt", "HOSTRUNNER_STOP_TIMEOUT": "soon"}
+	file := writeFile(t, "runtime_root: rt\nstop_timeout: soon\napprove_tail_lines: -1\n")
+	vars := map[string]string{"HOSTRUNNER_SETTINGS": file, "HOSTRUNNER_RUNTIME_ROOT": "rt", "HOSTRUNNER_STOP_TIMEOUT": "soon", "HOSTRUNNER_APPROVE_TAIL_LINES": "abc"}
 	for name, f := range map[string]*settings.Flags{"serve": parse(t), "up": parseUp(t)} {
-		if got, err := f.Resolve(env(vars), noWorkspace); err != nil || got.RuntimeRoot != "" || got.StopTimeout != 0 {
-			t.Errorf("%s: got %+v, %v; want no runtime root or stop timeout", name, got, err)
+		if got, err := f.Resolve(env(vars), noWorkspace); err != nil || got.RuntimeRoot != "" || got.StopTimeout != 0 || got.ApproveTailLines != 0 {
+			t.Errorf("%s: got %+v, %v; want no runtime root, stop timeout or tail lines", name, got, err)
 		}
 	}
 }

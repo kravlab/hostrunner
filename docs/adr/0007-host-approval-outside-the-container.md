@@ -52,3 +52,9 @@ while a session serves the daemon.
   serving the daemon.
 - The daemon log, which the container can read, records approvals but
   never secrets' values or the session's environment.
+- An approved run's output reaches only the approval session serving
+  the daemon, which keeps it in its memory only (the last 64 KiB of
+  each of its last 20 runs); the daemon log never holds it.
+- The session and the daemon list show build versions and mark a
+  daemon of another version, so the human can run
+  `hostrunner restart`.

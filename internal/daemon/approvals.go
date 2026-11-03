@@ -58,7 +58,7 @@ var (
 // stops. Without it, nothing is approved.
 func WithApprovals(l net.Listener, rulesFile string) Option {
 	return func(s *Server) {
-		s.approvals = &approvals{listener: l, rulesFile: rulesFile, waiting: map[uint64]*approvalRequest{}, telling: map[uint64]protocol.EndReason{}}
+		s.approvals = &approvals{listener: l, rulesFile: rulesFile, waiting: map[uint64]*approvalRequest{}, telling: map[uint64]protocol.EndReason{}, going: map[uint64]*approvedRun{}}
 	}
 }
 
@@ -83,6 +83,13 @@ type approvals struct {
 	// granted them serves the daemon.
 	held     []heldApproval
 	lastHeld uint64
+	// going holds the approved runs that have not ended, by number, as
+	// they started (see startRun), for a session that starts serving the
+	// daemon (see serve); noRuns, while one goes, is closed once none
+	// does.
+	going   map[uint64]*approvedRun
+	lastRun uint64
+	noRuns  chan struct{}
 }
 
 // heldApproval is a standing approval, or a session approval granted
@@ -117,7 +124,8 @@ type sessionConn struct {
 	conn    net.Conn
 	out     *frameWriter
 	pid     int
-	notices atomic.Bool // it reads FrameRulesReread (protocol.Serve.Notices)
+	notices atomic.Bool             // it reads FrameRulesReread (protocol.Serve.Notices)
+	runs    atomic.Pointer[runFeed] // where its run frames go, once it asked for them (protocol.Serve.Runs)
 }
 
 // approvalRequest is a request waiting for its outcome, which arrives once
@@ -273,20 +281,28 @@ func (a *approvals) answer(c *sessionConn, ans protocol.Answer) (string, protoco
 	return "", ""
 }
 
-// handover is what a session that takes the daemon over gets from the one
-// it replaces, old: the requests waiting for old's answer, now waiting for
-// the new session's, and how many session approvals old granted, which
-// ended with it.
+// handover is what a session that starts serving the daemon gets: when
+// it asked for runs, the approved runs going, as they started, marked as
+// started earlier (see approvedRun.announced), in the order of their
+// numbers; and, from the session it takes the daemon over from, old, the
+// requests waiting for old's answer, now waiting for the new session's,
+// and how many session approvals old granted, which ended with it.
 type handover struct {
-	old   *sessionConn
-	moved []*approvalRequest
-	ended int
+	earlier []protocol.RunStarted
+	old     *sessionConn
+	moved   []*approvalRequest
+	ended   int
 }
 
-// serve makes c the session that serves the daemon and returns why not, or
-// "". With takeOver it replaces the session serving it and returns the
-// handover from it: the caller sends the requests moved to c and tells
-// the old session (see serveSession).
+// serve makes c the session that serves the daemon, taking it over from
+// the session serving it with takeOver, and returns why not, or "", and
+// the handover to c: the caller announces the runs going to c, sends it
+// the requests moved to it and tells the session it replaced (see
+// serveSession). The runs going are taken as c starts serving, under the
+// same lock, when c asked for runs (its feed is set before it asks to
+// serve): their frames go to c from then on (see startRun and
+// approvedRun.end), none before. A session already serving starts
+// nothing, and gets an empty handover.
 func (a *approvals) serve(c *sessionConn, takeOver bool) (string, handover) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -299,6 +315,12 @@ func (a *approvals) serve(c *sessionConn, takeOver bool) (string, handover) {
 	}
 	a.serving = c
 	h := handover{old: old, ended: a.endSessionApprovals(old)}
+	if c.runs.Load() != nil {
+		for _, r := range a.going {
+			h.earlier = append(h.earlier, r.announced())
+		}
+		slices.SortFunc(h.earlier, func(x, y protocol.RunStarted) int { return cmp.Compare(x.Run, y.Run) })
+	}
 	for _, r := range a.waiting {
 		if r.session == old {
 			r.session = c
@@ -514,8 +536,6 @@ func (s *Server) serveApprovals(ctx context.Context, wg *sync.WaitGroup) {
 // whatever the hello's version. Any other frame ends it.
 func (s *Server) handleSession(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
-	stop := context.AfterFunc(ctx, func() { conn.Close() })
-	defer stop()
 	uid, pid, err := transport.PeerCred(conn)
 	if err != nil || uid != os.Getuid() {
 		s.log.Warn("approval socket connection refused", "uid", uid, "pid", pid, "error", err)
@@ -523,6 +543,13 @@ func (s *Server) handleSession(ctx context.Context, conn net.Conn) {
 	}
 	out := &frameWriter{conn: conn, timeout: sessionWriteTimeout}
 	c := &sessionConn{conn: conn, out: out, pid: pid}
+	stop := context.AfterFunc(ctx, func() { s.closeStopping(c) })
+	defer stop()
+	defer func() {
+		if feed := c.runs.Load(); feed != nil {
+			feed.stop()
+		}
+	}()
 	// A bug triggered by one session must not take the daemon down.
 	defer func() {
 		if r := recover(); r != nil {
@@ -549,7 +576,8 @@ func (s *Server) handleSession(ctx context.Context, conn net.Conn) {
 		Version: protocol.ApprovalVersion, Workspace: host, ContainerWorkspace: container,
 		RulesFile: s.approvals.rulesFile, RulesDigest: s.rulesDigest(), Served: s.approvals.served(),
 		Stops: true, ContainerStopped: s.containerStopped != nil && s.containerStopped(),
-		Rereads: s.rereadsByItself(), NoReread: !s.rereadsByItself(),
+		Rereads: s.rereadsByItself(), NoReread: !s.rereadsByItself(), BuildVersion: s.buildVersion,
+		Runs: true,
 	})
 	defer func() {
 		// The daemon stopping closes the connection too: its requests end
@@ -585,6 +613,11 @@ func (s *Server) handleSession(ctx context.Context, conn net.Conn) {
 				}
 			}
 			c.notices.Store(sv.Notices)
+			if sv.Runs && c.runs.Load() == nil {
+				feed := newRunFeed(out)
+				c.runs.Store(feed)
+				go feed.pump() // stopped as handleSession returns
+			}
 			if why := s.serveSession(c, sv.TakeOver); why != "" {
 				_ = out.writeJSON(protocol.FrameError, protocol.Error{Code: protocol.ExitRejected, Message: why})
 				continue
@@ -634,6 +667,19 @@ func (s *Server) handleSession(ctx context.Context, conn net.Conn) {
 	}
 }
 
+// closeStopping closes session c's connection as the daemon stops. A
+// session that asked for runs is closed once the approved runs going,
+// which the stop cancels, have ended and it has been sent their ends, so
+// it learns how they ended; both waits end within stopReportTimeout.
+func (s *Server) closeStopping(c *sessionConn) {
+	if feed := c.runs.Load(); feed != nil {
+		deadline := time.Now().Add(stopReportTimeout)
+		s.approvals.awaitRuns(deadline)
+		feed.drain(deadline)
+	}
+	c.conn.Close()
+}
+
 // reread rereads the rules file for session c, which wrote rr.Rule into
 // it, or, with no rule, found it changed by hand before proposing one,
 // and logs both; a failed reread keeps the old rules and is logged as a
@@ -681,10 +727,12 @@ func (a *approvals) waitingMsg(id uint64) (protocol.ApprovalRequest, bool) {
 
 // serveSession makes c the session that serves the daemon, taking it over
 // from the one serving it with takeOver, and returns why not, or "". It
-// confirms with FrameServing and sends c the requests a take-over passed
-// to it, each with the rest of its limit, holding c's writer from before
-// c serves: no request or end of one reaches c before them. It then tells
-// the session it replaced, which it drops. Take-overs run one at a time.
+// confirms with FrameServing, announces to c the approved runs going
+// that the handover holds (see serve), and sends it the requests a
+// take-over passed to it, each with the rest of its limit, holding c's
+// writer from before c serves: no request, end of one or frame of a run
+// reaches c before them. It then tells the session it replaced, which it
+// drops. Take-overs run one at a time.
 func (s *Server) serveSession(c *sessionConn, takeOver bool) string {
 	s.approvals.takeovers.Lock()
 	defer s.approvals.takeovers.Unlock()
@@ -698,6 +746,11 @@ func (s *Server) serveSession(c *sessionConn, takeOver bool) string {
 		}
 		if err := send(protocol.FrameServing, nil); err != nil {
 			return err
+		}
+		for _, m := range h.earlier {
+			if err := send(protocol.FrameRunStarted, m); err != nil {
+				return err
+			}
 		}
 		for _, r := range h.moved {
 			msg := r.msg
@@ -787,7 +840,7 @@ func (s *Server) ask(ctx context.Context, x exchange, f protocol.Frame) {
 			s.reject(x.out, r.code, r.message, r.err)
 			return
 		}
-		s.start(ctx, x, req, p, func() (protocol.Frame, error) { return protocol.ReadFrame(x.conn) })
+		s.startUnasked(ctx, x, req, p)
 		return
 	}
 	// From here on the daemon stopping does not close the connection: a
@@ -874,15 +927,17 @@ func (s *Server) ask(ctx context.Context, x exchange, f protocol.Frame) {
 		}
 	}
 	s.log.Info("approval answered", "approval_id", id, "scope", scope)
+	// The session learns how the run it approved goes, also when it never
+	// starts.
+	run := s.approvals.startRun(protocol.RunStarted{Argv: req.Argv, Cwd: req.Cwd, Approval: scope, Request: id})
 	if s.isDraining() {
 		// Answered as the daemon began to drain: it runs nothing new, and
 		// grants nothing.
 		if p != nil {
 			p.close()
 		}
-		r := endedDraining.refusal()
 		s.log.Info("approval not run", "approval_id", id, "reason", string(endedDraining))
-		s.reject(x.out, r.code, r.message, r.err)
+		s.rejectRun(x.out, run, *endedDraining.refusal(), drainingMessage)
 		return
 	}
 	_ = x.out.writeJSON(protocol.FrameApproved, protocol.Approved{Scope: scope})
@@ -893,7 +948,7 @@ func (s *Server) ask(ctx context.Context, x exchange, f protocol.Frame) {
 	if p == nil {
 		var r *refusal
 		if p, r = s.prepareAllowed(req, need.approved, false, seen); r != nil {
-			s.reject(x.out, r.code, r.message, r.err)
+			s.rejectRun(x.out, run, *r, r.message)
 			return
 		}
 	}
@@ -913,7 +968,7 @@ func (s *Server) ask(ctx context.Context, x exchange, f protocol.Frame) {
 			s.log.Info("session approval not granted", "approval_id", id, "reason", approvalsEndedLeft)
 		}
 	}
-	s.start(ctx, x, req, p, frames.next, "approved", scope, "approval_id", id)
+	s.start(ctx, x, req, p, frames.next, run, "approved", scope, "approval_id", id)
 }
 
 // approvalNeed is what --ask would ask a human about a request: what the
