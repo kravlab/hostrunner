@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -62,12 +63,20 @@ func startSessionWith(t *testing.T, cfg approval.Config) *session {
 // returns at once. It ends when the test does.
 func launchSession(t *testing.T, cfg approval.Config) *session {
 	t.Helper()
+	out := &lockedBuffer{}
+	return launchSessionTo(t, cfg, out, out)
+}
+
+// launchSessionTo is launchSession with the session printing to print,
+// which writes on to out, what the test reads.
+func launchSessionTo(t *testing.T, cfg approval.Config, out *lockedBuffer, print io.Writer) *session {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	pr, pw := io.Pipe()
-	s := &session{in: pw, out: &lockedBuffer{}, ended: make(chan struct{}), cancel: cancel}
+	s := &session{in: pw, out: out, ended: make(chan struct{}), cancel: cancel}
 	go func() {
 		defer close(s.ended)
-		s.err = approval.Run(ctx, cfg, pr, s.out)
+		s.err = approval.Run(ctx, cfg, pr, print)
 	}()
 	t.Cleanup(func() {
 		cancel()
@@ -95,6 +104,55 @@ func (s *session) waitFor(t *testing.T, text string) string {
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("the session did not print %q; it printed %q", text, out[s.seen:])
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// waitForMatch waits until the session prints text matching pattern after
+// what the test has read, and returns what it printed up to the end of
+// the match.
+func (s *session) waitForMatch(t *testing.T, pattern string) string {
+	t.Helper()
+	re := regexp.MustCompile(pattern)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		out := s.out.String()
+		if loc := re.FindStringIndex(out[s.seen:]); loc != nil {
+			got := out[s.seen : s.seen+loc[1]]
+			s.seen += loc[1]
+			return got
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the session did not print a match of %q; it printed %q", pattern, out[s.seen:])
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// waitForSummaries waits until the session has printed the summaries of
+// runs 1 to n, in whichever order the runs ended, and reads past the last
+// of them, so that what it prints next answers what the test types then.
+func (s *session) waitForSummaries(t *testing.T, n int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		out, end := s.out.String(), 0
+		for i := 1; i <= n && end >= 0; i++ {
+			j := strings.Index(out, fmt.Sprintf("── run %d · ", i))
+			k := strings.Index(out[max(j, 0):], " ──\n")
+			if j < 0 || k < 0 {
+				end = -1
+				break
+			}
+			end = max(end, j+k+len(" ──\n"))
+		}
+		if end >= 0 {
+			s.seen = max(s.seen, end)
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the session did not print the summaries of runs 1 to %d; it printed %q", n, out)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -1122,6 +1180,8 @@ func TestAskSessionShowsRequestsInTurn(t *testing.T) {
 	}
 	s.answer(t, "o")
 	awaitResult(t, second)
+	// A run's summary may show the prompt again before the third block.
+	s.waitFor(t, "── request 3 ──")
 	block = s.waitFor(t, answerPromptText)
 	if !strings.Contains(block, "cmd   touch third\n") || strings.Contains(block, "more waiting") {
 		t.Errorf("the third block %q", block)

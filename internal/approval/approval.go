@@ -143,7 +143,9 @@ var scopeTexts = map[protocol.Scope]struct{ outcome, confirm string }{
 // revokes one, daemons leaves the daemon for the list, quit ends the
 // session. It says its own version as it starts (see Config.Version) and
 // the daemon's on each serving line, followed by a warning whenever that
-// is another or unknown, so the human can restart the daemon.
+// is another or unknown, so the human can restart the daemon. The runs
+// the human approves are numbered, the answer's line naming its run, and
+// summarised once they end (see runs), when the daemon reports them.
 //
 // Without cfg.Socket it lists the daemons under cfg.Root to choose from
 // (see choose), and a daemon another session serves can be taken over:
@@ -241,7 +243,8 @@ const (
 // alike. When the daemon has gone (nextAwait), it also returns what the
 // session said of that, the prompt of the wait for the next one (see
 // awaitDaemon). Serving it, it says the daemon's build version and warns
-// when it is not the session's (see hostterm.OtherVersion).
+// when it is not the session's (see hostterm.OtherVersion), and says so
+// when the daemon does not report approved runs (noRunOutput).
 // Without takeOver, a daemon another session serves is not served
 // (nextServedElsewhere, errServed).
 func (t *term) serveDaemon(ctx context.Context, socket string, takeOver, canList bool) (next, string, error) {
@@ -276,11 +279,14 @@ func (t *term) serveDaemon(ctx context.Context, socket string, takeOver, canList
 	if hostterm.OtherVersion(info, t.version) {
 		fmt.Fprintf(t.out, "⚠ %s, this session %s: run hostrunner restart to update\n", daemonVersion, hostterm.Display(t.version))
 	}
+	if !info.Runs {
+		fmt.Fprintln(t.out, noRunOutput)
+	}
 	fmt.Fprintf(t.out, "waiting for requests · %s\n", idleCommands)
 
 	done := make(chan struct{})
 	defer close(done)
-	s := &session{term: t, conn: conn, canList: canList, daemon: info}
+	s := &session{term: t, conn: conn, canList: canList, daemon: info, runs: newRuns()}
 	s.prompt(idlePrompt)
 	frames := readDaemon(conn, done)
 	then, err := s.loop(ctx, frames)
@@ -326,9 +332,10 @@ func halfClose(conn net.Conn) {
 
 // serve makes the session the one that serves the daemon, taking it over
 // from the session serving it with takeOver; the session reads the
-// daemon's notices of a reread (see rulesReread).
+// daemon's notices of a reread (see rulesReread) and the frames of the
+// approved runs (see runs).
 func serve(conn io.ReadWriter, takeOver bool) error {
-	if err := protocol.WriteJSON(conn, protocol.FrameServe, protocol.Serve{TakeOver: takeOver, Notices: true}); err != nil {
+	if err := protocol.WriteJSON(conn, protocol.FrameServe, protocol.Serve{TakeOver: takeOver, Notices: true, Runs: true}); err != nil {
 		return err
 	}
 	f, err := protocol.ReadFrame(conn)
@@ -353,6 +360,8 @@ type term struct {
 	// version is the session's build version (Config.Version, or
 	// devVersion), against which a daemon of another one is marked.
 	version string
+	// lastRun is the number of the last approved run (see nextRun).
+	lastRun uint64
 }
 
 // session is the state of a session serving one daemon: the requests
@@ -380,9 +389,12 @@ type session struct {
 	// confirm is the scope the human confirms approving a guarded request
 	// for (awaitConfirm).
 	confirm protocol.Scope
-	// sent is the outcome of the answer sent for the first request,
-	// printed once the daemon has taken it (awaitAnswered).
-	sent string
+	// sent is the answer sent for the first request, its outcome printed
+	// once the daemon has taken it (awaitAnswered).
+	sent sentAnswer
+	// runs are the approved runs not reported yet, of a daemon that
+	// reports them (DaemonInfo.Runs).
+	runs runs
 
 	// daemon is what the daemon said of itself when the session connected
 	// (see daemonlist.Hello): a rule is added to its RulesFile, in its host
@@ -428,6 +440,13 @@ type waiting struct {
 	protocol.ApprovalRequest
 	deadline time.Time
 	ended    protocol.EndReason
+}
+
+// sentAnswer is an answer sent and not yet confirmed: its outcome, and its
+// scope, "" for a refusal: an approval's outcome names its run.
+type sentAnswer struct {
+	outcome string
+	scope   protocol.Scope
 }
 
 // loop handles the daemon's frames and the human's lines until one of them
@@ -511,10 +530,19 @@ func (s *session) daemonFrame(f protocol.Frame) error {
 			fmt.Fprintf(s.out, "request %d %s\n", a.ID, ended)
 		case a.Error != "":
 			fmt.Fprintf(s.out, "request %d: not taken: %s\n", a.ID, a.Error)
+		case s.sent.scope != "" && s.daemon.Runs:
+			// The run approved: reported with its answer when it ended
+			// already.
+			n, r := s.numberRun(a.ID)
+			fmt.Fprintf(s.out, "%s · run %d\n", s.sent.outcome, n)
+			if r != nil && r.ended != nil {
+				delete(s.runs.going, r.ended.Run)
+				fmt.Fprintln(s.out, summary(r))
+			}
 		default:
-			fmt.Fprintln(s.out, s.sent)
+			fmt.Fprintln(s.out, s.sent.outcome)
 		}
-		s.awaiting, s.sent = awaitAnswer, ""
+		s.awaiting, s.sent = awaitAnswer, sentAnswer{}
 		s.advance()
 	case protocol.FrameWithdrawn:
 		var w protocol.Withdrawn
@@ -560,6 +588,24 @@ func (s *session) daemonFrame(f protocol.Frame) error {
 			return err
 		}
 		s.rulesReread(r)
+	case protocol.FrameRunStarted:
+		var m protocol.RunStarted
+		if err := protocol.DecodeJSON(f, &m); err != nil {
+			return err
+		}
+		s.runStarted(m)
+	case protocol.FrameRunOutput:
+		var m protocol.RunOutput
+		if err := protocol.DecodeJSON(f, &m); err != nil {
+			return err
+		}
+		s.runOutput(m)
+	case protocol.FrameRunEnded:
+		var m protocol.RunEnded
+		if err := protocol.DecodeJSON(f, &m); err != nil {
+			return err
+		}
+		s.runEnded(m)
 	case protocol.FrameRevoked:
 		var r protocol.Revoked
 		if err := protocol.DecodeJSON(f, &r); err != nil {
@@ -711,7 +757,7 @@ func (s *session) approve(id uint64, scope protocol.Scope) {
 // send sends ans to the daemon; outcome is printed once the daemon has
 // taken it.
 func (s *session) send(ans protocol.Answer, outcome string) {
-	s.awaiting, s.sent = awaitAnswered, outcome
+	s.awaiting, s.sent = awaitAnswered, sentAnswer{outcome: outcome, scope: ans.Scope}
 	s.write(protocol.FrameAnswer, ans)
 }
 

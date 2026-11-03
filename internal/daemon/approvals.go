@@ -58,7 +58,7 @@ var (
 // stops. Without it, nothing is approved.
 func WithApprovals(l net.Listener, rulesFile string) Option {
 	return func(s *Server) {
-		s.approvals = &approvals{listener: l, rulesFile: rulesFile, waiting: map[uint64]*approvalRequest{}, telling: map[uint64]protocol.EndReason{}}
+		s.approvals = &approvals{listener: l, rulesFile: rulesFile, waiting: map[uint64]*approvalRequest{}, telling: map[uint64]protocol.EndReason{}, going: map[uint64]protocol.RunStarted{}}
 	}
 }
 
@@ -83,6 +83,11 @@ type approvals struct {
 	// granted them serves the daemon.
 	held     []heldApproval
 	lastHeld uint64
+	// going holds the approved runs that have not ended, by number (see
+	// startRun); noRuns, while one goes, is closed once none does.
+	going   map[uint64]protocol.RunStarted
+	lastRun uint64
+	noRuns  chan struct{}
 }
 
 // heldApproval is a standing approval, or a session approval granted
@@ -117,7 +122,8 @@ type sessionConn struct {
 	conn    net.Conn
 	out     *frameWriter
 	pid     int
-	notices atomic.Bool // it reads FrameRulesReread (protocol.Serve.Notices)
+	notices atomic.Bool             // it reads FrameRulesReread (protocol.Serve.Notices)
+	runs    atomic.Pointer[runFeed] // where its run frames go, once it asked for them (protocol.Serve.Runs)
 }
 
 // approvalRequest is a request waiting for its outcome, which arrives once
@@ -514,8 +520,6 @@ func (s *Server) serveApprovals(ctx context.Context, wg *sync.WaitGroup) {
 // whatever the hello's version. Any other frame ends it.
 func (s *Server) handleSession(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
-	stop := context.AfterFunc(ctx, func() { conn.Close() })
-	defer stop()
 	uid, pid, err := transport.PeerCred(conn)
 	if err != nil || uid != os.Getuid() {
 		s.log.Warn("approval socket connection refused", "uid", uid, "pid", pid, "error", err)
@@ -523,6 +527,13 @@ func (s *Server) handleSession(ctx context.Context, conn net.Conn) {
 	}
 	out := &frameWriter{conn: conn, timeout: sessionWriteTimeout}
 	c := &sessionConn{conn: conn, out: out, pid: pid}
+	stop := context.AfterFunc(ctx, func() { s.closeStopping(c) })
+	defer stop()
+	defer func() {
+		if feed := c.runs.Load(); feed != nil {
+			feed.stop()
+		}
+	}()
 	// A bug triggered by one session must not take the daemon down.
 	defer func() {
 		if r := recover(); r != nil {
@@ -550,6 +561,7 @@ func (s *Server) handleSession(ctx context.Context, conn net.Conn) {
 		RulesFile: s.approvals.rulesFile, RulesDigest: s.rulesDigest(), Served: s.approvals.served(),
 		Stops: true, ContainerStopped: s.containerStopped != nil && s.containerStopped(),
 		Rereads: s.rereadsByItself(), NoReread: !s.rereadsByItself(), BuildVersion: s.buildVersion,
+		Runs: true,
 	})
 	defer func() {
 		// The daemon stopping closes the connection too: its requests end
@@ -585,6 +597,11 @@ func (s *Server) handleSession(ctx context.Context, conn net.Conn) {
 				}
 			}
 			c.notices.Store(sv.Notices)
+			if sv.Runs && c.runs.Load() == nil {
+				feed := newRunFeed(out)
+				c.runs.Store(feed)
+				go feed.pump() // stopped as handleSession returns
+			}
 			if why := s.serveSession(c, sv.TakeOver); why != "" {
 				_ = out.writeJSON(protocol.FrameError, protocol.Error{Code: protocol.ExitRejected, Message: why})
 				continue
@@ -632,6 +649,19 @@ func (s *Server) handleSession(ctx context.Context, conn net.Conn) {
 			return
 		}
 	}
+}
+
+// closeStopping closes session c's connection as the daemon stops. A
+// session that asked for runs is closed once the approved runs going,
+// which the stop cancels, have ended and it has been sent their ends, so
+// it learns how they ended; both waits end within stopReportTimeout.
+func (s *Server) closeStopping(c *sessionConn) {
+	if feed := c.runs.Load(); feed != nil {
+		deadline := time.Now().Add(stopReportTimeout)
+		s.approvals.awaitRuns(deadline)
+		feed.drain(deadline)
+	}
+	c.conn.Close()
 }
 
 // reread rereads the rules file for session c, which wrote rr.Rule into
@@ -787,7 +817,7 @@ func (s *Server) ask(ctx context.Context, x exchange, f protocol.Frame) {
 			s.reject(x.out, r.code, r.message, r.err)
 			return
 		}
-		s.start(ctx, x, req, p, func() (protocol.Frame, error) { return protocol.ReadFrame(x.conn) })
+		s.start(ctx, x, req, p, func() (protocol.Frame, error) { return protocol.ReadFrame(x.conn) }, nil)
 		return
 	}
 	// From here on the daemon stopping does not close the connection: a
@@ -874,15 +904,17 @@ func (s *Server) ask(ctx context.Context, x exchange, f protocol.Frame) {
 		}
 	}
 	s.log.Info("approval answered", "approval_id", id, "scope", scope)
+	// The session learns how the run it approved goes, also when it never
+	// starts.
+	run := s.approvals.startRun(protocol.RunStarted{Argv: req.Argv, Cwd: req.Cwd, Approval: scope, Request: id})
 	if s.isDraining() {
 		// Answered as the daemon began to drain: it runs nothing new, and
 		// grants nothing.
 		if p != nil {
 			p.close()
 		}
-		r := endedDraining.refusal()
 		s.log.Info("approval not run", "approval_id", id, "reason", string(endedDraining))
-		s.reject(x.out, r.code, r.message, r.err)
+		s.rejectRun(x.out, run, *endedDraining.refusal(), drainingMessage)
 		return
 	}
 	_ = x.out.writeJSON(protocol.FrameApproved, protocol.Approved{Scope: scope})
@@ -893,7 +925,7 @@ func (s *Server) ask(ctx context.Context, x exchange, f protocol.Frame) {
 	if p == nil {
 		var r *refusal
 		if p, r = s.prepareAllowed(req, need.approved, false, seen); r != nil {
-			s.reject(x.out, r.code, r.message, r.err)
+			s.rejectRun(x.out, run, *r, r.message)
 			return
 		}
 	}
@@ -913,7 +945,7 @@ func (s *Server) ask(ctx context.Context, x exchange, f protocol.Frame) {
 			s.log.Info("session approval not granted", "approval_id", id, "reason", approvalsEndedLeft)
 		}
 	}
-	s.start(ctx, x, req, p, frames.next, "approved", scope, "approval_id", id)
+	s.start(ctx, x, req, p, frames.next, run, "approved", scope, "approval_id", id)
 }
 
 // approvalNeed is what --ask would ask a human about a request: what the

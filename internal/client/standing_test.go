@@ -16,17 +16,19 @@ import (
 
 // grantAnswer is an answer that grants an approval held for later runs:
 // the key typed, the guarded confirmation the session asks, and the
-// outcome it says.
+// outcome it says, which then names the run approved.
 type grantAnswer struct{ key, confirm, outcome string }
 
 // The answers granting a standing approval and a session approval.
 var (
-	standingAnswer = grantAnswer{"d", `Type "yes" to approve it as standing (until the daemon stops): `, "approved as standing (until the daemon stops)\n"}
-	sessionAnswer  = grantAnswer{"s", `Type "yes" to approve it for this session: `, "approved for this session (until it ends)\n"}
+	standingAnswer = grantAnswer{"d", `Type "yes" to approve it as standing (until the daemon stops): `, "approved as standing (until the daemon stops) · run "}
+	sessionAnswer  = grantAnswer{"s", `Type "yes" to approve it for this session: `, "approved for this session (until it ends) · run "}
 )
 
 // grantAs asks for argv with --ask and gives answer a, typing "yes" when
-// the request is guarded; it returns what hostrun printed.
+// the request is guarded, and waits for the run's summary, so that what
+// the session prints next answers what the test types then; it returns
+// what hostrun printed.
 func (h harness) grantAs(t *testing.T, s *session, a grantAnswer, guarded bool, argv ...string) result {
 	t.Helper()
 	ch := h.ask(t, argv...)
@@ -42,6 +44,8 @@ func (h harness) grantAs(t *testing.T, s *session, a grantAnswer, guarded bool, 
 	}
 	got := awaitResult(t, ch)
 	s.waitFor(t, a.outcome)
+	s.waitFor(t, "── run ")
+	s.waitFor(t, " ──\n")
 	return got
 }
 
@@ -239,6 +243,7 @@ func TestStandingApprovalIsGrantedOnce(t *testing.T) {
 	s.waitFor(t, answerPromptText)
 	s.answer(t, "d")
 	awaitResult(t, second)
+	s.waitForSummaries(t, 2)
 	s.waitFor(t, "> ")
 	s.answer(t, "standing")
 	list := s.waitFor(t, "> ")

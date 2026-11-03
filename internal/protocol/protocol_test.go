@@ -99,11 +99,11 @@ func TestDecodeJSONRejectsMalformedPayload(t *testing.T) {
 }
 
 func TestReadFrameAcceptsUpToTheLastFrameType(t *testing.T) {
-	if _, err := ReadFrame(bytes.NewReader([]byte{byte(FrameRulesReread), 0, 0, 0, 0})); err != nil {
-		t.Fatalf("FrameRulesReread: %v", err)
+	if _, err := ReadFrame(bytes.NewReader([]byte{byte(FrameRunEnded), 0, 0, 0, 0})); err != nil {
+		t.Fatalf("FrameRunEnded: %v", err)
 	}
-	if _, err := ReadFrame(bytes.NewReader([]byte{byte(FrameRulesReread) + 1, 0, 0, 0, 0})); !errors.Is(err, ErrUnknownFrameType) {
-		t.Fatalf("the type after FrameRulesReread: got %v, want ErrUnknownFrameType", err)
+	if _, err := ReadFrame(bytes.NewReader([]byte{byte(FrameRunEnded) + 1, 0, 0, 0, 0})); !errors.Is(err, ErrUnknownFrameType) {
+		t.Fatalf("the type after FrameRunEnded: got %v, want ErrUnknownFrameType", err)
 	}
 }
 
@@ -113,7 +113,7 @@ func TestFrameTypesKeepTheirWireValues(t *testing.T) {
 	for typ, want := range map[FrameType]byte{
 		FrameRequest: 1, FrameApproved: 15, FrameHello: 16, FrameTakenOver: 30,
 		FrameRunning: 31, FrameRunningList: 32, FrameStop: 33, FrameStopping: 34,
-		FrameRulesReread: 35,
+		FrameRulesReread: 35, FrameRunStarted: 36, FrameRunOutput: 37, FrameRunEnded: 38,
 	} {
 		if byte(typ) != want {
 			t.Errorf("frame %v has value %d, want %d", typ, byte(typ), want)

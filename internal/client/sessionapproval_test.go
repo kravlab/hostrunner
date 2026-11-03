@@ -89,6 +89,7 @@ func TestApprovalGrantedAgainTakesTheNewKind(t *testing.T) {
 			s.waitFor(t, answerPromptText)
 			s.answer(t, tt.second)
 			awaitResult(t, second)
+			s.waitForSummaries(t, 2)
 			s.waitFor(t, "> ")
 			s.answer(t, "standing")
 			list := s.waitFor(t, "> ")

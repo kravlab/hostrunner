@@ -141,8 +141,9 @@ from `protocol.Version` of the container's socket.
   socket; the approval socket accepts no container frames.
 - Hello: the daemon answers with its approval protocol version, the host
   and container workspaces, the rules file path, whether a session
-  serves it, and its build version (`build_version`, optional; see
-  Approval session). A session does not serve a daemon of another approval
+  serves it, its build version (`build_version`, optional; see
+  Approval session), and whether it reports approved runs (`runs`,
+  optional; see Approved runs). A session does not serve a daemon of another approval
   protocol version; there is no backward compatibility.
 - Each approval request has an id (a counter in the daemon), sent with its
   content. The session answers by id; only the serving session is heard;
@@ -340,7 +341,9 @@ waiting for requests · commands: standing, revoke <n>, daemons, quit
 answer [r]efuse [o]nce [s]ession stan[d]ing [c]md [h]elp ? o
 ⚠ explicitly denied: flag --force is not allowed
 Type "yes" to run it once: yes
-approved once
+approved once · run 1
+
+── run 1 · git push --force origin main · exit 0 · 2.4s · 3 lines ──
 
 ── request 9 ── 10:00 left ──────────────────────────────
   dir   /workspaces/app
@@ -500,9 +503,91 @@ revoked 1
   right after shows the daemon unserved. Leaving a daemon, by any of
   these, ends the session approvals the session granted it; serving it
   again starts with none.
-- Session frames: `Serve{take_over}` (an empty `Serve` serves a daemon
-  nobody serves), answered by `FrameServing` and the requests passed on;
-  the session replaced gets `FrameTakenOver`.
+- Session frames: `Serve{take_over, notices, runs}` (an empty `Serve`
+  serves a daemon nobody serves; `notices` and `runs` say the session
+  reads `FrameRulesReread` and the frames of approved runs), answered by
+  `FrameServing` and the requests passed on; the session replaced gets
+  `FrameTakenOver`.
+
+## Approved runs
+
+- An approved run is one run of a command an approval let through (see
+  [CONTEXT.md](../../CONTEXT.md)). The session reports the runs a human
+  approved when asked: once, for this session, standing, and the run of
+  an "add a rule" answer (under the new rule, or once). Commands the
+  rules allow and dry runs are not approved runs. The repeats a standing
+  or session approval lets through are approved runs this version does
+  not report yet.
+- Asking: the session sends `Serve{runs: true}`; a daemon that reports
+  approved runs says so in its hello (`DaemonInfo.runs`) and sends their
+  frames to the serving session only when it asked. An older session
+  asks nothing and gets none. A session serving a daemon without `runs`
+  (older than it) serves it all the same and says so, after the serving
+  line and any version warning: `no run output: this daemon does not
+  report approved runs`. The approval protocol version stays 1.
+- Frames, daemon → session:
+  - `RunStarted{run, argv, cwd, approval, request}`: `run` is the
+    daemon's number for the run, which its later frames carry;
+    `approval` the scope that let it through (`once`, `session`,
+    `standing`, `rule`), `request` the id of the request answered. Sent
+    once the answer is taken, before the checks starting the command
+    runs again.
+  - `RunOutput{run, stderr, data}`: a chunk of stdout, or of stderr with
+    `stderr`, of at most 4 KiB, exactly as the container gets it, after
+    the mask of the rule's secrets (`data` base64 in the JSON).
+  - `RunEnded{run, code, error, cancelled, duration_ms, dropped}`: the
+    exit code; or `error`, why a run never started after its approval
+    (the daemon draining, a check refusing it when checked again, a
+    start failure), as its client is told, with the client's exit code
+    in `code`; or `cancelled`, `client gone` (its client went away) or
+    `daemon stopping` (the daemon stopped or stepped aside), also for a
+    run whose request is cancelled as its command starts. `duration_ms`
+    counts from the run's start frame; `dropped` the bytes of output the
+    session was not sent.
+- Delivery: the run frames of each session go through a buffer of their
+  own, apart from the container's stream, holding up to 256 KiB of
+  output; output beyond it is dropped and counted in `dropped`; start and
+  end frames are never dropped. A run frame the session does not take
+  within 100 ms is tried again later, other frames going first; one it
+  takes part of is finished before any other frame, which then waits
+  only for the rest of that frame, a few KiB at most. So the container
+  is never slowed and the session never dropped for run output; the
+  2-second limit stays for other frames. Run frames go to the session
+  serving when each is sent: a session that starts serving while a run
+  goes is not told of it, and ignores its frames.
+- A daemon that stops keeps a session that asked for runs, for up to 3
+  seconds, until the runs the stop cancels have ended and their end
+  frames have reached it.
+- Numbers: the session numbers runs 1, 2, 3… across the daemons it
+  serves, apart from request numbers. A fresh approval's run gets its
+  number when the daemon confirms the answer (`Answered`), whose line
+  names it: `approved once · run 3` (`approved for this session (until
+  it ends) · run 3`, …). The run's frames come from another goroutine of
+  the daemon than `Answered`, in either order: frames that arrive first
+  wait for it.
+- Summary: once a numbered run ends, one line:
+
+  ```
+  ── run 3 · git push origin main · exit 0 · 2.4s · 12 lines ──
+  ── run 4 · ./run.sh · not started: command ./run.sh not found on the host · 0.0s · 0 lines ──
+  ── run 5 · make test · cancelled: client gone · 3m07s · 1 line ──
+  ── run 6 · make logs · exit 0 · 1h02m · 920 lines · 4096 bytes not received ──
+  ```
+
+  The command is shown as on the `cmd` line, cut alike; `not started:
+  <why>`, `cancelled: client gone` or `cancelled: daemon stopping` stand
+  in place of the exit code. The duration is in seconds with one decimal
+  under a minute (`12.3s`), minutes and seconds under an hour (`3m07s`),
+  hours and minutes above (`1h02m`). The session counts the lines of the
+  output it got, the complete lines of stdout and stderr and an
+  unfinished last line of each; `<N> bytes not received` follows when
+  output was dropped (`1 line`, `1 byte` in the singular).
+- The summary of a run that ended before its answer was confirmed
+  follows the answer's line; any other is printed when the run ends,
+  below what is shown, and the prompt shown is shown again, keeping what
+  the human typed after it.
+- The output lives in the session's memory only; the daemon keeps none,
+  and its log gains none.
 
 ## Dry run and Rules test
 
@@ -620,7 +705,10 @@ no answer, report and wait instead of asking again.
   a temporary socket) gains the approval socket and a scripted approval
   session, so one test plays the agent and the human. Every behavior above
   is checked there, by exit codes, output, markers in the workspace, the
-  rules file and log lines.
+  rules file and log lines. A fake daemon there stands in for one older
+  than a session (no build version, no approved runs) and for frame
+  orders a real daemon gives only by chance; a session's output that the
+  test stops stands in for a terminal stopped while a run goes.
 - The Rules test's tests: every reason and the class marks.
 - e2e: from inside the container the approval socket is unreachable, and
   `--ask` without a session is refused at once with 126.
