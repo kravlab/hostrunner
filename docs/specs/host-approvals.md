@@ -344,8 +344,6 @@ answer [r]efuse [o]nce [s]ession stan[d]ing [c]md [h]elp ? o
 Type "yes" to run it once: yes
 approved once · run 1
 
-── run 1 · git push --force origin main · exit 0 · 2.4s · 3 lines ──
-
 ── request 9 ── 10:00 left ──────────────────────────────
   dir   /workspaces/app
   cmd   git rebase -i main
@@ -360,6 +358,10 @@ answer [r]efuse [o]nce [s]ession stan[d]ing [a]dd rule [c]md [h]elp ? a
 +      allow: [main]
 [w]rite [e]dit in $EDITOR [c]ancel ? w
 rule added; the daemon reread the rules · request 9 runs under it
+approved under the new rule · run 2
+── run 1 · git push --force origin main · exit 0 · 2.4s · 2 lines ──
+! To example.com:app.git
+!  + 1a2b3c4...5d6e7f8 main -> main (forced update)
 
 ── request 10 ── 10:00 left ─────────────────────────────
   dir   /workspaces/app
@@ -914,7 +916,10 @@ no answer, report and wait instead of asking again.
   `--ask` without a session is refused at once with 126.
 - No new seams beyond these; the rules engine, protocol and socket are
   covered through the client harness, apart from where existing unit tests
-  of a touched module must stay accurate.
+  of a touched module must stay accurate and from unit tests of pure text
+  helpers (cutting and sanitising lines: `internal/textcut`, the output
+  lines of `internal/hostterm`), as `internal/textcut/textcut_test.go`
+  and `internal/hostterm/output_test.go` have.
 
 ## Out of scope
 

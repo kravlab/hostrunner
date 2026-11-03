@@ -20,6 +20,7 @@ import (
 	"github.com/kravlab/hostrunner/internal/client"
 	"github.com/kravlab/hostrunner/internal/daemon"
 	"github.com/kravlab/hostrunner/internal/protocol"
+	"github.com/kravlab/hostrunner/internal/settings"
 	"github.com/kravlab/hostrunner/internal/transport"
 )
 
@@ -46,7 +47,7 @@ func (h harness) startSession(t *testing.T) *session {
 // socket.
 func startSessionOn(t *testing.T, socket string) *session {
 	t.Helper()
-	return startSessionWith(t, approval.Config{Socket: socket})
+	return startSessionWith(t, approval.Config{Socket: socket, TailLines: settings.DefaultApproveTailLines})
 }
 
 // startSessionWith is startSession as cfg configures it; without a socket

@@ -351,6 +351,16 @@ idle `>` prompt, `daemons` leaves the daemon for the list (without
 approved runs, and `out [n]` prints the last 64 KiB of the output of run
 n (by default the last one), kept in the session's memory only.
 
+The session prints its version as it starts and the daemon's on each
+serving line, followed by a warning ending `run hostrunner restart to
+update` when they differ. Each approved run gets a number on its
+answer's line (`approved once · run 1`); when it ends, a summary line
+(`── run 1 · <cmd> · exit 0 · 2.4s · 3 lines ──`) follows, with the
+last `approve_tail_lines` lines of its output under it (`│` stdout,
+`!` stderr). A run that a standing or session approval lets through
+without asking prints a start line first (`run 2 · <cmd> · by
+standing approval`).
+
 It serves the daemon chosen: it prints each approval request as
 it arrives, with the container directory, the argv (`cmd` line) and why
 the rules refused it, rings the terminal bell, and takes the answer, a

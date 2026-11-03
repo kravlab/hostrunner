@@ -43,28 +43,17 @@ type Config struct {
 	// Cwd is the directory the session runs in: the daemon whose host
 	// workspace holds it is marked and chosen by default.
 	Cwd string
-	// Version is this hostrunner's build version, as `hostrunner version`
-	// prints it: the session says it as it starts and marks the daemons
-	// of another one. "" is devVersion, as for a build without one.
-	Version string
+	// BuildVersion is this hostrunner's build version, as `hostrunner
+	// version` prints it: the session says it as it starts and marks the
+	// daemons of another one. "" is hostterm.DevVersion, as for a build
+	// without one.
+	BuildVersion string
 	// TailLines is how many of an approved run's last lines of output the
-	// session shows under its summary: 0 shows the summary alone, nil
-	// defaultTailLines.
-	TailLines *int
+	// session shows under its summary: 0 shows the summary alone. The
+	// setting approve_tail_lines sets it, settings.DefaultApproveTailLines
+	// by default.
+	TailLines int
 }
-
-// tailLines returns how many tail lines cfg sets: TailLines, or
-// defaultTailLines when it is nil.
-func (cfg Config) tailLines() int {
-	if cfg.TailLines == nil {
-		return defaultTailLines
-	}
-	return *cfg.TailLines
-}
-
-// devVersion is the version of a session given none, what `hostrunner
-// version` prints for a build without one.
-const devVersion = "dev"
 
 // errNoEditor is what editInEditor returns when neither $VISUAL nor
 // $EDITOR names an editor.
@@ -186,7 +175,7 @@ var scopeTexts = map[protocol.Scope]scopeText{
 // standing lists the daemon's standing and session approvals, revoke <n>
 // revokes one, out [n] prints the output kept of a run, runs lists the
 // runs kept, daemons leaves the daemon for the list, quit ends the
-// session. It says its own version as it starts (see Config.Version) and
+// session. It says its own version as it starts (see Config.BuildVersion) and
 // the daemon's on each serving line, followed by a warning whenever that
 // is another or unknown, so the human can restart the daemon. The runs
 // the human approves are numbered, the answer's line naming its run, and
@@ -207,7 +196,7 @@ var scopeTexts = map[protocol.Scope]scopeText{
 // approvals, and one another session serves is left to it unless taken
 // over.
 func Run(ctx context.Context, cfg Config, in io.Reader, out io.Writer) error {
-	t := &term{out: out, Input: hostterm.NewInput(in), version: cmp.Or(cfg.Version, devVersion), tailLines: cfg.tailLines()}
+	t := &term{out: out, Input: hostterm.NewInput(in), version: cmp.Or(cfg.BuildVersion, hostterm.DevVersion), tailLines: cfg.TailLines}
 	defer t.Close()
 	fmt.Fprintf(out, "hostrunner approve %s\n", hostterm.Display(t.version))
 	socket, takeOver := cfg.Socket, false
@@ -409,8 +398,9 @@ type term struct {
 	*hostterm.Input
 	// asking is the current prompt.
 	asking string
-	// version is the session's build version (Config.Version, or
-	// devVersion), against which a daemon of another one is marked.
+	// version is the session's build version (Config.BuildVersion, or
+	// hostterm.DevVersion), against which a daemon of another one is
+	// marked.
 	version string
 	// lastRun is the number of the last approved run (see nextRun).
 	lastRun uint64
@@ -597,11 +587,10 @@ func (s *session) daemonFrame(f protocol.Frame) error {
 		case s.sent.scope != "" && s.daemon.Runs:
 			// The run approved: reported with its answer when it ended
 			// already.
-			n, r := s.numberRun(a.ID)
+			n, ended := s.answeredRun(a.ID)
 			fmt.Fprintf(s.out, "%s · run %d\n", s.sent.outcome, n)
-			if r != nil && r.ended != nil {
-				delete(s.runs.going, r.ended.Run)
-				fmt.Fprintln(s.out, report(r))
+			if ended != "" {
+				fmt.Fprintln(s.out, ended)
 			}
 		default:
 			fmt.Fprintln(s.out, s.sent.outcome)
@@ -637,7 +626,7 @@ func (s *session) daemonFrame(f protocol.Frame) error {
 			fmt.Fprintln(&b, line)
 			printMarks(&b, a.Argv)
 		}
-		s.outcome(b.String())
+		s.commandOutcome(b.String())
 	case protocol.FrameRereadResult:
 		var r protocol.RereadResult
 		if err := protocol.DecodeJSON(f, &r); err != nil {
@@ -677,9 +666,9 @@ func (s *session) daemonFrame(f protocol.Frame) error {
 			return err
 		}
 		if r.Error != "" {
-			s.outcome(fmt.Sprintf("revoke %d: %s\n", r.N, r.Error))
+			s.commandOutcome(fmt.Sprintf("revoke %d: %s\n", r.N, r.Error))
 		} else {
-			s.outcome(fmt.Sprintf("revoked %d\n", r.N))
+			s.commandOutcome(fmt.Sprintf("revoked %d\n", r.N))
 		}
 	default:
 		return daemonlist.ErrorOf(f)
@@ -796,8 +785,8 @@ type idleCommand struct {
 var idleCommandTable = []idleCommand{
 	{"standing", "standing", func(s *session, _ string) { s.write(protocol.FrameStanding, nil) }},
 	{"revoke", "revoke <n>", (*session).revoke},
-	{"out", "out [n]", func(s *session, arg string) { s.outcome(s.showOutput(arg)) }},
-	{"runs", "runs", func(s *session, _ string) { s.outcome(s.listRuns()) }},
+	{"out", "out [n]", func(s *session, arg string) { s.commandOutcome(s.showOutput(arg)) }},
+	{"runs", "runs", func(s *session, _ string) { s.commandOutcome(s.listRuns()) }},
 	{"daemons", "daemons", (*session).leaveForList},
 	{"quit", "quit", func(s *session, _ string) { s.after = nextQuit }},
 }
@@ -960,13 +949,14 @@ func (s *session) printBelow(text string) {
 	s.showAgain()
 }
 
-// outcome prints text, the outcome of a command typed at the idle
-// prompt (standing, revoke, out, runs), each line ending with a newline.
+// commandOutcome prints text, the outcome of a command typed at the
+// idle prompt (standing, revoke, out, runs), each line ending with a
+// newline.
 // It is held while a request is shown, as a notice is (see hold); at the
 // idle prompt it is printed at once, right below the command's line, and
 // the prompt shown again, keeping what the human typed after it, as
 // printBelow does.
-func (s *session) outcome(text string) {
+func (s *session) commandOutcome(text string) {
 	if !s.hold(text) {
 		fmt.Fprint(s.out, text)
 		s.showAgain()

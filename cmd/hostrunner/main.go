@@ -189,7 +189,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 		if cfg.Restart != nil {
 			cfg.Restart.Runtimes = watch.Detect()
 		}
-		cfg.Version = version
+		cfg.BuildVersion = version
 		sctx, commands, releaseSignals := stopCommands(cfg.Commands)
 		defer releaseSignals()
 		cfg.Commands = commands
@@ -218,7 +218,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 		if err != nil {
 			return err
 		}
-		cfg.Version = version
+		cfg.BuildVersion = version
 		return approval.Run(ctx, cfg, os.Stdin, stdout)
 	case "update":
 		check, err := parseUpdate(args[1:], stderr)
@@ -246,10 +246,11 @@ func run(args []string, stdout, stderr io.Writer) error {
 // buildVersion is the main module version the Go toolchain stamped into the
 // binary, as returned by debug.ReadBuildInfo: the tag for a release or
 // `go install …@vX.Y.Z`, a pseudo-version between tags. A build without
-// VCS data reports "(devel)" or nothing, which becomes "dev".
+// VCS data reports "(devel)" or nothing, which becomes
+// hostterm.DevVersion.
 func buildVersion(info *debug.BuildInfo, ok bool) string {
 	if !ok || info.Main.Version == "" || info.Main.Version == "(devel)" {
-		return "dev"
+		return hostterm.DevVersion
 	}
 	return info.Main.Version
 }
@@ -543,7 +544,7 @@ func parseApprove(args []string, getenv func(string) string, output io.Writer) (
 	if err != nil {
 		return approval.Config{}, err
 	}
-	c := approval.Config{Cwd: cwd, TailLines: &s.ApproveTailLines}
+	c := approval.Config{Cwd: cwd, TailLines: s.ApproveTailLines}
 	if dir != "" {
 		c.Socket = launch.ApprovalSocket(dir)
 		return c, nil

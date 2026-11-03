@@ -16,33 +16,31 @@ const (
 )
 
 // outputLines puts a run's output together in lines as it arrives: the
-// lines each stream got, and the last of them on both (tail).
+// lines each stream got, indexed by stream, and the last of them on both
+// (tail).
 type outputLines struct {
-	stdout, stderr streamLines
-	tail           tail
+	streams [2]streamLines
+	tail    tail
 }
 
-// write takes data, a chunk of stderr or of stdout: it counts its lines,
-// continues the stream's line not yet complete, if any, and starts a line
-// of the tail at each line's first byte.
-func (o *outputLines) write(stderr bool, data []byte) {
-	stream := &o.stdout
-	if stderr {
-		stream = &o.stderr
-	}
+// write takes data, a chunk of stream s: it counts its lines, continues
+// the stream's line not yet complete, if any, and starts a line of the
+// tail at each line's first byte.
+func (o *outputLines) write(s stream, data []byte) {
+	got := &o.streams[s]
 	for len(data) > 0 {
-		if stream.open == nil {
-			stream.open = o.tail.start(stderr)
+		if got.open == nil {
+			got.open = o.tail.start(s)
 		}
 		end := bytes.IndexByte(data, '\n')
 		if end < 0 {
-			stream.open.Write(data)
+			got.open.Write(data)
 			return
 		}
-		stream.open.Write(data[:end])
-		stream.open.End()
-		stream.open = nil
-		stream.lines++
+		got.open.Write(data[:end])
+		got.open.End()
+		got.open = nil
+		got.lines++
 		data = data[end+1:]
 	}
 }
@@ -78,51 +76,40 @@ func (t *term) findKept(n uint64) (int, bool) {
 
 // keptOutput is the last keptBytes of a run's output, as it arrived, in
 // segments of one stream each, and what was dropped before them: how
-// many bytes, and, for each stream, whether its line kept first lost its
-// start (cut), so that the rest of that line is not shown (see lines).
+// many bytes, and, for each stream, indexed by it, whether the last of
+// its bytes dropped is not a newline (cut): its line kept first lost its
+// start, so that the rest of that line is not shown (see lines).
 type keptOutput struct {
 	segments []segment
 	size     int // bytes in segments
 	dropped  int
-	cut      lineCut
+	cut      [2]bool
 }
 
-// segment is output of one stream, stderr or stdout, that arrived with
-// none of the other's in between.
+// segment is output of one stream that arrived with none of the other's
+// in between.
 type segment struct {
-	stderr bool
+	stream stream
 	data   []byte
 }
 
-// lineCut is, for each stream, whether the last of its bytes dropped is
-// not a newline: the line it is part of lost its start.
-type lineCut struct{ stdout, stderr bool }
-
-// of returns the stream's flag, stderr's or stdout's.
-func (c *lineCut) of(stderr bool) *bool {
-	if stderr {
-		return &c.stderr
-	}
-	return &c.stdout
-}
-
-// write adds data, a chunk of stderr or of stdout, dropping the oldest
-// bytes beyond keptBytes. A segment cut at its start is copied, so the
-// bytes dropped are released.
-func (o *keptOutput) write(stderr bool, data []byte) {
+// write adds data, a chunk of stream s, dropping the oldest bytes beyond
+// keptBytes. A segment cut at its start is copied, so the bytes dropped
+// are released.
+func (o *keptOutput) write(s stream, data []byte) {
 	if len(data) == 0 {
 		return
 	}
-	if last := len(o.segments) - 1; last >= 0 && o.segments[last].stderr == stderr {
+	if last := len(o.segments) - 1; last >= 0 && o.segments[last].stream == s {
 		o.segments[last].data = append(o.segments[last].data, data...)
 	} else {
-		o.segments = append(o.segments, segment{stderr: stderr, data: slices.Clone(data)})
+		o.segments = append(o.segments, segment{stream: s, data: slices.Clone(data)})
 	}
 	o.size += len(data)
 	for over := o.size - keptBytes; over > 0; over = o.size - keptBytes {
 		first := &o.segments[0]
 		n := min(over, len(first.data))
-		*o.cut.of(first.stderr) = first.data[n-1] != '\n'
+		o.cut[first.stream] = first.data[n-1] != '\n'
 		if n == len(first.data) {
 			o.segments[0] = segment{}
 			o.segments = o.segments[1:]
@@ -143,17 +130,17 @@ func (o *keptOutput) lines() ([]tailLine, int) {
 	dropped, cut := o.dropped, o.cut
 	for _, seg := range o.segments {
 		data := seg.data
-		if skip := cut.of(seg.stderr); *skip {
+		if cut[seg.stream] {
 			end := bytes.IndexByte(data, '\n')
 			if end < 0 {
 				dropped += len(data)
 				continue
 			}
 			dropped += end + 1
-			*skip = false
+			cut[seg.stream] = false
 			data = data[end+1:]
 		}
-		all.write(seg.stderr, data)
+		all.write(seg.stream, data)
 	}
 	return all.tail.lines, dropped
 }

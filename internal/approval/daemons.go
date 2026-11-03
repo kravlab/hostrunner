@@ -91,7 +91,7 @@ func (t *term) printList(shown []daemonlist.Daemon, cwd string) {
 		t.prompt("no daemons yet: waiting for one (q quits)\n")
 		return
 	}
-	t.prompt(hostterm.List{Daemons: shown, Cwd: cwd, Version: t.version}.Print(t.out))
+	t.prompt(hostterm.List{Daemons: shown, Cwd: cwd, BuildVersion: t.version}.Print(t.out))
 }
 
 // isYes reports whether text says yes to taking a daemon over.

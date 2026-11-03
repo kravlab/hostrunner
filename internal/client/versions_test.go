@@ -2,16 +2,14 @@ package client_test
 
 import (
 	"log/slog"
-	"net"
 	"strings"
 	"sync/atomic"
 	"testing"
 
 	"github.com/kravlab/hostrunner/internal/approval"
 	"github.com/kravlab/hostrunner/internal/daemon"
-	"github.com/kravlab/hostrunner/internal/launch"
+	"github.com/kravlab/hostrunner/internal/fakedaemon"
 	"github.com/kravlab/hostrunner/internal/protocol"
-	"github.com/kravlab/hostrunner/internal/transport"
 )
 
 // startVersionedDaemon starts a daemon with the echoOnly rules, its
@@ -81,41 +79,12 @@ func (d versionedDaemons) checkListed(t *testing.T, list string) {
 	}
 }
 
-// fakeDaemonOfVersion answers every hello on the approval socket of the
-// runtime directory dir as a daemon serving workspace, of the build
-// version version and then of each one set with the returned function.
-func fakeDaemonOfVersion(t *testing.T, dir, workspace, version string) (set func(string)) {
-	t.Helper()
-	var current atomic.Value
-	current.Store(version)
-	l, err := transport.Unix{Path: launch.ApprovalSocket(dir)}.Listen()
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { l.Close() })
-	go func() {
-		for {
-			c, err := l.Accept()
-			if err != nil {
-				return
-			}
-			go func(c net.Conn) {
-				defer c.Close()
-				if f, err := protocol.ReadFrame(c); err == nil && f.Type == protocol.FrameHello {
-					_ = protocol.WriteJSON(c, protocol.FrameDaemonInfo, protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: workspace, BuildVersion: current.Load().(string)})
-				}
-			}(c)
-		}
-	}()
-	return func(v string) { current.Store(v) }
-}
-
 // A session says which version it is and which its daemon is, and warns
 // of nothing when they are the same.
 func TestSessionShowsItsAndTheDaemonsVersion(t *testing.T) {
 	base, _ := newBase(t)
 	h := startVersionedDaemon(t, base, "v1.2.0")
-	s := startSessionWith(t, approval.Config{Socket: h.approvalSocket, Version: "v1.2.0"})
+	s := startSessionWith(t, approval.Config{Socket: h.approvalSocket, BuildVersion: "v1.2.0"})
 	out := s.out.String()
 	for _, want := range []string{"hostrunner approve v1.2.0\n", "serving " + h.hostRoot + " (container " + containerRoot + ") · daemon v1.2.0\n"} {
 		if !strings.Contains(out, want) {
@@ -132,7 +101,7 @@ func TestSessionShowsItsAndTheDaemonsVersion(t *testing.T) {
 func TestSessionWarnsOfADaemonOfAnotherVersion(t *testing.T) {
 	base, _ := newBase(t)
 	h := startVersionedDaemon(t, base, "v1.1.0")
-	s := startSessionWith(t, approval.Config{Socket: h.approvalSocket, Version: "v1.2.0"})
+	s := startSessionWith(t, approval.Config{Socket: h.approvalSocket, BuildVersion: "v1.2.0"})
 	out := s.out.String()
 	if want := "serving " + h.hostRoot + " (container " + containerRoot + ") · daemon v1.1.0\n"; !strings.Contains(out, want) {
 		t.Errorf("the session printed %q, lacking %q", out, want)
@@ -152,7 +121,7 @@ func TestSessionWarnsOfADaemonOfAnotherVersion(t *testing.T) {
 // as of an unknown version, and the session still serves it.
 func TestSessionServesADaemonOfUnknownVersion(t *testing.T) {
 	socket, served := fakeDaemonWith(t, protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: "/home/u/app", ContainerWorkspace: containerRoot})
-	s := startSessionWith(t, approval.Config{Socket: socket, Version: "v1.2.0"})
+	s := startSessionWith(t, approval.Config{Socket: socket, BuildVersion: "v1.2.0"})
 	<-served
 	s.waitFor(t, answerPromptText)
 	out := s.out.String()
@@ -167,7 +136,7 @@ func TestSessionServesADaemonOfUnknownVersion(t *testing.T) {
 // session's or unknown, when choosing and again after `daemons`.
 func TestSessionListShowsTheDaemonsVersions(t *testing.T) {
 	d := startVersionedDaemons(t)
-	s := startSessionWith(t, approval.Config{Root: d.root, Cwd: d.same.hostRoot, Version: "v1.2.0"})
+	s := startSessionWith(t, approval.Config{Root: d.root, Cwd: d.same.hostRoot, BuildVersion: "v1.2.0"})
 	d.checkListed(t, s.waitForListed(t))
 	s.answer(t, "")
 	s.waitFor(t, "serving "+d.same.hostRoot)
@@ -180,12 +149,16 @@ func TestSessionListShowsTheDaemonsVersions(t *testing.T) {
 // shown again with its new version.
 func TestSessionListShowsAChangedVersion(t *testing.T) {
 	base, root := newBase(t)
-	set := fakeDaemonOfVersion(t, base, "/home/u/app", "v1.1.0")
-	s := startSessionWith(t, approval.Config{Root: root, Version: "v1.2.0"})
+	var version atomic.Value
+	version.Store("v1.1.0")
+	fakedaemon.Serve(t, base, func() protocol.DaemonInfo {
+		return protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: "/home/u/app", BuildVersion: version.Load().(string)}
+	})
+	s := startSessionWith(t, approval.Config{Root: root, BuildVersion: "v1.2.0"})
 	if line := listLine(t, s.waitForListed(t), "/home/u/app"); !strings.Contains(line, " v1.1.0 ⚠ ") {
 		t.Fatalf("the line %q, want version v1.1.0 marked", line)
 	}
-	set("v1.2.0")
+	version.Store("v1.2.0")
 	if line := listLine(t, s.waitForListed(t), "/home/u/app"); !strings.Contains(line, " v1.2.0 ") || strings.Contains(line, "⚠") {
 		t.Fatalf("the line %q, want version v1.2.0 unmarked", line)
 	}
@@ -196,7 +169,7 @@ func TestSessionListShowsAChangedVersion(t *testing.T) {
 func TestSessionWarnsWithEachServingLine(t *testing.T) {
 	base, root := newBase(t)
 	h := startVersionedDaemon(t, base, "v1.1.0")
-	s := startSessionWith(t, approval.Config{Root: root, Cwd: h.hostRoot, Version: "v1.2.0"})
+	s := startSessionWith(t, approval.Config{Root: root, Cwd: h.hostRoot, BuildVersion: "v1.2.0"})
 	for range 2 {
 		s.waitForListed(t)
 		s.answer(t, "")

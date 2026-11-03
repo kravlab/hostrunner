@@ -18,6 +18,7 @@ import (
 	"github.com/kravlab/hostrunner/internal/approval"
 	"github.com/kravlab/hostrunner/internal/client"
 	"github.com/kravlab/hostrunner/internal/protocol"
+	"github.com/kravlab/hostrunner/internal/settings"
 )
 
 // echoAlone allows echo and nothing else: every other command is asked
@@ -87,7 +88,7 @@ func TestRunNumbersAreApartFromRequestNumbers(t *testing.T) {
 // the fake's connection.
 func startRunsFake(t *testing.T) (*session, net.Conn) {
 	t.Helper()
-	return startRunsFakeWith(t, approval.Config{})
+	return startRunsFakeWith(t, approval.Config{TailLines: settings.DefaultApproveTailLines})
 }
 
 // startRunsFakeWith is startRunsFake with the session as cfg configures

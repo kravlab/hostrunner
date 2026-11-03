@@ -23,10 +23,16 @@ type List struct {
 	// HideServed leaves out which daemons another approval session
 	// serves, for a list where that does not matter.
 	HideServed bool
-	// Version is this hostrunner's build version: every daemon's is shown,
-	// one of another or an unknown version marked (see OtherVersion).
-	Version string
+	// BuildVersion is this hostrunner's build version: every daemon's is
+	// shown, one of another or an unknown version marked (see
+	// OtherVersion).
+	BuildVersion string
 }
+
+// DevVersion is the build version of a hostrunner built without one, as
+// `hostrunner version` prints it; it also stands for a build version left
+// unset.
+const DevVersion = "dev"
 
 // OtherVersion reports whether info is of a daemon whose build version
 // is not version: another one, or none reported (a daemon older than
@@ -114,10 +120,10 @@ func (l List) Print(w io.Writer) (prompt string) {
 }
 
 // version returns d's build version as the list shows it, "unknown"
-// when it reports none, followed by " ⚠" when it is not l.Version.
+// when it reports none, followed by " ⚠" when it is not l.BuildVersion.
 func (l List) version(d daemonlist.Daemon) string {
 	v := ShownVersion(d.Info, "unknown")
-	if OtherVersion(d.Info, l.Version) {
+	if OtherVersion(d.Info, l.BuildVersion) {
 		v += " ⚠"
 	}
 	return v

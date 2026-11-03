@@ -66,7 +66,11 @@ type approvedRun struct {
 }
 
 // startRun records m, a run the human approved, as going, gives it its
-// number and tells the session of it.
+// number and tells the session of it. It queues the start frame on the
+// run feed taken under a.mu after releasing a.mu. That is safe: a
+// session that starts serving in between finds the run going and is
+// announced it as earlier (see approvals.serve), while the start goes
+// to the feed taken under the lock, the old session's.
 func (a *approvals) startRun(m protocol.RunStarted) *approvedRun {
 	a.mu.Lock()
 	a.lastRun++

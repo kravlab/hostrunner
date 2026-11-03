@@ -40,11 +40,11 @@
 // runs a human approved go: FrameRunStarted, FrameRunOutput, FrameRunEnded,
 // sent apart from the container's stream so that a session falling behind
 // loses output but neither slows the command nor is dropped for it. A
-// session that takes the daemon over from another
-// (Serve.TakeOver) gets its waiting requests, and the other
-// FrameTakenOver. `hostrunner stop`, `restart` and `up --restart` open
-// with FrameHello too, without serving: FrameRunning lists what the
-// daemon runs, and FrameStop, confirmed by FrameStopping, stops it.
+// session that takes the daemon over from another (Serve.TakeOver) gets
+// its waiting requests, and the other FrameTakenOver. `hostrunner stop`,
+// `restart` and `up --restart` open with FrameHello too, without
+// serving: FrameRunning lists what the daemon runs, and FrameStop,
+// confirmed by FrameStopping, stops it.
 package protocol
 
 import (
@@ -634,11 +634,12 @@ func ReadFrame(r io.Reader) (Frame, error) {
 
 // WriteJSON marshals v and writes it as a frame of type t.
 func WriteJSON(w io.Writer, t FrameType, v any) error {
-	payload, err := json.Marshal(v)
+	buf, err := EncodeJSON(t, v)
 	if err != nil {
-		return fmt.Errorf("protocol: encode %T: %w", v, err)
+		return err
 	}
-	return WriteFrame(w, Frame{Type: t, Payload: payload})
+	_, err = w.Write(buf)
+	return err
 }
 
 // DecodesLosslessly reports whether the JSON payload decodes without loss:

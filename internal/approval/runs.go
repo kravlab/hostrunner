@@ -9,17 +9,11 @@ import (
 
 	"github.com/kravlab/hostrunner/internal/hostterm"
 	"github.com/kravlab/hostrunner/internal/protocol"
-	"github.com/kravlab/hostrunner/internal/settings"
 )
 
 // noRunOutput is what a session says of a daemon that does not report
 // approved runs (protocol.DaemonInfo.Runs): it serves it all the same.
 const noRunOutput = "no run output: this daemon does not report approved runs"
-
-// defaultTailLines is how many of a run's last lines of output a session
-// given no Config.TailLines shows under its summary (term.tailLines): the
-// default of the setting approve_tail_lines.
-const defaultTailLines = settings.DefaultApproveTailLines
 
 // outUsage is what out says of an argument that is not a run's number.
 const outUsage = "usage: out [n], n from runs"
@@ -48,7 +42,34 @@ type sessionRun struct {
 
 // lines returns the lines of r's output as its report counts them: those
 // of both streams, a line not yet complete included (see streamLines).
-func (r *sessionRun) lines() int { return r.stdout.shown() + r.stderr.shown() }
+func (r *sessionRun) lines() int { return r.streams[stdout].shown() + r.streams[stderr].shown() }
+
+// stream is one of a run's two streams of output, stdout or stderr; it
+// indexes what the session holds of each.
+type stream int
+
+const (
+	stdout stream = iota
+	stderr
+)
+
+// streamOf returns the stream a chunk of output came on, as the daemon
+// tells it (protocol.RunOutput.Stderr).
+func streamOf(isStderr bool) stream {
+	if isStderr {
+		return stderr
+	}
+	return stdout
+}
+
+// mark returns what marks a line of the stream where the session shows
+// it: │ for stdout, ! for stderr.
+func (s stream) mark() string {
+	if s == stderr {
+		return "!"
+	}
+	return "│"
+}
 
 // streamLines is what a run's stream got: its complete lines, and the line
 // not yet complete it ends with, nil when it ends with a newline.
@@ -76,20 +97,20 @@ type tail struct {
 	lines []tailLine
 }
 
-// tailLine is a line of a tail, of stderr or of stdout.
+// tailLine is a line of a tail, of one stream.
 type tailLine struct {
-	stderr bool
+	stream stream
 	line   *hostterm.OutputLine
 }
 
-// start returns a new line of the stream, stderr or stdout, the last of
-// the tail, pushing its first out when the tail holds max already.
-func (t *tail) start(stderr bool) *hostterm.OutputLine {
+// start returns a new line of stream s, the last of the tail, pushing its
+// first out when the tail holds max already.
+func (t *tail) start(s stream) *hostterm.OutputLine {
 	l := &hostterm.OutputLine{}
 	if t.whole {
 		l = hostterm.WholeOutputLine()
 	}
-	t.lines = append(t.lines, tailLine{stderr: stderr, line: l})
+	t.lines = append(t.lines, tailLine{stream: s, line: l})
 	if len(t.lines) > t.max {
 		t.lines = t.lines[1:]
 	}
@@ -135,6 +156,19 @@ func (s *session) numberRun(id uint64) (uint64, *sessionRun) {
 	r.n = n
 	s.keep(r)
 	return n, r
+}
+
+// answeredRun numbers the run that the answer to request id approved,
+// as the daemon confirms the answer (see numberRun), and returns its
+// number and, when the run ended already, its report (see report),
+// the run then no longer going; "" otherwise.
+func (s *session) answeredRun(id uint64) (uint64, string) {
+	n, r := s.numberRun(id)
+	if r == nil || r.ended == nil {
+		return n, ""
+	}
+	delete(s.runs.going, r.ended.Run)
+	return n, report(r)
 }
 
 // runStarted takes the start of approved run m: numbered already when its
@@ -207,15 +241,16 @@ func (s *session) runOutput(m protocol.RunOutput) {
 	if r == nil {
 		return
 	}
+	st := streamOf(m.Stderr)
 	if r.outputKept() {
-		r.output.write(m.Stderr, m.Data)
+		r.output.write(st, m.Data)
 	}
-	r.write(m.Stderr, m.Data)
+	r.write(st, m.Data)
 }
 
 // runEnded takes the end of an approved run and, once it is numbered,
 // reports it in a notice (see notify). A run whose answer is not
-// confirmed yet is reported with the answer's line (see numberRun).
+// confirmed yet is reported with the answer's line (see answeredRun).
 func (s *session) runEnded(m protocol.RunEnded) {
 	r := s.runs.going[m.Run]
 	if r == nil {
@@ -300,11 +335,6 @@ func (t *term) listRuns() string {
 	return b.String()
 }
 
-// droppedUnknown is the bytes of output the daemon dropped, not received,
-// that the line of a run without an end says: the daemon counts them in
-// a run's end alone, so it says none.
-const droppedUnknown = 0
-
 // runLine returns the line that runs lists run r with: its summary once
 // it ended; `── run N · <cmd> · running · <duration so far> · <lines>
 // lines ──` while it goes, and `end not received` in place of running,
@@ -315,9 +345,9 @@ func runLine(r *sessionRun) string {
 	case r.ended != nil:
 		return summary(r)
 	case !r.left.IsZero():
-		return statusLine(r, "end not received", r.left.Sub(r.started), droppedUnknown)
+		return statusLine(r, "end not received", r.left.Sub(r.started))
 	}
-	return statusLine(r, "running", time.Since(r.started), droppedUnknown)
+	return statusLine(r, "running", time.Since(r.started))
 }
 
 // report returns what reports run r, ended, each line but the last
@@ -338,14 +368,10 @@ func report(r *sessionRun) string {
 }
 
 // writeLines writes lines on b, each on a line of its own after a
-// newline, marked │ for stdout or ! for stderr.
+// newline, marked as its stream's (see stream.mark).
 func writeLines(b *strings.Builder, lines []tailLine) {
 	for _, l := range lines {
-		mark := "│"
-		if l.stderr {
-			mark = "!"
-		}
-		fmt.Fprintf(b, "\n%s %s", mark, l.line)
+		fmt.Fprintf(b, "\n%s %s", l.stream.mark(), l.line)
 	}
 }
 
@@ -362,23 +388,24 @@ func summary(r *sessionRun) string {
 	case e.Cancelled != "":
 		outcome = "cancelled: " + hostterm.Display(string(e.Cancelled))
 	}
-	return statusLine(r, outcome, time.Duration(e.DurationMs)*time.Millisecond, int(e.Dropped))
+	return statusLine(r, outcome, time.Duration(e.DurationMs)*time.Millisecond)
 }
 
 // statusLine returns the line of run r that says how it went, outcome, in
-// duration d, and the bytes of its output the daemon dropped, not
-// received: `── run N · <cmd> · <outcome> · <duration> · <lines> lines ──`,
-// `· earlier output not received` before the end for a run that started
-// before the session served its daemon, whose lines count only the
-// output since, then `· <N> bytes not received` when the daemon dropped
-// any.
-func statusLine(r *sessionRun, outcome string, d time.Duration, dropped int) string {
+// duration d: `── run N · <cmd> · <outcome> · <duration> · <lines> lines
+// ──`, `· earlier output not received` before the end for a run that
+// started before the session served its daemon, whose lines count only
+// the output since, then `· <N> bytes not received` when the daemon
+// dropped any of its output. The daemon counts those in a run's end
+// alone (protocol.RunEnded.Dropped), so the line of a run without one
+// says none.
+func statusLine(r *sessionRun, outcome string, d time.Duration) string {
 	line := fmt.Sprintf("── run %d · %s · %s · %s · %s", r.n, hostterm.ArgvLine(r.argv), outcome, shownDuration(d), counted(r.lines(), "line"))
 	if r.earlier {
 		line += " · earlier output not received"
 	}
-	if dropped > 0 {
-		line += " · " + counted(dropped, "byte") + " not received"
+	if r.ended != nil && r.ended.Dropped > 0 {
+		line += " · " + counted(int(r.ended.Dropped), "byte") + " not received"
 	}
 	return line + " ──"
 }

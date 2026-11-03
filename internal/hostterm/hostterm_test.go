@@ -169,7 +169,7 @@ func daemons() []daemonlist.Daemon {
 
 func TestListPrintsTheDaemonsNumbered(t *testing.T) {
 	var out bytes.Buffer
-	prompt := hostterm.List{Daemons: daemons(), Cwd: "/home/u/b/src", Version: "v1.2.0"}.Print(&out)
+	prompt := hostterm.List{Daemons: daemons(), Cwd: "/home/u/b/src", BuildVersion: "v1.2.0"}.Print(&out)
 	want := "daemons:\n" +
 		"  1   /home/u/a     v1.2.0      (container /workspaces/a)     served by another session\n" +
 		"  2   /home/u/old   unknown ⚠   another version: restart its container\n" +
@@ -183,7 +183,7 @@ func TestListPrintsTheDaemonsNumbered(t *testing.T) {
 }
 
 func TestListOfAnyVersionLetsAnOlderDaemonBeTheDefault(t *testing.T) {
-	l := hostterm.List{Daemons: daemons(), Cwd: "/home/u/old", AnyVersion: true, Version: "v1.2.0"}
+	l := hostterm.List{Daemons: daemons(), Cwd: "/home/u/old", AnyVersion: true, BuildVersion: "v1.2.0"}
 	if l.Default() != 1 {
 		t.Fatalf("Default = %d, want 1", l.Default())
 	}

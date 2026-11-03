@@ -14,6 +14,7 @@ import (
 	"github.com/kravlab/hostrunner/internal/approval"
 	"github.com/kravlab/hostrunner/internal/daemon"
 	"github.com/kravlab/hostrunner/internal/protocol"
+	"github.com/kravlab/hostrunner/internal/settings"
 )
 
 // goingScript prints a line, then waits until the file go lies in its
@@ -130,7 +131,7 @@ func TestATakeOverPicksUpTheApprovedRunGoing(t *testing.T) {
 			waiting := h.ask(t, "touch", "marker")
 			first.waitFor(t, answerPromptText)
 
-			second := launchSession(t, approval.Config{Socket: h.approvalSocket})
+			second := launchSession(t, approval.Config{Socket: h.approvalSocket, TailLines: settings.DefaultApproveTailLines})
 			second.waitFor(t, takeOverPromptText)
 			second.answer(t, "y")
 			first.waitFor(t, "taken over by another session\n")
@@ -185,7 +186,7 @@ func TestServingADaemonPicksUpTheApprovedRunsGoing(t *testing.T) {
 		h := startHarnessAt(t, slog.New(slog.DiscardHandler), base, func(string) (daemon.Policy, []daemon.Option) {
 			return policy(t, echoAlone), nil
 		})
-		s := startSessionWith(t, approval.Config{Root: root, Cwd: h.hostRoot})
+		s := startSessionWith(t, approval.Config{Root: root, Cwd: h.hostRoot, TailLines: settings.DefaultApproveTailLines})
 		s.waitForListed(t)
 		s.answer(t, "")
 		s.waitFor(t, "serving "+h.hostRoot)
@@ -220,7 +221,7 @@ func TestServingADaemonPicksUpTheApprovedRunsGoing(t *testing.T) {
 		waitStarted(t, line)
 		first.waitFor(t, "\nrun 2 · "+goingLine+" · by session approval\n")
 
-		second := launchSession(t, approval.Config{Socket: h.approvalSocket})
+		second := launchSession(t, approval.Config{Socket: h.approvalSocket, TailLines: settings.DefaultApproveTailLines})
 		second.waitFor(t, takeOverPromptText)
 		second.answer(t, "y")
 		first.waitFor(t, "taken over by another session\n")

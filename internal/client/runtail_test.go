@@ -47,11 +47,11 @@ func TestARunsLastLinesFollowItsSummary(t *testing.T) {
 }
 
 // tailing returns a session's config that shows n lines of a run's tail.
-func tailing(n int) approval.Config { return approval.Config{TailLines: &n} }
+func tailing(n int) approval.Config { return approval.Config{TailLines: n} }
 
 // The number of tail lines the session is given sets how many of a run's
 // last lines follow its summary, a line saying how many are above them
-// when there are more; a session given none shows 3.
+// when there are more.
 func TestTheTailLinesSetHowManyLinesFollowTheSummary(t *testing.T) {
 	output := []protocol.RunOutput{outChunk("one\ntwo\n"), errChunk("three\n")}
 	for _, tt := range []struct {
@@ -62,7 +62,6 @@ func TestTheTailLinesSetHowManyLinesFollowTheSummary(t *testing.T) {
 		{"1", tailing(1), "3 lines ──\n! three\n(2 lines above · out 1)\n> "},
 		{"3", tailing(3), "3 lines ──\n│ one\n│ two\n! three\n> "},
 		{"5", tailing(5), "3 lines ──\n│ one\n│ two\n! three\n> "},
-		{"unset", approval.Config{}, "3 lines ──\n│ one\n│ two\n! three\n> "},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			s, conn := startRunsFakeWith(t, tt.cfg)

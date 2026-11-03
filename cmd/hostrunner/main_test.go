@@ -13,14 +13,13 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
-	"strconv"
 	"strings"
 	"testing"
 	"testing/synctest"
 	"time"
 
-	"github.com/kravlab/hostrunner/internal/approval"
 	"github.com/kravlab/hostrunner/internal/client"
+	"github.com/kravlab/hostrunner/internal/fakedaemon"
 	"github.com/kravlab/hostrunner/internal/instructions"
 	"github.com/kravlab/hostrunner/internal/launch"
 	"github.com/kravlab/hostrunner/internal/protocol"
@@ -87,25 +86,9 @@ func emptyStdin(t *testing.T) {
 // workspace of the build version version.
 func fakeVersionedDaemon(t *testing.T, dir, workspace, version string) {
 	t.Helper()
-	l, err := transport.Unix{Path: launch.ApprovalSocket(dir)}.Listen()
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { l.Close() })
-	go func() {
-		for {
-			c, err := l.Accept()
-			if err != nil {
-				return
-			}
-			go func(c net.Conn) {
-				defer c.Close()
-				if f, err := protocol.ReadFrame(c); err == nil && f.Type == protocol.FrameHello {
-					_ = protocol.WriteJSON(c, protocol.FrameDaemonInfo, protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: workspace, Stops: true, BuildVersion: version})
-				}
-			}(c)
-		}
-	}()
+	fakedaemon.Serve(t, dir, func() protocol.DaemonInfo {
+		return protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: workspace, Stops: true, BuildVersion: version}
+	})
 }
 
 // approve and stop --choose get the build version version prints, "dev"
@@ -1670,26 +1653,17 @@ func TestStopRestartAndApproveResolveTheirSettings(t *testing.T) {
 			}
 		}
 		got, err := parseApprove(tt.rootFlags, envOf(tt.vars), io.Discard)
-		if err != nil || got.Root != tt.root || got.TailLines == nil || *got.TailLines != tt.tailLines {
-			t.Errorf("approve, %s: got %q, tail lines %v, %v; want %q and %d", tt.name, got.Root, tailLinesOf(got), err, tt.root, tt.tailLines)
+		if err != nil || got.Root != tt.root || got.TailLines != tt.tailLines {
+			t.Errorf("approve, %s: got %q, tail lines %d, %v; want %q and %d", tt.name, got.Root, got.TailLines, err, tt.root, tt.tailLines)
 		}
 		withDir, err := parseApprove(append([]string{"--dir", "/d"}, tt.rootFlags...), envOf(tt.vars), io.Discard)
-		if err != nil || withDir.TailLines == nil || *withDir.TailLines != tt.tailLines {
-			t.Errorf("approve --dir, %s: got tail lines %v, %v; want %d", tt.name, tailLinesOf(withDir), err, tt.tailLines)
+		if err != nil || withDir.TailLines != tt.tailLines {
+			t.Errorf("approve --dir, %s: got tail lines %d, %v; want %d", tt.name, withDir.TailLines, err, tt.tailLines)
 		}
 	}
 	if _, err := parseApprove([]string{"--stop-timeout", "1m"}, xdgEnv, io.Discard); err == nil {
 		t.Error("approve: got no error for --stop-timeout")
 	}
-}
-
-// tailLinesOf is the number of tail lines cfg sets, as a test error
-// shows it: "unset" when it sets none.
-func tailLinesOf(cfg approval.Config) string {
-	if cfg.TailLines == nil {
-		return "unset"
-	}
-	return strconv.Itoa(*cfg.TailLines)
 }
 
 // An invalid setting of stop, restart or approve fails the command, a
