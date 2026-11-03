@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/kravlab/hostrunner/internal/approval"
 	"github.com/kravlab/hostrunner/internal/protocol"
 )
 
@@ -42,6 +43,46 @@ func TestARunsLastLinesFollowItsSummary(t *testing.T) {
 	got := runOnFake(t, s, conn, outChunk("one\ntwo\n"), errChunk("three\n"), outChunk("four\nfive"))
 	if want := "5 lines ──\n! three\n│ four\n│ five\n(2 lines above · out 1)\n> "; got != want {
 		t.Fatalf("the session printed %q, want %q", got, want)
+	}
+}
+
+// tailing returns a session's config that shows n lines of a run's tail.
+func tailing(n int) approval.Config { return approval.Config{TailLines: &n} }
+
+// The number of tail lines the session is given sets how many of a run's
+// last lines follow its summary, a line saying how many are above them
+// when there are more; a session given none shows 3.
+func TestTheTailLinesSetHowManyLinesFollowTheSummary(t *testing.T) {
+	output := []protocol.RunOutput{outChunk("one\ntwo\n"), errChunk("three\n")}
+	for _, tt := range []struct {
+		name string
+		cfg  approval.Config
+		want string
+	}{
+		{"1", tailing(1), "3 lines ──\n! three\n(2 lines above · out 1)\n> "},
+		{"3", tailing(3), "3 lines ──\n│ one\n│ two\n! three\n> "},
+		{"5", tailing(5), "3 lines ──\n│ one\n│ two\n! three\n> "},
+		{"unset", approval.Config{}, "3 lines ──\n│ one\n│ two\n! three\n> "},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s, conn := startRunsFakeWith(t, tt.cfg)
+			if got := runOnFake(t, s, conn, output...); got != tt.want {
+				t.Fatalf("the session printed %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// With no tail lines a run's summary is printed alone, with no line
+// saying what is above, and out still prints the run's output.
+func TestNoTailLinesPrintTheSummaryAlone(t *testing.T) {
+	s, conn := startRunsFakeWith(t, tailing(0))
+	if got, want := runOnFake(t, s, conn, outChunk("one\ntwo\n"), errChunk("three")), "3 lines ──\n> "; got != want {
+		t.Fatalf("the session printed %q, want %q", got, want)
+	}
+	want := "── run 1 · touch marker · exit 0 · 1.5s · 3 lines ──\n│ one\n│ two\n! three\n> "
+	if got := s.command(t, "out 1"); got != want {
+		t.Fatalf("out 1: the session printed %q, want %q", got, want)
 	}
 }
 

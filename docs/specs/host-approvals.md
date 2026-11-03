@@ -630,8 +630,9 @@ revoked 1
   output it got, the complete lines of stdout and stderr and an
   unfinished last line of each; `<N> bytes not received` follows when
   output was dropped (`1 line`, `1 byte` in the singular).
-- Tail: under the summary, the last 3 lines of the run's output, of
-  stdout and stderr in the order the lines' first bytes arrived (a line
+- Tail: under the summary, the last `approve_tail_lines` lines of the
+  run's output (3 unless set), of stdout and stderr in the order the
+  lines' first bytes arrived (a line
   that arrives in chunks, the other stream's in between, is shown whole
   where it began), each marked `│ ` (stdout) or `! ` (stderr), then
   `(<K> lines above · out N)` when the run printed more lines than
@@ -644,6 +645,25 @@ revoked 1
   ! FAIL
   (38 lines above · out 3)
   ```
+
+  `approve_tail_lines` sets how many lines the tail shows: from
+  `--approve-tail-lines`, then `HOSTRUNNER_APPROVE_TAIL_LINES`, then the
+  common part of the host settings file, then 3. The session takes it as
+  it starts and keeps it for every daemon it serves. With `0` the summary
+  line is printed alone, without `(<K> lines above · out N)`: the summary
+  counts the lines already, and `out N` still prints the run's kept
+  output, which does not depend on the tail. A negative, non-numeric or
+  fractional value, or a quoted number in a settings file, fails
+  `hostrunner approve`, naming its source
+  (`HOSTRUNNER_APPROVE_TAIL_LINES: must not be negative, got -1`,
+  `settings file <path>: approve_tail_lines: invalid integer "many"`,
+  `settings file <path>: approve_tail_lines: invalid integer 2.5`,
+  `settings file <path>: approve_tail_lines: invalid integer "3"`,
+  `--approve-tail-lines: must not be negative; usage: …`); a non-numeric
+  or fractional flag value is refused by the flag package, which names
+  the flag (`invalid value "many" for flag -approve-tail-lines: parse
+  error`). In the workspace settings file or a workspace section the key
+  is an error, as `runtime_root` is.
 
   The output is what the container got, the rule's secrets masked. A
   tail line longer than 200 characters is cut as an argument of the

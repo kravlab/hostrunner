@@ -272,11 +272,11 @@ func TestWorkspaceFileRejectsWhatItCannotApply(t *testing.T) {
 	}
 }
 
-// runtime_root and stop_timeout are read before a workspace is known, so
-// neither the workspace settings file nor a workspace section may set
-// them.
+// runtime_root, stop_timeout and approve_tail_lines are read before a
+// workspace is known, so neither the workspace settings file nor a
+// workspace section may set them.
 func TestCommonOnlyKeysAreRefusedOutsideTheCommonPart(t *testing.T) {
-	for _, name := range []string{"runtime_root", "stop_timeout"} {
+	for _, name := range []string{"runtime_root", "stop_timeout", "approve_tail_lines"} {
 		t.Run(name, func(t *testing.T) {
 			ws := newWorkspace(t, name+": x\n")
 			path := filepath.Join(ws, ".devcontainer", "hostrunner.yaml")

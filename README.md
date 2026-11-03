@@ -224,17 +224,18 @@ Besides its rules, a daemon has settings:
 |---|---|---|---|---|---|
 | `runtime_root` | `HOSTRUNNER_RUNTIME_ROOT` | `--runtime-root` | `$XDG_RUNTIME_DIR/hostrunner` | where they look for daemons without `--dir` | `stop`, `restart`, `approve` |
 | `stop_timeout` | `HOSTRUNNER_STOP_TIMEOUT` | `--stop-timeout` | `10s` | how long they wait for a stopped daemon to close its sockets | `stop`, `restart` |
+| `approve_tail_lines` | `HOSTRUNNER_APPROVE_TAIL_LINES` | `--approve-tail-lines` | `3` | how many of an approved run's last lines of output show under its summary; `0` shows the summary alone | `approve` |
 
 They do not know a workspace before they choose a daemon, so they read
 only the flag, the variable and the common part of the host settings
 file (`--settings` names it), then the default; in the workspace
-settings file or a workspace section these two keys are an error. A
+settings file or a workspace section these keys are an error. A
 `runtime_root` from the file or the variable must be absolute after `~`
 expansion; a relative `--runtime-root` is read against the current
 directory. Without `XDG_RUNTIME_DIR` and a runtime root from any source,
 these commands need `--dir`.
 
-`up` and `serve` neither read nor check these two settings. `up` puts
+`up` and `serve` neither read nor check these settings. `up` puts
 the runtime directory where its `--dir` says, so set `runtime_root` to
 the directory that holds the `--dir` of your `devcontainer.json`;
 `up --restart` waits 10 seconds for the daemon it stops to close its
@@ -266,6 +267,7 @@ request_timeout: 30s
 ready_timeout: 1m
 runtime_root: ~/.local/run/hostrunner
 stop_timeout: 1m
+approve_tail_lines: 5
 workspaces:
   ~/src/app:
     grace: 5m
@@ -296,8 +298,10 @@ both is an error.
 
 A duration is written with a unit (`90s`, `1m30s`, `2h`) and must be
 above zero; a bool is `true` or `false` (`1`, `0` and the like in a
-variable). An unknown key or an invalid value fails `hostrunner up`,
-and with it `devcontainer up`, naming the source and the key
+variable); an integer is written in decimal (`3`), unquoted in a
+settings file, and must not be negative: a fraction (`2.5`) or a quoted
+number (`"3"`) is refused. An unknown key or an invalid value fails
+`hostrunner up`, and with it `devcontainer up`, naming the source and the key
 (`settings file /home/u/.config/hostrunner/settings.yaml: grase: unknown
 key`, `settings file /home/u/.config/hostrunner/settings.yaml:
 workspaces./home/u/other: grase: unknown key`, `HOSTRUNNER_GRACE:

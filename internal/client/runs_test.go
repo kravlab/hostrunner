@@ -87,8 +87,16 @@ func TestRunNumbersAreApartFromRequestNumbers(t *testing.T) {
 // the fake's connection.
 func startRunsFake(t *testing.T) (*session, net.Conn) {
 	t.Helper()
+	return startRunsFakeWith(t, approval.Config{})
+}
+
+// startRunsFakeWith is startRunsFake with the session as cfg configures
+// it, serving the fake daemon.
+func startRunsFakeWith(t *testing.T, cfg approval.Config) (*session, net.Conn) {
+	t.Helper()
 	socket, served := fakeDaemonWith(t, protocol.DaemonInfo{Version: protocol.ApprovalVersion, Runs: true})
-	s := startSessionOn(t, socket)
+	cfg.Socket = socket
+	s := startSessionWith(t, cfg)
 	conn := <-served
 	s.waitFor(t, answerPromptText)
 	return s, conn

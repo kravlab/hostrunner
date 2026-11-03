@@ -1,5 +1,7 @@
 // Package settings resolves what tunes a daemon besides its rules: its
-// rules file, its timeouts and whether it rereads the rules file.
+// rules file, its timeouts and whether it rereads the rules file; and
+// what tunes stop, restart and approve: where they look for daemons, how
+// long they wait for one to stop, and how many tail lines approve shows.
 //
 // Each key comes from the highest source that sets it (ADR 0008): the
 // command's flags (Flags), the HOSTRUNNER_* variables, the workspace
@@ -26,7 +28,7 @@ import (
 
 // Settings are the resolved settings of a daemon, of the up that starts
 // it, and of stop, restart and approve; a command's settings hold the
-// keys it takes.
+// keys it takes, the others zero.
 type Settings struct {
 	// RulesFile (rules_file) is the rules file, absolute when the
 	// workspace path is.
@@ -58,6 +60,10 @@ type Settings struct {
 	// StopTimeout (stop_timeout) is how long stop and restart wait for a
 	// daemon to close its sockets once it has stopped.
 	StopTimeout time.Duration
+	// ApproveTailLines (approve_tail_lines) is how many of an approved
+	// run's last lines of output approve shows under its summary; 0 shows
+	// the summary alone. It is 0 for the commands that do not take it.
+	ApproveTailLines int
 }
 
 // Resolved is what resolving settings found: the Settings and, besides
@@ -96,14 +102,29 @@ func defaults(workspace string) Settings {
 // daemon takes to close its sockets, unless something is wrong.
 const DefaultStopTimeout = 10 * time.Second
 
+// DefaultApproveTailLines is the approve_tail_lines no source sets: enough
+// lines to see how a run ended, few enough to keep the session readable.
+const DefaultApproveTailLines = 3
+
 // flagDefaults are the defaults the flags' help shows, those of
-// defaults and DefaultStopTimeout: --runtime-root, whose default depends
-// on XDG_RUNTIME_DIR, and --rules-file, whose default depends on the
-// workspace, name theirs in their usage instead.
+// defaults, DefaultStopTimeout and the keys' own (def): --runtime-root,
+// whose default depends on XDG_RUNTIME_DIR, and --rules-file, whose
+// default depends on the workspace, name theirs in their usage instead.
 func flagDefaults() Settings {
 	s := defaults("")
 	s.StopTimeout = DefaultStopTimeout
+	applyDefs(&s, keys)
 	return s
+}
+
+// applyDefs sets in s the field of each of ks that has a default of its
+// own (def).
+func applyDefs(s *Settings, ks []key) {
+	for _, k := range ks {
+		if k.def != nil {
+			k.set(s, k.def)
+		}
+	}
 }
 
 // Daemon returns the settings serve takes, keyed by their names, each
@@ -120,8 +141,8 @@ func (s Settings) Daemon() map[string]string {
 }
 
 // layer is what one source sets: values by key name (as in a settings
-// file), each a string, a time.Duration or a bool as its key's kind
-// says. A key the source does not set is absent.
+// file), each a string, a time.Duration, a bool or an int as its key's
+// kind says. A key the source does not set is absent.
 type layer map[string]any
 
 // kind is the type of a key's value.
@@ -132,6 +153,7 @@ const (
 	kindBool                 // a bool
 	kindPath                 // a file path, not empty; a relative one is read against the workspace
 	kindAbsPath              // a directory path, not empty; a relative one is an error
+	kindCount                // a non-negative int, written in decimal
 )
 
 // String names the kind in errors ("invalid duration") and usages.
@@ -141,6 +163,8 @@ func (k kind) String() string {
 		return "bool"
 	case kindPath, kindAbsPath:
 		return "path"
+	case kindCount:
+		return "integer"
 	}
 	return "duration"
 }
@@ -153,27 +177,31 @@ const (
 	scopeUp                       // up alone: it tunes up, not the daemon
 	scopeRuntimeRoot              // stop, restart and approve
 	scopeStop                     // stop and restart
+	scopeApprove                  // approve alone
 )
 
 // commonOnly says whether only the common part of the host settings file
 // may set the keys of s: their commands (stop, restart, approve) know no
 // workspace when they read them (ADR 0008), so the workspace settings file
 // and a workspace section refuse them.
-func (s scope) commonOnly() bool { return s == scopeRuntimeRoot || s == scopeStop }
+func (s scope) commonOnly() bool {
+	return s == scopeRuntimeRoot || s == scopeStop || s == scopeApprove
+}
 
 // key is one setting: its name in a settings file, from which its
-// variable and flag are named, the commands that take its flag, and the
-// field of Settings it sets.
+// variable and flag are named, the commands that take its flag, the
+// field of Settings it sets and, for some, its default.
 type key struct {
 	name  string
 	kind  kind
 	scope scope
 	usage string                // the flag's help
-	field func(s *Settings) any // a *string, *time.Duration or *bool into s
+	field func(s *Settings) any // a *string, *time.Duration, *bool or *int into s
+	def   any                   // the value no source sets, of the kind; nil when defaults or hostDefaults give it
 }
 
-// get returns the value of k in s: a string, a time.Duration or a bool,
-// as k's kind says.
+// get returns the value of k in s: a string, a time.Duration, a bool or
+// an int, as k's kind says.
 func (k key) get(s *Settings) any {
 	switch p := k.field(s).(type) {
 	case *string:
@@ -181,6 +209,8 @@ func (k key) get(s *Settings) any {
 	case *time.Duration:
 		return *p
 	case *bool:
+		return *p
+	case *int:
 		return *p
 	default:
 		panic(fmt.Sprintf("settings: key %s has a field of type %T", k.name, p))
@@ -196,6 +226,8 @@ func (k key) set(s *Settings, v any) {
 		*p = v.(time.Duration)
 	case *bool:
 		*p = v.(bool)
+	case *int:
+		*p = v.(int)
 	default:
 		panic(fmt.Sprintf("settings: key %s has a field of type %T", k.name, p))
 	}
@@ -252,6 +284,12 @@ var keys = []key{
 		name: "stop_timeout", kind: kindDuration, scope: scopeStop,
 		usage: "how long to wait for a stopped daemon to close its sockets",
 		field: func(s *Settings) any { return &s.StopTimeout },
+	},
+	{
+		name: "approve_tail_lines", kind: kindCount, scope: scopeApprove,
+		usage: "how many of an approved run's last lines of output to show under its summary (0: the summary alone)",
+		field: func(s *Settings) any { return &s.ApproveTailLines },
+		def:   DefaultApproveTailLines,
 	},
 }
 
@@ -344,8 +382,9 @@ func UpUsage() string { return usageOf(keysOf(scopeDaemon, scopeUp)) }
 func StopUsage() string { return usageOf(keysOf(scopeRuntimeRoot, scopeStop)) }
 
 // ApproveUsage is the usage of the flags RegisterApprove adds:
-// [--settings <path>] [--runtime-root <path>].
-func ApproveUsage() string { return usageOf(keysOf(scopeRuntimeRoot)) }
+// [--settings <path>] [--runtime-root <path>] [--approve-tail-lines
+// <integer>].
+func ApproveUsage() string { return usageOf(keysOf(scopeRuntimeRoot, scopeApprove)) }
 
 // RestartUsage is the usage of the flags RegisterRestart adds: those of
 // StopUsage, [--workspace-settings <path>] and [--rules-file <path>].
@@ -391,6 +430,27 @@ var errNotPositive = errors.New("must be positive")
 // errEmptyPath is the problem with an empty path, which names no file.
 var errEmptyPath = errors.New("empty path")
 
+// errNegative is the problem with an integer below zero, which no
+// setting can mean.
+var errNegative = errors.New("must not be negative")
+
+// check returns the problem with v, a value of kind k, that no setting
+// can mean whatever its source: errNotPositive for a duration at or
+// below zero, errNegative for an integer below zero; nil otherwise.
+func (k kind) check(v any) error {
+	switch k {
+	case kindDuration:
+		if v.(time.Duration) <= 0 {
+			return errNotPositive
+		}
+	case kindCount:
+		if v.(int) < 0 {
+			return errNegative
+		}
+	}
+	return nil
+}
+
 // parse reads raw, the text a variable or a file gives, as a value of
 // kind k; the error describes the problem without naming the source.
 func (k kind) parse(raw string) (any, error) {
@@ -406,25 +466,39 @@ func (k kind) parse(raw string) (any, error) {
 			return nil, fmt.Errorf("invalid bool %q", raw)
 		}
 		return b, nil
+	case kindCount:
+		n, err := strconv.Atoi(raw)
+		if err != nil {
+			return nil, fmt.Errorf("invalid integer %q", raw)
+		}
+		return k.checked(n, raw)
 	}
 	d, err := time.ParseDuration(raw)
 	if err != nil {
 		return nil, fmt.Errorf("invalid duration %q", raw)
 	}
-	if d <= 0 {
-		return nil, fmt.Errorf("%w, got %s", errNotPositive, raw)
+	return k.checked(d, raw)
+}
+
+// checked returns v, read from raw, or the problem check finds with it,
+// naming raw: `must be positive, got 0s`.
+func (k kind) checked(v any, raw string) (any, error) {
+	if err := k.check(v); err != nil {
+		return nil, fmt.Errorf("%w, got %s", err, raw)
 	}
-	return d, nil
+	return v, nil
 }
 
 // format writes v, a value of kind k, as a settings file writes it:
-// `1m30s`, `true`, a path.
+// `1m30s`, `true`, a path, `3`.
 func (k kind) format(v any) string {
 	switch k {
 	case kindDuration:
 		return v.(time.Duration).String()
 	case kindBool:
 		return strconv.FormatBool(v.(bool))
+	case kindCount:
+		return strconv.Itoa(v.(int))
 	default:
 		return v.(string)
 	}
@@ -557,14 +631,17 @@ func env(in scopes, getenv func(string) string) (layer, error) {
 	return l, nil
 }
 
-// hostDefaults are the settings of stop, restart and approve that no
-// source sets: the runtime root under $XDG_RUNTIME_DIR, which getenv
-// reads (none when it is unset), and DefaultStopTimeout.
-func hostDefaults(getenv func(string) string) Settings {
+// hostDefaults are the settings of stop, restart and approve, which take
+// the keys of in, that no source sets: the runtime root under
+// $XDG_RUNTIME_DIR, which getenv reads (none when it is unset),
+// DefaultStopTimeout, and the own default (def) of each key of in, so
+// that a command holds no default of a key it does not take.
+func hostDefaults(in scopes, getenv func(string) string) Settings {
 	s := Settings{StopTimeout: DefaultStopTimeout}
 	if xdg := getenv("XDG_RUNTIME_DIR"); xdg != "" {
 		s.RuntimeRoot = filepath.Join(xdg, "hostrunner")
 	}
+	applyDefs(&s, keysOf(in...))
 	return s
 }
 
@@ -588,7 +665,7 @@ func resolveHost(in scopes, flags layer, hostNamed string, getenv func(string) s
 	if err != nil {
 		return Settings{}, err
 	}
-	s := hostDefaults(getenv)
+	s := hostDefaults(in, getenv)
 	if err := stack(&s, "", getenv, flags, common, sourced{vars, key.variable}); err != nil {
 		return Settings{}, err
 	}

@@ -47,6 +47,19 @@ type Config struct {
 	// prints it: the session says it as it starts and marks the daemons
 	// of another one. "" is devVersion, as for a build without one.
 	Version string
+	// TailLines is how many of an approved run's last lines of output the
+	// session shows under its summary: 0 shows the summary alone, nil
+	// defaultTailLines.
+	TailLines *int
+}
+
+// tailLines returns how many tail lines cfg sets: TailLines, or
+// defaultTailLines when it is nil.
+func (cfg Config) tailLines() int {
+	if cfg.TailLines == nil {
+		return defaultTailLines
+	}
+	return *cfg.TailLines
 }
 
 // devVersion is the version of a session given none, what `hostrunner
@@ -148,7 +161,8 @@ var scopeTexts = map[protocol.Scope]struct{ outcome, confirm, by string }{
 // the human approves are numbered, the answer's line naming its run, and
 // summarised once they end (see runs), when the daemon reports them; the
 // session keeps the last of their output in its memory for out (see
-// keptOutput).
+// keptOutput), and shows the last cfg.TailLines lines of each under its
+// summary.
 //
 // Without cfg.Socket it lists the daemons under cfg.Root to choose from
 // (see choose), and a daemon another session serves can be taken over:
@@ -160,7 +174,7 @@ var scopeTexts = map[protocol.Scope]struct{ outcome, confirm, by string }{
 // approvals, and one another session serves is left to it unless taken
 // over.
 func Run(ctx context.Context, cfg Config, in io.Reader, out io.Writer) error {
-	t := &term{out: out, Input: hostterm.NewInput(in), version: cmp.Or(cfg.Version, devVersion), tailLines: defaultTailLines}
+	t := &term{out: out, Input: hostterm.NewInput(in), version: cmp.Or(cfg.Version, devVersion), tailLines: cfg.tailLines()}
 	defer t.Close()
 	fmt.Fprintf(out, "hostrunner approve %s\n", hostterm.Display(t.version))
 	socket, takeOver := cfg.Socket, false

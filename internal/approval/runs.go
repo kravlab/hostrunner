@@ -9,6 +9,7 @@ import (
 
 	"github.com/kravlab/hostrunner/internal/hostterm"
 	"github.com/kravlab/hostrunner/internal/protocol"
+	"github.com/kravlab/hostrunner/internal/settings"
 )
 
 // noRunOutput is what a session says of a daemon that does not report
@@ -16,8 +17,9 @@ import (
 const noRunOutput = "no run output: this daemon does not report approved runs"
 
 // defaultTailLines is how many of a run's last lines of output a session
-// shows under its summary (term.tailLines).
-const defaultTailLines = 3
+// given no Config.TailLines shows under its summary (term.tailLines): the
+// default of the setting approve_tail_lines.
+const defaultTailLines = settings.DefaultApproveTailLines
 
 // outUsage is what out says of an argument that is not a run's number.
 const outUsage = "usage: out [n], n from runs"
@@ -297,12 +299,14 @@ func runLine(r *sessionRun) string {
 // ending with a newline: its summary line, then the lines of its tail,
 // each cut (see hostterm.OutputLine) and marked │ for stdout or ! for
 // stderr, then, when the tail holds fewer than the run's lines, `(<K>
-// lines above · out N)`, out N being the command that shows them.
+// lines above · out N)`, out N being the command that shows them. A
+// session showing no tail lines reports the summary alone: the summary
+// counts the lines already.
 func report(r *sessionRun) string {
 	var b strings.Builder
 	b.WriteString(summary(r))
 	writeLines(&b, r.tail.lines)
-	if above := r.lines() - len(r.tail.lines); above > 0 {
+	if above := r.lines() - len(r.tail.lines); above > 0 && r.tail.max > 0 {
 		fmt.Fprintf(&b, "\n(%s above · out %d)", counted(above, "line"), r.n)
 	}
 	return b.String()

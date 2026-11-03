@@ -48,10 +48,10 @@
 // them and starts the daemon with every one as a flag. The settings of
 // `stop` and `restart` are [--settings <path>] [--runtime-root <path>]
 // [--stop-timeout <duration>], those of `approve` [--settings <path>]
-// [--runtime-root <path>]; a setting no flag gives comes from its
-// HOSTRUNNER_* variable, the common part of the host settings file or
-// the default. `restart` resolves the new daemon's settings as `up`
-// does, for the old daemon's workspace, also taking
+// [--runtime-root <path>] [--approve-tail-lines <integer>]; a setting no
+// flag gives comes from its HOSTRUNNER_* variable, the common part of the
+// host settings file or the default. `restart` resolves the new daemon's
+// settings as `up` does, for the old daemon's workspace, also taking
 // [--workspace-settings <path>] and [--rules-file <path>] (not with
 // --all).
 package main
@@ -521,7 +521,8 @@ func parseServe(args []string, getenv func(string) string, output io.Writer) (se
 // $XDG_RUNTIME_DIR/hostrunner (where `hostrunner up` puts their runtime
 // directories) unless a setting says, and the current directory chooses
 // the default; with it, the session serves that daemon alone. The
-// settings are resolved with getenv reading the environment.
+// settings are resolved with getenv reading the environment; the number
+// of tail lines applies with --dir or without.
 func parseApprove(args []string, getenv func(string) string, output io.Writer) (approval.Config, error) {
 	var (
 		dir string
@@ -542,13 +543,16 @@ func parseApprove(args []string, getenv func(string) string, output io.Writer) (
 	if err != nil {
 		return approval.Config{}, err
 	}
+	c := approval.Config{Cwd: cwd, TailLines: &s.ApproveTailLines}
 	if dir != "" {
-		return approval.Config{Socket: launch.ApprovalSocket(dir), Cwd: cwd}, nil
+		c.Socket = launch.ApprovalSocket(dir)
+		return c, nil
 	}
 	if s.RuntimeRoot == "" {
 		return approval.Config{}, errNoRuntimeRoot
 	}
-	return approval.Config{Root: s.RuntimeRoot, Cwd: cwd}, nil
+	c.Root = s.RuntimeRoot
+	return c, nil
 }
 
 // hostSettings resolves the settings of stop, restart or approve that sf
