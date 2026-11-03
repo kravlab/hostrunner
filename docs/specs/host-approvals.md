@@ -465,7 +465,9 @@ revoked 1
 - The idle prompt `>` takes `standing` (the standing and session
   approvals), `revoke <n>`, `out [n]` and `runs` (see Approved runs),
   `daemons`, `quit`. The serving line's `commands: …` list names them;
-  the idle prompt has no other help.
+  the idle prompt has no other help. A command that takes no argument
+  (`standing`, `runs`, `daemons`, `quit`) given one prints
+  `usage: <command>` and does nothing.
 - Notices: what the daemon tells the session of its own accord, not as
   the outcome of what the human typed: a repeat's start line, a run's
   summary and tail (see Approved runs), and the rules-reread lines

@@ -784,8 +784,10 @@ func commandList(cmds []idleCommand) string {
 }
 
 // command runs a command typed at the idle prompt (see
-// idleCommandTable); an empty line shows the prompt again, and any other
-// says it is unknown, with the command list.
+// idleCommandTable); an empty line shows the prompt again, a command
+// that takes no argument, its syntax being its name, given one prints its
+// usage (`usage: runs`), and any other says it is unknown, with the
+// command list.
 func (s *session) command(text string) {
 	name, arg, _ := strings.Cut(text, " ")
 	if name == "" {
@@ -798,7 +800,14 @@ func (s *session) command(text string) {
 		s.prompt(idlePrompt)
 		return
 	}
-	idleCommandTable[i].run(s, strings.TrimSpace(arg))
+	c := idleCommandTable[i]
+	arg = strings.TrimSpace(arg)
+	if arg != "" && c.syntax == c.name {
+		fmt.Fprintf(s.out, "usage: %s\n", c.name)
+		s.prompt(idlePrompt)
+		return
+	}
+	c.run(s, arg)
 }
 
 // revoke runs revoke arg: it asks the daemon to revoke the approval arg

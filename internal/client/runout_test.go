@@ -90,6 +90,19 @@ func TestOutAndRunsBeforeAnyRun(t *testing.T) {
 	}
 }
 
+// A command that takes no argument, given one, prints its usage and
+// does nothing.
+func TestACommandWithoutArgumentsRefusesOne(t *testing.T) {
+	h := startDaemon(t, policy(t, echoAlone))
+	s := h.startSession(t)
+	s.waitFor(t, idlePromptText)
+	for _, name := range []string{"standing", "runs", "daemons", "quit"} {
+		if got, want := s.command(t, name+" x"), "usage: "+name+"\n> "; got != want {
+			t.Fatalf("%s x: the session printed %q, want %q", name, got, want)
+		}
+	}
+}
+
 // out prints an approved run's output, as the container got it, below
 // its summary line.
 func TestOutPrintsAnApprovedRunsOutput(t *testing.T) {
