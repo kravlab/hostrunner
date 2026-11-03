@@ -112,8 +112,8 @@ func sendFrame(t *testing.T, conn net.Conn, typ protocol.FrameType, v any) {
 	}
 }
 
-// A fresh approval's answer line names its run, and its summary follows,
-// whether the daemon confirms the answer before the run's frames or
+// A fresh approval's answer line names its run, and its summary and tail
+// follow, whether the daemon confirms the answer before the run's frames or
 // after them: they come from two of its goroutines.
 func TestARunIsNumberedWhicheverFrameComesFirst(t *testing.T) {
 	for _, answeredFirst := range []bool{true, false} {
@@ -132,7 +132,7 @@ func TestARunIsNumberedWhicheverFrameComesFirst(t *testing.T) {
 				answered()
 			}
 			s.waitFor(t, "approved once · run 1\n")
-			s.waitFor(t, "── run 1 · touch marker · exit 0 · 1.5s · 3 lines ──\n")
+			s.waitFor(t, "── run 1 · touch marker · exit 0 · 1.5s · 3 lines ──\n│ a\n│ b\n! c\n")
 		})
 	}
 }

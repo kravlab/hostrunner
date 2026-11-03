@@ -582,10 +582,41 @@ revoked 1
   output it got, the complete lines of stdout and stderr and an
   unfinished last line of each; `<N> bytes not received` follows when
   output was dropped (`1 line`, `1 byte` in the singular).
+- Tail: under the summary, the last 3 lines of the run's output, of
+  stdout and stderr in the order the lines' first bytes arrived (a line
+  that arrives in chunks, the other stream's in between, is shown whole
+  where it began), each marked `│ ` (stdout) or `! ` (stderr), then
+  `(<K> lines above · out N)` when the run printed more lines than
+  shown (`1 line` in the singular), counted as the summary counts them:
+
+  ```
+  ── run 3 · make test · exit 2 · 12.3s · 41 lines ──
+  │ ok   example/app/core  0.41s
+  ! --- FAIL: TestCheckout (0.02s)
+  ! FAIL
+  (38 lines above · out 3)
+  ```
+
+  The output is what the container got, the rule's secrets masked. A
+  tail line longer than 200 characters is cut as an argument of the
+  `cmd` line is, `…(+<N> bytes)` counting the bytes left out. Each line
+  is shown sanitised, so no output can steer the terminal: SGR (colour)
+  sequences are removed; a `\r` right before the `\n` ending a line
+  belongs to the ending (a CRLF line shows whole), and otherwise the
+  text before a line's last `\r` is dropped, as the terminal would
+  overwrite it; every other character that is not printable is escaped
+  on its own with its Go escape (`\x1b`, `\a`, `\u200b`, `\xff` for a
+  byte of invalid UTF-8), with no quotes around the line, while a tab is
+  shown as it is. An escape counts as one character of the 200; the
+  bytes counted are those of the text, SGR sequences not included (a
+  sequence of the SGR form longer than 64 bytes is not taken for one and
+  is shown as text). Of each line the session holds only the first 200
+  characters of text after its last `\r`, removing SGR sequences as they
+  arrive, and counts the bytes of the rest.
 - The summary of a run that ended before its answer was confirmed
-  follows the answer's line; any other is printed when the run ends,
-  below what is shown, and the prompt shown is shown again, keeping what
-  the human typed after it.
+  follows the answer's line, with its tail; any other is printed when
+  the run ends, below what is shown, and the prompt shown is shown
+  again, keeping what the human typed after it.
 - The output lives in the session's memory only; the daemon keeps none,
   and its log gains none.
 

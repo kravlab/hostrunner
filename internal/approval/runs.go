@@ -3,6 +3,7 @@ package approval
 import (
 	"bytes"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/kravlab/hostrunner/internal/hostterm"
@@ -13,31 +14,67 @@ import (
 // approved runs (protocol.DaemonInfo.Runs): it serves it all the same.
 const noRunOutput = "no run output: this daemon does not report approved runs"
 
+// defaultTailLines is how many of a run's last lines of output a session
+// shows under its summary (term.tailLines).
+const defaultTailLines = 3
+
 // sessionRun is an approved run the daemon told the session of, until the
 // session has reported how it ended: its number in the session (0 until
 // the answer that approved it is confirmed), its command, the lines of
-// output it got on each stream, and its end, once that came.
+// output it got on each stream, the last of them on both (tail), and its
+// end, once that came.
 type sessionRun struct {
 	n              uint64
 	argv           []string
 	stdout, stderr streamLines
+	tail           tail
 	ended          *protocol.RunEnded
 }
 
-// streamLines is what a run's stream got: its complete lines, and whether
-// it ends with a line not yet complete.
+// lines returns the lines of r's output as its report counts them: those
+// of both streams, a line not yet complete included (see streamLines).
+func (r *sessionRun) lines() int { return r.stdout.shown() + r.stderr.shown() }
+
+// streamLines is what a run's stream got: its complete lines, and the line
+// not yet complete it ends with, nil when it ends with a newline.
 type streamLines struct {
 	lines int
-	open  bool
+	open  *hostterm.OutputLine
 }
 
 // shown returns the lines of the stream as the summary counts them: a line
 // not yet complete counts.
 func (l streamLines) shown() int {
-	if l.open {
+	if l.open != nil {
 		return l.lines + 1
 	}
 	return l.lines
+}
+
+// tail is the last lines of a run's output, of both streams, in the order
+// their first bytes arrived, at most max of them, the oldest first. A line
+// pushed out while not yet complete gets the rest of it all the same,
+// unseen.
+type tail struct {
+	max   int
+	lines []tailLine
+}
+
+// tailLine is a line of a tail, of stderr or of stdout.
+type tailLine struct {
+	stderr bool
+	line   *hostterm.OutputLine
+}
+
+// start returns a new line of the stream, stderr or stdout, the last of
+// the tail, pushing its first out when the tail holds max already.
+func (t *tail) start(stderr bool) *hostterm.OutputLine {
+	l := &hostterm.OutputLine{}
+	t.lines = append(t.lines, tailLine{stderr: stderr, line: l})
+	if len(t.lines) > t.max {
+		t.lines = t.lines[1:]
+	}
+	return l
 }
 
 // runs are the approved runs of the daemon served that the session has not
@@ -84,7 +121,7 @@ func (s *session) numberRun(id uint64) (uint64, *sessionRun) {
 // answer was confirmed, numbered then otherwise. A run no request
 // approved is numbered at once.
 func (s *session) runStarted(m protocol.RunStarted) {
-	r := &sessionRun{argv: m.Argv}
+	r := &sessionRun{argv: m.Argv, tail: tail{max: s.tailLines}}
 	s.runs.going[m.Run] = r
 	switch n, ok := s.runs.numberByRequest[m.Request]; {
 	case ok:
@@ -97,20 +134,35 @@ func (s *session) runStarted(m protocol.RunStarted) {
 	}
 }
 
-// runOutput counts the lines of a chunk of an approved run's output. The
-// output of a run the session was not told of (one that started before
-// it served the daemon) is ignored.
+// runOutput takes a chunk of an approved run's output: it counts its
+// lines, continues the stream's line not yet complete, if any, and starts
+// a line of the tail at each line's first byte. The output of a run the
+// session was not told of (one that started before it served the daemon)
+// is ignored.
 func (s *session) runOutput(m protocol.RunOutput) {
 	r := s.runs.going[m.Run]
-	if r == nil || len(m.Data) == 0 {
+	if r == nil {
 		return
 	}
 	stream := &r.stdout
 	if m.Stderr {
 		stream = &r.stderr
 	}
-	stream.lines += bytes.Count(m.Data, []byte("\n"))
-	stream.open = m.Data[len(m.Data)-1] != '\n'
+	for data := m.Data; len(data) > 0; {
+		if stream.open == nil {
+			stream.open = r.tail.start(m.Stderr)
+		}
+		end := bytes.IndexByte(data, '\n')
+		if end < 0 {
+			stream.open.Write(data)
+			return
+		}
+		stream.open.Write(data[:end])
+		stream.open.End()
+		stream.open = nil
+		stream.lines++
+		data = data[end+1:]
+	}
 }
 
 // runEnded takes the end of an approved run and, once it is numbered,
@@ -128,10 +180,31 @@ func (s *session) runEnded(m protocol.RunEnded) {
 		return
 	}
 	delete(s.runs.going, m.Run)
-	fmt.Fprintf(s.out, "\n%s\n", summary(r))
+	fmt.Fprintf(s.out, "\n%s", report(r))
 	if !s.awaiting.waitsForDaemon() {
 		fmt.Fprint(s.out, s.asking)
 	}
+}
+
+// report returns what reports run r, ended, each line ending with a
+// newline: its summary line, then the lines of its tail, each cut (see
+// hostterm.OutputLine) and marked │ for stdout or ! for stderr, then, when
+// the tail holds fewer than the run's lines, `(<K> lines above · out N)`,
+// out N being the command that shows them.
+func report(r *sessionRun) string {
+	var b strings.Builder
+	b.WriteString(summary(r) + "\n")
+	for _, l := range r.tail.lines {
+		mark := "│"
+		if l.stderr {
+			mark = "!"
+		}
+		fmt.Fprintf(&b, "%s %s\n", mark, l.line)
+	}
+	if above := r.lines() - len(r.tail.lines); above > 0 {
+		fmt.Fprintf(&b, "(%s above · out %d)\n", counted(above, "line"), r.n)
+	}
+	return b.String()
 }
 
 // summary returns the line that reports run r, ended: `── run N · <cmd> ·
@@ -147,8 +220,7 @@ func summary(r *sessionRun) string {
 	case e.Cancelled != "":
 		outcome = "cancelled: " + hostterm.Display(string(e.Cancelled))
 	}
-	lines := r.stdout.shown() + r.stderr.shown()
-	line := fmt.Sprintf("── run %d · %s · %s · %s · %s", r.n, hostterm.ArgvLine(r.argv), outcome, shownDuration(time.Duration(e.DurationMs)*time.Millisecond), counted(lines, "line"))
+	line := fmt.Sprintf("── run %d · %s · %s · %s · %s", r.n, hostterm.ArgvLine(r.argv), outcome, shownDuration(time.Duration(e.DurationMs)*time.Millisecond), counted(r.lines(), "line"))
 	if e.Dropped > 0 {
 		line += " · " + counted(int(e.Dropped), "byte") + " not received"
 	}

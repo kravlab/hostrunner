@@ -157,7 +157,7 @@ var scopeTexts = map[protocol.Scope]struct{ outcome, confirm string }{
 // approvals, and one another session serves is left to it unless taken
 // over.
 func Run(ctx context.Context, cfg Config, in io.Reader, out io.Writer) error {
-	t := &term{out: out, Input: hostterm.NewInput(in), version: cmp.Or(cfg.Version, devVersion)}
+	t := &term{out: out, Input: hostterm.NewInput(in), version: cmp.Or(cfg.Version, devVersion), tailLines: defaultTailLines}
 	defer t.Close()
 	fmt.Fprintf(out, "hostrunner approve %s\n", hostterm.Display(t.version))
 	socket, takeOver := cfg.Socket, false
@@ -362,6 +362,9 @@ type term struct {
 	version string
 	// lastRun is the number of the last approved run (see nextRun).
 	lastRun uint64
+	// tailLines is how many of a run's last lines of output its report
+	// shows (see report).
+	tailLines int
 }
 
 // session is the state of a session serving one daemon: the requests
@@ -537,7 +540,7 @@ func (s *session) daemonFrame(f protocol.Frame) error {
 			fmt.Fprintf(s.out, "%s · run %d\n", s.sent.outcome, n)
 			if r != nil && r.ended != nil {
 				delete(s.runs.going, r.ended.Run)
-				fmt.Fprintln(s.out, summary(r))
+				fmt.Fprint(s.out, report(r))
 			}
 		default:
 			fmt.Fprintln(s.out, s.sent.outcome)
