@@ -162,9 +162,12 @@ func TestARepeatCancelledForItsClientIsSummarised(t *testing.T) {
 }
 
 // A repeat of an approval kind the session does not know is shown with
-// the kind as the daemon names it.
+// the kind as the daemon names it. The fake's request is withdrawn first:
+// a start line waits while a request is shown.
 func TestARepeatOfAnUnknownApprovalKindIsShownByItsKind(t *testing.T) {
 	s, conn := startRunsFake(t)
+	sendFrame(t, conn, protocol.FrameWithdrawn, protocol.Withdrawn{ID: 1, Reason: protocol.WithdrawnByClient})
+	s.waitFor(t, "request 1 withdrawn\n> ")
 	sendFrame(t, conn, protocol.FrameRunStarted, protocol.RunStarted{Run: 9, Argv: []string{"touch", "marker"}, Cwd: containerRoot, Approval: "rulebook"})
 	s.waitFor(t, "\nrun 1 · touch marker · by rulebook\n")
 }

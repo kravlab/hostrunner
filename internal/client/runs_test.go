@@ -94,11 +94,12 @@ func startRunsFake(t *testing.T) (*session, net.Conn) {
 	return s, conn
 }
 
-// approveOnFake answers request 1 of the fake daemon on conn once, and
-// returns once the fake has read the answer.
-func approveOnFake(t *testing.T, s *session, conn net.Conn) {
+// answerOnFake types line as the answer to the prompt the session
+// serving the fake daemon on conn shows, and returns once the fake has
+// read the answer it sends: line "o" approves request 1 once.
+func answerOnFake(t *testing.T, s *session, conn net.Conn, line string) {
 	t.Helper()
-	s.answer(t, "o")
+	s.answer(t, line)
 	if f, err := protocol.ReadFrame(conn); err != nil || f.Type != protocol.FrameAnswer {
 		t.Fatalf("frame %v, err %v; want the answer", f.Type, err)
 	}
@@ -119,7 +120,7 @@ func TestARunIsNumberedWhicheverFrameComesFirst(t *testing.T) {
 	for _, answeredFirst := range []bool{true, false} {
 		t.Run(fmt.Sprintf("answered first %v", answeredFirst), func(t *testing.T) {
 			s, conn := startRunsFake(t)
-			approveOnFake(t, s, conn)
+			answerOnFake(t, s, conn, "o")
 			answered := func() { sendFrame(t, conn, protocol.FrameAnswered, protocol.Answered{ID: 1}) }
 			if answeredFirst {
 				answered()
@@ -156,7 +157,7 @@ func TestARunsSummaryShowsHowItEnded(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			s, conn := startRunsFake(t)
-			approveOnFake(t, s, conn)
+			answerOnFake(t, s, conn, "o")
 			sendFrame(t, conn, protocol.FrameAnswered, protocol.Answered{ID: 1})
 			sendFrame(t, conn, protocol.FrameRunStarted, protocol.RunStarted{Run: 1, Argv: []string{"touch", "marker"}, Cwd: containerRoot, Approval: protocol.ScopeOnce, Request: 1})
 			if tt.output != "" {
@@ -179,7 +180,7 @@ func TestASessionSaysADaemonWithoutRunsSendsNoRunOutput(t *testing.T) {
 	if out := s.out.String(); !strings.Contains(out, "\nno run output: this daemon does not report approved runs\nwaiting for requests") {
 		t.Fatalf("the session printed %q, lacking that it gets no run output", out)
 	}
-	approveOnFake(t, s, conn)
+	answerOnFake(t, s, conn, "o")
 	sendFrame(t, conn, protocol.FrameAnswered, protocol.Answered{ID: 1})
 	if out := s.waitFor(t, "approved once\n"); strings.Contains(out, "run") {
 		t.Fatalf("the session printed %q, naming a run", out)
@@ -447,9 +448,12 @@ func TestASessionFallingBehindLosesOutputNotItsConnection(t *testing.T) {
 	}
 	time.Sleep(2500 * time.Millisecond) // longer than a session is given to take another frame
 	resume()
-	s.waitForMatch(t, regexp.QuoteMeta("── run 1 · sh -c '"+script+"' · exit 0 · ")+durationPattern+` · \d+ lines? · \d+ bytes not received ──\n`)
+	// The summary waits while the other request is shown: it follows the
+	// answer's line.
 	s.waitFor(t, answerPromptText)
 	s.answer(t, "o")
+	s.waitFor(t, "approved once · run 2\n")
+	s.waitForMatch(t, regexp.QuoteMeta("── run 1 · sh -c '"+script+"' · exit 0 · ")+durationPattern+` · \d+ lines? · \d+ bytes not received ──\n`)
 	if got := awaitResult(t, other); got.code != 0 {
 		t.Fatalf("got %+v, want the session to serve the daemon still", got)
 	}

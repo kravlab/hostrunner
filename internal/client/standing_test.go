@@ -269,22 +269,24 @@ func TestStandingRevokeLeavesARunningCommand(t *testing.T) {
 	}
 }
 
-// A command's outcome that arrives while a request is shown is printed,
-// and the request's prompt asked again; a refused list does not end the
-// session.
-func TestSessionReprintsThePromptAfterACommandsOutcome(t *testing.T) {
+// A command's outcome that arrives while a request is shown is held as a
+// notice is: nothing of it is printed until the request is answered, and
+// then it is printed in the order it arrived, before the idle prompt. A
+// refused list does not end the session.
+func TestACommandsOutcomeWaitsForTheRequestShown(t *testing.T) {
 	socket, served := fakeDaemon(t)
 	s := startSessionOn(t, socket)
 	conn := <-served
 	s.waitFor(t, answerPromptText)
-	_ = protocol.WriteJSON(conn, protocol.FrameStandingList, protocol.StandingList{Approvals: []protocol.Standing{{N: 3, Argv: []string{"touch", "x"}, Cwd: containerRoot}}})
-	s.waitFor(t, "  3  touch x   in "+containerRoot+"\n"+answerPromptText)
-	_ = protocol.WriteJSON(conn, protocol.FrameStandingList, protocol.StandingList{Error: "not now"})
-	s.waitFor(t, "standing: not now\n"+answerPromptText)
-	s.answer(t, "o")
-	if f, err := protocol.ReadFrame(conn); err != nil || f.Type != protocol.FrameAnswer {
-		t.Fatalf("frame %v, err %v; want the answer", f.Type, err)
+	sendFrame(t, conn, protocol.FrameStandingList, protocol.StandingList{Approvals: []protocol.Standing{{N: 3, Argv: []string{"touch", "x"}, Cwd: containerRoot}}})
+	sendFrame(t, conn, protocol.FrameStandingList, protocol.StandingList{Error: "not now"})
+	syncOnFake(t, s, conn)
+	if out := s.out.String(); strings.Contains(out, "touch x") || strings.Contains(out, "not now") {
+		t.Fatalf("the session printed an outcome while the request was shown:\n%s", out)
 	}
+	answerOnFake(t, s, conn, "o")
+	sendFrame(t, conn, protocol.FrameAnswered, protocol.Answered{ID: 1})
+	s.waitFor(t, "approved once\n  3  touch x   in "+containerRoot+"\nstanding: not now\n"+idlePromptText)
 }
 
 // A standing approval goes with the daemon: once it steps aside, the next

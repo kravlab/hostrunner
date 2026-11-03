@@ -26,7 +26,7 @@ import (
 // test as a human would drive it: it reads what the session prints and
 // types answers.
 type session struct {
-	in     *io.PipeWriter
+	in     io.WriteCloser
 	out    *lockedBuffer
 	seen   int                // how much of out the test has read
 	ended  chan struct{}      // closed once the session has ended, err set
@@ -71,16 +71,23 @@ func launchSession(t *testing.T, cfg approval.Config) *session {
 // which writes on to out, what the test reads.
 func launchSessionTo(t *testing.T, cfg approval.Config, out *lockedBuffer, print io.Writer) *session {
 	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
 	pr, pw := io.Pipe()
-	s := &session{in: pw, out: out, ended: make(chan struct{}), cancel: cancel}
+	return launchSessionTyping(t, cfg, pr, pw, out, print)
+}
+
+// launchSessionTyping is launchSessionTo with the session reading the
+// human from read, which the test types on through typed.
+func launchSessionTyping(t *testing.T, cfg approval.Config, read io.Reader, typed io.WriteCloser, out *lockedBuffer, print io.Writer) *session {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &session{in: typed, out: out, ended: make(chan struct{}), cancel: cancel}
 	go func() {
 		defer close(s.ended)
-		s.err = approval.Run(ctx, cfg, pr, print)
+		s.err = approval.Run(ctx, cfg, read, print)
 	}()
 	t.Cleanup(func() {
 		cancel()
-		pw.Close()
+		typed.Close()
 		select {
 		case <-s.ended:
 		case <-time.After(5 * time.Second):

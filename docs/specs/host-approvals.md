@@ -458,12 +458,37 @@ revoked 1
   characters is sent Go-quoted.
 - Requests come one at a time, first in, first out. A new one rings the
   bell (BEL) and counts in `(N more waiting)` at the next block; nothing
-  is printed in the middle of a prompt. A current request that is
-  withdrawn or expires is announced (`request N withdrawn`, `… expired`),
-  typed input is discarded, and the next is shown; queued ones that expire
-  drop out silently.
+  is printed in the middle of a prompt (see Notices). A current request
+  that is withdrawn or expires is announced (`request N withdrawn`, `…
+  expired`), typed input is discarded, and the next is shown; queued ones
+  that expire drop out silently.
 - The idle prompt `>` takes `standing` (the standing and session
   approvals), `revoke <n>`, `daemons`, `quit`.
+- Notices: what the daemon tells the session of its own accord, not as
+  the outcome of what the human typed: a repeat's start line, a run's
+  summary and tail (see Approved runs), and the rules-reread lines
+  (`the rules file changed; …`). A request is on screen from its block
+  until the daemon has taken its answer (the answer's line printed) or
+  it is withdrawn or expires, with every prompt it asks meanwhile (a
+  refusal's note, the guarded `yes`, adding a rule, rereading a file
+  changed by hand), the answer on its way to the daemon included. While
+  one is, notices are held, nothing of them printed; once it is gone
+  they are printed in the order they arrived, below its last line (the
+  answer's line, or `request N withdrawn`), before the next request is
+  shown or the idle prompt. A session that stops serving the daemon
+  meanwhile (Ctrl+C, taken over, a write failing, the daemon gone)
+  prints them after a blank line, once it has said what it says of that
+  (`refused 1 waiting request`, `taken over by another session`, …),
+  before it ends or waits for the next daemon (`the daemon ended:
+  waiting for the next one` follows them). At the idle prompt a notice
+  is printed at once, on a line of its own, and `> ` is shown again,
+  keeping what the human has typed so far: a command typed in part
+  (`stand`) runs once finished (`standing`), on a terminal too, whose
+  input a prompt discards. A command's outcome (`standing`, `revoke`) is
+  not a notice, but it is held alike: while a request is on screen it is
+  held with the notices, in the order they arrived; at the idle prompt
+  it is printed at once, right below the command's line, and `> ` is
+  shown again, keeping what the human has typed so far.
 - Without `--dir`, the session globs
   `$XDG_RUNTIME_DIR/hostrunner/*.approval.sock` and sends hellos, every 2
   seconds while it lists or waits. The daemon whose host workspace holds
@@ -582,10 +607,9 @@ revoked 1
   run 5 · make test · by session approval
   ```
 
-  It is printed below what is shown, and the prompt shown is shown
-  again, keeping what the human typed after it. Its summary follows when
-  it ends. A fresh approval prints no start line: its answer line names
-  its run.
+  It is a notice (see Notices): held while a request is on screen,
+  printed at once at the idle prompt. Its summary follows when it ends.
+  A fresh approval prints no start line: its answer line names its run.
 - Summary: once a numbered run ends, one line:
 
   ```
@@ -635,9 +659,9 @@ revoked 1
   characters of text after its last `\r`, removing SGR sequences as they
   arrive, and counts the bytes of the rest.
 - The summary of a run that ended before its answer was confirmed
-  follows the answer's line, with its tail; any other is printed when
-  the run ends, below what is shown, and the prompt shown is shown
-  again, keeping what the human typed after it.
+  follows the answer's line, with its tail; any other is a notice (see
+  Notices), printed when the run ends, or held while a request is on
+  screen.
 - The output lives in the session's memory only; the daemon keeps none,
   and its log gains none.
 
@@ -760,7 +784,9 @@ no answer, report and wait instead of asking again.
   rules file and log lines. A fake daemon there stands in for one older
   than a session (no build version, no approved runs) and for frame
   orders a real daemon gives only by chance; a session's output that the
-  test stops stands in for a terminal stopped while a run goes.
+  test stops stands in for a terminal stopped while a run goes; a
+  pseudo-terminal stands in for the human's terminal where a prompt
+  would discard what is typed on it (a command typed in part).
 - The Rules test's tests: every reason and the class marks.
 - e2e: from inside the container the approval socket is unreachable, and
   `--ask` without a session is refused at once with 126.

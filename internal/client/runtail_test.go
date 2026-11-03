@@ -14,7 +14,7 @@ import (
 // run's summary line and what follows it up to the idle prompt.
 func runOnFake(t *testing.T, s *session, conn net.Conn, output ...protocol.RunOutput) string {
 	t.Helper()
-	approveOnFake(t, s, conn)
+	answerOnFake(t, s, conn, "o")
 	sendFrame(t, conn, protocol.FrameAnswered, protocol.Answered{ID: 1})
 	sendFrame(t, conn, protocol.FrameRunStarted, protocol.RunStarted{Run: 1, Argv: []string{"touch", "marker"}, Cwd: containerRoot, Approval: protocol.ScopeOnce, Request: 1})
 	for _, m := range output {

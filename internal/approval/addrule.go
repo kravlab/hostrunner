@@ -283,7 +283,7 @@ func (s *session) reread(res protocol.RereadResult) {
 	}
 	fmt.Fprintln(s.out)
 	if !waiting {
-		s.idle()
+		s.askAgain()
 		return
 	}
 	s.send(protocol.Answer{ID: a.id, Scope: scope}, scopeTexts[scope].outcome)
@@ -330,7 +330,7 @@ func (s *session) rereadThenPropose(res protocol.RereadResult) {
 	}
 	switch {
 	case len(s.queue) == 0:
-		s.idle()
+		s.askAgain()
 	case s.queue[0].ID != id:
 		s.askAnswer()
 	case res.Error != "":

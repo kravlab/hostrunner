@@ -256,6 +256,12 @@ One run of a command that an approval let through: one a human
 approved when asked, or a repeat a standing or session approval
 let through. Runs the rules allow are not approved runs.
 
+**Notice**:
+What the daemon tells an approval session of its own accord, not
+as the outcome of what the human typed: an approved run's start
+line or summary, a reread of the rules.
+_Avoid_: message, event
+
 **Approval socket**:
 The daemon's socket for approval sessions, beside its runtime
 directory and outside the container's reach.

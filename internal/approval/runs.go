@@ -119,9 +119,8 @@ func (s *session) numberRun(id uint64) (uint64, *sessionRun) {
 
 // runStarted takes the start of approved run m: numbered already when its
 // answer was confirmed, numbered then otherwise. A run no request
-// approved, a repeat, is numbered at once, and its start line is printed
-// below what is shown (see printBelow), as a summary is: no answer line
-// names it.
+// approved, a repeat, is numbered at once, and its start line is a
+// notice (see notify), as a summary is: no answer line names it.
 func (s *session) runStarted(m protocol.RunStarted) {
 	r := &sessionRun{argv: m.Argv, tail: tail{max: s.tailLines}}
 	s.runs.going[m.Run] = r
@@ -131,7 +130,7 @@ func (s *session) runStarted(m protocol.RunStarted) {
 		r.n = n
 	case m.Request == 0:
 		r.n = s.nextRun()
-		s.printBelow(startLine(r, m.Approval) + "\n")
+		s.notify(startLine(r, m.Approval))
 	default:
 		s.runs.startedEarly[m.Request] = r
 	}
@@ -186,10 +185,8 @@ func (s *session) runOutput(m protocol.RunOutput) {
 }
 
 // runEnded takes the end of an approved run and, once it is numbered,
-// reports it below what is shown, the prompt shown, if any, shown again,
-// keeping what the human typed after it: a summary that arrives as they
-// type takes none of their answer. A run whose answer is not confirmed yet
-// is reported with the answer's line (see numberRun).
+// reports it in a notice (see notify). A run whose answer is not
+// confirmed yet is reported with the answer's line (see numberRun).
 func (s *session) runEnded(m protocol.RunEnded) {
 	r := s.runs.going[m.Run]
 	if r == nil {
@@ -200,37 +197,26 @@ func (s *session) runEnded(m protocol.RunEnded) {
 		return
 	}
 	delete(s.runs.going, m.Run)
-	s.printBelow(report(r))
+	s.notify(report(r))
 }
 
-// printBelow prints text, ending with a newline, below what is shown,
-// then the prompt shown, if any, again, keeping what the human typed
-// after it; no prompt is shown again while the session waits for the
-// daemon to take an answer.
-func (s *session) printBelow(text string) {
-	fmt.Fprintf(s.out, "\n%s", text)
-	if !s.awaiting.waitsForDaemon() {
-		fmt.Fprint(s.out, s.asking)
-	}
-}
-
-// report returns what reports run r, ended, each line ending with a
-// newline: its summary line, then the lines of its tail, each cut (see
-// hostterm.OutputLine) and marked │ for stdout or ! for stderr, then, when
-// the tail holds fewer than the run's lines, `(<K> lines above · out N)`,
-// out N being the command that shows them.
+// report returns what reports run r, ended, each line but the last
+// ending with a newline: its summary line, then the lines of its tail,
+// each cut (see hostterm.OutputLine) and marked │ for stdout or ! for
+// stderr, then, when the tail holds fewer than the run's lines, `(<K>
+// lines above · out N)`, out N being the command that shows them.
 func report(r *sessionRun) string {
 	var b strings.Builder
-	b.WriteString(summary(r) + "\n")
+	b.WriteString(summary(r))
 	for _, l := range r.tail.lines {
 		mark := "│"
 		if l.stderr {
 			mark = "!"
 		}
-		fmt.Fprintf(&b, "%s %s\n", mark, l.line)
+		fmt.Fprintf(&b, "\n%s %s", mark, l.line)
 	}
 	if above := r.lines() - len(r.tail.lines); above > 0 {
-		fmt.Fprintf(&b, "(%s above · out %d)\n", counted(above, "line"), r.n)
+		fmt.Fprintf(&b, "\n(%s above · out %d)", counted(above, "line"), r.n)
 	}
 	return b.String()
 }
