@@ -61,3 +61,29 @@ func TestOutputLine(t *testing.T) {
 		})
 	}
 }
+
+// A whole line holds all of its text, not cut, sanitised as any line, and
+// stays whole when a \r rewrites it.
+func TestWholeOutputLine(t *testing.T) {
+	long := strings.Repeat("é", 5000)
+	for _, tt := range []struct {
+		name   string
+		chunks []string
+		want   string
+	}{
+		{"long", []string{long[:3001], long[3001:]}, long},
+		{"sanitised", []string{long + "\x1b[31mred\x1b[0m\x00"}, long + `red\x00`},
+		{"rewritten", []string{"old\r", long}, long},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			l := hostterm.WholeOutputLine()
+			for _, c := range tt.chunks {
+				l.Write([]byte(c))
+			}
+			l.End()
+			if got := l.String(); got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}

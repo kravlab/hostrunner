@@ -341,7 +341,9 @@ daemon alone, asking first whether to take it over from another session
 serving it. When its daemon ends, or its connection to it fails, the
 session waits for the next one in the same runtime directory. At the
 idle `>` prompt, `daemons` leaves the daemon for the list (without
-`--dir`) and `quit` ends the session.
+`--dir`) and `quit` ends the session. `runs` lists the session's last 20
+approved runs, and `out [n]` prints the last 64 KiB of the output of run
+n (by default the last one), kept in the session's memory only.
 
 It serves the daemon chosen: it prints each approval request as
 it arrives, with the container directory, the argv (`cmd` line) and why

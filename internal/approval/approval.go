@@ -78,7 +78,6 @@ const (
 	rereadPrompt        = "the rules file changed since the daemon loaded it; reread it, making that change live now? [r]eread [c]ancel ? "
 	notePrompt          = "note for the agent (Enter for none): "
 	idlePrompt          = "> "
-	idleCommands        = "commands: standing, revoke <n>, daemons, quit"
 	takeOverPrompt      = "Take over? [y/N] "
 	goneSaid            = "\nthe daemon ended: waiting for the next one\n"
 )
@@ -141,12 +140,15 @@ var scopeTexts = map[protocol.Scope]struct{ outcome, confirm, by string }{
 // (see proposeRule), opening it in $VISUAL or $EDITOR when the human
 // asks. While no request is shown, the idle prompt takes commands:
 // standing lists the daemon's standing and session approvals, revoke <n>
-// revokes one, daemons leaves the daemon for the list, quit ends the
+// revokes one, out [n] prints the output kept of a run, runs lists the
+// runs kept, daemons leaves the daemon for the list, quit ends the
 // session. It says its own version as it starts (see Config.Version) and
 // the daemon's on each serving line, followed by a warning whenever that
 // is another or unknown, so the human can restart the daemon. The runs
 // the human approves are numbered, the answer's line naming its run, and
-// summarised once they end (see runs), when the daemon reports them.
+// summarised once they end (see runs), when the daemon reports them; the
+// session keeps the last of their output in its memory for out (see
+// keptOutput).
 //
 // Without cfg.Socket it lists the daemons under cfg.Root to choose from
 // (see choose), and a daemon another session serves can be taken over:
@@ -291,6 +293,7 @@ func (t *term) serveDaemon(ctx context.Context, socket string, takeOver, canList
 	s.prompt(idlePrompt)
 	frames := readDaemon(conn, done)
 	then, err := s.loop(ctx, frames)
+	s.leftRuns()
 	s.printHeld(true)
 	s.dropAddition()
 	hangUp(conn, frames)
@@ -367,6 +370,11 @@ type term struct {
 	// tailLines is how many of a run's last lines of output its report
 	// shows (see report).
 	tailLines int
+	// kept are the last runs, by number, whose output out shows and runs
+	// lists (see keep); droppedThrough is the number of the last run no
+	// longer kept.
+	kept           []*sessionRun
+	droppedThrough uint64
 }
 
 // session is the state of a session serving one daemon: the requests
@@ -723,38 +731,84 @@ func (s *session) answerTyped(r waiting, text string) {
 	}
 }
 
-// command runs a command typed at the idle prompt: standing lists the
-// standing and session approvals, revoke <n> revokes one, the daemon's
-// answer printing the outcome; daemons leaves the daemon for the list of
-// daemons, quit ends the session.
+// idleCommand is a command the idle prompt takes: its name, how the
+// command list (idleCommands) shows it, and what runs it, given the
+// argument typed after the name, spaces trimmed.
+type idleCommand struct {
+	name, syntax string
+	run          func(s *session, arg string)
+}
+
+// idleCommandTable are the commands the idle prompt takes, in the order
+// the command list names them: standing lists the standing and session
+// approvals, revoke <n> revokes one, the daemon's answer printing the
+// outcome; out [n] prints the output kept of a run (see showOutput), runs
+// lists the runs kept (see listRuns), their outcome held as the daemon's
+// is; daemons leaves the daemon for the list of daemons, quit ends the
+// session.
+var idleCommandTable = []idleCommand{
+	{"standing", "standing", func(s *session, _ string) { s.write(protocol.FrameStanding, nil) }},
+	{"revoke", "revoke <n>", (*session).revoke},
+	{"out", "out [n]", func(s *session, arg string) { s.outcome(s.showOutput(arg)) }},
+	{"runs", "runs", func(s *session, _ string) { s.outcome(s.listRuns()) }},
+	{"daemons", "daemons", (*session).leaveForList},
+	{"quit", "quit", func(s *session, _ string) { s.after = nextQuit }},
+}
+
+// idleCommands is the command list the session prints as it starts
+// serving a daemon and of a command it does not know: `commands: ` and
+// the syntax of each command of idleCommandTable.
+var idleCommands = commandList(idleCommandTable)
+
+// commandList returns the command list of the commands cmds.
+func commandList(cmds []idleCommand) string {
+	syntaxes := make([]string, len(cmds))
+	for i, c := range cmds {
+		syntaxes[i] = c.syntax
+	}
+	return "commands: " + strings.Join(syntaxes, ", ")
+}
+
+// command runs a command typed at the idle prompt (see
+// idleCommandTable); an empty line shows the prompt again, and any other
+// says it is unknown, with the command list.
 func (s *session) command(text string) {
 	name, arg, _ := strings.Cut(text, " ")
-	switch name {
-	case "":
+	if name == "" {
 		s.prompt(idlePrompt)
-	case "standing":
-		s.write(protocol.FrameStanding, nil)
-	case "revoke":
-		n, err := strconv.ParseUint(strings.TrimSpace(arg), 10, 64)
-		if err != nil {
-			fmt.Fprintln(s.out, "usage: revoke <n>, n from standing")
-			s.prompt(idlePrompt)
-			return
-		}
-		s.write(protocol.FrameRevoke, protocol.Revoke{N: n})
-	case "daemons":
-		if !s.canList {
-			fmt.Fprintln(s.out, "this session serves the one daemon it was given")
-			s.prompt(idlePrompt)
-			return
-		}
-		s.after = nextList
-	case "quit":
-		s.after = nextQuit
-	default:
+		return
+	}
+	i := slices.IndexFunc(idleCommandTable, func(c idleCommand) bool { return c.name == name })
+	if i < 0 {
 		fmt.Fprintf(s.out, "unknown command %q: %s\n", hostterm.Display(text), idleCommands)
 		s.prompt(idlePrompt)
+		return
 	}
+	idleCommandTable[i].run(s, strings.TrimSpace(arg))
+}
+
+// revoke runs revoke arg: it asks the daemon to revoke the approval arg
+// numbers in the standing list, or prints the usage for an arg that is
+// not a number.
+func (s *session) revoke(arg string) {
+	n, err := strconv.ParseUint(arg, 10, 64)
+	if err != nil {
+		fmt.Fprintln(s.out, "usage: revoke <n>, n from standing")
+		s.prompt(idlePrompt)
+		return
+	}
+	s.write(protocol.FrameRevoke, protocol.Revoke{N: n})
+}
+
+// leaveForList runs daemons: it leaves the daemon for the list of
+// daemons, unless the session serves the one daemon it was given.
+func (s *session) leaveForList(string) {
+	if !s.canList {
+		fmt.Fprintln(s.out, "this session serves the one daemon it was given")
+		s.prompt(idlePrompt)
+		return
+	}
+	s.after = nextList
 }
 
 // approve approves request id for scope.
@@ -850,11 +904,12 @@ func (s *session) printBelow(text string) {
 	s.showAgain()
 }
 
-// outcome prints text, the outcome of a command typed at the idle prompt
-// (standing, revoke), each line ending with a newline. It is held while a
-// request is shown, as a notice is (see hold); at the idle prompt it is
-// printed at once, right below the command's line, and the prompt shown
-// again, keeping what the human typed after it, as printBelow does.
+// outcome prints text, the outcome of a command typed at the idle
+// prompt (standing, revoke, out, runs), each line ending with a newline.
+// It is held while a request is shown, as a notice is (see hold); at the
+// idle prompt it is printed at once, right below the command's line, and
+// the prompt shown again, keeping what the human typed after it, as
+// printBelow does.
 func (s *session) outcome(text string) {
 	if !s.hold(text) {
 		fmt.Fprint(s.out, text)

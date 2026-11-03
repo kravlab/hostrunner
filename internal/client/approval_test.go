@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1333,12 +1334,7 @@ func fakeDaemon(t *testing.T) (string, <-chan net.Conn) {
 // fakeDaemonWith is fakeDaemon saying it is info.
 func fakeDaemonWith(t *testing.T, info protocol.DaemonInfo) (string, <-chan net.Conn) {
 	t.Helper()
-	socket := filepath.Join(t.TempDir(), "fake.approval.sock")
-	l, err := transport.Unix{Path: socket}.Listen()
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { l.Close() })
+	socket, l := listenFake(t)
 	served := make(chan net.Conn, 1)
 	go func() {
 		conn, err := l.Accept()
@@ -1346,27 +1342,90 @@ func fakeDaemonWith(t *testing.T, info protocol.DaemonInfo) (string, <-chan net.
 			return
 		}
 		t.Cleanup(func() { conn.Close() })
-		for _, step := range []struct {
-			read  protocol.FrameType
-			reply protocol.FrameType
-			v     any
-		}{
-			{protocol.FrameHello, protocol.FrameDaemonInfo, info},
-			{protocol.FrameServe, protocol.FrameServing, nil},
-		} {
-			if f, err := protocol.ReadFrame(conn); err != nil || f.Type != step.read {
-				return
-			}
-			if step.v == nil {
-				_ = protocol.WriteFrame(conn, protocol.Frame{Type: step.reply})
-			} else {
-				_ = protocol.WriteJSON(conn, step.reply, step.v)
-			}
+		if serveFake(conn, info) {
+			served <- conn
 		}
-		_ = protocol.WriteJSON(conn, protocol.FrameApprovalRequest, protocol.ApprovalRequest{ID: 1, Argv: []string{"touch", "marker"}, Cwd: containerRoot, Reasons: []string{"no rule"}, TimeoutMs: 60000})
-		served <- conn
 	}()
 	return socket, served
+}
+
+// fakeDaemonsWith is fakeDaemonWith serving one session connection after
+// another, each passed on once served: a session that waits for the next
+// daemon finds it on the same socket.
+func fakeDaemonsWith(t *testing.T, info protocol.DaemonInfo) (string, <-chan net.Conn) {
+	t.Helper()
+	socket, l := listenFake(t)
+	var mu sync.Mutex
+	var conns []net.Conn
+	done := make(chan struct{})
+	t.Cleanup(func() {
+		close(done)
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range conns {
+			c.Close()
+		}
+	})
+	served := make(chan net.Conn)
+	go func() {
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, conn)
+			mu.Unlock()
+			if !serveFake(conn, info) {
+				conn.Close()
+				continue
+			}
+			select {
+			case served <- conn:
+			case <-done:
+				return
+			}
+		}
+	}()
+	return socket, served
+}
+
+// listenFake listens on a new fake daemon's approval socket, closed when
+// the test ends, and returns the socket and the listener.
+func listenFake(t *testing.T) (string, net.Listener) {
+	t.Helper()
+	socket := filepath.Join(t.TempDir(), "fake.approval.sock")
+	l, err := transport.Unix{Path: socket}.Listen()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	return socket, l
+}
+
+// serveFake plays the fake daemon's part on conn up to serving a session,
+// saying it is info, and sends the session request 1; it reports whether
+// the session asked to be served.
+func serveFake(conn net.Conn, info protocol.DaemonInfo) bool {
+	for _, step := range []struct {
+		read  protocol.FrameType
+		reply protocol.FrameType
+		v     any
+	}{
+		{protocol.FrameHello, protocol.FrameDaemonInfo, info},
+		{protocol.FrameServe, protocol.FrameServing, nil},
+	} {
+		if f, err := protocol.ReadFrame(conn); err != nil || f.Type != step.read {
+			return false
+		}
+		if step.v == nil {
+			_ = protocol.WriteFrame(conn, protocol.Frame{Type: step.reply})
+		} else {
+			_ = protocol.WriteJSON(conn, step.reply, step.v)
+		}
+	}
+	_ = protocol.WriteJSON(conn, protocol.FrameApprovalRequest, protocol.ApprovalRequest{ID: 1, Argv: []string{"touch", "marker"}, Cwd: containerRoot, Reasons: []string{"no rule"}, TimeoutMs: 60000})
+	return true
 }
 
 // An answer that crosses its request's end is reported as the end, in

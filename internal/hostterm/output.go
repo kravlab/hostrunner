@@ -21,9 +21,12 @@ const maxPendingSGR = 64
 // (colour) sequences are removed as they arrive, so they are not text. Of
 // the text it holds the first textcut.MaxChars characters, a character
 // being a rune or a byte that is not part of one, and counts the bytes of
-// the rest, so a line of gigabytes holds a few hundred bytes. Its zero
-// value is an empty line.
+// the rest, so a line of gigabytes holds a few hundred bytes; one that
+// WholeOutputLine returns holds all of its text. Its zero value is an
+// empty line.
 type OutputLine struct {
+	// whole is whether the line holds all of its text, not cut.
+	whole bool
 	held  []byte
 	chars int // characters in held
 	over  int // bytes of text past held
@@ -40,7 +43,7 @@ type OutputLine struct {
 func (l *OutputLine) Write(p []byte) {
 	for _, b := range p {
 		if l.cr {
-			*l = OutputLine{held: l.held[:0], part: l.part[:0], esc: l.esc[:0]}
+			*l = OutputLine{whole: l.whole, held: l.held[:0], part: l.part[:0], esc: l.esc[:0]}
 		}
 		if b == '\r' {
 			l.cr = true
@@ -86,9 +89,9 @@ func (l *OutputLine) text(b byte) {
 }
 
 // keep adds character c to the text held, or counts its bytes once the
-// text held is as long as it is shown.
+// text held is as long as it is shown, a whole line holding all of it.
 func (l *OutputLine) keep(c []byte) {
-	if l.chars == textcut.MaxChars {
+	if !l.whole && l.chars == textcut.MaxChars {
 		l.over += len(c)
 		return
 	}
@@ -121,15 +124,24 @@ func (l *OutputLine) End() {
 // \u200b, and \xHH for a byte not part of a rune, no quotes around the
 // line, and cut (see textcut.CutCounting), an escape counting as one
 // character and the bytes counted being the text's. A line whose last
-// byte written is a \r, not ended, shows as empty.
+// byte written is a \r, not ended, shows as empty. A whole line (see
+// WholeOutputLine) is shown uncut.
 func (l *OutputLine) String() string {
 	if l.cr {
 		return ""
 	}
-	shown := OutputLine{held: slices.Clone(l.held), chars: l.chars, over: l.over, part: slices.Clone(l.part), esc: slices.Clone(l.esc)}
+	shown := OutputLine{whole: l.whole, held: slices.Clone(l.held), chars: l.chars, over: l.over, part: slices.Clone(l.part), esc: slices.Clone(l.esc)}
 	shown.flush()
+	if shown.whole {
+		return escapeEach(string(shown.held))
+	}
 	return textcut.CutCounting(string(shown.held), shown.over, escapeEach)
 }
+
+// WholeOutputLine returns an empty line that holds all of its text and
+// is shown uncut, sanitised as any other: whoever writes it bounds what
+// it holds.
+func WholeOutputLine() *OutputLine { return &OutputLine{whole: true} }
 
 // escapeEach returns text with every character that is not printable but
 // a tab escaped on its own (see OutputLine.String).

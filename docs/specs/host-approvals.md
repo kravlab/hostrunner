@@ -329,7 +329,7 @@ daemons:
   3   /home/u/legacy     unknown ⚠   another version: restart its container
 choose [1-3, Enter = 1, q quit] ? 1
 serving /home/u/app (container /workspaces/app) · daemon v1.2.0
-waiting for requests · commands: standing, revoke <n>, daemons, quit
+waiting for requests · commands: standing, revoke <n>, out [n], runs, daemons, quit
 >
 
 ── request 7 ── 10:00 left ──────────────────────────────
@@ -463,7 +463,9 @@ revoked 1
   expired`), typed input is discarded, and the next is shown; queued ones
   that expire drop out silently.
 - The idle prompt `>` takes `standing` (the standing and session
-  approvals), `revoke <n>`, `daemons`, `quit`.
+  approvals), `revoke <n>`, `out [n]` and `runs` (see Approved runs),
+  `daemons`, `quit`. The serving line's `commands: …` list names them;
+  the idle prompt has no other help.
 - Notices: what the daemon tells the session of its own accord, not as
   the outcome of what the human typed: a repeat's start line, a run's
   summary and tail (see Approved runs), and the rules-reread lines
@@ -484,11 +486,12 @@ revoked 1
   is printed at once, on a line of its own, and `> ` is shown again,
   keeping what the human has typed so far: a command typed in part
   (`stand`) runs once finished (`standing`), on a terminal too, whose
-  input a prompt discards. A command's outcome (`standing`, `revoke`) is
-  not a notice, but it is held alike: while a request is on screen it is
-  held with the notices, in the order they arrived; at the idle prompt
-  it is printed at once, right below the command's line, and `> ` is
-  shown again, keeping what the human has typed so far.
+  input a prompt discards. A command's outcome (`standing`, `revoke`,
+  `out`, `runs`) is not a notice, but it is held alike: while a request
+  is on screen it is held with the notices, in the order they arrived;
+  at the idle prompt it is printed at once, right below the command's
+  line, and `> ` is shown again, keeping what the human has typed so
+  far.
 - Without `--dir`, the session globs
   `$XDG_RUNTIME_DIR/hostrunner/*.approval.sock` and sends hellos, every 2
   seconds while it lists or waits. The daemon whose host workspace holds
@@ -662,6 +665,50 @@ revoked 1
   follows the answer's line, with its tail; any other is a notice (see
   Notices), printed when the run ends, or held while a request is on
   screen.
+- Kept output: the session keeps, in its memory only, the last 64 KiB
+  of the output of each of its last 20 runs, by number, across the
+  daemons it serves; a run's output is kept from its start, before it is
+  numbered too, and an older run is dropped with its output. At the idle
+  prompt, `out N` prints run N's line as `runs` lists it, then, when
+  output was dropped beyond the 64 KiB kept, `(<B> bytes dropped: out
+  keeps a run's last 64 KiB)` (`1 byte` in the singular), then the lines
+  kept, of a run still going those that have arrived so far. The lines
+  are whole: where the 64 KiB cut falls inside a line, of either stream,
+  the rest of that line is dropped too and counted in `<B>`. They are
+  shown as the tail shows its lines, of stdout and stderr in the order
+  their first bytes arrived, marked `│ ` or `! `, sanitised alike, but
+  not cut at 200 characters: a line is at most the 64 KiB kept. `out`
+  prints the run with the highest number kept, going or ended:
+
+  ```
+  > out 3
+  ── run 3 · make logs · exit 0 · 12.3s · 920 lines ──
+  (1234 bytes dropped: out keeps a run's last 64 KiB)
+  │ first line kept
+  ! warning: …
+  │ done
+  ```
+
+  `runs` lists the runs kept, the oldest first, one line each: an ended
+  run's summary, and for a run still going `running` in place of the
+  exit code, with its duration so far, counted from its start line's
+  arrival, and its lines so far; a run whose end never came because the
+  session stopped serving its daemon (it left it for the list, the
+  daemon went away, or a write to it failed) shows `end not received`,
+  with its duration until then:
+
+  ```
+  > runs
+  ── run 3 · make logs · exit 0 · 12.3s · 920 lines ──
+  ── run 4 · make test · running · 3m07s · 41 lines ──
+  ── run 5 · make serve · end not received · 1h02m · 7 lines ──
+  ```
+
+  `out` and `runs` before any run print `no runs yet`; `out` with an
+  argument that is not a number prints `usage: out [n], n from runs`;
+  `out N` for a number no run has prints `run N: no such run`, and for a
+  number in the range of runs no longer kept, whether its run started or
+  not, `run N: output dropped`.
 - The output lives in the session's memory only; the daemon keeps none,
   and its log gains none.
 
