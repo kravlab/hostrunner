@@ -1,9 +1,11 @@
 package settings
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -22,15 +24,16 @@ type Flags struct {
 	paths         map[string]*string        // by key name
 	durations     map[string]*time.Duration // by key name
 	bools         map[string]*bool          // by key name
+	ints          map[string]*int           // by key name
 	negated       map[string]*bool          // the --no- flags, by key name
 	scopes        scopes                    // the keys the command takes, which alone are read
 }
 
 // FlagError is a settings flag given a value no setting can take
-// (`--grace: must be positive`), or --reread with --no-reread, or
-// --rules-file with --config, as the resolving methods of Flags return
-// it, so a caller can tell it from an invalid variable or file and add
-// its usage.
+// (`--grace: must be positive`, `--approve-tail-lines: must not be
+// negative`), or --reread with --no-reread, or --rules-file with
+// --config, as the resolving methods of Flags return it, so a caller can
+// tell it from an invalid variable or file and add its usage.
 type FlagError struct{ err error }
 
 // Error is the problem with the flag, naming it.
@@ -65,9 +68,10 @@ func (f *Flags) RegisterStop(fs *flag.FlagSet) {
 }
 
 // RegisterApprove adds to fs the flags of the settings approve takes:
-// --settings and --runtime-root. Resolve them with ResolveHost.
+// --settings, --runtime-root and --approve-tail-lines. Resolve them with
+// ResolveHost.
 func (f *Flags) RegisterApprove(fs *flag.FlagSet) {
-	f.register(fs, keysOf(scopeRuntimeRoot), scopeRuntimeRoot)
+	f.register(fs, keysOf(scopeRuntimeRoot, scopeApprove), scopeRuntimeRoot, scopeApprove)
 }
 
 // RegisterRestart adds to fs the flags of the settings restart takes:
@@ -88,6 +92,7 @@ func (f *Flags) register(fs *flag.FlagSet, flagged []key, in ...scope) {
 	f.fs, f.scopes = fs, in
 	f.paths, f.durations = map[string]*string{}, map[string]*time.Duration{}
 	f.bools, f.negated = map[string]*bool{}, map[string]*bool{}
+	f.ints = map[string]*int{}
 	fs.StringVar(&f.file, "settings", "", "host settings file (default $XDG_CONFIG_HOME/hostrunner/settings.yaml)")
 	if f.scopes.knowWorkspace() {
 		fs.StringVar(&f.workspaceFile, "workspace-settings", "", "workspace settings file (default <workspace>/.devcontainer/hostrunner.yaml)")
@@ -105,8 +110,35 @@ func (f *Flags) register(fs *flag.FlagSet, flagged []key, in ...scope) {
 		case kindBool:
 			f.bools[k.name] = fs.Bool(k.flagName(), false, k.usage)
 			f.negated[k.name] = fs.Bool("no-"+k.flagName(), false, "do not "+k.usage)
+		case kindCount:
+			n := decimal(k.get(&defaults).(int))
+			fs.Var(&n, k.flagName(), k.usage)
+			f.ints[k.name] = (*int)(&n)
 		}
 	}
+}
+
+// decimal is the value of an integer flag, written in decimal as a
+// variable or a settings file writes it: unlike flag.Int, it refuses
+// 0x10 and reads 010 as 10.
+type decimal int
+
+// String writes the value in decimal.
+func (d *decimal) String() string { return strconv.Itoa(int(*d)) }
+
+// Set reads s in decimal; the error is the one flag.Int gives, which the
+// flag package names the flag in (`invalid value "many" for flag
+// -approve-tail-lines: parse error`).
+func (d *decimal) Set(s string) error {
+	n, err := strconv.Atoi(s)
+	switch {
+	case errors.Is(err, strconv.ErrRange):
+		return errors.New("value out of range")
+	case err != nil:
+		return errors.New("parse error")
+	}
+	*d = decimal(n)
+	return nil
 }
 
 // Resolve returns the settings of the parsed command line for the
@@ -155,9 +187,10 @@ func (f *Flags) ResolveAsGiven(getenv func(string) string, workspace string) (Se
 // restart and approve resolve before they know a workspace, each key
 // from its flag, its HOSTRUNNER_* variable getenv reads, the common part
 // of the host settings file (as for Resolve), then the default: the
-// runtime root under $XDG_RUNTIME_DIR, none when it is unset, and 10s to
-// stop. A runtime root from the file or a variable must be absolute
-// after ~ expansion. A flag that cannot be applied is a *FlagError.
+// runtime root under $XDG_RUNTIME_DIR, none when it is unset, 10s to
+// stop, and 3 tail lines for approve. A runtime root from the file or a
+// variable must be absolute after ~ expansion. A flag that cannot be
+// applied is a *FlagError.
 func (f *Flags) ResolveHost(getenv func(string) string) (Settings, error) {
 	in := f.scopes.commonOnly()
 	flags, err := f.given(in)
@@ -179,7 +212,8 @@ func (f *Flags) given(in scopes) (layer, error) {
 // layer returns the keys the parsed command line sets: only flags given
 // count, even with their default value. A path is made absolute against
 // the current directory. A duration at or below zero (`--grace: must be
-// positive`), an empty path, --reread with --no-reread and a flag with
+// positive`), an integer below zero (`--approve-tail-lines: must not be
+// negative`), an empty path, --reread with --no-reread and a flag with
 // its synonym (--rules-file with --config) are *FlagErrors.
 func (f *Flags) layer() (layer, error) {
 	l := layer{}
@@ -195,12 +229,8 @@ func (f *Flags) layer() (layer, error) {
 		name := strings.ReplaceAll(flagName, "-", "_")
 		negatedName, negating := strings.CutPrefix(name, "no_")
 		switch {
-		case f.durations[name] != nil:
-			if d := *f.durations[name]; d > 0 {
-				l[name] = d
-			} else {
-				err = &FlagError{fmt.Errorf("--%s: %w", fl.Name, errNotPositive)}
-			}
+		case f.durations[name] != nil || f.ints[name] != nil:
+			err = f.setChecked(l, name, fl.Name)
 		case f.paths[name] != nil:
 			if _, set := l[name]; set { // given as itself and as its synonym
 				err = &FlagError{fmt.Errorf("--%s and --%s exclude each other", rulesFileFlag, configFlag)}
@@ -223,6 +253,24 @@ func (f *Flags) layer() (layer, error) {
 		}
 	})
 	return l, err
+}
+
+// setChecked sets the duration or integer key named name in l to the
+// value of its flag, flagName; a value check refuses (`--grace: must be
+// positive`) is a *FlagError.
+func (f *Flags) setChecked(l layer, name, flagName string) error {
+	k := mustLookup(name)
+	var v any
+	if d := f.durations[name]; d != nil {
+		v = *d
+	} else {
+		v = *f.ints[name]
+	}
+	if err := k.kind.check(v); err != nil {
+		return &FlagError{fmt.Errorf("--%s: %w", flagName, err)}
+	}
+	l[name] = v
+	return nil
 }
 
 // setBool sets the bool key named name in l to v, given by its flag or

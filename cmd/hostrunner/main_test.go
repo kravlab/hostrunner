@@ -18,8 +18,8 @@ import (
 	"testing/synctest"
 	"time"
 
-	"github.com/kravlab/hostrunner/internal/approval"
 	"github.com/kravlab/hostrunner/internal/client"
+	"github.com/kravlab/hostrunner/internal/fakedaemon"
 	"github.com/kravlab/hostrunner/internal/instructions"
 	"github.com/kravlab/hostrunner/internal/launch"
 	"github.com/kravlab/hostrunner/internal/protocol"
@@ -62,6 +62,62 @@ func TestRunVersionPrintsTheVersion(t *testing.T) {
 	}
 	if got := out.String(); got != "dev\n" {
 		t.Fatalf("got %q, want %q", got, "dev\n")
+	}
+}
+
+// emptyStdin makes os.Stdin, which run reads the human from, an input
+// that ends at once, until the test ends.
+func emptyStdin(t *testing.T) {
+	t.Helper()
+	f, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdin := os.Stdin
+	os.Stdin = f
+	t.Cleanup(func() {
+		os.Stdin = stdin
+		f.Close()
+	})
+}
+
+// fakeVersionedDaemon answers every hello on the approval socket of the
+// runtime directory dir, under a runtime root, as a daemon serving
+// workspace of the build version version.
+func fakeVersionedDaemon(t *testing.T, dir, workspace, version string) {
+	t.Helper()
+	fakedaemon.Serve(t, dir, func() protocol.DaemonInfo {
+		return protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: workspace, Stops: true, BuildVersion: version}
+	})
+}
+
+// approve and stop --choose get the build version version prints, "dev"
+// in a test binary: approve says it as it starts, and the list of stop
+// --choose marks a daemon of another version but not one of dev.
+func TestRunPassesTheBuildVersion(t *testing.T) {
+	t.Setenv("HOSTRUNNER_SETTINGS", "")
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	emptyStdin(t)
+	var out strings.Builder
+	if err := run([]string{"approve", "--dir", filepath.Join(t.TempDir(), "none")}, &out, io.Discard); err == nil {
+		t.Fatal("approve served a runtime directory without a daemon")
+	}
+	if got := out.String(); !strings.HasPrefix(got, "hostrunner approve dev\n") {
+		t.Errorf("approve printed %q, want it to start with its version", got)
+	}
+
+	root := t.TempDir()
+	t.Setenv("HOSTRUNNER_RUNTIME_ROOT", root)
+	fakeVersionedDaemon(t, filepath.Join(root, "a"), "/home/u/dev", "dev")
+	fakeVersionedDaemon(t, filepath.Join(root, "b"), "/home/u/other", "v1.2.0")
+	var list strings.Builder
+	if err := run([]string{"stop", "--choose"}, io.Discard, &list); err == nil {
+		t.Fatal("stop --choose stopped without a choice")
+	}
+	for _, want := range []string{"/home/u/dev     dev        ", "/home/u/other   v1.2.0 ⚠   "} {
+		if !strings.Contains(list.String(), want) {
+			t.Errorf("stop --choose printed %q, lacking %q", list.String(), want)
+		}
 	}
 }
 
@@ -1057,11 +1113,13 @@ func TestUpdateMessage(t *testing.T) {
 
 // serve listens for approval sessions beside its socket's directory, the
 // runtime directory, which the container mounts, so the container cannot
-// reach it; it removes the socket when it stops.
+// reach it; it removes the socket when it stops. Its hello reports the
+// build version it is given.
 func TestServeListensOnTheApprovalSocket(t *testing.T) {
 	cfg := watchConfig(t)
 	cfg.watch = false
 	cfg.RulesFile = filepath.Join(cfg.workspace, "hostrun.yaml")
+	cfg.version = "v1.2.0"
 	approvalSocket := launch.ApprovalSocket(filepath.Dir(cfg.socket))
 	t.Cleanup(func() { os.Remove(approvalSocket) })
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1090,7 +1148,7 @@ func TestServeListensOnTheApprovalSocket(t *testing.T) {
 	if err != nil || f.Type != protocol.FrameDaemonInfo || protocol.DecodeJSON(f, &got) != nil {
 		t.Fatalf("hello: frame %v, err %v", f.Type, err)
 	}
-	want := protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: cfg.workspace, ContainerWorkspace: cfg.containerWorkspace, RulesFile: cfg.RulesFile, RulesDigest: "missing", Stops: true, Rereads: true}
+	want := protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: cfg.workspace, ContainerWorkspace: cfg.containerWorkspace, RulesFile: cfg.RulesFile, RulesDigest: "missing", Stops: true, Rereads: true, BuildVersion: "v1.2.0", Runs: true}
 	if real, err := filepath.EvalSymlinks(cfg.workspace); err == nil {
 		want.Workspace = real
 	}
@@ -1132,8 +1190,8 @@ func TestParseApproveListsTheDaemonsOfTheRuntimeRootWithoutADirectory(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := (approval.Config{Root: "/run/user/1000/hostrunner", Cwd: cwd}); got != want {
-		t.Fatalf("got %+v, want %+v", got, want)
+	if got.Root != "/run/user/1000/hostrunner" || got.Cwd != cwd || got.Socket != "" {
+		t.Fatalf("got %+v, want the runtime root and %s", got, cwd)
 	}
 	if _, err := parseApprove(nil, noEnv, io.Discard); !errors.Is(err, errNoRuntimeRoot) {
 		t.Fatalf("got %v, want it to need a runtime root", err)
@@ -1558,16 +1616,17 @@ func TestParseStopNeedsARuntimeRootWithoutDir(t *testing.T) {
 
 // stop, restart and approve hand the settings they resolve (the order of
 // the sources is internal/settings' to test) to what they run: the
-// runtime root to look for daemons under and, for stop and restart, the
-// stop timeout. A flag comes first, then the variable, then the common
-// part of the host settings file, by default the one under
-// XDG_CONFIG_HOME; the workspace sections are not read.
+// runtime root to look for daemons under, for stop and restart the stop
+// timeout, and for approve the number of tail lines. A flag comes first,
+// then the variable, then the common part of the host settings file, by
+// default the one under XDG_CONFIG_HOME; the workspace sections are not
+// read.
 func TestStopRestartAndApproveResolveTheirSettings(t *testing.T) {
 	config := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(config, "hostrunner"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	content := "runtime_root: /file/root\nstop_timeout: 1m\ngrace: soon\nworkspaces:\n  /w:\n    grase: 1m\n"
+	content := "runtime_root: /file/root\nstop_timeout: 1m\napprove_tail_lines: 5\ngrace: soon\nworkspaces:\n  /w:\n    grase: 1m\n"
 	if err := os.WriteFile(filepath.Join(config, "hostrunner", "settings.yaml"), []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -1579,10 +1638,12 @@ func TestStopRestartAndApproveResolveTheirSettings(t *testing.T) {
 		rootFlags   []string // for approve
 		root        string
 		stopTimeout time.Duration
+		tailLines   int
 	}{
-		{"the default host settings file", fromFile, nil, nil, "/file/root", time.Minute},
-		{"variables", map[string]string{"XDG_CONFIG_HOME": config, "HOSTRUNNER_RUNTIME_ROOT": "/var/root", "HOSTRUNNER_STOP_TIMEOUT": "2m"}, nil, nil, "/var/root", 2 * time.Minute},
-		{"flags", fromFile, []string{"--runtime-root", "/flag/root", "--stop-timeout", "3m"}, []string{"--runtime-root", "/flag/root"}, "/flag/root", 3 * time.Minute},
+		{"the default host settings file", fromFile, nil, nil, "/file/root", time.Minute, 5},
+		{"variables", map[string]string{"XDG_CONFIG_HOME": config, "HOSTRUNNER_RUNTIME_ROOT": "/var/root", "HOSTRUNNER_STOP_TIMEOUT": "2m", "HOSTRUNNER_APPROVE_TAIL_LINES": "7"}, nil, nil, "/var/root", 2 * time.Minute, 7},
+		{"flags", fromFile, []string{"--runtime-root", "/flag/root", "--stop-timeout", "3m"}, []string{"--runtime-root", "/flag/root", "--approve-tail-lines", "0"}, "/flag/root", 3 * time.Minute, 0},
+		{"the default", map[string]string{"XDG_RUNTIME_DIR": "/run/user/1000"}, []string{"--runtime-root", "/flag/root"}, []string{"--runtime-root", "/flag/root"}, "/flag/root", 10 * time.Second, 3},
 	}
 	for _, tt := range tests {
 		for _, name := range []string{"stop", "restart"} {
@@ -1592,8 +1653,12 @@ func TestStopRestartAndApproveResolveTheirSettings(t *testing.T) {
 			}
 		}
 		got, err := parseApprove(tt.rootFlags, envOf(tt.vars), io.Discard)
-		if err != nil || got.Root != tt.root {
-			t.Errorf("approve, %s: got %q, %v; want %q", tt.name, got.Root, err, tt.root)
+		if err != nil || got.Root != tt.root || got.TailLines != tt.tailLines {
+			t.Errorf("approve, %s: got %q, tail lines %d, %v; want %q and %d", tt.name, got.Root, got.TailLines, err, tt.root, tt.tailLines)
+		}
+		withDir, err := parseApprove(append([]string{"--dir", "/d"}, tt.rootFlags...), envOf(tt.vars), io.Discard)
+		if err != nil || withDir.TailLines != tt.tailLines {
+			t.Errorf("approve --dir, %s: got tail lines %d, %v; want %d", tt.name, withDir.TailLines, err, tt.tailLines)
 		}
 	}
 	if _, err := parseApprove([]string{"--stop-timeout", "1m"}, xdgEnv, io.Discard); err == nil {
@@ -1633,6 +1698,13 @@ func TestStopRestartAndApproveRefuseInvalidSettings(t *testing.T) {
 	}{
 		{"relative in the file", relative, nil, `runtime_root: must be absolute, got "rel"`},
 		{"empty flag", xdgVars, []string{"--runtime-root", ""}, "--runtime-root: empty path; usage: hostrunner approve"},
+		{"negative tail lines variable", map[string]string{"XDG_RUNTIME_DIR": "/run/user/1000", "HOSTRUNNER_APPROVE_TAIL_LINES": "-1"}, nil, "HOSTRUNNER_APPROVE_TAIL_LINES: must not be negative, got -1"},
+		{"non-numeric tail lines variable", map[string]string{"XDG_RUNTIME_DIR": "/run/user/1000", "HOSTRUNNER_APPROVE_TAIL_LINES": "many"}, nil, `HOSTRUNNER_APPROVE_TAIL_LINES: invalid integer "many"`},
+		{"negative tail lines in the file", withFile("approve_tail_lines: -1\n"), nil, "approve_tail_lines: must not be negative, got -1"},
+		{"non-numeric tail lines in the file", withFile("approve_tail_lines: many\n"), nil, `approve_tail_lines: invalid integer "many"`},
+		{"negative tail lines flag", xdgVars, []string{"--approve-tail-lines", "-1"}, "--approve-tail-lines: must not be negative; usage: hostrunner approve"},
+		{"non-numeric tail lines flag", xdgVars, []string{"--approve-tail-lines", "many"}, `invalid value "many" for flag -approve-tail-lines`},
+		{"hex tail lines flag", xdgVars, []string{"--approve-tail-lines", "0x10"}, `invalid value "0x10" for flag -approve-tail-lines: parse error`},
 	} {
 		if _, err := parseApprove(tt.args, envOf(tt.vars), io.Discard); err == nil || !strings.Contains(err.Error(), tt.want) {
 			t.Errorf("approve, %s: got %v, want an error containing %q", tt.name, err, tt.want)

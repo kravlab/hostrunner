@@ -161,19 +161,19 @@ func TestDiscardTypedAheadLeavesAPipeAlone(t *testing.T) {
 
 func daemons() []daemonlist.Daemon {
 	return []daemonlist.Daemon{
-		{Socket: "/run/u/hostrunner/a.approval.sock", Info: protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: "/home/u/a", ContainerWorkspace: "/workspaces/a", Served: true}},
+		{Socket: "/run/u/hostrunner/a.approval.sock", Info: protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: "/home/u/a", ContainerWorkspace: "/workspaces/a", Served: true, BuildVersion: "v1.2.0"}},
 		{Socket: "/run/u/hostrunner/old.approval.sock", Info: protocol.DaemonInfo{Version: protocol.ApprovalVersion - 1, Workspace: "/home/u/old", ContainerWorkspace: "/workspaces/old"}},
-		{Socket: "/run/u/hostrunner/b.approval.sock", Info: protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: "/home/u/b", ContainerWorkspace: "/w/b"}},
+		{Socket: "/run/u/hostrunner/b.approval.sock", Info: protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: "/home/u/b", ContainerWorkspace: "/w/b", BuildVersion: "v1.1.0"}},
 	}
 }
 
 func TestListPrintsTheDaemonsNumbered(t *testing.T) {
 	var out bytes.Buffer
-	prompt := hostterm.List{Daemons: daemons(), Cwd: "/home/u/b/src"}.Print(&out)
+	prompt := hostterm.List{Daemons: daemons(), Cwd: "/home/u/b/src", BuildVersion: "v1.2.0"}.Print(&out)
 	want := "daemons:\n" +
-		"  1   /home/u/a     (container /workspaces/a)     served by another session\n" +
-		"  2   /home/u/old   another version: restart its container\n" +
-		"  3 * /home/u/b     (container /w/b)              ← current directory\n"
+		"  1   /home/u/a     v1.2.0      (container /workspaces/a)     served by another session\n" +
+		"  2   /home/u/old   unknown ⚠   another version: restart its container\n" +
+		"  3 * /home/u/b     v1.1.0 ⚠    (container /w/b)              ← current directory\n"
 	if out.String() != want {
 		t.Errorf("list:\n%s\nwant:\n%s", out.String(), want)
 	}
@@ -183,13 +183,13 @@ func TestListPrintsTheDaemonsNumbered(t *testing.T) {
 }
 
 func TestListOfAnyVersionLetsAnOlderDaemonBeTheDefault(t *testing.T) {
-	l := hostterm.List{Daemons: daemons(), Cwd: "/home/u/old", AnyVersion: true}
+	l := hostterm.List{Daemons: daemons(), Cwd: "/home/u/old", AnyVersion: true, BuildVersion: "v1.2.0"}
 	if l.Default() != 1 {
 		t.Fatalf("Default = %d, want 1", l.Default())
 	}
 	var out bytes.Buffer
 	l.Print(&out)
-	if !strings.Contains(out.String(), "  2 * /home/u/old   (container /workspaces/old)   ← current directory\n") {
+	if !strings.Contains(out.String(), "  2 * /home/u/old   unknown ⚠   (container /workspaces/old)   ← current directory\n") {
 		t.Errorf("list:\n%s", out.String())
 	}
 	if (hostterm.List{Daemons: daemons(), Cwd: "/home/u/old"}).Default() != -1 {

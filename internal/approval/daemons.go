@@ -79,17 +79,19 @@ func (t *term) choose(ctx context.Context, cfg Config) (socket string, takeOver,
 // what the list does not show (a reread's digest) does not show it again.
 func sameListing(a, b daemonlist.Daemon) bool {
 	return a.Socket == b.Socket && a.Info.Version == b.Info.Version && a.Info.Served == b.Info.Served &&
-		a.Info.Workspace == b.Info.Workspace && a.Info.ContainerWorkspace == b.Info.ContainerWorkspace
+		a.Info.Workspace == b.Info.Workspace && a.Info.ContainerWorkspace == b.Info.ContainerWorkspace &&
+		a.Info.BuildVersion == b.Info.BuildVersion
 }
 
-// printList prints the daemons and asks to choose one, or, when there is
-// none, says that it waits for one.
+// printList prints the daemons, marking the one whose workspace holds cwd
+// and those of another version than the session's, and asks to choose
+// one, or, when there is none, says that it waits for one.
 func (t *term) printList(shown []daemonlist.Daemon, cwd string) {
 	if len(shown) == 0 {
 		t.prompt("no daemons yet: waiting for one (q quits)\n")
 		return
 	}
-	t.prompt(hostterm.List{Daemons: shown, Cwd: cwd}.Print(t.out))
+	t.prompt(hostterm.List{Daemons: shown, Cwd: cwd, BuildVersion: t.version}.Print(t.out))
 }
 
 // isYes reports whether text says yes to taking a daemon over.

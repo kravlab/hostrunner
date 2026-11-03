@@ -16,17 +16,19 @@ import (
 
 // grantAnswer is an answer that grants an approval held for later runs:
 // the key typed, the guarded confirmation the session asks, and the
-// outcome it says.
+// outcome it says, which then names the run approved.
 type grantAnswer struct{ key, confirm, outcome string }
 
 // The answers granting a standing approval and a session approval.
 var (
-	standingAnswer = grantAnswer{"d", `Type "yes" to approve it as standing (until the daemon stops): `, "approved as standing (until the daemon stops)\n"}
-	sessionAnswer  = grantAnswer{"s", `Type "yes" to approve it for this session: `, "approved for this session (until it ends)\n"}
+	standingAnswer = grantAnswer{"d", `Type "yes" to approve it as standing (until the daemon stops): `, "approved as standing (until the daemon stops) · run "}
+	sessionAnswer  = grantAnswer{"s", `Type "yes" to approve it for this session: `, "approved for this session (until it ends) · run "}
 )
 
 // grantAs asks for argv with --ask and gives answer a, typing "yes" when
-// the request is guarded; it returns what hostrun printed.
+// the request is guarded, and waits for the run's summary, so that what
+// the session prints next answers what the test types then; it returns
+// what hostrun printed.
 func (h harness) grantAs(t *testing.T, s *session, a grantAnswer, guarded bool, argv ...string) result {
 	t.Helper()
 	ch := h.ask(t, argv...)
@@ -42,6 +44,8 @@ func (h harness) grantAs(t *testing.T, s *session, a grantAnswer, guarded bool, 
 	}
 	got := awaitResult(t, ch)
 	s.waitFor(t, a.outcome)
+	s.waitFor(t, "── run ")
+	s.waitFor(t, " ──\n")
 	return got
 }
 
@@ -239,6 +243,7 @@ func TestStandingApprovalIsGrantedOnce(t *testing.T) {
 	s.waitFor(t, answerPromptText)
 	s.answer(t, "d")
 	awaitResult(t, second)
+	s.waitForSummaries(t, 2)
 	s.waitFor(t, "> ")
 	s.answer(t, "standing")
 	list := s.waitFor(t, "> ")
@@ -264,22 +269,24 @@ func TestStandingRevokeLeavesARunningCommand(t *testing.T) {
 	}
 }
 
-// A command's outcome that arrives while a request is shown is printed,
-// and the request's prompt asked again; a refused list does not end the
-// session.
-func TestSessionReprintsThePromptAfterACommandsOutcome(t *testing.T) {
+// A command's outcome that arrives while a request is shown is held as a
+// notice is: nothing of it is printed until the request is answered, and
+// then it is printed in the order it arrived, before the idle prompt. A
+// refused list does not end the session.
+func TestACommandsOutcomeWaitsForTheRequestShown(t *testing.T) {
 	socket, served := fakeDaemon(t)
 	s := startSessionOn(t, socket)
 	conn := <-served
 	s.waitFor(t, answerPromptText)
-	_ = protocol.WriteJSON(conn, protocol.FrameStandingList, protocol.StandingList{Approvals: []protocol.Standing{{N: 3, Argv: []string{"touch", "x"}, Cwd: containerRoot}}})
-	s.waitFor(t, "  3  touch x   in "+containerRoot+"\n"+answerPromptText)
-	_ = protocol.WriteJSON(conn, protocol.FrameStandingList, protocol.StandingList{Error: "not now"})
-	s.waitFor(t, "standing: not now\n"+answerPromptText)
-	s.answer(t, "o")
-	if f, err := protocol.ReadFrame(conn); err != nil || f.Type != protocol.FrameAnswer {
-		t.Fatalf("frame %v, err %v; want the answer", f.Type, err)
+	sendFrame(t, conn, protocol.FrameStandingList, protocol.StandingList{Approvals: []protocol.Standing{{N: 3, Argv: []string{"touch", "x"}, Cwd: containerRoot}}})
+	sendFrame(t, conn, protocol.FrameStandingList, protocol.StandingList{Error: "not now"})
+	syncOnFake(t, s, conn)
+	if out := s.out.String(); strings.Contains(out, "touch x") || strings.Contains(out, "not now") {
+		t.Fatalf("the session printed an outcome while the request was shown:\n%s", out)
 	}
+	answerOnFake(t, s, conn, "o")
+	sendFrame(t, conn, protocol.FrameAnswered, protocol.Answered{ID: 1})
+	s.waitFor(t, "approved once\n  3  touch x   in "+containerRoot+"\nstanding: not now\n"+idlePromptText)
 }
 
 // A standing approval goes with the daemon: once it steps aside, the next

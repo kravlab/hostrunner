@@ -4,7 +4,6 @@ import (
 	"context"
 	"io"
 	"log/slog"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +12,7 @@ import (
 	"time"
 
 	"github.com/kravlab/hostrunner/internal/daemonlist"
+	"github.com/kravlab/hostrunner/internal/fakedaemon"
 	"github.com/kravlab/hostrunner/internal/launch"
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/stop"
@@ -67,25 +67,9 @@ func (h harness) stillServes(t *testing.T) {
 // nothing.
 func fakeDaemonFor(t *testing.T, dir, workspace string) {
 	t.Helper()
-	l, err := transport.Unix{Path: launch.ApprovalSocket(dir)}.Listen()
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { l.Close() })
-	go func() {
-		for {
-			c, err := l.Accept()
-			if err != nil {
-				return
-			}
-			go func(c net.Conn) {
-				defer c.Close()
-				if f, err := protocol.ReadFrame(c); err == nil && f.Type == protocol.FrameHello {
-					_ = protocol.WriteJSON(c, protocol.FrameDaemonInfo, protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: workspace, Stops: true})
-				}
-			}(c)
-		}
-	}()
+	fakedaemon.Serve(t, dir, func() protocol.DaemonInfo {
+		return protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: workspace, Stops: true}
+	})
 }
 
 func TestStopStopsTheDaemonOfTheCurrentDirectory(t *testing.T) {
@@ -197,6 +181,33 @@ func TestStopChooseStopsTheChosenDaemon(t *testing.T) {
 	}
 	chosen.waitServed(t)
 	kept.stillServes(t)
+}
+
+// The list of stop --choose shows every daemon's version, marking those
+// other than stop's own or unknown.
+func TestStopChooseShowsTheDaemonsVersions(t *testing.T) {
+	d := startVersionedDaemons(t)
+	s := launchStop(t, stop.Config{Root: d.root, Choose: true, Cwd: t.TempDir(), BuildVersion: "v1.2.0", Commands: stop.Commands{Terminal: true}})
+	d.checkListed(t, s.waitFor(t, "choose [1-3, q quit] ? "))
+	s.answer(t, "q")
+	waitEnded(t, s)
+	d.same.stillServes(t)
+	d.older.stillServes(t)
+}
+
+// The list of a stop --choose given no version marks a daemon of dev as
+// of its version, as that of an approval session does.
+func TestStopChooseWithoutAVersionIsDev(t *testing.T) {
+	base, root := newBase(t)
+	h := startVersionedDaemon(t, base, "dev")
+	s := launchStop(t, stop.Config{Root: root, Choose: true, Cwd: t.TempDir(), Commands: stop.Commands{Terminal: true}})
+	list := s.waitFor(t, "choose [1-1, q quit] ? ")
+	if line := listLine(t, list, h.hostRoot); !strings.Contains(line, " dev ") || strings.Contains(line, "⚠") {
+		t.Errorf("the line %q, want version dev unmarked", line)
+	}
+	s.answer(t, "q")
+	waitEnded(t, s)
+	h.stillServes(t)
 }
 
 func TestStopChooseQuitStopsNothing(t *testing.T) {

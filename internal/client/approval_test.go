@@ -9,8 +9,10 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,6 +20,7 @@ import (
 	"github.com/kravlab/hostrunner/internal/client"
 	"github.com/kravlab/hostrunner/internal/daemon"
 	"github.com/kravlab/hostrunner/internal/protocol"
+	"github.com/kravlab/hostrunner/internal/settings"
 	"github.com/kravlab/hostrunner/internal/transport"
 )
 
@@ -25,7 +28,7 @@ import (
 // test as a human would drive it: it reads what the session prints and
 // types answers.
 type session struct {
-	in     *io.PipeWriter
+	in     io.WriteCloser
 	out    *lockedBuffer
 	seen   int                // how much of out the test has read
 	ended  chan struct{}      // closed once the session has ended, err set
@@ -44,7 +47,7 @@ func (h harness) startSession(t *testing.T) *session {
 // socket.
 func startSessionOn(t *testing.T, socket string) *session {
 	t.Helper()
-	return startSessionWith(t, approval.Config{Socket: socket})
+	return startSessionWith(t, approval.Config{Socket: socket, TailLines: settings.DefaultApproveTailLines})
 }
 
 // startSessionWith is startSession as cfg configures it; without a socket
@@ -62,16 +65,31 @@ func startSessionWith(t *testing.T, cfg approval.Config) *session {
 // returns at once. It ends when the test does.
 func launchSession(t *testing.T, cfg approval.Config) *session {
 	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
+	out := &lockedBuffer{}
+	return launchSessionTo(t, cfg, out, out)
+}
+
+// launchSessionTo is launchSession with the session printing to print,
+// which writes on to out, what the test reads.
+func launchSessionTo(t *testing.T, cfg approval.Config, out *lockedBuffer, print io.Writer) *session {
+	t.Helper()
 	pr, pw := io.Pipe()
-	s := &session{in: pw, out: &lockedBuffer{}, ended: make(chan struct{}), cancel: cancel}
+	return launchSessionTyping(t, cfg, pr, pw, out, print)
+}
+
+// launchSessionTyping is launchSessionTo with the session reading the
+// human from read, which the test types on through typed.
+func launchSessionTyping(t *testing.T, cfg approval.Config, read io.Reader, typed io.WriteCloser, out *lockedBuffer, print io.Writer) *session {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &session{in: typed, out: out, ended: make(chan struct{}), cancel: cancel}
 	go func() {
 		defer close(s.ended)
-		s.err = approval.Run(ctx, cfg, pr, s.out)
+		s.err = approval.Run(ctx, cfg, read, print)
 	}()
 	t.Cleanup(func() {
 		cancel()
-		pw.Close()
+		typed.Close()
 		select {
 		case <-s.ended:
 		case <-time.After(5 * time.Second):
@@ -95,6 +113,55 @@ func (s *session) waitFor(t *testing.T, text string) string {
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("the session did not print %q; it printed %q", text, out[s.seen:])
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// waitForMatch waits until the session prints text matching pattern after
+// what the test has read, and returns what it printed up to the end of
+// the match.
+func (s *session) waitForMatch(t *testing.T, pattern string) string {
+	t.Helper()
+	re := regexp.MustCompile(pattern)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		out := s.out.String()
+		if loc := re.FindStringIndex(out[s.seen:]); loc != nil {
+			got := out[s.seen : s.seen+loc[1]]
+			s.seen += loc[1]
+			return got
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the session did not print a match of %q; it printed %q", pattern, out[s.seen:])
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// waitForSummaries waits until the session has printed the summaries of
+// runs 1 to n, in whichever order the runs ended, and reads past the last
+// of them, so that what it prints next answers what the test types then.
+func (s *session) waitForSummaries(t *testing.T, n int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		out, end := s.out.String(), 0
+		for i := 1; i <= n && end >= 0; i++ {
+			j := strings.Index(out, fmt.Sprintf("── run %d · ", i))
+			k := strings.Index(out[max(j, 0):], " ──\n")
+			if j < 0 || k < 0 {
+				end = -1
+				break
+			}
+			end = max(end, j+k+len(" ──\n"))
+		}
+		if end >= 0 {
+			s.seen = max(s.seen, end)
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the session did not print the summaries of runs 1 to %d; it printed %q", n, out)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -1122,6 +1189,8 @@ func TestAskSessionShowsRequestsInTurn(t *testing.T) {
 	}
 	s.answer(t, "o")
 	awaitResult(t, second)
+	// A run's summary may show the prompt again before the third block.
+	s.waitFor(t, "── request 3 ──")
 	block = s.waitFor(t, answerPromptText)
 	if !strings.Contains(block, "cmd   touch third\n") || strings.Contains(block, "more waiting") {
 		t.Errorf("the third block %q", block)
@@ -1266,12 +1335,7 @@ func fakeDaemon(t *testing.T) (string, <-chan net.Conn) {
 // fakeDaemonWith is fakeDaemon saying it is info.
 func fakeDaemonWith(t *testing.T, info protocol.DaemonInfo) (string, <-chan net.Conn) {
 	t.Helper()
-	socket := filepath.Join(t.TempDir(), "fake.approval.sock")
-	l, err := transport.Unix{Path: socket}.Listen()
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { l.Close() })
+	socket, l := listenFake(t)
 	served := make(chan net.Conn, 1)
 	go func() {
 		conn, err := l.Accept()
@@ -1279,27 +1343,90 @@ func fakeDaemonWith(t *testing.T, info protocol.DaemonInfo) (string, <-chan net.
 			return
 		}
 		t.Cleanup(func() { conn.Close() })
-		for _, step := range []struct {
-			read  protocol.FrameType
-			reply protocol.FrameType
-			v     any
-		}{
-			{protocol.FrameHello, protocol.FrameDaemonInfo, info},
-			{protocol.FrameServe, protocol.FrameServing, nil},
-		} {
-			if f, err := protocol.ReadFrame(conn); err != nil || f.Type != step.read {
-				return
-			}
-			if step.v == nil {
-				_ = protocol.WriteFrame(conn, protocol.Frame{Type: step.reply})
-			} else {
-				_ = protocol.WriteJSON(conn, step.reply, step.v)
-			}
+		if serveFake(conn, info) {
+			served <- conn
 		}
-		_ = protocol.WriteJSON(conn, protocol.FrameApprovalRequest, protocol.ApprovalRequest{ID: 1, Argv: []string{"touch", "marker"}, Cwd: containerRoot, Reasons: []string{"no rule"}, TimeoutMs: 60000})
-		served <- conn
 	}()
 	return socket, served
+}
+
+// fakeDaemonsWith is fakeDaemonWith serving one session connection after
+// another, each passed on once served: a session that waits for the next
+// daemon finds it on the same socket.
+func fakeDaemonsWith(t *testing.T, info protocol.DaemonInfo) (string, <-chan net.Conn) {
+	t.Helper()
+	socket, l := listenFake(t)
+	var mu sync.Mutex
+	var conns []net.Conn
+	done := make(chan struct{})
+	t.Cleanup(func() {
+		close(done)
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range conns {
+			c.Close()
+		}
+	})
+	served := make(chan net.Conn)
+	go func() {
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, conn)
+			mu.Unlock()
+			if !serveFake(conn, info) {
+				conn.Close()
+				continue
+			}
+			select {
+			case served <- conn:
+			case <-done:
+				return
+			}
+		}
+	}()
+	return socket, served
+}
+
+// listenFake listens on a new fake daemon's approval socket, closed when
+// the test ends, and returns the socket and the listener.
+func listenFake(t *testing.T) (string, net.Listener) {
+	t.Helper()
+	socket := filepath.Join(t.TempDir(), "fake.approval.sock")
+	l, err := transport.Unix{Path: socket}.Listen()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	return socket, l
+}
+
+// serveFake plays the fake daemon's part on conn up to serving a session,
+// saying it is info, and sends the session request 1; it reports whether
+// the session asked to be served.
+func serveFake(conn net.Conn, info protocol.DaemonInfo) bool {
+	for _, step := range []struct {
+		read  protocol.FrameType
+		reply protocol.FrameType
+		v     any
+	}{
+		{protocol.FrameHello, protocol.FrameDaemonInfo, info},
+		{protocol.FrameServe, protocol.FrameServing, nil},
+	} {
+		if f, err := protocol.ReadFrame(conn); err != nil || f.Type != step.read {
+			return false
+		}
+		if step.v == nil {
+			_ = protocol.WriteFrame(conn, protocol.Frame{Type: step.reply})
+		} else {
+			_ = protocol.WriteJSON(conn, step.reply, step.v)
+		}
+	}
+	_ = protocol.WriteJSON(conn, protocol.FrameApprovalRequest, protocol.ApprovalRequest{ID: 1, Argv: []string{"touch", "marker"}, Cwd: containerRoot, Reasons: []string{"no rule"}, TimeoutMs: 60000})
+	return true
 }
 
 // An answer that crosses its request's end is reported as the end, in

@@ -36,11 +36,15 @@
 // FrameRevoke list and revoke the standing and session approvals;
 // FrameReread makes the daemon reread its rules file once the session has
 // added a rule, and FrameRulesReread tells the session the daemon reread
-// it by itself. A session that takes the daemon over from another
-// (Serve.TakeOver) gets its waiting requests, and the other
-// FrameTakenOver. `hostrunner stop`, `restart` and `up --restart` open
-// with FrameHello too, without serving: FrameRunning lists what the
-// daemon runs, and FrameStop, confirmed by FrameStopping, stops it.
+// it by itself. A session that asks for them (Serve.Runs) learns how the
+// runs a human approved go: FrameRunStarted, FrameRunOutput, FrameRunEnded,
+// sent apart from the container's stream so that a session falling behind
+// loses output but neither slows the command nor is dropped for it. A
+// session that takes the daemon over from another (Serve.TakeOver) gets
+// its waiting requests, and the other FrameTakenOver. `hostrunner stop`,
+// `restart` and `up --restart` open with FrameHello too, without
+// serving: FrameRunning lists what the daemon runs, and FrameStop,
+// confirmed by FrameStopping, stops it.
 package protocol
 
 import (
@@ -113,8 +117,11 @@ const (
 	FrameStop            // `hostrunner stop` → daemon, JSON Stop
 	FrameStopping        // daemon → `hostrunner stop`, no payload: the daemon stops; the connection closes once it does, maybe before its sockets are closed and its commands are gone
 	FrameRulesReread     // daemon → session, JSON RulesReread: the daemon reread its rules file by itself, to a session that said it reads this (Serve.Notices)
+	FrameRunStarted      // daemon → session, JSON RunStarted: an approved run began, to a session that asked for runs (Serve.Runs)
+	FrameRunOutput       // daemon → session, JSON RunOutput: a chunk of an approved run's output, likewise
+	FrameRunEnded        // daemon → session, JSON RunEnded: an approved run ended, likewise
 
-	lastFrameType = FrameRulesReread
+	lastFrameType = FrameRunEnded
 )
 
 // Exit codes for failures of hostrun itself rather than of the command,
@@ -287,11 +294,77 @@ const ApprovalVersion = 1
 // the session that serves it, which is told so (FrameTakenOver) and whose
 // waiting requests pass to the new one with the rest of their limit.
 // Notices says the session reads FrameRulesReread: an older session takes
-// a frame it does not know for an error, so a daemon sends it none.
+// a frame it does not know for an error, so a daemon sends it none. Runs
+// says, for the same reason, that it reads the frames of approved runs
+// (FrameRunStarted, FrameRunOutput, FrameRunEnded), which a daemon with
+// DaemonInfo.Runs then sends it.
 type Serve struct {
 	TakeOver bool `json:"take_over,omitempty"`
 	Notices  bool `json:"notices,omitempty"`
+	Runs     bool `json:"runs,omitempty"`
 }
+
+// RunStarted tells the session serving the daemon that an approved run
+// began: Run, the daemon's number for it, names it in the run's later
+// frames; Argv ran from the container directory Cwd, let through by
+// Approval, the scope of the answer to request Request, which the session
+// is told it took with FrameAnswered, perhaps after this frame. A repeat
+// a standing or session approval let through without asking has Request
+// 0 and that approval's kind, ScopeStanding or ScopeSession. A run that
+// does not start after all ends at once, with RunEnded.Error. Earlier
+// says the run started before the session served the daemon: the daemon
+// announces each run still going as the session starts serving it,
+// right after FrameServing, and the run's output from then on and its
+// end follow; the answer to its request, if any, went to another
+// session, or to an earlier connection of this one. ElapsedMs, with
+// Earlier, is how long the run had gone when the daemon announced it.
+type RunStarted struct {
+	Run       uint64   `json:"run"`
+	Argv      []string `json:"argv"`
+	Cwd       string   `json:"cwd"`
+	Approval  Scope    `json:"approval"`
+	Request   uint64   `json:"request,omitempty"`
+	Earlier   bool     `json:"earlier,omitempty"`
+	ElapsedMs int64    `json:"elapsed_ms,omitempty"`
+}
+
+// Repeat reports whether m is the start of a repeat, a run a standing or
+// session approval let through without asking: one with Request 0.
+func (m RunStarted) Repeat() bool {
+	return m.Request == 0
+}
+
+// RunOutput is a chunk of approved run Run's output, as the container
+// gets it, after the mask of the rule's secrets: of its stderr with
+// Stderr, of its stdout otherwise.
+type RunOutput struct {
+	Run    uint64 `json:"run"`
+	Stderr bool   `json:"stderr,omitempty"`
+	Data   []byte `json:"data"`
+}
+
+// RunEnded tells the session that approved run Run ended: it exited with
+// Code; or it never started, Error saying why as the client is told; or
+// it was cancelled, Cancelled saying why. DurationMs is how long it took
+// since its RunStarted, in milliseconds; Dropped counts the bytes of its
+// output the session was not sent because it fell behind.
+type RunEnded struct {
+	Run        uint64       `json:"run"`
+	Code       int          `json:"code"`
+	Error      string       `json:"error,omitempty"`
+	Cancelled  CancelReason `json:"cancelled,omitempty"`
+	DurationMs int64        `json:"duration_ms"`
+	Dropped    int64        `json:"dropped,omitempty"`
+}
+
+// CancelReason is why an approved run was cancelled, as RunEnded gives it.
+type CancelReason string
+
+// Reasons an approved run is cancelled.
+const (
+	CancelledClientGone CancelReason = "client gone"     // its client went away
+	CancelledStopping   CancelReason = "daemon stopping" // the daemon stopped or stepped aside
+)
 
 // RulesReread tells the session serving the daemon that the daemon found
 // its rules file changed: it now serves the rules of Digest, or Error says
@@ -327,6 +400,13 @@ type Hello struct {
 // a daemon older than both reports neither, so a session asks before
 // having it reread a file changed by hand, and `hostrunner restart`
 // names no change of rereading.
+// BuildVersion is the build version of the daemon's hostrunner, as
+// `hostrunner version` prints it, apart from the approval protocol
+// version: a daemon older than the field reports none, which reads as an
+// unknown version. An older session ignores it.
+// Runs says the daemon sends the frames of approved runs to a session
+// that asks for them (Serve.Runs); a daemon older than the field reports
+// it not, and a session then gets no run output.
 type DaemonInfo struct {
 	Version            int    `json:"version"`
 	Workspace          string `json:"workspace"`
@@ -338,6 +418,8 @@ type DaemonInfo struct {
 	ContainerStopped   bool   `json:"container_stopped,omitempty"`
 	Rereads            bool   `json:"rereads,omitempty"`
 	NoReread           bool   `json:"no_reread,omitempty"`
+	BuildVersion       string `json:"build_version,omitempty"`
+	Runs               bool   `json:"runs,omitempty"`
 }
 
 // RunningList answers FrameRunning: the commands the daemon runs, and
@@ -495,15 +577,34 @@ const headerSize = 5
 // split by a failed partial write of a separate header. Concurrent callers
 // must still serialize their calls.
 func WriteFrame(w io.Writer, f Frame) error {
+	buf, err := EncodeFrame(f)
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(buf)
+	return err
+}
+
+// EncodeFrame returns f as WriteFrame writes it, for a writer that must
+// know how much of a frame went out.
+func EncodeFrame(f Frame) ([]byte, error) {
 	if len(f.Payload) > MaxPayload {
-		return ErrPayloadTooLarge
+		return nil, ErrPayloadTooLarge
 	}
 	buf := make([]byte, headerSize+len(f.Payload))
 	buf[0] = byte(f.Type)
 	binary.BigEndian.PutUint32(buf[1:headerSize], uint32(len(f.Payload)))
 	copy(buf[headerSize:], f.Payload)
-	_, err := w.Write(buf)
-	return err
+	return buf, nil
+}
+
+// EncodeJSON returns v as a frame of type t, as WriteJSON writes it.
+func EncodeJSON(t FrameType, v any) ([]byte, error) {
+	payload, err := json.Marshal(v)
+	if err != nil {
+		return nil, fmt.Errorf("protocol: encode %T: %w", v, err)
+	}
+	return EncodeFrame(Frame{Type: t, Payload: payload})
 }
 
 // ReadFrame decodes the next frame from r. It returns io.EOF when r ends
@@ -533,11 +634,12 @@ func ReadFrame(r io.Reader) (Frame, error) {
 
 // WriteJSON marshals v and writes it as a frame of type t.
 func WriteJSON(w io.Writer, t FrameType, v any) error {
-	payload, err := json.Marshal(v)
+	buf, err := EncodeJSON(t, v)
 	if err != nil {
-		return fmt.Errorf("protocol: encode %T: %w", v, err)
+		return err
 	}
-	return WriteFrame(w, Frame{Type: t, Payload: payload})
+	_, err = w.Write(buf)
+	return err
 }
 
 // DecodesLosslessly reports whether the JSON payload decodes without loss:

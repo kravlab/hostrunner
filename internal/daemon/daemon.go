@@ -13,7 +13,8 @@
 // mounts, and takes no frames from the container's socket, nor that socket
 // any of its frames. A session that adds a rule to the rules file makes the
 // daemon reread it (WithReread), and with WithRereadEvery the daemon
-// rereads it by itself once it changes (see reread.go).
+// rereads it by itself once it changes (see reread.go). The session that
+// asks for them learns how the runs a human approved go (see runs.go).
 package daemon
 
 import (
@@ -61,6 +62,7 @@ type Server struct {
 	approvals        *approvals                                           // nil: no approval socket, so nothing is approved
 	containerStopped func() bool                                          // nil: the armed container is not known to have stopped
 	rereadEvery      time.Duration                                        // 0: the rules file is not watched; see WithRereadEvery
+	buildVersion     string                                               // "": unknown; see WithBuildVersion
 
 	// rereading makes rereads one at a time, so a slower one never
 	// replaces the rules a later one served.
@@ -100,6 +102,14 @@ func WithRequestTimeout(d time.Duration) Option {
 // limit, it may exceed an hour: the host chose it.
 func WithAskTimeout(d time.Duration) Option {
 	return func(s *Server) { s.askTimeout = d }
+}
+
+// WithBuildVersion sets the build version of the hostrunner the Server
+// runs in, as `hostrunner version` prints it, which it tells approval
+// sessions and stops (protocol.DaemonInfo.BuildVersion); without it the
+// Server reports none, as a daemon older than the field does.
+func WithBuildVersion(v string) Option {
+	return func(s *Server) { s.buildVersion = v }
 }
 
 // WithReread lets an approval session make the Server reread its rules
@@ -274,14 +284,16 @@ func isTemporary(err error) bool {
 // Cancelling ctx, or the client going away, kills the command without
 // reporting a result.
 func (s *Server) handle(ctx context.Context, conn net.Conn) {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
 	defer conn.Close()
 	stop := context.AfterFunc(ctx, func() { conn.Close() })
 	defer stop()
 
 	out := &frameWriter{conn: conn}
-	x := exchange{cancel: cancel, conn: conn, out: out}
+	// The cause tells an approved run cancelled for its client from one
+	// cancelled for the daemon stopping (see cancelReason).
+	x := exchange{cancel: func() { cancel(errClientGone) }, conn: conn, out: out}
 	// logArgs mark in the log every refusal of this connection's request,
 	// once its kind is known (a dry run).
 	var logArgs []any
@@ -522,7 +534,15 @@ func (s *Server) run(ctx context.Context, x exchange, req protocol.Request) {
 		s.reject(x.out, r.code, r.message, r.err)
 		return
 	}
-	s.start(ctx, x, req, p, func() (protocol.Frame, error) { return protocol.ReadFrame(x.conn) })
+	s.startUnasked(ctx, x, req, p)
+}
+
+// startUnasked starts p, the prepared command of req, on x, reading the
+// client's frames from its connection, when no human is asked about it:
+// the rules allow it, or a standing or session approval lets it through,
+// a repeat, which is an approved run (see approvals.startRepeat).
+func (s *Server) startUnasked(ctx context.Context, x exchange, req protocol.Request, p *prepared) {
+	s.start(ctx, x, req, p, func() (protocol.Frame, error) { return protocol.ReadFrame(x.conn) }, s.approvals.startRepeat(req, p))
 }
 
 // frameSource returns the client's next frame, or an error once the
@@ -531,9 +551,11 @@ type frameSource func() (protocol.Frame, error)
 
 // start runs p, the prepared command of req, on x: it streams stdio,
 // reading the client's frames from next, and reports the exit code;
-// x.cancel stops it early. logArgs (slog key-value pairs) go to its log
-// lines.
-func (s *Server) start(ctx context.Context, x exchange, req protocol.Request, p *prepared, next frameSource, logArgs ...any) {
+// x.cancel stops it early. For run, the approved run it is, it tells the
+// session serving the daemon the output and how the run ended, also when
+// it does not start; run is nil for a command the rules allowed. logArgs
+// (slog key-value pairs) go to its log lines.
+func (s *Server) start(ctx context.Context, x exchange, req protocol.Request, p *prepared, next frameSource, run *approvedRun, logArgs ...any) {
 	// The command inherits the files; the daemon's copies go once it has
 	// started (p.files is cleared then), or with the request on failure.
 	defer p.close()
@@ -542,23 +564,37 @@ func (s *Server) start(ctx context.Context, x exchange, req protocol.Request, p 
 	// starts nothing new.
 	key, ok := s.track(req)
 	if !ok {
-		s.reject(x.out, protocol.ExitHostrunError, drainingMessage, errDraining)
+		s.rejectRun(x.out, run, refusal{protocol.ExitHostrunError, drainingMessage, errDraining}, drainingMessage)
 		return
 	}
 	defer s.untrack(key)
 
 	cmd := newCommand(ctx, p.argv, p.dir, p.hostPath, p.env, x.out)
+	if run != nil {
+		// The session gets what the container gets: the masked output.
+		cmd.Stdout, cmd.Stderr = runTee{w: cmd.Stdout, run: run}, runTee{w: cmd.Stderr, run: run, stderr: true}
+	}
 	stdout, stderr := newMaskWriter(cmd.Stdout, p.masked), newMaskWriter(cmd.Stderr, p.masked)
 	cmd.Stdout, cmd.Stderr = stdout, stderr
 	cmd.ExtraFiles = p.files
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		s.reject(x.out, protocol.ExitHostrunError, "cannot start the command", err)
+		r := refusal{protocol.ExitHostrunError, "cannot start the command", err}
+		s.rejectRun(x.out, run, r, r.message)
 		return
 	}
 	if err := cmd.Start(); err != nil {
 		code, message := startFailure(req.Argv[0], err)
-		s.reject(x.out, code, message, err)
+		if ctx.Err() != nil {
+			// Cancelled before it could start (cmd.Start fails then): the
+			// run was cancelled; the container gets the failure all the
+			// same.
+			run.cancelled(ctx)
+			s.reject(x.out, code, message, err)
+			return
+		}
+		r := refusal{code, message, err}
+		s.rejectRun(x.out, run, r, r.message)
 		return
 	}
 	closeAll(p.files)
@@ -585,11 +621,21 @@ func (s *Server) start(ctx context.Context, x exchange, req protocol.Request, p 
 		code := exitCode(cmd.ProcessState)
 		s.log.Info("command finished", append(append(p.logArgs(req), logArgs...), "code", code, "wait_error", waitErr)...)
 		_ = x.out.writeJSON(protocol.FrameExit, protocol.Exit{Code: code})
+		run.exited(code)
 	} else {
 		s.log.Info("command cancelled", append(p.logArgs(req), logArgs...)...)
+		run.cancelled(ctx)
 	}
 	x.conn.Close()
 	streams.Wait()
+}
+
+// rejectRun rejects the command of run, an approved run (nil for one the
+// rules allowed), as r says, and ends run as not started for why, as the
+// session shows it.
+func (s *Server) rejectRun(out *frameWriter, run *approvedRun, r refusal, why string) {
+	run.failed(r.code, why)
+	s.reject(out, r.code, r.message, r.err)
 }
 
 // reject reports a command that could not run. The client gets message,
@@ -1011,11 +1057,16 @@ func (q *stdinQueue) close() {
 
 // frameWriter serializes frame writes from the stdout and stderr copiers and
 // the final status frame onto one connection. With a timeout, a write the
-// peer does not take within it fails instead of blocking the writer.
+// peer does not take within it fails instead of blocking the writer;
+// tryWrite, for frames a peer may take late or never (an approval
+// session's run frames), gives up without failing.
 type frameWriter struct {
 	mu      sync.Mutex
 	conn    net.Conn
 	timeout time.Duration // 0: writes may block as long as the peer lets them
+	// rest is the end of a frame tryWrite began but the peer did not take
+	// in time: it goes out before any other frame, which the stream needs.
+	rest []byte
 }
 
 // write sends one frame.
@@ -1023,6 +1074,9 @@ func (w *frameWriter) write(f protocol.Frame) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.setDeadline()
+	if err := w.finishRest(); err != nil {
+		return err
+	}
 	return protocol.WriteFrame(w.conn, f)
 }
 
@@ -1031,7 +1085,52 @@ func (w *frameWriter) writeJSON(t protocol.FrameType, v any) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.setDeadline()
+	if err := w.finishRest(); err != nil {
+		return err
+	}
 	return protocol.WriteJSON(w.conn, t, v)
+}
+
+// tryWrite sends buf, one encoded frame, giving the peer d to take it
+// instead of w's timeout. A peer that takes none of it in time leaves it
+// unsent: sent is false, and err nil. One that takes part of it gets the
+// rest before any other frame (see finishRest): that counts as sent. Any
+// other error means the connection is gone.
+func (w *frameWriter) tryWrite(buf []byte, d time.Duration) (sent bool, err error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	_ = w.conn.SetWriteDeadline(time.Now().Add(d))
+	if err := w.finishRest(); err != nil {
+		return false, ignoreTimeout(err)
+	}
+	n, err := w.conn.Write(buf)
+	if n > 0 && n < len(buf) {
+		w.rest = buf[n:]
+	}
+	if err != nil {
+		return n > 0, ignoreTimeout(err)
+	}
+	return true, nil
+}
+
+// ignoreTimeout returns nil for a write that ran out of time, err
+// otherwise.
+func ignoreTimeout(err error) error {
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return nil
+	}
+	return err
+}
+
+// finishRest writes the rest of a frame tryWrite left cut short, if any.
+// The caller holds w.mu and has set the deadline.
+func (w *frameWriter) finishRest() error {
+	if len(w.rest) == 0 {
+		return nil
+	}
+	n, err := w.conn.Write(w.rest)
+	w.rest = w.rest[n:]
+	return err
 }
 
 // batch calls f holding w: the frames f sends, a JSON frame of type t
@@ -1042,6 +1141,9 @@ func (w *frameWriter) batch(f func(send func(t protocol.FrameType, v any) error)
 	defer w.mu.Unlock()
 	return f(func(t protocol.FrameType, v any) error {
 		w.setDeadline()
+		if err := w.finishRest(); err != nil {
+			return err
+		}
 		if v == nil {
 			return protocol.WriteFrame(w.conn, protocol.Frame{Type: t})
 		}
@@ -1049,11 +1151,14 @@ func (w *frameWriter) batch(f func(send func(t protocol.FrameType, v any) error)
 	})
 }
 
-// setDeadline bounds the next write by w's timeout, if it has one.
+// setDeadline bounds the next write by w's timeout or, when w has none,
+// lifts any deadline a tryWrite left.
 func (w *frameWriter) setDeadline() {
+	var deadline time.Time
 	if w.timeout > 0 {
-		_ = w.conn.SetWriteDeadline(time.Now().Add(w.timeout))
+		deadline = time.Now().Add(w.timeout)
 	}
+	_ = w.conn.SetWriteDeadline(deadline)
 }
 
 // streamWriter turns a command's output stream into frames of one type,
