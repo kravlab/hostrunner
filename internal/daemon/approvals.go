@@ -807,6 +807,7 @@ func (s *Server) sessionRefused(out *frameWriter, pid int, err error) {
 // runs out, its session leaves or the daemon stops; but for the first,
 // the client is told why. To tell it the daemon stops, ask closes the
 // connection on ctx's end itself, once nothing waits (handle does not).
+// The waiting frame carries the warning of the daemon (see pendingAllowWarning).
 func (s *Server) ask(ctx context.Context, x exchange, f protocol.Frame) {
 	// The connection closes when the daemon stops, as handle closes it for
 	// other requests, but while a request waits: ask then tells its client
@@ -883,7 +884,7 @@ func (s *Server) ask(ctx context.Context, x exchange, f protocol.Frame) {
 	}
 	guarded := need.text.guarded()
 	s.log.Info("approval requested", "approval_id", id, "argv", req.Argv, "dir", need.hostDir, "reasons", need.text.agentReasons, "guarded", guarded, "timeout", timeout)
-	_ = x.out.writeJSON(protocol.FrameWaiting, protocol.Waiting{Reasons: need.text.agentReasons, Guarded: guarded})
+	_ = x.out.writeJSON(protocol.FrameWaiting, protocol.Waiting{Reasons: need.text.agentReasons, Guarded: guarded, Warning: s.pendingAllowWarning()})
 
 	frames := readFrames(ctx, x.conn)
 	timer := time.NewTimer(timeout)

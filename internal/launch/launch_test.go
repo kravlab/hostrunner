@@ -3,6 +3,7 @@ package launch
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"io"
@@ -129,6 +130,13 @@ func runFakeDaemon(mode string) {
 				stepAside = stepAside || !ok || got != v
 			}
 			appendLine(filepath.Join(dir, "fake.armed"), map[bool]string{false: "armed", true: "step aside"}[stepAside])
+			// What the arm reports not allowed, for the tests to read:
+			// the real daemon warns hostrun of it (see armWarning).
+			if a.NotAllowed != nil {
+				if b, err := json.Marshal(a.NotAllowed); err == nil {
+					appendLine(filepath.Join(dir, "fake.notallowed"), string(b))
+				}
+			}
 			_ = protocol.WriteJSON(c, protocol.FrameArmed, protocol.Armed{Version: protocol.Version, Restart: stepAside})
 			if stepAside {
 				c.Close()
@@ -1025,6 +1033,65 @@ func TestUpOfChangedRulesNotAllowedArmsTheDaemonServingAllowedRules(t *testing.T
 	if _, ok, err := cfg.Allows.Pending(cfg.Workspace); err != nil || !ok {
 		t.Errorf("Pending = %v, %v, want the request recorded", ok, err)
 	}
+}
+
+// The arm of a daemon serving allowed rules says what is not allowed, the
+// digest and the daemon settings up found, so the daemon warns hostrun of
+// the change. An up whose rules and settings are allowed says nothing.
+func TestUpNotAllowedTellsTheDaemonWhatIsNotAllowed(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		change func(t *testing.T, cfg *Config)
+		digest string
+	}{
+		{"a daemon setting", func(t *testing.T, cfg *Config) { cfg.Grace = time.Minute }, "missing"},
+		{"the rules file content", func(t *testing.T, cfg *Config) {
+			if err := os.WriteFile(cfg.RulesFile, []byte(gitStatusRules), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}, gitStatusDigest},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := fakeConfig(t, "serve")
+			if err := Up(context.Background(), cfg); err != nil {
+				t.Fatalf("first Up: %v", err)
+			}
+			if got := notAllowedArms(t, cfg.Dir); len(got) != 0 {
+				t.Fatalf("the allowed Up reported %v, want nothing", got)
+			}
+			tt.change(t, &cfg)
+			if err := Up(context.Background(), cfg); err != nil {
+				t.Fatalf("Up of a change not allowed: %v", err)
+			}
+			got := notAllowedArms(t, cfg.Dir)
+			want := protocol.ArmNotAllowed{Digest: tt.digest, Settings: cfg.Settings.Daemon()}
+			if len(got) != 1 || got[0].Digest != want.Digest || !maps.Equal(got[0].Settings, want.Settings) {
+				t.Fatalf("the arm reported %+v, want [%+v]", got, want)
+			}
+		})
+	}
+}
+
+// notAllowedArms returns what the arms the fake daemon in dir received
+// reported not allowed.
+func notAllowedArms(t *testing.T, dir string) []protocol.ArmNotAllowed {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(dir, "fake.notallowed"))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []protocol.ArmNotAllowed
+	for _, l := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		var na protocol.ArmNotAllowed
+		if err := json.Unmarshal([]byte(l), &na); err != nil {
+			t.Fatalf("fake.notallowed line %q: %v", l, err)
+		}
+		out = append(out, na)
+	}
+	return out
 }
 
 // Not allowed is fail-closed: a running daemon whose own rules and

@@ -33,9 +33,10 @@ func newAllowStore(t *testing.T) allowStore {
 }
 
 // check is the allow check a daemon of these tests runs (see
-// daemon.WithAllowed): whether the store allows digest for the workspace.
-func (a allowStore) check(digest string) (bool, error) {
-	return a.store.Allowed(a.workspace, digest, allowSettings)
+// daemon.WithAllowed): whether the store allows digest and settings for
+// the workspace.
+func (a allowStore) check(digest string, settings map[string]string) (bool, error) {
+	return a.store.Allowed(a.workspace, digest, settings)
 }
 
 // allow records an allow of content for the workspace, as `hostrunner
@@ -47,12 +48,12 @@ func (a allowStore) allow(t *testing.T, rulesFile, content string) {
 	}
 }
 
-// startDaemon starts a daemon serving the rules file content that
-// rereads the file by itself once it changes, provided a's store allows
-// the new content.
+// startDaemon starts a daemon serving the rules file content, with
+// allowSettings, that rereads the file by itself once it changes,
+// provided a's store allows the new content.
 func (a allowStore) startDaemon(t *testing.T, log *slog.Logger, content string) harness {
 	t.Helper()
-	return startRereadingDaemon(t, log, content, daemon.WithAllowed(a.check))
+	return startRereadingDaemon(t, log, content, daemon.WithSettings(allowSettings), daemon.WithAllowed(a.check))
 }
 
 // notAllowedLog is how the daemon logs a change of its rules file to
@@ -89,8 +90,8 @@ func TestRereadKeepsTheOldRulesOfAnEditNotAllowed(t *testing.T) {
 	if got := h.run(t, containerRoot, "", "touch", "marker"); got.code != protocol.ExitRejected {
 		t.Fatalf("a command of the edit: got %+v, want it refused", got)
 	}
-	if got := h.run(t, containerRoot, "", "echo", "old"); got != (result{stdout: "old\n"}) {
-		t.Fatalf("a command of the old rules: got %+v, want it to run", got)
+	if got := h.run(t, containerRoot, "", "echo", "old"); got != (result{stdout: "old\n", stderr: notAllowedWarningLine(digest)}) {
+		t.Fatalf("a command of the old rules: got %+v, want it to run, with the warning", got)
 	}
 }
 
@@ -153,7 +154,7 @@ func TestRereadKeepsTheOldRulesWhenTheAllowCannotBeChecked(t *testing.T) {
 	)
 	broken.Store(true)
 	h := startRereadingDaemon(t, slog.New(slog.NewTextHandler(&log, nil)), echoRules,
-		daemon.WithAllowed(func(string) (bool, error) {
+		daemon.WithAllowed(func(string, map[string]string) (bool, error) {
 			if broken.Load() {
 				return false, errors.New("the allow store is broken")
 			}
@@ -263,7 +264,7 @@ func TestRereadReportsAnotherReasonAgain(t *testing.T) {
 		broken atomic.Bool
 	)
 	h := startRereadingDaemon(t, slog.New(slog.NewTextHandler(&log, nil)), echoRules,
-		daemon.WithAllowed(func(string) (bool, error) {
+		daemon.WithAllowed(func(string, map[string]string) (bool, error) {
 			if broken.Load() {
 				return false, errors.New("the allow store is broken")
 			}
@@ -304,7 +305,7 @@ func TestRereadRecordsAnAllowRequestOnce(t *testing.T) {
 	if n := requests.Load(); n != 1 {
 		t.Fatalf("the request was recorded %d times, want once", n)
 	}
-	if got := h.run(t, containerRoot, "", "echo", "old"); got != (result{stdout: "old\n"}) {
-		t.Fatalf("a command of the old rules: got %+v, want it to run", got)
+	if got := h.run(t, containerRoot, "", "echo", "old"); got != (result{stdout: "old\n", stderr: notAllowedWarningLine(rules.ContentDigest([]byte(touchRules)))}) {
+		t.Fatalf("a command of the old rules: got %+v, want it to run, with the warning", got)
 	}
 }

@@ -65,6 +65,24 @@ the daemon rereads the file by itself once it changes, without stopping.
   going back to the rules served ends it too, logged as `rules change
   undone: the file holds the rules served`, without a notice; not when
   a session's reread just served the pending content.
+- While a refusal for content not allowed is pending, every `hostrun`
+  call of the daemon (issue #140) prints one line on stderr,
+  `hostrun: warning: <text>`, naming the digest and saying a human on
+  the host runs `hostrunner allow` (when the allow cannot be checked:
+  looks at the daemon log). It changes neither output nor exit code and
+  ends once the content is allowed or the refusal ends. The daemon sends
+  the text as the optional `warning` of the first answer of each
+  exchange (the initial credit, waiting, allowed and error frames); an
+  older `hostrun` ignores it, an older daemon sends none.
+- `up` keeping a daemon (rules or settings not allowed, the daemon
+  serving allowed ones) reports what is not allowed in `Arm`
+  (`not_allowed`: the digest and the daemon settings `up` found not
+  allowed, which the daemon compares with its own to choose the text);
+  the daemon warns the same way until the allow store allows it, a later
+  arm reports none, or, with the same settings, the rules file goes back
+  to the served content. Undoing a settings change alone is seen only at
+  the next `up`. Both sources pending: both texts on one line, joined by
+  "; ". An older daemon ignores `not_allowed`.
 - Content allowed that does not load is a file that does not load, as
   above.
 
@@ -150,11 +168,17 @@ hostrunner serve --socket … --workspace … --container-workspace … [--rules
   again; `a` after a hand edit not allowed adds no rule, and `a` after
   the daemon reported it logs nothing more; a session's reread of the
   pending content is not logged as undone; the allow request is
-  recorded once per refusal, and one that fails is logged.
+  recorded once per refusal, and one that fails is logged. The warning
+  (`rereadwarning_test.go`, `armwarning_test.go`, `warning_test.go`):
+  every call prints it on stderr while a change is pending, from a
+  reread and from an arm, without changing output or exit code, and it
+  goes once allowed or undone.
 - `internal/protocol`: the frame's wire value and the JSON names of
-  `DaemonInfo`, `Serve` and `RulesReread`.
+  `DaemonInfo`, `Serve` and `RulesReread`, and of `warning` and
+  `not_allowed`.
 - `internal/launch`: an `up` with another `--no-reread` replaces the
-  daemon, and the next such `up` arms the new one.
+  daemon, and the next such `up` arms the new one; an `up` keeping a
+  daemon reports what is not allowed in the arm.
 - `internal/stop`: `restart` takes `reread` from the settings it
   resolves.
 - `cmd/hostrunner`: `--no-reread` for `up` and `serve`, in their usages;

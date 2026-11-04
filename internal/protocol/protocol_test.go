@@ -197,6 +197,44 @@ func TestStopWireFormat(t *testing.T) {
 	}
 }
 
+// The JSON names warning and not_allowed are the contract between versions.
+func TestNotAllowedWarningWireFormat(t *testing.T) {
+	var (
+		credit  Credit
+		waiting Waiting
+		allowed Allowed
+		errAns  Error
+	)
+	for _, c := range []struct {
+		name string
+		typ  FrameType
+		into any
+		warn *string
+	}{
+		{"Credit", FrameStdinCredit, &credit, &credit.Warning},
+		{"Waiting", FrameWaiting, &waiting, &waiting.Warning},
+		{"Allowed", FrameAllowed, &allowed, &allowed.Warning},
+		{"Error", FrameError, &errAns, &errAns.Warning},
+	} {
+		if err := DecodeJSON(Frame{Type: c.typ, Payload: []byte(`{"warning":"w"}`)}, c.into); err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		if *c.warn != "w" {
+			t.Errorf("%s: got Warning %q, want %q", c.name, *c.warn, "w")
+		}
+	}
+
+	var arm Arm
+	payload := []byte(`{"not_allowed":{"digest":"d","settings":{"grace":"15s"}}}`)
+	if err := DecodeJSON(Frame{Type: FrameArm, Payload: payload}, &arm); err != nil {
+		t.Fatal(err)
+	}
+	want := &ArmNotAllowed{Digest: "d", Settings: map[string]string{"grace": "15s"}}
+	if !reflect.DeepEqual(arm.NotAllowed, want) {
+		t.Fatalf("got %+v, want %+v", arm.NotAllowed, want)
+	}
+}
+
 // An arm carrying settings still decodes into the Arm an older daemon
 // declares, its other fields unchanged: DecodeJSON, json.Unmarshal,
 // ignores the field the older Arm lacks. olderArm copies the fields of

@@ -17,6 +17,10 @@
 // connection from ever blocking on a command that does not read stdin, so it
 // always notices a disconnect. Structured payloads are JSON.
 //
+// The first answer of an exchange may carry a Warning, which the client
+// prints on stderr once without changing the command's output or exit
+// code (see Credit).
+//
 // A dry run has a frame type of its own rather than a field in Request: a
 // daemon that predates it rejects the unknown frame type, where it would
 // ignore an unknown field and run the command.
@@ -164,11 +168,26 @@ type Request struct {
 // still reads NoReread, which Settings' reread then repeats, and a
 // current daemon reads only Settings; an arm without the field, from an
 // `up` that predates it, has the daemon compare its NoReread alone.
+// NotAllowed is set when `up` found the rules file and settings not
+// allowed (see ArmNotAllowed); a daemon that predates it ignores the
+// field.
 type Arm struct {
 	Version      int               `json:"version"`
 	ConfigDigest string            `json:"config_digest"`
 	NoReread     bool              `json:"no_reread,omitempty"`
 	Settings     map[string]string `json:"settings,omitempty"`
+	NotAllowed   *ArmNotAllowed    `json:"not_allowed,omitempty"`
+}
+
+// ArmNotAllowed tells a running daemon that `hostrunner up` found the rules
+// file of Digest, with the daemon settings Settings (key to value text, as
+// settings.Settings.Daemon writes them), not allowed. The daemon, which
+// serves allowed ones, is armed instead of replaced; it warns the client
+// (the Warning fields) while that change stays not allowed, until an arm
+// without the field or the allow store allows it.
+type ArmNotAllowed struct {
+	Digest   string            `json:"digest"`
+	Settings map[string]string `json:"settings,omitempty"`
 }
 
 // Armed answers Arm. Restart means the daemon steps aside: it will not
@@ -187,12 +206,13 @@ type Armed struct {
 // client that predates them ignores the field. Approval is ScopeStanding
 // or ScopeSession when a standing or session approval lets the command
 // through, which runs it as the rule that refused it would (Dir,
-// Secrets).
+// Secrets). Warning is described on Credit.
 type Allowed struct {
 	Rule     string   `json:"rule"`
 	Dir      string   `json:"dir,omitempty"`
 	Secrets  []string `json:"secrets,omitempty"`
 	Approval Scope    `json:"approval,omitempty"`
+	Warning  string   `json:"warning,omitempty"`
 }
 
 // String describes a, as the dry run and the Rules test report it.
@@ -224,10 +244,11 @@ type Ask struct {
 // Waiting tells the client that its command waits for a human's answer.
 // Reasons are every reason it was refused, the first naming the rule that
 // refused it, as a refusal does; Guarded is set when approving it needs a
-// second confirmation.
+// second confirmation. Warning is described on Credit.
 type Waiting struct {
 	Reasons []string `json:"reasons"`
 	Guarded bool     `json:"guarded,omitempty"`
+	Warning string   `json:"warning,omitempty"`
 }
 
 // String is the line the client prints while its command waits.
@@ -565,15 +586,25 @@ type Exit struct {
 }
 
 // Error reports that the command could not run. Code is the exit code the
-// client must terminate with; Message is shown to the user.
+// client must terminate with; Message is shown to the user. Warning is
+// described on Credit.
 type Error struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
+	Warning string `json:"warning,omitempty"`
 }
 
-// Credit allows the client to send Bytes more bytes of stdin.
+// Credit allows the client to send Bytes more bytes of stdin. Warning is a
+// warning the daemon gives the client while the rules file or the daemon
+// settings changed but a human on the host has not allowed the change
+// (`hostrunner allow`); the client prints it on stderr, at most once per
+// call, from the first answer carrying it, without changing the command's
+// output or exit code. A daemon puts it in the first answer of an exchange:
+// the initial Credit when the command starts, Waiting, Allowed or Error.
+// An older client ignores the field; an older daemon sends none.
 type Credit struct {
-	Bytes int `json:"bytes"`
+	Bytes   int    `json:"bytes"`
+	Warning string `json:"warning,omitempty"`
 }
 
 const headerSize = 5

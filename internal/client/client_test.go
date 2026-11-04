@@ -147,6 +147,28 @@ func (h harness) waitServed(t *testing.T) {
 	}
 }
 
+// arm arms the daemon of h as `hostrunner up` does, with a, waits for its
+// answer and returns it.
+func (h harness) arm(t *testing.T, a protocol.Arm) protocol.Armed {
+	t.Helper()
+	conn, err := h.transport.Dial(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	a.Version = protocol.Version
+	if err := protocol.WriteJSON(conn, protocol.FrameArm, a); err != nil {
+		t.Fatal(err)
+	}
+	f, err := protocol.ReadFrame(conn)
+	var armed protocol.Armed
+	if err != nil || f.Type != protocol.FrameArmed || protocol.DecodeJSON(f, &armed) != nil {
+		t.Fatalf("frame %v, err %v; want armed", f.Type, err)
+	}
+	return armed
+}
+
 // result is what the user of hostrun observes.
 type result struct {
 	code           int

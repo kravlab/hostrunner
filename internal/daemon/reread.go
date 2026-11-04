@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"maps"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -27,11 +28,14 @@ func WithRereadEvery(interval time.Duration) Option {
 
 // WithAllowed makes the Server reread its rules file by itself (see
 // WithRereadEvery) only to content allowed reports allowed, by its
-// digest: one a human on the host allowed for the daemon's workspace and
-// settings (allow.Store.Allowed). A change to content not allowed keeps
-// the rules served and is logged, and noticed to the session serving
-// the daemon, once for its content. Without it every content is allowed.
-func WithAllowed(allowed func(digest string) (bool, error)) Option {
+// digest and the daemon settings (those of WithSettings): one a human on
+// the host allowed for the daemon's workspace with those settings
+// (allow.Store.Allowed). A change to content not allowed keeps the rules
+// served and is logged, and noticed to the session serving the daemon,
+// once for its content. Without it every content is allowed. The Server
+// also checks through it a change an arm reports not allowed (see
+// protocol.ArmNotAllowed and pendingAllowWarning), with the arm's settings.
+func WithAllowed(allowed func(digest string, settings map[string]string) (bool, error)) Option {
 	return func(s *Server) { s.allowed = allowed }
 }
 
@@ -123,7 +127,7 @@ func (s *Server) watchRules(ctx context.Context) {
 // which sees it changed; one a session had reread meanwhile changes
 // nothing.
 func (s *Server) rereadChanged(path, failedContent string) string {
-	content, _, readErr := rules.FileDigest(os.DirFS(filepath.Dir(path)), filepath.Base(path))
+	content, readErr := rulesFileDigest(path)
 	if readErr != nil {
 		content = "unreadable: " + readErr.Error()
 	}
@@ -215,7 +219,7 @@ func (s *Server) refuseUnallowed(digest string) (first bool, err error) {
 	}
 	s.unallowedMu.Lock()
 	defer s.unallowedMu.Unlock()
-	ok, checkErr := s.allowed(digest)
+	ok, checkErr := s.allowed(digest, s.settings)
 	if checkErr == nil && ok {
 		return false, nil
 	}
@@ -247,6 +251,105 @@ func (s *Server) pendingUnallowed() string {
 	s.unallowedMu.Lock()
 	defer s.unallowedMu.Unlock()
 	return s.unallowed.digest
+}
+
+// notAllowedWarning returns the warning that the rules file changed to
+// content refuseUnallowed refused, while that refusal is pending, with
+// the digest of the content and what a human on the host does about it;
+// "" for none. The allow of the content is checked as the warning is
+// asked for (see WithAllowed), not taken from the refusal: once the store
+// allows it there is no warning, even before the next look of the
+// watcher; a check that fails gives the warning of a change not checked.
+func (s *Server) notAllowedWarning() string {
+	s.unallowedMu.Lock()
+	pending := s.unallowed
+	s.unallowedMu.Unlock()
+	if pending.digest == "" {
+		return ""
+	}
+	notAllowed := pending.notAllowed
+	if s.allowed != nil {
+		ok, err := s.allowed(pending.digest, s.settings)
+		if err == nil && ok {
+			return ""
+		}
+		notAllowed = err == nil
+	}
+	return changeWarning(pending.digest, false, notAllowed)
+}
+
+// changeWarning returns the warning that the rules file, or with
+// withSettings the rules or the daemon settings, changed to content of
+// digest, but the change is not allowed, or with !notAllowed its allow
+// cannot be checked, so the daemon keeps the old rules, or ones, and what
+// a human on the host does about it. It defines the texts of all four
+// variants.
+func changeWarning(digest string, withSettings, notAllowed bool) string {
+	subject, kept := "the rules file", "rules"
+	if withSettings {
+		subject, kept = "the rules or the daemon settings", "ones"
+	}
+	cause, remedy := "the change is not allowed", "runs "+allowCommand+" to allow it"
+	if !notAllowed {
+		cause, remedy = "its allow cannot be checked", "looks at the daemon log"
+	}
+	return subject + " changed (digest " + digest + "), but " + cause + ", so the daemon keeps the old " + kept + "; a human on the host " + remedy
+}
+
+// armWarning returns the warning of the change the last arm reported not
+// allowed (see protocol.ArmNotAllowed), checked as it is asked for; ""
+// for none. The change is no longer warned of once the allow store allows
+// it (see WithAllowed; a Server without WithAllowed cannot check it, and
+// keeps it), nor, when it has the daemon's own settings (see
+// WithSettings), once the rules file holds the rules served again. A check
+// that fails keeps the change, warned of as one not checked. With the
+// daemon's own settings it is a change of the rules file, warned of as
+// notAllowedWarning does, and not at all when refusedDigest, the digest
+// of the refusal pending (see pendingUnallowed), is its digest, which
+// notAllowedWarning warns of already. Without WithApprovals there is no
+// rules file (see rulesFileServed), so such a change is not seen undone:
+// it ends only on an allow or the next arm.
+func (s *Server) armWarning(refusedDigest string) string {
+	s.armMu.Lock()
+	na := s.armNotAllowed
+	s.armMu.Unlock()
+	if na == nil {
+		return ""
+	}
+	notAllowed := true
+	if s.allowed != nil {
+		ok, err := s.allowed(na.Digest, na.Settings)
+		if err == nil && ok {
+			return ""
+		}
+		notAllowed = err == nil
+	}
+	if !maps.Equal(na.Settings, s.settings) {
+		return changeWarning(na.Digest, true, notAllowed)
+	}
+	if na.Digest == refusedDigest || s.rulesFileServed() {
+		return ""
+	}
+	return changeWarning(na.Digest, false, notAllowed)
+}
+
+// rulesFileServed reports whether the rules file (see WithApprovals)
+// holds the rules the Server serves; false without a rules file, so
+// without WithApprovals a change with the daemon's own settings is not
+// seen undone (see armWarning), or when it cannot be read.
+func (s *Server) rulesFileServed() bool {
+	if s.approvals == nil || s.approvals.rulesFile == "" {
+		return false
+	}
+	content, err := rulesFileDigest(s.approvals.rulesFile)
+	return err == nil && content == s.rulesDigest()
+}
+
+// rulesFileDigest returns the digest of the rules file at path, as
+// rules.FileDigest does for the file in its directory.
+func rulesFileDigest(path string) (string, error) {
+	digest, _, err := rules.FileDigest(os.DirFS(filepath.Dir(path)), filepath.Base(path))
+	return digest, err
 }
 
 // endUnallowed ends the pending refusal, if any, and returns the digest

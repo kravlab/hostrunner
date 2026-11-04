@@ -102,7 +102,8 @@ type Config struct {
 // none or the running one loaded other rules (it steps aside when armed
 // with a different digest). If they are not, it arms a running daemon that
 // serves allowed rules and settings, which keeps serving them, and says so
-// on cfg.Stderr (see keepAllowed); without one it fails with a
+// on cfg.Stderr, the arm reporting the change not allowed so that the daemon
+// warns hostrun of it (see keepAllowed); without one it fails with a
 // *NotAllowedError, starting nothing. It returns once the daemon has
 // answered an arm request, or an error carrying the daemon's log output if
 // it did not come up. Concurrent calls for the same directory are
@@ -131,9 +132,10 @@ func Up(ctx context.Context, cfg Config) error {
 // keepAllowed is Up, under the lock, for rules or settings that are not
 // allowed, notAllowed saying so: when the daemon serving cfg.Dir serves
 // allowed rules and settings for the workspace (see allowedDaemon), it
-// arms that daemon so that it keeps serving them and reports it (see
-// armAllowed). Otherwise it returns notAllowed and starts nothing, a
-// running daemon staying as it is. A store that cannot be read is an
+// arms that daemon so that it keeps serving them and reports the change
+// not allowed, for the daemon to warn hostrun of (see armAllowed).
+// Otherwise it returns notAllowed and starts nothing, a running daemon
+// staying as it is. A store that cannot be read is an
 // error of its own, as in checkAllowed.
 func (p *Prepared) keepAllowed(ctx context.Context, notAllowed *NotAllowedError) error {
 	info, ok, err := p.allowedDaemon(ctx)
@@ -173,7 +175,10 @@ func (p *Prepared) allowedDaemon(ctx context.Context) (info protocol.DaemonInfo,
 
 // armAllowed arms the daemon on the socket of p with the digest and the
 // daemon settings it said it serves, info, which allowedDaemon found
-// allowed, so it follows the arm and keeps serving them. It then tells
+// allowed, so it follows the arm and keeps serving them. The arm also
+// reports the change not allowed, the digest of p and the daemon settings
+// of the Config, exactly what checkAllowed checked and recorded, so the
+// daemon warns hostrun of it while it stays not allowed. It then tells
 // cfg.Stderr what is not allowed, notAllowed, and that the daemon keeps
 // serving the allowed rules, and returns nil. A daemon that stepped
 // aside, its rules reread since it answered, is waited for until it has
@@ -181,7 +186,10 @@ func (p *Prepared) allowedDaemon(ctx context.Context) (info protocol.DaemonInfo,
 // does not stop after stepping aside, is joined to notAllowed.
 func (p *Prepared) armAllowed(ctx context.Context, info protocol.DaemonInfo, notAllowed *NotAllowedError) error {
 	cfg := p.cfg
-	stepAside, err := arm(ctx, p.socket, protocol.Arm{ConfigDigest: info.RulesDigest, NoReread: info.NoReread, Settings: info.Settings})
+	stepAside, err := arm(ctx, p.socket, protocol.Arm{
+		ConfigDigest: info.RulesDigest, NoReread: info.NoReread, Settings: info.Settings,
+		NotAllowed: &protocol.ArmNotAllowed{Digest: p.digest, Settings: cfg.Settings.Daemon()},
+	})
 	if err != nil {
 		return errors.Join(notAllowed, err)
 	}

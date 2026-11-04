@@ -57,15 +57,15 @@ type Server struct {
 	log              *slog.Logger
 	requestTimeout   time.Duration
 	askTimeout       time.Duration
-	onArm            func(a protocol.Arm, digest string) (stepAside bool) // nil: arming changes nothing
-	rereadFile       func() (Policy, string, error)                       // nil: the rules are never reread
-	approvals        *approvals                                           // nil: no approval socket, so nothing is approved
-	containerStopped func() bool                                          // nil: the armed container is not known to have stopped
-	rereadEvery      time.Duration                                        // 0: the rules file is not watched; see WithRereadEvery
-	allowed          func(digest string) (bool, error)                    // nil: every content of the rules file is allowed; see WithAllowed
-	allowRequest     func(digest string) error                            // nil: no allow request is recorded; see WithAllowRequest
-	buildVersion     string                                               // "": unknown; see WithBuildVersion
-	settings         map[string]string                                    // nil: none reported; see WithSettings
+	onArm            func(a protocol.Arm, digest string) (stepAside bool)          // nil: arming changes nothing
+	rereadFile       func() (Policy, string, error)                                // nil: the rules are never reread
+	approvals        *approvals                                                    // nil: no approval socket, so nothing is approved
+	containerStopped func() bool                                                   // nil: the armed container is not known to have stopped
+	rereadEvery      time.Duration                                                 // 0: the rules file is not watched; see WithRereadEvery
+	allowed          func(digest string, settings map[string]string) (bool, error) // nil: every content of the rules file is allowed; see WithAllowed
+	allowRequest     func(digest string) error                                     // nil: no allow request is recorded; see WithAllowRequest
+	buildVersion     string                                                        // "": unknown; see WithBuildVersion
+	settings         map[string]string                                             // nil: none reported; see WithSettings
 
 	// rereading makes rereads one at a time, so a slower one never
 	// replaces the rules a later one served.
@@ -82,6 +82,8 @@ type Server struct {
 	stopping       bool                               // a stop request came
 	confirming     bool                               // a drain began and is not confirmed yet; see drain
 	draining       chan struct{}                      // closed once a stop drains the daemon
+	armMu          sync.Mutex                         // guards armNotAllowed
+	armNotAllowed  *protocol.ArmNotAllowed            // the change the last arm reported not allowed; nil for none; see armWarning
 }
 
 // Policy decides whether a command may run; rules.Policy implements it. A
@@ -357,7 +359,8 @@ var dryRunLogArgs = []any{"dry_run", true}
 
 // dryRun answers whether req would start: it runs the same checks as run,
 // then looks the program up as starting it would, and releases what the
-// checks opened, never starting the command or reading stdin.
+// checks opened, never starting the command or reading stdin. The answer
+// carries the warning of the daemon (see pendingAllowWarning).
 func (s *Server) dryRun(out *frameWriter, req protocol.Request) {
 	p, r := s.prepare(req, true)
 	if r == nil {
@@ -370,18 +373,28 @@ func (s *Server) dryRun(out *frameWriter, req protocol.Request) {
 	}
 	p.close()
 	s.log.Info("dry run allowed", append(append(p.logArgs(req), "rule", p.rule), dryRunLogArgs...)...)
-	_ = out.writeJSON(protocol.FrameAllowed, protocol.Allowed{Rule: p.rule, Dir: p.fixedDir, Secrets: p.secrets, Approval: p.approval})
+	_ = out.writeJSON(protocol.FrameAllowed, protocol.Allowed{Rule: p.rule, Dir: p.fixedDir, Secrets: p.secrets, Approval: p.approval, Warning: s.pendingAllowWarning()})
 }
 
 // arm handles FrameArm from `hostrunner up`. When the handler steps aside,
 // the answer is written before Serve is stopped, since stopping
-// closes every connection.
+// closes every connection. The change the arm reports not allowed
+// (protocol.Arm.NotAllowed) replaces the one an earlier arm reported, and
+// an arm without one ends it (see armWarning).
 func (s *Server) arm(out *frameWriter, f protocol.Frame) {
 	var a protocol.Arm
 	if err := protocol.DecodeJSON(f, &a); err != nil {
 		s.reject(out, protocol.ExitHostrunError, err.Error(), err)
 		return
 	}
+	var na *protocol.ArmNotAllowed
+	if a.NotAllowed != nil {
+		c := *a.NotAllowed
+		na = &c
+	}
+	s.armMu.Lock()
+	s.armNotAllowed = na
+	s.armMu.Unlock()
 	stepAside := s.onArm != nil && s.onArm(a, s.rulesDigest())
 	s.log.Info("armed by hostrunner up", "step_aside", stepAside)
 	_ = out.writeJSON(protocol.FrameArmed, protocol.Armed{Version: protocol.Version, Restart: stepAside})
@@ -541,7 +554,9 @@ type exchange struct {
 	out    *frameWriter
 }
 
-// run executes req on x if it passes prepare; x.cancel stops it early.
+// run executes req on x if it passes prepare; x.cancel stops it early. The
+// initial credit it sends once the command started carries the warning of
+// the daemon (see pendingAllowWarning).
 func (s *Server) run(ctx context.Context, x exchange, req protocol.Request) {
 	p, r := s.prepare(req, false)
 	if r != nil {
@@ -626,7 +641,7 @@ func (s *Server) start(ctx context.Context, x exchange, req protocol.Request, p 
 		x.cancel()
 	})
 	streams.Go(func() { feedStdin(queue, stdin, x.out) })
-	_ = x.out.writeJSON(protocol.FrameStdinCredit, protocol.Credit{Bytes: protocol.StdinWindow})
+	_ = x.out.writeJSON(protocol.FrameStdinCredit, protocol.Credit{Bytes: protocol.StdinWindow, Warning: s.pendingAllowWarning()})
 
 	waitErr := cmd.Wait()
 	// The output is complete: what a mask held back can go now.
@@ -654,11 +669,28 @@ func (s *Server) rejectRun(out *frameWriter, run *approvedRun, r refusal, why st
 }
 
 // reject reports a command that could not run. The client gets message,
-// which must not reveal host paths; the full err, and logArgs (slog
-// key-value pairs), go to the daemon log.
+// which must not reveal host paths, and the warning of the daemon (see
+// pendingAllowWarning); the full err, and logArgs (slog key-value pairs),
+// go to the daemon log.
 func (s *Server) reject(out *frameWriter, code int, message string, err error, logArgs ...any) {
 	s.log.Warn("request rejected", append([]any{"code", code, "error", err}, logArgs...)...)
-	_ = out.writeJSON(protocol.FrameError, protocol.Error{Code: code, Message: message})
+	_ = out.writeJSON(protocol.FrameError, protocol.Error{Code: code, Message: message, Warning: s.pendingAllowWarning()})
+}
+
+// pendingAllowWarning returns the warning the daemon gives a hostrun
+// client in the first answer of an exchange (the initial credit, waiting,
+// allowed or error frame; see protocol.Credit), computed as the frame is
+// written; "" when there is none. It joins, with "; ", the warnings of the pending
+// refusal of the rules file's content (see notAllowedWarning) and of the
+// change the last arm reported not allowed (see armWarning).
+func (s *Server) pendingAllowWarning() string {
+	var texts []string
+	for _, w := range []string{s.notAllowedWarning(), s.armWarning(s.pendingUnallowed())} {
+		if w != "" {
+			texts = append(texts, w)
+		}
+	}
+	return strings.Join(texts, "; ")
 }
 
 // cwdMessage describes a failed cwd mapping in container terms only.

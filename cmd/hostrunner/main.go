@@ -853,13 +853,15 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 
 // allowOptions returns the options that have the daemon of cfg reread
 // only rules file content allowed in cfg's allow store for its workspace
-// and its daemon settings, as `up` checks them, and record an allow
-// request of its own rules file and settings for content not allowed, so
-// that `hostrunner allow` allows what the daemon checks.
+// and its daemon settings, as `up` checks them (with the settings the
+// daemon gives, its own or those of a change an arm reports not allowed),
+// and record an allow request of its own rules file and settings for
+// content not allowed, so that `hostrunner allow` allows what the daemon
+// checks.
 func allowOptions(cfg serveConfig) []daemon.Option {
 	return []daemon.Option{
-		daemon.WithAllowed(func(digest string) (bool, error) {
-			return cfg.allows.Allowed(cfg.workspace, digest, cfg.Settings.Daemon())
+		daemon.WithAllowed(func(digest string, settings map[string]string) (bool, error) {
+			return cfg.allows.Allowed(cfg.workspace, digest, settings)
 		}),
 		daemon.WithAllowRequest(func(digest string) error {
 			return cfg.allows.Request(cfg.workspace, cfg.RulesFile, digest, cfg.Settings.Daemon())

@@ -256,6 +256,15 @@ effect within about 2 s, without a restart (see [Rules](#rules)). With `--no-rer
 edit takes effect at the next `up`. Adding a rule (`a`) after a hand
 edit not allowed adds none, and the old rules stay.
 
+While rules or settings wait for an allow (the daemon found the rules
+file changed to content not allowed, or `up` armed it as above), every
+`hostrun` call, a run, `--ask`, a dry run or a refusal, prints one line
+on stderr, `hostrun: warning: <text>`, saying that a human on the host
+runs `hostrunner allow`. The command's output and exit code do not
+change. The line goes once the change is allowed or undone (the file
+goes back to the rules served, or a later `up` arms none); undoing a
+settings change alone is seen only at the next `up`.
+
 The first `up` after upgrading to a hostrunner with allows fails the
 same way until the workspace is allowed. `up --restart` and `hostrunner
 restart` check the allow before they stop the running daemon: content
