@@ -201,6 +201,22 @@ workspace, with sections that apply to single workspaces.
 The settings file of one workspace, kept in the workspace unless
 its path is given; what it sets overrides the host settings file.
 
+### Config protection
+
+**Allow**:
+A human on the host trusting one content of a workspace's rules file
+together with the daemon settings resolved for it.
+_Avoid_: trust, approve (an approval lets one command through)
+
+**Allowed**:
+Said of rules and daemon settings an allow covers; a daemon serves no
+others.
+
+**Mount check**:
+The daemon's check that its armed container cannot write the files that
+configure the workspace's devcontainer and daemon.
+_Avoid_: read-only check, writable warning
+
 ### Approvals
 
 **Approval request**:
