@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kravlab/hostrunner/internal/allow"
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
 	"github.com/kravlab/hostrunner/internal/settings"
@@ -38,12 +39,17 @@ func TestMain(m *testing.M) {
 		dir, client, _ := strings.Cut(os.Getenv(runUpEnv), ":")
 		os.Unsetenv(runUpEnv) // the daemon Up spawns must not run Up again
 		os.Setenv(fakeDaemonEnv, "serve")
-		err := Up(context.Background(), Config{
+		cfg := Config{
 			Dir: dir, Workspace: "/w", ContainerWorkspace: "/c",
 			Daemon: os.Args[0], Client: client,
+			Allows:   allow.Store{Dir: filepath.Join(dir, "allow")},
 			Settings: settings.Settings{RulesFile: filepath.Join(dir, "missing-rules.yaml"), Reread: true, ReadyTimeout: 5 * time.Second},
-		})
-		if err != nil {
+		}
+		// The rules file is missing, which has the digest "missing".
+		if _, err := cfg.Allows.Allow(cfg.Workspace, cfg.RulesFile, "missing", cfg.Settings.Daemon()); err != nil {
+			os.Exit(1)
+		}
+		if err := Up(context.Background(), cfg); err != nil {
 			os.Exit(1)
 		}
 		os.Exit(0)
@@ -193,7 +199,8 @@ func shortDir(t *testing.T) string {
 }
 
 // fakeConfig returns a Config that spawns the fake daemon in mode, and
-// kills every fake daemon started into its Dir when the test ends.
+// kills every fake daemon started into its Dir when the test ends. Its
+// rules file is missing and that, with its settings, is allowed.
 func fakeConfig(t *testing.T, mode string) Config {
 	t.Helper()
 	base := shortDir(t)
@@ -203,8 +210,10 @@ func fakeConfig(t *testing.T, mode string) Config {
 		ContainerWorkspace: "/workspaces/app",
 		Daemon:             os.Args[0],
 		Client:             mustStatic(t),
+		Allows:             allow.Store{Dir: filepath.Join(base, "allow")},
 		Settings:           settings.Settings{RulesFile: filepath.Join(base, "hostrun.yaml"), Reread: true, ReadyTimeout: 5 * time.Second},
 	}
+	allowCurrent(t, cfg)
 	t.Setenv(fakeDaemonEnv, mode)
 	t.Cleanup(func() {
 		for _, pid := range lines(t, filepath.Join(cfg.Dir, "fake.pids")) {
@@ -214,6 +223,19 @@ func fakeConfig(t *testing.T, mode string) Config {
 		}
 	})
 	return cfg
+}
+
+// allowCurrent allows what a human running `hostrunner allow` would:
+// the rules file of cfg as it is now, with the daemon settings of cfg.
+func allowCurrent(t *testing.T, cfg Config) {
+	t.Helper()
+	policy, err := rules.Load(cfg.RulesFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cfg.Allows.Allow(cfg.Workspace, cfg.RulesFile, policy.Digest(), cfg.Settings.Daemon()); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // alivePid reports whether process pid exists.
@@ -496,6 +518,7 @@ func TestUpReplacesDaemonThatStepsAside(t *testing.T) {
 	if err := os.WriteFile(cfg.RulesFile, []byte("rules:\n  - command: git status\n    args: any\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	allowCurrent(t, cfg)
 	if err := Up(context.Background(), cfg); err != nil {
 		t.Fatalf("first Up: %v", err)
 	}
@@ -504,6 +527,7 @@ func TestUpReplacesDaemonThatStepsAside(t *testing.T) {
 	if err := os.WriteFile(cfg.RulesFile, []byte("rules:\n  - command: git status\n    args: none\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	allowCurrent(t, cfg)
 	if err := Up(context.Background(), cfg); err != nil {
 		t.Fatalf("Up after the rules changed: %v", err)
 	}
@@ -527,6 +551,7 @@ func TestUpReplacesDaemonWhoseRereadingDiffers(t *testing.T) {
 	}
 	first := onlyPid(t, cfg.Dir)
 	cfg.Reread = false
+	allowCurrent(t, cfg)
 	if err := Up(context.Background(), cfg); err != nil {
 		t.Fatalf("Up with --no-reread: %v", err)
 	}
@@ -797,11 +822,13 @@ func TestServeArgsResolveToUpsSettings(t *testing.T) {
 func TestUpReplacesDaemonWhoseSettingsDiffer(t *testing.T) {
 	cfg := fakeConfig(t, "serve")
 	cfg.Grace = 15 * time.Second
+	allowCurrent(t, cfg)
 	if err := Up(context.Background(), cfg); err != nil {
 		t.Fatalf("first Up: %v", err)
 	}
 	first := onlyPid(t, cfg.Dir)
 	cfg.Grace = time.Minute
+	allowCurrent(t, cfg)
 	if err := Up(context.Background(), cfg); err != nil {
 		t.Fatalf("Up with another grace: %v", err)
 	}
@@ -815,4 +842,201 @@ func TestUpReplacesDaemonWhoseSettingsDiffer(t *testing.T) {
 	if got := lines(t, filepath.Join(cfg.Dir, "fake.armed")); strings.Join(got, " ") != "armed step aside armed armed" {
 		t.Fatalf("arms %q, want armed, step aside, then the new daemon armed twice", got)
 	}
+}
+
+// gitStatusRules is a valid rules file, and gitStatusDigest the digest of
+// exactly these bytes.
+const (
+	gitStatusRules  = "rules:\n  - command: git status\n    args: any\n"
+	gitStatusDigest = "5dae3cd4d8455c5930e19b895e6c5d29acf4ac18b6c64010d05cd47dc2c97ac7"
+)
+
+// notAllowed fails the test unless err says that the rules file with
+// digest, and the daemon settings, are not allowed for the workspace of
+// cfg, and that a human allows them with `hostrunner allow`.
+func notAllowed(t *testing.T, err error, cfg Config, digest string) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("Up succeeded, want an error that the rules and settings are not allowed")
+	}
+	for _, want := range []string{cfg.RulesFile, "(digest " + digest + ")", "not allowed for " + cfg.Workspace, "hostrunner allow " + cfg.Workspace} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q lacks %q", err, want)
+		}
+	}
+}
+
+// nothingStarted fails the test if a daemon was started or armed in dir.
+func nothingStarted(t *testing.T, dir string) {
+	t.Helper()
+	if pids := lines(t, filepath.Join(dir, "fake.pids")); len(pids) != 0 {
+		t.Errorf("daemons were started: %v", pids)
+	}
+	if armed := lines(t, filepath.Join(dir, "fake.armed")); len(armed) != 0 {
+		t.Errorf("daemons were armed: %v", armed)
+	}
+}
+
+func TestUpWithoutAnAllowFailsAndStartsNothing(t *testing.T) {
+	cfg := fakeConfig(t, "serve")
+	cfg.Allows = allow.Store{Dir: filepath.Join(t.TempDir(), "allow")}
+	notAllowed(t, Up(context.Background(), cfg), cfg, "missing")
+	nothingStarted(t, cfg.Dir)
+}
+
+func TestUpFailsWithANotAllowedError(t *testing.T) {
+	cfg := fakeConfig(t, "serve")
+	if err := os.WriteFile(cfg.RulesFile, []byte(gitStatusRules), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := Up(context.Background(), cfg)
+	var na *NotAllowedError
+	if !errors.As(err, &na) {
+		t.Fatalf("got %v, want a *NotAllowedError", err)
+	}
+	if na.Workspace != cfg.Workspace || na.RulesFile != cfg.RulesFile || na.Digest != gitStatusDigest {
+		t.Fatalf("got %+v, want workspace %q, rules file %q and digest %q", na, cfg.Workspace, cfg.RulesFile, gitStatusDigest)
+	}
+}
+
+// The error shows the rules file and the workspace escaped, so a control
+// character in a path cannot reach the terminal raw.
+func TestNotAllowedErrorEscapesThePaths(t *testing.T) {
+	e := &NotAllowedError{Workspace: "/w\x1b[2J", RulesFile: "/w/r\x1b[2J.yaml", Digest: "abc123"}
+	want := `the rules file "/w/r\x1b[2J.yaml" (digest abc123) and the daemon settings are not allowed for "/w\x1b[2J": ` +
+		`a human on the host runs hostrunner allow "/w\x1b[2J" to allow them`
+	if got := e.Error(); got != want {
+		t.Fatalf("Error() = %q, want %q", got, want)
+	}
+}
+
+func TestUpAfterAnAllowStartsTheDaemon(t *testing.T) {
+	cfg := fakeConfig(t, "serve")
+	cfg.Allows = allow.Store{Dir: filepath.Join(t.TempDir(), "allow")}
+	notAllowed(t, Up(context.Background(), cfg), cfg, "missing")
+	allowCurrent(t, cfg)
+	if err := Up(context.Background(), cfg); err != nil {
+		t.Fatalf("Up after the allow: %v", err)
+	}
+	if !alivePid(onlyPid(t, cfg.Dir)) {
+		t.Fatal("daemon is not running")
+	}
+}
+
+// An allow covers one content of the rules file with the daemon settings
+// as they were: another content or another daemon setting needs a new
+// one.
+func TestUpAfterAChangeSinceTheAllowFails(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		change func(t *testing.T, cfg *Config)
+		digest string
+	}{
+		{"a daemon setting", func(t *testing.T, cfg *Config) { cfg.Grace = time.Minute }, "missing"},
+		{"the rules file content", func(t *testing.T, cfg *Config) {
+			if err := os.WriteFile(cfg.RulesFile, []byte(gitStatusRules), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}, gitStatusDigest},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := fakeConfig(t, "serve")
+			tt.change(t, &cfg)
+			notAllowed(t, Up(context.Background(), cfg), cfg, tt.digest)
+			nothingStarted(t, cfg.Dir)
+		})
+	}
+}
+
+// ready_timeout is up's own setting, which no daemon carries.
+func TestUpAfterAChangeOfTheReadyTimeoutNeedsNoNewAllow(t *testing.T) {
+	cfg := fakeConfig(t, "serve")
+	cfg.ReadyTimeout = 7 * time.Second
+	if err := Up(context.Background(), cfg); err != nil {
+		t.Fatalf("Up: %v", err)
+	}
+	onlyPid(t, cfg.Dir)
+}
+
+// Not allowed is fail-closed: a daemon that is running is neither armed
+// nor stopped by an up whose rules are not allowed.
+func TestUpOfChangedRulesNotAllowedLeavesTheRunningDaemon(t *testing.T) {
+	cfg := fakeConfig(t, "serve")
+	if err := Up(context.Background(), cfg); err != nil {
+		t.Fatalf("first Up: %v", err)
+	}
+	first := onlyPid(t, cfg.Dir)
+	if err := os.WriteFile(cfg.RulesFile, []byte(gitStatusRules), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	notAllowed(t, Up(context.Background(), cfg), cfg, gitStatusDigest)
+	if !alivePid(first) {
+		t.Fatal("the running daemon was stopped")
+	}
+	if pid := onlyPid(t, cfg.Dir); pid != first {
+		t.Fatalf("daemon pid %d, want %d", pid, first)
+	}
+	if got := lines(t, filepath.Join(cfg.Dir, "fake.armed")); strings.Join(got, " ") != "armed" {
+		t.Fatalf("arms %q, want only the first Up's", got)
+	}
+}
+
+// A refused up records what it asked for, for a human on the host to
+// allow with `hostrunner allow`.
+func TestUpRefusedRecordsItsRequest(t *testing.T) {
+	cfg := fakeConfig(t, "serve")
+	cfg.Grace = time.Minute
+	if err := os.WriteFile(cfg.RulesFile, []byte(gitStatusRules), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	notAllowed(t, Up(context.Background(), cfg), cfg, gitStatusDigest)
+	e, ok, err := cfg.Allows.Pending(cfg.Workspace)
+	if err != nil || !ok {
+		t.Fatalf("Pending = %v, %v, want a request", ok, err)
+	}
+	if e.Workspace != cfg.Workspace || e.RulesFile != cfg.RulesFile || e.Digest != gitStatusDigest || !maps.Equal(e.Settings, cfg.Settings.Daemon()) {
+		t.Fatalf("request %+v, want workspace %q, rules file %q, digest %q and settings %v", e, cfg.Workspace, cfg.RulesFile, gitStatusDigest, cfg.Settings.Daemon())
+	}
+	if e.Settings["grace"] != "1m0s" {
+		t.Errorf("request grace %q, want 1m0s", e.Settings["grace"])
+	}
+}
+
+func TestUpAllowedRecordsNoRequest(t *testing.T) {
+	cfg := fakeConfig(t, "serve")
+	if err := Up(context.Background(), cfg); err != nil {
+		t.Fatalf("Up: %v", err)
+	}
+	if _, ok, err := cfg.Allows.Pending(cfg.Workspace); err != nil || ok {
+		t.Fatalf("Pending = %v, %v, want no request", ok, err)
+	}
+}
+
+// A store where the request cannot be written fails up with that error,
+// not with the refusal, which would name an allow that cannot answer.
+func TestUpRefusedFailsWhenTheRequestCannotBeRecorded(t *testing.T) {
+	cfg := fakeConfig(t, "serve")
+	if err := os.WriteFile(cfg.RulesFile, []byte(gitStatusRules), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	notAllowed(t, Up(context.Background(), cfg), cfg, gitStatusDigest)
+	requests, err := filepath.Glob(filepath.Join(cfg.Allows.Dir, "*.request.json"))
+	if err != nil || len(requests) != 1 {
+		t.Fatalf("request files %v, %v, want one", requests, err)
+	}
+	// A directory that is not empty cannot be replaced by the new request.
+	if err := os.Remove(requests[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(requests[0], "x"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	err = Up(context.Background(), cfg)
+	if na, ok := errors.AsType[*NotAllowedError](err); ok || err == nil {
+		t.Fatalf("got %v (%v), want the error of recording the request", err, na)
+	}
+	if want := "record the request of " + cfg.Workspace; !strings.Contains(err.Error(), want) {
+		t.Errorf("error %q lacks %q", err, want)
+	}
+	nothingStarted(t, cfg.Dir)
 }

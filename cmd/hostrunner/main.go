@@ -9,6 +9,8 @@
 //	    [--watch] [settings]
 //	hostrunner test [--settings <path>] [--workspace-settings <path>] [--rules-file <path>]
 //	    [--] <command> [args...]
+//	hostrunner allow [<workspace>]
+//	hostrunner deny [<workspace>]
 //	hostrunner approve [--dir <runtime-dir>] [settings]
 //	hostrunner stop [--dir <runtime-dir> | --all | --choose] [--kill | --wait] [settings]
 //	hostrunner restart [--dir <runtime-dir> | --all | --choose] [--kill | --wait] [settings]
@@ -26,7 +28,17 @@
 // test: whether the rules file `up` would use with the current directory
 // as the workspace (default .devcontainer/hostrunner-rules.yaml) allows
 // a command; it exits 0 when it does, 126 when it does not, and 1 on any
-// error. `update` switches the versioned install
+// error. `allow` is what a human on the host runs to trust a workspace's
+// rules: `up` starts a daemon only for rules and settings so allowed, and
+// an `up` refused records what it asked for (the rules file, its digest
+// and the daemon settings) in $XDG_DATA_HOME/hostrunner/allow; `allow`
+// allows exactly that request once the rules file still has that digest,
+// or, without a request, the digest of the rules file together with the
+// daemon settings `up` without settings flags resolves for the workspace,
+// and prints what it allowed. `deny` removes the allow. Only the latest
+// allow of a workspace is kept; the workspace is the current directory
+// unless one is named (see internal/allow).
+// `update` switches the versioned install
 // of hostrunner and hostrun to the latest release (see internal/update).
 // `version` prints the module version Go stamped into the binary (see
 // buildVersion). `approve` runs an approval session in a host terminal: it
@@ -74,6 +86,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/kravlab/hostrunner/internal/allow"
 	"github.com/kravlab/hostrunner/internal/approval"
 	"github.com/kravlab/hostrunner/internal/daemon"
 	"github.com/kravlab/hostrunner/internal/hostterm"
@@ -90,7 +103,9 @@ import (
 )
 
 const (
-	usage             = "usage: hostrunner up|serve|test|approve|stop|restart|update|instructions|version [flags]; see `hostrunner <command> -h`"
+	usage             = "usage: hostrunner up|serve|test|allow|deny|approve|stop|restart|update|instructions|version [flags]; see `hostrunner <command> -h`"
+	allowUsage        = "usage: hostrunner allow [<workspace>]"
+	denyUsage         = "usage: hostrunner deny [<workspace>]"
 	updateUsage       = "usage: hostrunner update [--check]"
 	instructionsUsage = "usage: hostrunner instructions [--append [<path>]]"
 	versionUsage      = "usage: hostrunner version"
@@ -148,10 +163,10 @@ func exitCode(err error) int {
 }
 
 // run dispatches the subcommand in args; stdout receives `version`'s,
-// `update`'s and `instructions`' output and the approval session, which
-// reads the human's answers from stdin; stderr flag help, the daemon's
-// log, the Rules test's verdict and the questions of `instructions
-// --append`, answered on stdin.
+// `update`'s, `instructions`', `allow`'s and `deny`'s output and the
+// approval session, which reads the human's answers from stdin; stderr
+// flag help, the daemon's log, the Rules test's verdict, the warning of
+// `allow` and the questions of `instructions --append`, answered on stdin.
 // The caller prints a returned error; see exitCode for the exit code.
 func run(args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
@@ -213,6 +228,18 @@ func run(args []string, stdout, stderr io.Writer) error {
 			return err
 		}
 		return rulesTest(cfg, stderr)
+	case "allow":
+		cfg, err := parseAllow(args[1:], os.Getenv, stderr)
+		if err != nil {
+			return err
+		}
+		return runAllow(cfg, stdout, stderr)
+	case "deny":
+		cfg, err := parseDeny(args[1:], os.Getenv, stderr)
+		if err != nil {
+			return err
+		}
+		return runDeny(cfg, stdout)
 	case "approve":
 		cfg, err := parseApprove(args[1:], os.Getenv, stderr)
 		if err != nil {
@@ -294,7 +321,8 @@ func parseFlags(fs *flag.FlagSet, args []string, usage string) error {
 // paths are required. exe is the running hostrunner, which becomes the
 // daemon; the client is the hostrun binary installed next to it. The
 // settings are resolved here, with getenv reading the environment, and
-// all of them given to the daemon.
+// all of them given to the daemon. The allow store up checks is the one
+// allow.Open opens.
 func parseUp(args []string, exe string, getenv func(string) string, output io.Writer) (upConfig, error) {
 	var (
 		dir        string
@@ -330,8 +358,13 @@ func parseUp(args []string, exe string, getenv func(string) string, output io.Wr
 	if err != nil {
 		return upConfig{}, err
 	}
+	allows, err := allow.Open(getenv)
+	if err != nil {
+		return upConfig{}, err
+	}
 	cfg := daemonBinaries(exe)
 	cfg.Dir, cfg.Workspace, cfg.ContainerWorkspace = dir, ws.workspace, ws.containerWorkspace
+	cfg.Allows = allows
 	cfg.Settings = s.Settings
 	return upConfig{launch: cfg, ignored: s.IgnoredRules, restart: restart, answer: answer}, nil
 }

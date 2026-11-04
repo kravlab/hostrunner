@@ -98,7 +98,9 @@ type Config struct {
 // file and rereading. A daemon that saw its armed container stop, and so
 // is about to exit, is only stopped, its settings and rules unchecked,
 // and so is one that stops by itself meanwhile; the next `up` starts a
-// new one.
+// new one. `hostrunner restart` does not check the allow yet: it starts
+// the new daemon whether or not its rules and settings are allowed
+// (whether it should check is issue #138).
 type Restart struct {
 	Daemon string // hostrunner executable to start as the daemon
 	Client string // hostrun binary to install into the runtime directory

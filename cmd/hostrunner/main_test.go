@@ -18,6 +18,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/kravlab/hostrunner/internal/allow"
 	"github.com/kravlab/hostrunner/internal/client"
 	"github.com/kravlab/hostrunner/internal/fakedaemon"
 	"github.com/kravlab/hostrunner/internal/instructions"
@@ -189,7 +190,7 @@ func TestParseServeRejectsPositionalArguments(t *testing.T) {
 
 func TestParseUpBuildsLaunchConfig(t *testing.T) {
 	exe := "/home/u/.local/bin/hostrunner"
-	got, err := parseUp([]string{"--dir", "/run/user/1000/hostrunner/abc", "--workspace", "/home/u/app", "--container-workspace", "/workspaces/app"}, exe, noEnv, io.Discard)
+	got, err := parseUp([]string{"--dir", "/run/user/1000/hostrunner/abc", "--workspace", "/home/u/app", "--container-workspace", "/workspaces/app"}, exe, withDataHome(noEnv), io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,10 +200,24 @@ func TestParseUpBuildsLaunchConfig(t *testing.T) {
 		ContainerWorkspace: "/workspaces/app",
 		Daemon:             exe,
 		Client:             filepath.Join("/home/u/.local/bin", "hostrun"),
+		Allows:             allow.Store{Dir: "/data/hostrunner/allow"},
 		Settings:           tuned("/home/u/app/.devcontainer/hostrunner-rules.yaml", 30*time.Minute, 15*time.Second, true),
 	}
 	if got.launch != want || got.restart || got.answer != stop.Ask {
 		t.Fatalf("got %+v, want %+v without --restart", got, want)
+	}
+}
+
+// The allow store up checks is the one allow.Open opens; with no place to
+// keep an allow there is nothing to check against, which is an error.
+func TestParseUpFindsTheAllowStore(t *testing.T) {
+	args := []string{"--dir", "/d", "--workspace", "/w", "--container-workspace", "/c"}
+	got, err := parseUp(args, "/bin/hostrunner", envOf(map[string]string{"HOME": "/home/u"}), io.Discard)
+	if want := "/home/u/.local/share/hostrunner/allow"; err != nil || got.launch.Allows.Dir != want {
+		t.Fatalf("got %q, %v; want %q", got.launch.Allows.Dir, err, want)
+	}
+	if _, err := parseUp(args, "/bin/hostrunner", noEnv, io.Discard); err == nil || !strings.Contains(err.Error(), "XDG_DATA_HOME") {
+		t.Fatalf("got %v, want an error naming XDG_DATA_HOME", err)
 	}
 }
 
@@ -215,7 +230,7 @@ func TestUpAndServeMakeTheWorkspaceAbsolute(t *testing.T) {
 		t.Fatal(err)
 	}
 	ws := filepath.Join(cwd, "app")
-	up, err := parseUp([]string{"--dir", "/d", "--workspace", "app", "--container-workspace", "/c"}, "/bin/hostrunner", noEnv, io.Discard)
+	up, err := parseUp([]string{"--dir", "/d", "--workspace", "app", "--container-workspace", "/c"}, "/bin/hostrunner", withDataHome(noEnv), io.Discard)
 	if err != nil || up.launch.Workspace != ws || up.launch.RulesFile != filepath.Join(ws, ".devcontainer", "hostrunner-rules.yaml") {
 		t.Fatalf("up: got %q and %q, %v; want %q", up.launch.Workspace, up.launch.RulesFile, err, ws)
 	}
@@ -243,7 +258,7 @@ func TestParseUpRequiresEveryFlag(t *testing.T) {
 // --no-reread keeps a daemon from rereading its rules file by itself: up
 // passes it on to the daemon it starts.
 func TestParseNoReread(t *testing.T) {
-	up, err := parseUp([]string{"--dir", "/d", "--workspace", "/w", "--container-workspace", "/c", "--no-reread"}, "/bin/hostrunner", noEnv, io.Discard)
+	up, err := parseUp([]string{"--dir", "/d", "--workspace", "/w", "--container-workspace", "/c", "--no-reread"}, "/bin/hostrunner", withDataHome(noEnv), io.Discard)
 	if err != nil || up.launch.Reread {
 		t.Fatalf("up: got %+v, %v; want no reread", up.launch, err)
 	}
@@ -272,6 +287,17 @@ func tuned(rulesFile string, startupTimeout, grace time.Duration, reread bool) s
 // and no HOME or XDG_CONFIG_HOME, so no default host settings file.
 func noEnv(string) string { return "" }
 
+// withDataHome returns getenv with XDG_DATA_HOME set to /data, so the
+// allow store of an up lies in /data/hostrunner/allow.
+func withDataHome(getenv func(string) string) func(string) string {
+	return func(name string) string {
+		if name == "XDG_DATA_HOME" {
+			return "/data"
+		}
+		return getenv(name)
+	}
+}
+
 // envOf is a getenv over vars; every other variable is empty.
 func envOf(vars map[string]string) func(string) string {
 	return func(name string) string { return vars[name] }
@@ -289,10 +315,11 @@ func settingsFile(t *testing.T, content string) string {
 }
 
 // resolveUp parses `hostrunner up` with flags after the required ones
-// and returns the settings it gives the daemon.
+// and returns the settings it gives the daemon; getenv, besides what the
+// test sets, has the data directory of the allow store.
 func resolveUp(flags []string, getenv func(string) string) (settings.Settings, error) {
 	args := append([]string{"--dir", "/d", "--workspace", "/w", "--container-workspace", "/c"}, flags...)
-	cfg, err := parseUp(args, "/bin/hostrunner", getenv, io.Discard)
+	cfg, err := parseUp(args, "/bin/hostrunner", withDataHome(getenv), io.Discard)
 	return cfg.launch.Settings, err
 }
 
@@ -1087,7 +1114,7 @@ func TestRunDispatchesUpdate(t *testing.T) {
 // TestUsageListsTheSubcommands checks that the top-level usage names
 // every subcommand.
 func TestUsageListsTheSubcommands(t *testing.T) {
-	if err := run(nil, io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "up|serve|test|approve|stop|restart|update|instructions|version") {
+	if err := run(nil, io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "up|serve|test|allow|deny|approve|stop|restart|update|instructions|version") {
 		t.Fatalf("got %v, want the usage listing every subcommand", err)
 	}
 }
@@ -1534,7 +1561,7 @@ func TestParseUpRestart(t *testing.T) {
 		{[]string{"--restart", "--kill"}, stop.Kill},
 		{[]string{"--restart", "--wait"}, stop.Wait},
 	} {
-		got, err := parseUp(append(base, tt.flags...), "/bin/hostrunner", noEnv, io.Discard)
+		got, err := parseUp(append(base, tt.flags...), "/bin/hostrunner", withDataHome(noEnv), io.Discard)
 		if err != nil {
 			t.Fatalf("%q: %v", tt.flags, err)
 		}

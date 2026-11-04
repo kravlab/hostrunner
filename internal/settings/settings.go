@@ -76,9 +76,9 @@ type Resolved struct {
 	IgnoredRules string
 }
 
-// rulesFileKey is the name of the key rules_file, which resolve treats
+// RulesFileKey is the name of the key rules_file, which resolve treats
 // apart from the others: only it has a default that depends on files.
-const rulesFileKey = "rules_file"
+const RulesFileKey = "rules_file"
 
 // defaults are the settings no source sets, for the workspace at the
 // host path workspace. Its rules file is the default name, which looks at
@@ -236,7 +236,7 @@ func (k key) set(s *Settings, v any) {
 // keys are every setting, in the order errors and flags follow.
 var keys = []key{
 	{
-		name: rulesFileKey, kind: kindPath, scope: scopeDaemon,
+		name: RulesFileKey, kind: kindPath, scope: scopeDaemon,
 		usage: "rules file (default <workspace>/.devcontainer/hostrunner-rules.yaml, else hostrun.yaml there)",
 		field: func(s *Settings) any { return &s.RulesFile },
 	},
@@ -327,7 +327,7 @@ var restartScopes = []scope{scopeRuntimeRoot, scopeStop, scopeDaemon, scopeUp}
 // restartKeys are the keys restart has flags for: the rules file of the
 // new daemon and the keys of stop.
 func restartKeys() []key {
-	return append([]key{mustLookup(rulesFileKey)}, keysOf(scopeRuntimeRoot, scopeStop)...)
+	return append([]key{mustLookup(RulesFileKey)}, keysOf(scopeRuntimeRoot, scopeStop)...)
 }
 
 // keysOf returns the keys whose flags the commands of in take.
@@ -406,7 +406,7 @@ func usageOf(flagged []key) string {
 
 // RulesFileUsage is the usage of the flags RegisterRulesFile adds, those
 // that choose the rules file.
-func RulesFileUsage() string { return usageOf([]key{mustLookup(rulesFileKey)}) }
+func RulesFileUsage() string { return usageOf([]key{mustLookup(RulesFileKey)}) }
 
 // settingsFlagUsage and workspaceFlagUsage are the usages of the flags
 // that name the host settings file and the workspace settings file.
@@ -552,7 +552,7 @@ func resolve(in scopes, flags layer, hostNamed, workspaceNamed, workspace string
 		return Resolved{}, err
 	}
 	r := Resolved{Settings: s}
-	if !sets(rulesFileKey, flags, common.layer, section.layer, wsFile.layer, vars) {
+	if !sets(RulesFileKey, flags, common.layer, section.layer, wsFile.layer, vars) {
 		r.RulesFile, r.IgnoredRules = rulesfile.Choose(filepath.Join(workspace, rulesfile.Dir))
 	}
 	return r, nil

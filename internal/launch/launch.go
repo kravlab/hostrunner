@@ -7,7 +7,8 @@
 // a rebuild removes the old container before building the new image: the
 // daemon must wait for the new container rather than exit after its grace
 // period. The runtime directory is what the container mounts (read-only) at
-// /run/hostrunner.
+// /run/hostrunner. It starts or arms a daemon only for rules and daemon
+// settings a human on the host has allowed.
 package launch
 
 import (
@@ -23,6 +24,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/kravlab/hostrunner/internal/allow"
+	"github.com/kravlab/hostrunner/internal/hostterm"
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
 	"github.com/kravlab/hostrunner/internal/settings"
@@ -73,6 +76,11 @@ type Config struct {
 	ContainerWorkspace string // the same folder inside the container
 	Daemon             string // hostrunner executable to start as the daemon
 	Client             string // hostrun binary to install into Dir
+	// Allows is the allow store up checks: it starts or arms a daemon only
+	// for the rules and daemon settings the store holds for Workspace. No
+	// setting names it, so a workspace cannot point up at a store it
+	// controls.
+	Allows allow.Store
 	// Settings are the settings up, or restart, resolved. Each the daemon
 	// takes is given to it as its flag and carried in every arm;
 	// ReadyTimeout, up's own, is how long to wait for the daemon's socket
@@ -81,14 +89,18 @@ type Config struct {
 }
 
 // Up makes sure an armed daemon serves cfg.Dir with the current rules. It
-// validates cfg.RulesFile first (invalid rules are an error), arms a running
-// daemon, and starts a new one if there is none or the running one loaded
-// other rules (it steps aside when armed with a different digest). It
-// returns once the daemon has answered an arm request, or an error carrying
-// the daemon's log output if it did not come up. Concurrent calls for the
-// same directory are serialized, so they end up sharing one daemon.
+// validates cfg.RulesFile first (invalid rules are an error), then checks
+// that the rules and the daemon settings are allowed (see PrepareAllowed):
+// if they are not it fails before taking the lock, and starts and arms
+// nothing, leaving a daemon that is already running as it is. Otherwise it
+// arms a running daemon, and starts a new one if there is none or the
+// running one loaded other rules (it steps aside when armed with a
+// different digest). It returns once the daemon has answered an arm
+// request, or an error carrying the daemon's log output if it did not come
+// up. Concurrent calls for the same directory are serialized, so they end
+// up sharing one daemon.
 func Up(ctx context.Context, cfg Config) error {
-	p, err := Prepare(cfg)
+	p, err := PrepareAllowed(cfg)
 	if err != nil {
 		return err
 	}
@@ -101,7 +113,8 @@ func Up(ctx context.Context, cfg Config) error {
 }
 
 // Prepared is an `up` whose runtime directory is ready and whose rules
-// are valid, to run with UpLocked.
+// are valid, to run with UpLocked. Whether the rules and settings are
+// allowed is not part of being prepared: PrepareAllowed checks it too.
 type Prepared struct {
 	cfg            Config
 	socket, digest string
@@ -126,8 +139,71 @@ func Prepare(cfg Config) (*Prepared, error) {
 	return &Prepared{cfg: cfg, socket: socket, digest: policy.Digest()}, nil
 }
 
+// PrepareAllowed is Prepare, then the check that the rules and the daemon
+// settings are allowed (see checkAllowed): the entry point of `hostrunner
+// up` and `up --restart`, before they take the lock or touch a running
+// daemon. Plain Prepare stays for `hostrunner restart`, which does not
+// check the allow yet (whether it should is issue #138).
+func PrepareAllowed(cfg Config) (*Prepared, error) {
+	p, err := Prepare(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if err := p.checkAllowed(); err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+// NotAllowedError says that the content of the rules file, with the
+// daemon settings, is not allowed for the workspace: no human on the host
+// ran `hostrunner allow` for exactly this since it last changed. The
+// refused up recorded its request, which `hostrunner allow` allows.
+type NotAllowedError struct {
+	Workspace string // the workspace folder on the host
+	RulesFile string // the rules file as up resolved it
+	Digest    string // the digest of the rules file's content, "missing" for a missing file
+}
+
+// Error names the rules file and its digest, so the human sees what is
+// refused, and the command that allows it. The paths are shown through
+// hostterm.Display, so a control character in one cannot reach the
+// terminal raw.
+func (e *NotAllowedError) Error() string {
+	ws := hostterm.Display(e.Workspace)
+	return fmt.Sprintf("the rules file %s (digest %s) and the daemon settings are not allowed for %s: "+
+		"a human on the host runs hostrunner allow %s to allow them",
+		hostterm.Display(e.RulesFile), e.Digest, ws, ws)
+}
+
+// checkAllowed returns a *NotAllowedError unless the allow store of the
+// Config holds exactly these rules and daemon settings for its workspace.
+// Before it refuses, it records them in the store as the workspace's
+// request (see allow.Store.Request), so the human who runs `hostrunner
+// allow` allows what this up asked for. PrepareAllowed calls it, before
+// the lock is taken or a running daemon touched; UpLocked does not check.
+// A store that cannot be read, or where the request cannot be
+// recorded, is an error of its own, not a refusal, and is wrapped.
+func (p *Prepared) checkAllowed() error {
+	cfg := p.cfg
+	ok, err := cfg.Allows.Allowed(cfg.Workspace, p.digest, cfg.Settings.Daemon())
+	if err != nil {
+		return fmt.Errorf("check the allow of %s: %w", cfg.Workspace, err)
+	}
+	if !ok {
+		if err := cfg.Allows.Request(cfg.Workspace, cfg.RulesFile, p.digest, cfg.Settings.Daemon()); err != nil {
+			return fmt.Errorf("record the request of %s: %w", cfg.Workspace, err)
+		}
+		return &NotAllowedError{Workspace: cfg.Workspace, RulesFile: cfg.RulesFile, Digest: p.digest}
+	}
+	return nil
+}
+
 // UpLocked is Up for a caller that holds the runtime directory's lock
-// (see LockDir): restart, which stopped the daemon under it.
+// (see LockDir): restart, which stopped the daemon under it. It does not
+// check the allow: `up --restart` checked it before (see PrepareAllowed),
+// and `hostrunner restart` does not check the allow yet (whether it
+// should is issue #138).
 func (p *Prepared) UpLocked(ctx context.Context) error {
 	cfg, socket, digest := p.cfg, p.socket, p.digest
 	stepAside, err := arm(ctx, socket, digest, cfg.Settings)

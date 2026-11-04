@@ -35,13 +35,16 @@ const (
 )
 
 // env is the environment the devcontainer CLI (and so initializeCommand)
-// runs with: the fresh binaries first in PATH. XDG_RUNTIME_DIR is left as
+// runs with: the fresh binaries first in PATH, and XDG_DATA_HOME in a
+// directory of the test's, so the allows the suite records stay out of the
+// host's own allow store. XDG_RUNTIME_DIR is left as
 // is: rootless podman keeps its own container state there, so overriding it
 // would leave containers that later podman calls cannot stop.
 type env struct {
 	bin     string
 	runtime string // docker or podman binary
 	ws      string // host workspace
+	data    string // XDG_DATA_HOME, which holds the allow store
 }
 
 // shortTemp makes a temp dir with a short path.
@@ -146,7 +149,17 @@ func lastLines(s string, n int) string {
 }
 
 func (e env) vars() []string {
-	return append(os.Environ(), "PATH="+e.bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return append(os.Environ(), "PATH="+e.bin+string(os.PathListSeparator)+os.Getenv("PATH"), "XDG_DATA_HOME="+e.data)
+}
+
+// allow runs `hostrunner allow` for the workspace, as the human on the
+// host does before the first up and after each edit of the rules or the
+// settings: up starts a daemon only for allowed ones.
+func (e env) allow(t *testing.T) {
+	t.Helper()
+	if _, err := run(t, e.vars(), filepath.Join(e.bin, "hostrunner"), "allow", e.ws); err != nil {
+		t.Fatalf("hostrunner allow: %v", err)
+	}
 }
 
 // up runs `devcontainer up` with extra flags and returns the container ID.
@@ -249,7 +262,7 @@ func TestDevcontainerIntegration(t *testing.T) {
 			if runtime == "podman" && os.Getenv("HOSTRUNNER_E2E_PODMAN") != "1" {
 				t.Skip("podman e2e is opt-in (HOSTRUNNER_E2E_PODMAN=1): devcontainer up sometimes hangs on podman events")
 			}
-			testLifecycle(t, env{bin: bin, runtime: rtPath, ws: newWorkspace(t)})
+			testLifecycle(t, env{bin: bin, runtime: rtPath, ws: newWorkspace(t), data: shortTemp(t, "hrdata")})
 		})
 	}
 }
@@ -287,6 +300,7 @@ func (e env) cleanUp(t *testing.T) {
 
 func testLifecycle(t *testing.T, e env) {
 	t.Cleanup(func() { e.cleanUp(t) })
+	e.allow(t)
 	container := e.up(t)
 	runtimeDir := e.runtimeDirOf(t, container)
 	socket := filepath.Join(runtimeDir, "hostrunner.sock")
@@ -386,6 +400,7 @@ func testLifecycle(t *testing.T, e env) {
 		if err := os.WriteFile(rulesFile, data, 0o644); err != nil {
 			t.Fatal(err)
 		}
+		e.allow(t)
 		// The daemon looks at the file every 2 s.
 		deadline := time.Now().Add(10 * time.Second)
 		for {
@@ -417,6 +432,7 @@ func testLifecycle(t *testing.T, e env) {
 		if err := os.WriteFile(rulesFile, data, 0o644); err != nil {
 			t.Fatal(err)
 		}
+		e.allow(t)
 		before := daemonStarts(t, runtimeDir)
 		// By its path: exec resolves a bare name with the test's own PATH,
 		// not e.vars()'s, and would find an installed hostrunner.
@@ -449,6 +465,7 @@ func testLifecycle(t *testing.T, e env) {
 				t.Fatal(err)
 			}
 		}
+		e.allow(t)
 		before := daemonStarts(t, runtimeDir)
 		if _, err := run(t, e.vars(), filepath.Join(e.bin, "hostrunner"), "restart", "--dir", runtimeDir); err != nil {
 			t.Fatalf("hostrunner restart: %v", err)

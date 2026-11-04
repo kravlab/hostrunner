@@ -144,7 +144,7 @@ also come from variables or a host settings file (see
 
 Add the rules as `.devcontainer/hostrunner-rules.yaml` (start from
 [the example](examples/devcontainer/.devcontainer/hostrunner-rules.yaml)),
-then, inside the container:
+allow them on the host (see [Allow](#allow)), then, inside the container:
 
 ```sh
 hostrun git push
@@ -202,6 +202,48 @@ say), append another copy or cancel. The questions need a terminal:
 without one, `--append` still adds the text to a file that lacks it and
 refuses otherwise. The file is written in place, so a symlink keeps
 pointing to it.
+
+### Allow
+
+`hostrunner up` starts a daemon only for rules and settings a human on
+the host has allowed: otherwise anything that can write the rules file
+or the workspace settings file (an agent in the container, or a command
+it runs on the host through `hostrun`, such as `git checkout`) could
+grant itself commands on the host. Allow a workspace on the host, in
+the workspace or naming it, after every change of its rules or settings:
+
+```sh
+hostrunner allow                 # the current directory
+hostrunner allow ~/src/app       # or the workspace given
+hostrunner deny ~/src/app        # withdraw the allow
+```
+
+Without an allow of the current rules and settings, `up` fails, naming
+the rules file, its digest and `hostrunner allow`, so `devcontainer up`
+fails and the container does not start; it starts nothing and leaves a
+running daemon as it is. It also records what it asked for (the rules
+file, its digest and the daemon settings, from every flag
+devcontainer.json gave it) in `$XDG_DATA_HOME/hostrunner/allow`
+(`~/.local/share/hostrunner/allow` when it is unset). `allow` allows
+exactly that request after checking that the rules file still has the
+digest `up` saw (if it changed since, `allow` fails and allows nothing:
+run `up` again), and prints the rules file, the digest and the settings
+it allowed; the next `up` passes. Without a request, `allow` allows the
+rules file and the settings as `up` without settings flags resolves
+them for the workspace (variables, the workspace settings file, the
+host settings file), after checking the rules; a missing rules file is
+allowed too. It takes no settings flags and asks nothing. Only the
+latest allow of a workspace is kept: going back to content allowed
+before needs a new allow, and a workspace whose devcontainer configs
+give `up` different settings flags overwrites one allow with the other
+(issue #144). Settings that only tune `up`, `stop`, `restart` or
+`approve` (`ready_timeout`, `runtime_root`, `stop_timeout`,
+`approve_tail_lines`) are not part of an allow. `deny` removes the
+allow of the workspace.
+
+The first `up` after upgrading to a hostrunner with allows fails the
+same way until the workspace is allowed. `up --restart` checks the
+allow before it stops the running daemon.
 
 ### Settings
 
