@@ -249,6 +249,13 @@ give `up` different settings flags overwrites one allow with the other
 `approve_tail_lines`) are not part of an allow. `deny` removes the
 allow of the workspace.
 
+A daemon that rereads its rules file by itself serves an edit only once
+it is allowed, and records the request with its own rules file and
+settings, so plain `hostrunner allow` allows exactly that and takes
+effect within about 2 s, without a restart (see [Rules](#rules)). With `--no-reread` an allowed
+edit takes effect at the next `up`. Adding a rule (`a`) after a hand
+edit not allowed adds none, and the old rules stay.
+
 The first `up` after upgrading to a hostrunner with allows fails the
 same way until the workspace is allowed. `up --restart` and `hostrunner
 restart` check the allow before they stop the running daemon: content
@@ -681,7 +688,15 @@ rules:
   keeps the old rules, and a missing one denies every command, as at
   start; `daemon.log` and the approval session serving the daemon say
   which (`the rules file changed; the daemon reread it`, or why the old
-  rules stay). With `hostrunner up --no-reread`, changes apply on the
+  rules stay). The daemon rereads only content allowed (see
+  [Allow](#allow)): an edit not allowed, a deleted file (digest
+  `missing`) among them, keeps the rules served, and `daemon.log` and the approval session say
+  so, with its digest and `hostrunner allow`, once each time the file
+  changes to that content (again if the reason changes: not allowed, or
+  the allow store unreadable); after `hostrunner allow` the daemon
+  rereads it within about 2 s, standing and session approvals kept, and
+  the file going back to the rules served ends it without an allow.
+  With `hostrunner up --no-reread`, changes apply on the
   next container start (reopen, restart or rebuild): `hostrunner up`
   notices that the file differs from what the running daemon loaded and
   replaces the daemon; a rule added from the approval session, and a hand

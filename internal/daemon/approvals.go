@@ -683,7 +683,9 @@ func (s *Server) closeStopping(c *sessionConn) {
 // reread rereads the rules file for session c, which wrote rr.Rule into
 // it, or, with no rule, found it changed by hand before proposing one,
 // and logs both; a failed reread keeps the old rules and is logged as a
-// warning.
+// warning. A hand edit whose content is not allowed (see WithAllowed) is
+// not reread: the old rules stay, and the result says why (see
+// refuseUnallowed).
 func (s *Server) reread(c *sessionConn, rr protocol.Reread) protocol.RereadResult {
 	if why := s.approvals.heard(c); why != "" {
 		return protocol.RereadResult{Error: why}
@@ -691,7 +693,11 @@ func (s *Server) reread(c *sessionConn, rr protocol.Reread) protocol.RereadResul
 	if rr.Rule != "" {
 		s.log.Info("rule added", "file", s.approvals.rulesFile, "rule", rr.Rule, "edited", rr.Edited, "pid", c.pid)
 	} else {
-		// A file changed by hand, reread before a rule is proposed.
+		// A file changed by hand, reread before a rule is proposed, unless
+		// its content is not allowed (see WithAllowed).
+		if _, err := s.refuseUnallowed(rr.Digest); err != nil {
+			return protocol.RereadResult{Error: err.Error()}
+		}
 		s.log.Info("hand-edited rules reread", "file", s.approvals.rulesFile, "pid", c.pid)
 	}
 	digest, _, err := s.rereadRules(rr.Digest)

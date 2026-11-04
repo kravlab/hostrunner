@@ -15,6 +15,7 @@ import (
 	"reflect"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -140,13 +141,14 @@ func TestParseVersionHelpIsTheFlagHelp(t *testing.T) {
 }
 
 func TestParseServeAcceptsAllFlags(t *testing.T) {
-	got, err := parseServe([]string{"--socket", "/run/h.sock", "--workspace", "/home/u/app", "--container-workspace", "/workspaces/app"}, noEnv, io.Discard)
+	got, err := parseServe([]string{"--socket", "/run/h.sock", "--workspace", "/home/u/app", "--container-workspace", "/workspaces/app"}, withDataHome(noEnv), io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := serveConfig{
 		socket:         "/run/h.sock",
 		workspaceFlags: workspaceFlags{workspace: "/home/u/app", containerWorkspace: "/workspaces/app"},
+		allows:         allow.Store{Dir: "/data/hostrunner/allow"},
 		Settings:       tuned("/home/u/app/.devcontainer/hostrunner-rules.yaml", 30*time.Minute, 15*time.Second, true),
 	}
 	if got != want {
@@ -158,7 +160,7 @@ func TestParseServeAcceptsWatchSettings(t *testing.T) {
 	got, err := parseServe([]string{
 		"--socket", "/run/h.sock", "--workspace", "/w", "--container-workspace", "/c",
 		"--watch", "--startup-timeout", "5m", "--grace", "3s",
-	}, noEnv, io.Discard)
+	}, withDataHome(noEnv), io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,6 +188,20 @@ func TestParseServeRejectsPositionalArguments(t *testing.T) {
 	args := []string{"--socket", "/run/h.sock", "--workspace", "/w", "--container-workspace", "/c", "extra"}
 	if _, err := parseServe(args, noEnv, io.Discard); err == nil {
 		t.Fatal("expected an error for an unexpected positional argument")
+	}
+}
+
+// The allow store serve checks a hand edit in is the one allow.Open
+// opens; with no place to keep an allow there is nothing to check
+// against, which is an error.
+func TestParseServeFindsTheAllowStore(t *testing.T) {
+	args := []string{"--socket", "/run/h.sock", "--workspace", "/w", "--container-workspace", "/c"}
+	got, err := parseServe(args, envOf(map[string]string{"HOME": "/home/u"}), io.Discard)
+	if want := "/home/u/.local/share/hostrunner/allow"; err != nil || got.allows.Dir != want {
+		t.Fatalf("got %q, %v; want %q", got.allows.Dir, err, want)
+	}
+	if _, err := parseServe(args, noEnv, io.Discard); err == nil || !strings.Contains(err.Error(), "XDG_DATA_HOME") {
+		t.Fatalf("got %v, want an error naming XDG_DATA_HOME", err)
 	}
 }
 
@@ -239,7 +255,7 @@ func TestUpAndServeMakeTheWorkspaceAbsolute(t *testing.T) {
 	if err != nil || up.launch.Workspace != ws || up.launch.RulesFile != filepath.Join(ws, ".devcontainer", "hostrunner-rules.yaml") {
 		t.Fatalf("up: got %q and %q, %v; want %q", up.launch.Workspace, up.launch.RulesFile, err, ws)
 	}
-	serve, err := parseServe([]string{"--socket", "/run/h.sock", "--workspace", "app", "--container-workspace", "/c"}, noEnv, io.Discard)
+	serve, err := parseServe([]string{"--socket", "/run/h.sock", "--workspace", "app", "--container-workspace", "/c"}, withDataHome(noEnv), io.Discard)
 	if err != nil || serve.workspace != ws || serve.RulesFile != filepath.Join(ws, ".devcontainer", "hostrunner-rules.yaml") {
 		t.Fatalf("serve: got %q and %q, %v; want %q", serve.workspace, serve.RulesFile, err, ws)
 	}
@@ -267,7 +283,7 @@ func TestParseNoReread(t *testing.T) {
 	if err != nil || up.launch.Reread {
 		t.Fatalf("up: got %+v, %v; want no reread", up.launch, err)
 	}
-	sv, err := parseServe([]string{"--socket", "/run/h.sock", "--workspace", "/w", "--container-workspace", "/c", "--no-reread"}, noEnv, io.Discard)
+	sv, err := parseServe([]string{"--socket", "/run/h.sock", "--workspace", "/w", "--container-workspace", "/c", "--no-reread"}, withDataHome(noEnv), io.Discard)
 	if err != nil || sv.Reread {
 		t.Fatalf("serve: got %+v, %v; want no reread", sv, err)
 	}
@@ -293,7 +309,7 @@ func tuned(rulesFile string, startupTimeout, grace time.Duration, reread bool) s
 func noEnv(string) string { return "" }
 
 // withDataHome returns getenv with XDG_DATA_HOME set to /data, so the
-// allow store of an up lies in /data/hostrunner/allow.
+// allow store of an up or a serve lies in /data/hostrunner/allow.
 func withDataHome(getenv func(string) string) func(string) string {
 	return func(name string) string {
 		if name == "XDG_DATA_HOME" {
@@ -329,10 +345,11 @@ func resolveUp(flags []string, getenv func(string) string) (settings.Settings, e
 }
 
 // resolveServe parses `hostrunner serve` with flags after the required
-// ones and returns the settings it runs with.
+// ones and returns the settings it runs with; getenv, besides what the
+// test sets, has the data directory of the allow store.
 func resolveServe(flags []string, getenv func(string) string) (settings.Settings, error) {
 	args := append([]string{"--socket", "/run/h.sock", "--workspace", "/w", "--container-workspace", "/c"}, flags...)
-	cfg, err := parseServe(args, getenv, io.Discard)
+	cfg, err := parseServe(args, withDataHome(getenv), io.Discard)
 	return cfg.Settings, err
 }
 
@@ -670,6 +687,12 @@ func watchConfig(t *testing.T) serveConfig {
 // still running when the test ends is stopped then.
 func startServe(t *testing.T, cfg serveConfig, runtimes ...*watchtest.Runtime) <-chan error {
 	t.Helper()
+	return startLoggingServe(t, cfg, slog.New(slog.DiscardHandler), runtimes...)
+}
+
+// startLoggingServe is startServe for a serve that logs to log.
+func startLoggingServe(t *testing.T, cfg serveConfig, log *slog.Logger, runtimes ...*watchtest.Runtime) <-chan error {
+	t.Helper()
 	rts := make([]watch.Runtime, len(runtimes))
 	for i, rt := range runtimes {
 		rts[i] = rt
@@ -678,7 +701,7 @@ func startServe(t *testing.T, cfg serveConfig, runtimes ...*watchtest.Runtime) <
 	done := make(chan error, 1)
 	exited := make(chan struct{})
 	go func() {
-		done <- serve(ctx, cfg, slog.New(slog.DiscardHandler), rts)
+		done <- serve(ctx, cfg, log, rts)
 		close(exited)
 	}()
 	t.Cleanup(func() {
@@ -765,7 +788,7 @@ func TestServeWatchWaitsAgainWhenArmed(t *testing.T) {
 
 func TestParseServeAcceptsConfigPath(t *testing.T) {
 	for _, name := range []string{"--rules-file", "--config"} {
-		got, err := parseServe([]string{"--socket", "/s", "--workspace", "/w", "--container-workspace", "/c", name, "/etc/rules.yaml"}, noEnv, io.Discard)
+		got, err := parseServe([]string{"--socket", "/s", "--workspace", "/w", "--container-workspace", "/c", name, "/etc/rules.yaml"}, withDataHome(noEnv), io.Discard)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1333,6 +1356,171 @@ func TestServeRereadsItsRulesOnceARuleIsAdded(t *testing.T) {
 	if stepAside := armServe(t, cfg, p.Digest()); stepAside {
 		t.Fatal("stepped aside for the rules it reread")
 	}
+}
+
+// logBuffer collects a serve's log for a test to wait on.
+type logBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *logBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+// waitFor waits until the log holds text, for 5 s at most.
+func (b *logBuffer) waitFor(t *testing.T, text string) {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		b.mu.Lock()
+		got := b.buf.String()
+		b.mu.Unlock()
+		if strings.Contains(got, text) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the log lacks %q:\n%s", text, got)
+		}
+	}
+}
+
+// handEdit is the rules a hand-edit test of serve starts with, and the
+// edit, which adds a rule for `sh -c 'exit 3'`.
+const (
+	handEditLoaded = "rules:\n  - command: true\n    args: none\n"
+	handEdited     = handEditLoaded + "  - command: sh\n    args: any\n"
+)
+
+// runServed runs argv in the container workspace of cfg's serve and
+// returns its exit code.
+func runServed(cfg serveConfig, argv ...string) int {
+	return client.Run(context.Background(), transport.Unix{Path: cfg.socket}, argv, cfg.containerWorkspace, strings.NewReader(""), io.Discard, io.Discard)
+}
+
+// waitServed runs `sh -c 'exit 3'` on cfg's serve until the edit allowing
+// it is served, for 5 s at most.
+func waitServed(t *testing.T, cfg serveConfig) {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); runServed(cfg, "sh", "-c", "exit 3") != 3; time.Sleep(cfg.PollInterval) {
+		if time.Now().After(deadline) {
+			t.Fatal("the edit allowed is not served")
+		}
+	}
+}
+
+// serve rereads a hand edit of its rules file only once it is allowed in
+// its allow store, the one allow.Open opens.
+func TestServeRereadsAHandEditOnceAllowed(t *testing.T) {
+	cfg := watchConfig(t)
+	cfg.watch = false
+	cfg.RulesFile = filepath.Join(cfg.workspace, "hostrun.yaml")
+	if err := os.WriteFile(cfg.RulesFile, []byte(handEditLoaded), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store, err := allow.Open(envOf(map[string]string{"XDG_DATA_HOME": t.TempDir()}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.allows = store
+	var log logBuffer
+	startLoggingServe(t, cfg, slog.New(slog.NewTextHandler(&log, nil)))
+	if err := os.WriteFile(cfg.RulesFile, []byte(handEdited), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	log.waitFor(t, "rules changed but not allowed")
+	if code := runServed(cfg, "sh", "-c", "exit 3"); code != protocol.ExitRejected {
+		t.Fatalf("a command of the edit not allowed exited %d, want %d", code, protocol.ExitRejected)
+	}
+	if _, err := store.Allow(cfg.workspace, cfg.RulesFile, rules.ContentDigest([]byte(handEdited)), cfg.Settings.Daemon()); err != nil {
+		t.Fatal(err)
+	}
+	waitServed(t, cfg)
+}
+
+// serve without reread leaves an allowed hand edit to the next up: it
+// goes on serving the rules it loaded, and the next arm makes it step
+// aside. With no watcher there is no log to wait on, so the test waits
+// many of its polls.
+func TestServeWithoutRereadLeavesAnAllowedHandEditToTheNextUp(t *testing.T) {
+	cfg := watchConfig(t)
+	cfg.watch = false
+	cfg.Reread = false
+	cfg.RulesFile = filepath.Join(cfg.workspace, "hostrun.yaml")
+	if err := os.WriteFile(cfg.RulesFile, []byte(handEditLoaded), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store, err := allow.Open(envOf(map[string]string{"XDG_DATA_HOME": t.TempDir()}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.allows = store
+	startServe(t, cfg)
+	if err := os.WriteFile(cfg.RulesFile, []byte(handEdited), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	digest := rules.ContentDigest([]byte(handEdited))
+	if _, err := store.Allow(cfg.workspace, cfg.RulesFile, digest, cfg.Settings.Daemon()); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * cfg.PollInterval)
+	if code := runServed(cfg, "sh", "-c", "exit 3"); code != protocol.ExitRejected {
+		t.Fatalf("a command of the edit exited %d, want %d", code, protocol.ExitRejected)
+	}
+	if stepAside := armServe(t, cfg, digest); !stepAside {
+		t.Fatal("kept running for an arm with the edit")
+	}
+}
+
+// A hand edit not allowed records an allow request of the daemon's own
+// rules file, digest and settings, so `hostrunner allow` allows what the
+// daemon checks, though serve was given a setting `up` without flags does
+// not resolve; the daemon then serves the edit.
+func TestServeRecordsTheAllowRequestOfAHandEdit(t *testing.T) {
+	base, err := os.MkdirTemp("", "hrs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(base) })
+	rulesFile := filepath.Join(base, ".devcontainer", "hostrunner-rules.yaml")
+	if err := os.MkdirAll(filepath.Dir(rulesFile), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(rulesFile, []byte(handEditLoaded), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	getenv := envOf(map[string]string{"XDG_DATA_HOME": t.TempDir()})
+	cfg, err := parseServe([]string{
+		"--socket", filepath.Join(base, "h.sock"), "--workspace", base, "--container-workspace", "/workspaces/app",
+		"--grace", "1m", "--poll-interval", "10ms",
+	}, getenv, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	startServe(t, cfg)
+	if err := os.WriteFile(rulesFile, []byte(handEdited), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ac, err := parseAllow([]string{base}, getenv, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(cfg.PollInterval) {
+		if _, ok, err := ac.store.Pending(base); err != nil || ok {
+			if err != nil {
+				t.Fatal(err)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no allow request recorded")
+		}
+	}
+	if err := runAllow(ac, io.Discard, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	waitServed(t, cfg)
 }
 
 // TestParseInstructions checks that --append takes an optional path,

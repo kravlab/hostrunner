@@ -517,16 +517,18 @@ func stopCommands(parsed stop.Commands) (ctx context.Context, commands stop.Comm
 type serveConfig struct {
 	socket string // Unix socket to listen on
 	workspaceFlags
-	watch             bool   // exit once the armed container stops
-	version           string // the build version the daemon reports (see buildVersion)
-	settings.Settings        // the daemon's settings
+	watch             bool        // exit once the armed container stops
+	version           string      // the build version the daemon reports (see buildVersion)
+	allows            allow.Store // where a hand edit of the rules file is checked as allowed
+	settings.Settings             // the daemon's settings
 }
 
 // parseServe parses the flags of `hostrunner serve`; the socket and both
 // workspace paths are required. The settings no flag gives are resolved
 // like `up` does, with getenv reading the environment, so a hand-started
 // serve runs like one `up` starts; given all of them, as `up` does, it
-// reads no other source.
+// reads no other source. The allow store a hand edit of the rules file
+// is checked in is the one allow.Open opens, as `up` checks.
 func parseServe(args []string, getenv func(string) string, output io.Writer) (serveConfig, error) {
 	var cfg serveConfig
 	var sf settings.Flags
@@ -553,6 +555,9 @@ func parseServe(args []string, getenv func(string) string, output io.Writer) (se
 		return cfg, err
 	}
 	cfg.Settings = s
+	if cfg.allows, err = allow.Open(getenv); err != nil {
+		return cfg, err
+	}
 	return cfg, nil
 }
 
@@ -765,10 +770,15 @@ func isTerminal(f *os.File) bool {
 // The rules file is read here: an invalid file stops the daemon from
 // starting (fail closed), a missing one makes it deny every command. Later
 // edits, e.g. by a `git pull` on the host, are reread once the daemon sees
-// the file changed (every PollInterval); without Reread they take effect
-// only in a new daemon, except that an approval session which adds a rule
-// makes the daemon reread the file. The digest of the rules reread is the
-// one arms compare.
+// the file changed (every PollInterval), once their content is allowed
+// in cfg's allow store for the workspace and the daemon's settings, as
+// `up` checks it: an edit not allowed keeps the rules served, and records
+// the allow request, until a `hostrunner allow` (see allowOptions).
+// Without Reread they take
+// effect only in a new daemon, except that an approval session which adds
+// a rule makes the daemon reread the file, and one that found the file
+// edited by hand has it reread once allowed. The digest of the rules
+// reread is the one arms compare.
 func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []watch.Runtime) error {
 	policy, err := rules.Load(cfg.RulesFile)
 	if err != nil {
@@ -830,6 +840,7 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 		daemon.WithBuildVersion(cfg.version),
 		daemon.WithSettings(cfg.Settings.Daemon()),
 	}
+	opts = append(opts, allowOptions(cfg)...)
 	if cfg.Reread {
 		opts = append(opts, daemon.WithRereadEvery(cfg.PollInterval))
 	}
@@ -838,6 +849,22 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 	}
 	srv := daemon.New(mapper, policy, log, opts...)
 	return srv.Serve(ctx, l)
+}
+
+// allowOptions returns the options that have the daemon of cfg reread
+// only rules file content allowed in cfg's allow store for its workspace
+// and its daemon settings, as `up` checks them, and record an allow
+// request of its own rules file and settings for content not allowed, so
+// that `hostrunner allow` allows what the daemon checks.
+func allowOptions(cfg serveConfig) []daemon.Option {
+	return []daemon.Option{
+		daemon.WithAllowed(func(digest string) (bool, error) {
+			return cfg.allows.Allowed(cfg.workspace, digest, cfg.Settings.Daemon())
+		}),
+		daemon.WithAllowRequest(func(digest string) error {
+			return cfg.allows.Request(cfg.workspace, cfg.RulesFile, digest, cfg.Settings.Daemon())
+		}),
+	}
 }
 
 // checkApprovalSocket refuses an approval socket inside the workspace,

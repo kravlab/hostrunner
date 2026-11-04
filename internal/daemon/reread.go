@@ -25,6 +25,30 @@ func WithRereadEvery(interval time.Duration) Option {
 	return func(s *Server) { s.rereadEvery = interval }
 }
 
+// WithAllowed makes the Server reread its rules file by itself (see
+// WithRereadEvery) only to content allowed reports allowed, by its
+// digest: one a human on the host allowed for the daemon's workspace and
+// settings (allow.Store.Allowed). A change to content not allowed keeps
+// the rules served and is logged, and noticed to the session serving
+// the daemon, once for its content. Without it every content is allowed.
+func WithAllowed(allowed func(digest string) (bool, error)) Option {
+	return func(s *Server) { s.allowed = allowed }
+}
+
+// WithAllowRequest makes the Server record an allow request through
+// request, with the digest of content of its rules file it found not
+// allowed (see WithAllowed), once each time it reports that content, so
+// that the allow command allows exactly what the Server checks (e.g.
+// allow.Store.Request with its workspace, rules file and settings). A
+// request that fails is logged and changes nothing else.
+func WithAllowRequest(request func(digest string) error) Option {
+	return func(s *Server) { s.allowRequest = request }
+}
+
+// allowCommand is the command a human on the host runs to allow the
+// content of the rules file (see WithAllowed).
+const allowCommand = "hostrunner allow"
+
 // errChangedMeanwhile is why rereadRules keeps the old rules when the file
 // it rereads is not the one it was asked to.
 var errChangedMeanwhile = errors.New("the rules file changed meanwhile")
@@ -59,10 +83,16 @@ func statRules(path string) fileState {
 // watchRules looks at the rules file every rereadEvery until ctx is done
 // and rereads it when it changed (see rereadChanged). The first look
 // always reads it, so an edit made before Serve started is not missed.
+// While content not allowed is pending (see WithAllowed), every look
+// reads the file, changed or not, so an allow made meanwhile is taken at
+// the next look.
 func (s *Server) watchRules(ctx context.Context) {
 	path := s.approvals.rulesFile
 	var (
-		last          fileState
+		last fileState
+		// failedContent is the content whose reread last failed, logged
+		// once: its digest, or "unreadable: " and why it could not be
+		// read; "" for none.
 		failedContent string
 	)
 	tick := time.NewTicker(s.rereadEvery)
@@ -73,30 +103,46 @@ func (s *Server) watchRules(ctx context.Context) {
 			return
 		case <-tick.C:
 		}
-		if now := statRules(path); now != last {
+		if now := statRules(path); now != last || s.pendingUnallowed() != "" {
 			last = now
 			failedContent = s.rereadChanged(path, failedContent)
 		}
 	}
 }
 
-// rereadChanged rereads the rules file at path, which changed, unless it
-// holds the rules served or failedContent, the content whose reread last
-// failed (its digest, or why it could not be read). It returns
-// failedContent from then on: this content when its reread fails, ""
-// otherwise. A file that changes again while it is reread is left to the
-// next look, which sees it changed; one a session had reread meanwhile
-// changes nothing.
+// rereadChanged reads the rules file at path, which changed, and returns
+// the failedContent of the next look (see watchRules):
+//   - the rules served: nothing to do; a pending change not allowed ends,
+//     logged as undone unless a session's reread served it;
+//   - failedContent: nothing to do, it was logged;
+//   - content not allowed: the rules served stay (see refuseUnallowed);
+//   - otherwise it is reread, and a failure is logged and kept as
+//     failedContent.
+//
+// A file that changes again while it is reread is left to the next look,
+// which sees it changed; one a session had reread meanwhile changes
+// nothing.
 func (s *Server) rereadChanged(path, failedContent string) string {
-	content, _, err := rules.FileDigest(os.DirFS(filepath.Dir(path)), filepath.Base(path))
-	if err != nil {
-		content = "unreadable: " + err.Error()
+	content, _, readErr := rules.FileDigest(os.DirFS(filepath.Dir(path)), filepath.Base(path))
+	if readErr != nil {
+		content = "unreadable: " + readErr.Error()
 	}
 	if content == s.rulesDigest() {
+		if pending := s.endUnallowed(); pending != "" && pending != content {
+			s.log.Info("rules change undone: the file holds the rules served", "file", path)
+		}
 		return ""
 	}
 	if content == failedContent {
 		return failedContent
+	}
+	if readErr == nil {
+		if first, err := s.refuseUnallowed(content); err != nil {
+			if first {
+				s.approvals.notice(protocol.RulesReread{Error: err.Error()})
+			}
+			return ""
+		}
 	}
 	digest, changed, err := s.rereadRules(content)
 	if errors.Is(err, errChangedMeanwhile) || err == nil && !changed {
@@ -119,4 +165,96 @@ func (s *Server) logReread(digest string, err error) {
 		return
 	}
 	s.log.Info("rules reread", "file", s.approvals.rulesFile, "digest", digest)
+}
+
+// errNotAllowed is why the Server keeps its rules against content of
+// its rules file no human on the host allowed (see WithAllowed).
+var errNotAllowed = errors.New("not allowed")
+
+// unallowedError is why the Server keeps its rules against content of
+// its rules file, of digest: err is errNotAllowed, or why the allow
+// could not be checked, which allows nothing. Its message is what the
+// approval session shows.
+type unallowedError struct {
+	digest string
+	err    error
+}
+
+// Error says why the content is refused and, when it is not allowed, how
+// a human on the host allows it.
+func (e *unallowedError) Error() string {
+	if errors.Is(e.err, errNotAllowed) {
+		return "its content (digest " + e.digest + ") is not allowed; run `" + allowCommand + "` on the host"
+	}
+	return "the allow of its content (digest " + e.digest + ") cannot be checked: " + e.err.Error()
+}
+
+// Unwrap returns errNotAllowed or the error of the check.
+func (e *unallowedError) Unwrap() error { return e.err }
+
+// unallowedReport is the content of the rules file the Server last
+// refused as not allowed (see refuseUnallowed), pending until the file
+// holds the rules served or a reread serves new ones.
+type unallowedReport struct {
+	digest     string // the content's digest; "" for none
+	notAllowed bool   // the check found it not allowed; false: the check failed
+}
+
+// refuseUnallowed returns nil when the Server may serve rules of the
+// given digest (see WithAllowed), or why not, an *unallowedError. The
+// refusal becomes the one pending; when its content or its reason (not
+// allowed, or not checked) differs from the one pending before, it is
+// logged, content not allowed gets an allow request (see
+// WithAllowRequest), and first is true, for the caller to tell the
+// session. Both the
+// watcher and a session's reread of a hand edit check through it, so
+// each refusal is reported once.
+func (s *Server) refuseUnallowed(digest string) (first bool, err error) {
+	if s.allowed == nil {
+		return false, nil
+	}
+	s.unallowedMu.Lock()
+	defer s.unallowedMu.Unlock()
+	ok, checkErr := s.allowed(digest)
+	if checkErr == nil && ok {
+		return false, nil
+	}
+	refusal := &unallowedError{digest: digest, err: errNotAllowed}
+	if checkErr != nil {
+		refusal.err = checkErr
+	}
+	report := unallowedReport{digest: digest, notAllowed: checkErr == nil}
+	if s.unallowed == report {
+		return false, refusal
+	}
+	s.unallowed = report
+	if checkErr != nil {
+		s.log.Warn("rules change not checked: the old rules stay", "file", s.approvals.rulesFile, "digest", digest, "error", checkErr)
+		return true, refusal
+	}
+	s.log.Warn("rules changed but not allowed: the old rules stay until `"+allowCommand+"`", "file", s.approvals.rulesFile, "digest", digest)
+	if s.allowRequest != nil {
+		if err := s.allowRequest(digest); err != nil {
+			s.log.Warn("allow request not recorded", "file", s.approvals.rulesFile, "digest", digest, "error", err)
+		}
+	}
+	return true, refusal
+}
+
+// pendingUnallowed returns the digest of the content refuseUnallowed
+// last refused, while it is pending; "" for none.
+func (s *Server) pendingUnallowed() string {
+	s.unallowedMu.Lock()
+	defer s.unallowedMu.Unlock()
+	return s.unallowed.digest
+}
+
+// endUnallowed ends the pending refusal, if any, and returns the digest
+// it was pending for; "" for none.
+func (s *Server) endUnallowed() string {
+	s.unallowedMu.Lock()
+	defer s.unallowedMu.Unlock()
+	pending := s.unallowed.digest
+	s.unallowed = unallowedReport{}
+	return pending
 }

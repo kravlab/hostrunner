@@ -35,6 +35,38 @@ the daemon rereads the file by itself once it changes, without stopping.
   nothing more. The next content that loads is reread.
 - A missing file loads as the rules that deny every command, as at start.
 - A file that changes again while it is reread is left to the next look.
+- Only content allowed is reread (issue #139): before a reread the daemon
+  checks the content's digest in the allow store, for its workspace and
+  its daemon settings, as `hostrunner up` checks it. A missing file is
+  content like any other, of digest `missing`: until it is allowed the
+  old rules stay. Content not allowed keeps the rules served, logged as
+  ``rules changed but not allowed: the old rules stay until `hostrunner
+  allow` `` with the file and the digest, and the session gets the error
+  ``its content (digest <digest>) is not allowed; run `hostrunner allow`
+  on the host``. The daemon also records an allow request, as a refused
+  `up` does, with its own rules file, the digest and its daemon
+  settings, so `hostrunner allow` without flags allows exactly what the
+  daemon checks, settings flags `up` was given included; a request that
+  cannot be recorded is logged as `allow request not recorded` and
+  changes nothing else. An allow store that cannot be read allows nothing:
+  logged as `rules change not checked: the old rules stay` with the
+  error, the session getting it too.
+- Each refusal is reported once each time the file changes to that
+  content: the daemon remembers the one refusal pending, its content and
+  its reason, for its own looks and the session's `a` alike. The same
+  content refused for the other reason (not allowed, or not checked) is
+  reported again; so is content refused before, once another content
+  was refused in between (B, C, B reports B twice) or the file went back
+  to the rules served.
+- While a refusal is pending the daemon checks the allow again at every
+  look, the file changed or not, so after `hostrunner allow` it rereads
+  the file at the next look (`rules reread`, approvals kept). New rules
+  served, by the daemon or a session's reread, end the refusal. The file
+  going back to the rules served ends it too, logged as `rules change
+  undone: the file holds the rules served`, without a notice; not when
+  a session's reread just served the pending content.
+- Content allowed that does not load is a file that does not load, as
+  above.
 
 ### Approval session
 
@@ -53,7 +85,10 @@ the daemon rereads the file by itself once it changes, without stopping.
 - Adding a rule (`a`) after a hand edit the daemon has not reread yet: a
   daemon with `rereads` is asked to reread at once and the diff is against
   the rules it then serves, without the `[r]eread [c]ancel` question; for
-  any other daemon the question stays.
+  any other daemon the question stays. A hand edit not allowed is not
+  reread: the session says it cannot add a rule, with the daemon's
+  error, and asks for the answer again; the old rules stay. A rule the
+  session writes is reread as before (issue #141).
 
 ### Commands
 
@@ -84,6 +119,12 @@ hostrunner serve --socket … --workspace … --container-workspace … [--rules
   read the file just before the session's reread waits for it, then
   finds the rules served and does nothing either: no second log entry,
   no notice.
+- An edit not allowed, touched without changing, or met again by `a`:
+  nothing more is reported.
+- A deleted rules file while allows are checked: the old rules stay
+  until the missing file is allowed, then every command is denied.
+- With `--no-reread` the daemon does not look at the file, so nothing
+  changes: allowed new content takes effect at the next `up`.
 - `.devcontainer/` is mounted read-only in the container, so only the host
   changes the rules; `hostrun` warns when it is not.
 
@@ -99,7 +140,17 @@ hostrunner serve --socket … --workspace … --container-workspace … [--rules
   an arm after a reread gets the new digest; a daemon without rereading
   leaves a hand edit out; `DaemonInfo` says `rereads` or `no_reread`; the
   session prints both lines; a session without `notices` gets no frame;
-  `a` after a hand edit rereads without asking.
+  `a` after a hand edit rereads without asking. With a real allow store:
+  an edit not allowed keeps the old rules, is logged once even when
+  touched, and the session prints the notice; once allowed it is served
+  and approvals stay; going back to the served content is logged and the
+  same edit again is reported again, with no notice of the undo; an
+  allow check that fails keeps the old rules, is logged once and is
+  retried; the same content refused for the other reason is reported
+  again; `a` after a hand edit not allowed adds no rule, and `a` after
+  the daemon reported it logs nothing more; a session's reread of the
+  pending content is not logged as undone; the allow request is
+  recorded once per refusal, and one that fails is logged.
 - `internal/protocol`: the frame's wire value and the JSON names of
   `DaemonInfo`, `Serve` and `RulesReread`.
 - `internal/launch`: an `up` with another `--no-reread` replaces the
@@ -108,6 +159,11 @@ hostrunner serve --socket … --workspace … --container-workspace … [--rules
   resolves.
 - `cmd/hostrunner`: `--no-reread` for `up` and `serve`, in their usages;
   the arm handler steps aside on another setting; `serve`'s hello says
-  whether it rereads.
+  whether it rereads; `serve` opens the allow store as `up` does (no
+  place for it is an error) and rereads a hand edit only once allowed;
+  without reread an allowed hand edit waits for the next `up`; a hand
+  edit not allowed of a serve given a setting `up` without flags does
+  not resolve records the request, and `hostrunner allow` then has it
+  served.
 - e2e: a hand edit on the host takes effect in a running container
   without a restart.

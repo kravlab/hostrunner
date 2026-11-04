@@ -62,12 +62,16 @@ type Server struct {
 	approvals        *approvals                                           // nil: no approval socket, so nothing is approved
 	containerStopped func() bool                                          // nil: the armed container is not known to have stopped
 	rereadEvery      time.Duration                                        // 0: the rules file is not watched; see WithRereadEvery
+	allowed          func(digest string) (bool, error)                    // nil: every content of the rules file is allowed; see WithAllowed
+	allowRequest     func(digest string) error                            // nil: no allow request is recorded; see WithAllowRequest
 	buildVersion     string                                               // "": unknown; see WithBuildVersion
 	settings         map[string]string                                    // nil: none reported; see WithSettings
 
 	// rereading makes rereads one at a time, so a slower one never
 	// replaces the rules a later one served.
 	rereading      sync.Mutex
+	unallowedMu    sync.Mutex      // guards unallowed; held across an allow check, so each refusal is reported once
+	unallowed      unallowedReport // the refusal pending; see refuseUnallowed
 	mu             sync.Mutex
 	stopServe      context.CancelFunc                 // stops the running Serve; nil when not serving
 	closeListeners func()                             // closes the running Serve's sockets; nil when not serving
@@ -164,7 +168,8 @@ func (s *Server) rules() Policy {
 // why it keeps the old rules: errChangedMeanwhile for another digest.
 // Rules of digest want already served, as a reread just before this one
 // left them, are not reread again: changed reports whether the rules
-// served changed.
+// served changed. New rules served end a pending refusal of content not
+// allowed (see refuseUnallowed).
 func (s *Server) rereadRules(want string) (digest string, changed bool, err error) {
 	if s.rereadFile == nil {
 		return "", false, errors.New("this daemon does not reread its rules")
@@ -184,6 +189,7 @@ func (s *Server) rereadRules(want string) (digest string, changed bool, err erro
 	s.mu.Lock()
 	s.policy, s.digest = p, digest
 	s.mu.Unlock()
+	s.endUnallowed()
 	return digest, true, nil
 }
 
