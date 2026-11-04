@@ -1307,13 +1307,24 @@ func TestServeClosesTheApprovalSocketFirstWhenSteppingAside(t *testing.T) {
 
 // A session that adds a rule makes serve reread its rules file: the next
 // arm, carrying the new file's digest, does not make the daemon step aside.
+// The file was allowed before the session wrote it, so serve records an
+// allow of the content written, with its own settings, in its allow store.
 func TestServeRereadsItsRulesOnceARuleIsAdded(t *testing.T) {
 	cfg := watchConfig(t)
 	cfg.watch = false
 	cfg.RulesFile = filepath.Join(cfg.workspace, "hostrun.yaml")
-	if err := os.WriteFile(cfg.RulesFile, []byte("rules:\n  - command: echo\n    args: any\n"), 0o644); err != nil {
+	loaded := []byte("rules:\n  - command: echo\n    args: any\n")
+	if err := os.WriteFile(cfg.RulesFile, loaded, 0o644); err != nil {
 		t.Fatal(err)
 	}
+	store, err := allow.Open(envOf(map[string]string{"XDG_DATA_HOME": t.TempDir()}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Allow(cfg.workspace, cfg.RulesFile, rules.ContentDigest(loaded), cfg.Settings.Daemon()); err != nil {
+		t.Fatal(err)
+	}
+	cfg.allows = store
 	approvalSocket := launch.ApprovalSocket(filepath.Dir(cfg.socket))
 	t.Cleanup(func() { os.Remove(approvalSocket) })
 	startServe(t, cfg)
@@ -1338,7 +1349,7 @@ func TestServeRereadsItsRulesOnceARuleIsAdded(t *testing.T) {
 	if err := os.WriteFile(cfg.RulesFile, added, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := protocol.WriteJSON(c, protocol.FrameReread, protocol.Reread{Rule: "date", Digest: rules.ContentDigest(added)}); err != nil {
+	if err := protocol.WriteJSON(c, protocol.FrameReread, protocol.Reread{Rule: "date", Digest: rules.ContentDigest(added), WrittenOver: rules.ContentDigest(loaded)}); err != nil {
 		t.Fatal(err)
 	}
 	f, err := protocol.ReadFrame(c)
@@ -1352,6 +1363,9 @@ func TestServeRereadsItsRulesOnceARuleIsAdded(t *testing.T) {
 	}
 	if res.Error != "" || res.Digest != p.Digest() {
 		t.Fatalf("reread: got %+v, want the new file's digest %s", res, p.Digest())
+	}
+	if ok, err := store.Allowed(cfg.workspace, p.Digest(), cfg.Settings.Daemon()); err != nil || !ok {
+		t.Fatalf("the store allows the file as written: %v, %v; want it allowed", ok, err)
 	}
 	if stepAside := armServe(t, cfg, p.Digest()); stepAside {
 		t.Fatal("stepped aside for the rules it reread")

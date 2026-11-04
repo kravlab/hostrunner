@@ -179,10 +179,12 @@ func (s *session) addTyped(r waiting, text string) {
 }
 
 // writeRule writes the rule being added into the rules file and asks the
-// daemon to reread it; the daemon's result answers the request (see
-// reread). A file that changed since the proposal is not overwritten, and
-// a failed write goes back to the answer. The file is checked and written
-// in the directory the proposal read it from (see addition).
+// daemon to reread it, telling it the digest of the file the rule was
+// written over, which the daemon allows the new content on if it allowed
+// that; the daemon's result answers the request (see reread). A file that
+// changed since the proposal is not overwritten, and a failed write goes
+// back to the answer. The file is checked and written in the directory the
+// proposal read it from (see addition).
 func (s *session) writeRule() {
 	a := s.adding
 	digest, _, err := a.file.digest()
@@ -200,7 +202,7 @@ func (s *session) writeRule() {
 		return
 	}
 	s.awaiting = awaitReread
-	s.write(protocol.FrameReread, protocol.Reread{Rule: a.rule, Edited: a.edited, Digest: rules.ContentDigest(a.data), ID: a.id})
+	s.write(protocol.FrameReread, protocol.Reread{Rule: a.rule, Edited: a.edited, Digest: rules.ContentDigest(a.data), WrittenOver: a.base, ID: a.id})
 }
 
 // editRule opens the rules file to write in $VISUAL or $EDITOR and writes

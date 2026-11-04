@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # Allow the rules and settings a daemon serves

@@ -543,12 +543,15 @@ type Revoked struct {
 // hand, and the human agreed to have it reread before a rule is proposed;
 // Digest is that of the file the session read. The daemon keeps its rules
 // when the file it rereads has another digest: an edit nobody reviewed
-// waits for the next start.
+// waits for the next start. WrittenOver is the digest of the file Rule
+// was written over: the daemon allows the content of a Rule it checks the
+// allow of (see daemon.WithAllowed) if it allowed that file.
 type Reread struct {
-	Rule   string `json:"rule,omitempty"`
-	Edited bool   `json:"edited,omitempty"`
-	Digest string `json:"digest"`
-	ID     uint64 `json:"id,omitempty"`
+	Rule        string `json:"rule,omitempty"`
+	Edited      bool   `json:"edited,omitempty"`
+	Digest      string `json:"digest"`
+	WrittenOver string `json:"written_over,omitempty"`
+	ID          uint64 `json:"id,omitempty"`
 }
 
 // RereadResult answers Reread: Digest identifies the rules the daemon now

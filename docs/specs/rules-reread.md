@@ -106,7 +106,9 @@ the daemon rereads the file by itself once it changes, without stopping.
   any other daemon the question stays. A hand edit not allowed is not
   reread: the session says it cannot add a rule, with the daemon's
   error, and asks for the answer again; the old rules stay. A rule the
-  session writes is reread as before (issue #141).
+  session writes over allowed rules is allowed with the content written
+  and reread; over rules not allowed it is not, and the content written
+  waits for an allow as a hand edit does (issue #141).
 
 ### Commands
 

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -20,16 +21,19 @@ import (
 var allowSettings = map[string]string{"reread": "true"}
 
 // allowStore is an allow store, and the workspace whose allow the
-// daemons of these tests check in it.
+// daemons of these tests check in it. rulesFile is the rules file that the
+// allows made by record name.
 type allowStore struct {
 	store     allow.Store
 	workspace string
+	rulesFile string
 }
 
 // newAllowStore returns an empty allow store in a temporary directory.
 func newAllowStore(t *testing.T) allowStore {
 	t.Helper()
-	return allowStore{store: allow.Store{Dir: t.TempDir()}, workspace: t.TempDir()}
+	workspace := t.TempDir()
+	return allowStore{store: allow.Store{Dir: t.TempDir()}, workspace: workspace, rulesFile: filepath.Join(workspace, "hostrun.yaml")}
 }
 
 // check is the allow check a daemon of these tests runs (see
@@ -48,12 +52,22 @@ func (a allowStore) allow(t *testing.T, rulesFile, content string) {
 	}
 }
 
+// record is the allow a daemon of these tests records (see
+// daemon.WithAllow) for a rule added from the approval session: an allow
+// of content of the given digest for the workspace, as `hostrunner allow`
+// does.
+func (a allowStore) record(digest string) error {
+	_, err := a.store.Allow(a.workspace, a.rulesFile, digest, allowSettings)
+	return err
+}
+
 // startDaemon starts a daemon serving the rules file content, with
 // allowSettings, that rereads the file by itself once it changes,
-// provided a's store allows the new content.
+// provided a's store allows the new content, and records in the store the
+// allow of a rule added from the approval session.
 func (a allowStore) startDaemon(t *testing.T, log *slog.Logger, content string) harness {
 	t.Helper()
-	return startRereadingDaemon(t, log, content, daemon.WithSettings(allowSettings), daemon.WithAllowed(a.check))
+	return startRereadingDaemon(t, log, content, daemon.WithSettings(allowSettings), daemon.WithAllowed(a.check), daemon.WithAllow(a.record))
 }
 
 // notAllowedLog is how the daemon logs a change of its rules file to
@@ -230,17 +244,19 @@ func TestAddRuleDoesNotReportAnEditNotAllowedAgain(t *testing.T) {
 }
 
 // A pending edit not allowed that a session's reread serves, as one of a
-// rule the session wrote, is not taken for undone when the daemon then
-// finds the file holding the rules served.
+// rule the session wrote over the rules served, which are allowed, is not
+// taken for undone when the daemon then finds the file holding the rules
+// served.
 func TestRereadOfThePendingEditIsNotUndone(t *testing.T) {
 	var log lockedBuffer
 	a := newAllowStore(t)
+	a.allow(t, a.rulesFile, echoRules)
 	h := a.startDaemon(t, slog.New(slog.NewTextHandler(&log, nil)), echoRules)
 	conn := h.serveRaw(t)
 	writeRules(t, h.rulesFile, touchRules)
 	waitForLog(t, &log, notAllowedLog)
 	digest := rules.ContentDigest([]byte(touchRules))
-	if err := protocol.WriteJSON(conn, protocol.FrameReread, protocol.Reread{Rule: "touch", Digest: digest}); err != nil {
+	if err := protocol.WriteJSON(conn, protocol.FrameReread, protocol.Reread{Rule: "touch", Digest: digest, WrittenOver: rules.ContentDigest([]byte(echoRules))}); err != nil {
 		t.Fatal(err)
 	}
 	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))

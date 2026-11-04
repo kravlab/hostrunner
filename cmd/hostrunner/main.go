@@ -857,7 +857,8 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 // daemon gives, its own or those of a change an arm reports not allowed),
 // and record an allow request of its own rules file and settings for
 // content not allowed, so that `hostrunner allow` allows what the daemon
-// checks.
+// checks. They also have it allow, as `hostrunner allow` does, a rule added
+// from the approval session to a rules file that was allowed.
 func allowOptions(cfg serveConfig) []daemon.Option {
 	return []daemon.Option{
 		daemon.WithAllowed(func(digest string, settings map[string]string) (bool, error) {
@@ -865,6 +866,10 @@ func allowOptions(cfg serveConfig) []daemon.Option {
 		}),
 		daemon.WithAllowRequest(func(digest string) error {
 			return cfg.allows.Request(cfg.workspace, cfg.RulesFile, digest, cfg.Settings.Daemon())
+		}),
+		daemon.WithAllow(func(digest string) error {
+			_, err := cfg.allows.Allow(cfg.workspace, cfg.RulesFile, digest, cfg.Settings.Daemon())
+			return err
 		}),
 	}
 }

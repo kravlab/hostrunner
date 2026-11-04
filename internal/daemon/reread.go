@@ -49,6 +49,14 @@ func WithAllowRequest(request func(digest string) error) Option {
 	return func(s *Server) { s.allowRequest = request }
 }
 
+// WithAllow makes the Server record an allow of the rules file content of
+// the given digest through allow (e.g. allow.Store.Allow with its
+// workspace, rules file and settings), as the human who approved a rule
+// added from the approval session allows what that session writes.
+func WithAllow(allow func(digest string) error) Option {
+	return func(s *Server) { s.allowRecorder = allow }
+}
+
 // allowCommand is the command a human on the host runs to allow the
 // content of the rules file (see WithAllowed).
 const allowCommand = "hostrunner allow"
@@ -148,7 +156,7 @@ func (s *Server) rereadChanged(path, failedContent string) string {
 			return ""
 		}
 	}
-	digest, changed, err := s.rereadRules(content)
+	digest, changed, err := s.rereadRules(content, nil)
 	if errors.Is(err, errChangedMeanwhile) || err == nil && !changed {
 		return ""
 	}
@@ -243,6 +251,52 @@ func (s *Server) refuseUnallowed(digest string) (first bool, err error) {
 		}
 	}
 	return true, refusal
+}
+
+// allowAddedRule decides whether the Server rereads the rules file a
+// session wrote the rule rr.Rule into: it returns why not, or nil with the
+// function that records the allow of rr.Digest for the reread to call (see
+// rereadRules), nil when none is to be recorded. Without WithAllowed every
+// content is allowed, and none is recorded. A rule added to a file the
+// Server allowed (rr.WrittenOver, the content the session wrote over, is
+// allowed with the daemon settings) is allowed too, as the human approving
+// it reviewed it: its allow is recorded through WithAllow, and only once
+// the reread has read the content of rr.Digest, so no allow of content the
+// Server never loaded is left. A failure to record it keeps the old rules,
+// is logged as a warning, and leaves the written content pending as a
+// change not allowed (see refuseUnallowed). In any other case (the file
+// written over was not allowed or its allow cannot be checked, no
+// written-over digest was given, or no allow can be recorded) the written
+// content is treated as a hand edit: it is reread only if it is allowed by
+// itself (see refuseUnallowed), and no allow is recorded.
+func (s *Server) allowAddedRule(rr protocol.Reread) (record func(digest string) error, err error) {
+	if s.allowed == nil {
+		return nil, nil
+	}
+	if s.allowRecorder != nil && rr.WrittenOver != "" {
+		// A failed check of the file written over is one not allowed:
+		// refuseUnallowed checks the written content too, and reports a
+		// check that fails.
+		if ok, err := s.allowed(rr.WrittenOver, s.settings); err == nil && ok {
+			return s.recordAllow, nil
+		}
+	}
+	_, err = s.refuseUnallowed(rr.Digest)
+	return nil, err
+}
+
+// recordAllow records through WithAllow an allow of the rules file content
+// of the given digest, which a session wrote and the reread loaded. A
+// failure is logged as a warning, and the content is marked pending as a
+// change not allowed, so it is reported as any other (see refuseUnallowed).
+func (s *Server) recordAllow(digest string) error {
+	if err := s.allowRecorder(digest); err != nil {
+		s.log.Warn("allow not recorded", "file", s.approvals.rulesFile, "digest", digest, "error", err)
+		_, _ = s.refuseUnallowed(digest)
+		return err
+	}
+	s.log.Info("rule allowed", "file", s.approvals.rulesFile, "digest", digest)
+	return nil
 }
 
 // pendingUnallowed returns the digest of the content refuseUnallowed

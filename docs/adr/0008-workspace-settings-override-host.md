@@ -19,10 +19,12 @@ settings file.
 
 ## Consequences
 
-- hostrunner does not protect the workspace settings file or the rules
-  file: whether the container can write them depends only on the mounts
-  in `devcontainer.json`. A container that can write the workspace
-  settings file chooses the daemon's rules file and timeouts.
+- hostrunner does not stop the container from writing the workspace
+  settings file or the rules file: whether it can depends only on the
+  mounts in `devcontainer.json`. A container that can write the
+  workspace settings file chooses the daemon's rules file and timeouts,
+  but they take effect only once a human allows them with `hostrunner
+  allow` ([ADR 0009](0009-allow-rules-and-settings.md)).
 - `runtime_root`, `stop_timeout` and `approve_tail_lines` are refused in
   the workspace file and in workspace sections: only `stop`, `restart`
   and `approve` read them, before they know a workspace (an approval

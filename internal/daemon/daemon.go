@@ -64,6 +64,7 @@ type Server struct {
 	rereadEvery      time.Duration                                                 // 0: the rules file is not watched; see WithRereadEvery
 	allowed          func(digest string, settings map[string]string) (bool, error) // nil: every content of the rules file is allowed; see WithAllowed
 	allowRequest     func(digest string) error                                     // nil: no allow request is recorded; see WithAllowRequest
+	allowRecorder    func(digest string) error                                     // nil: no allow is recorded; see WithAllow
 	buildVersion     string                                                        // "": unknown; see WithBuildVersion
 	settings         map[string]string                                             // nil: none reported; see WithSettings
 
@@ -169,10 +170,15 @@ func (s *Server) rules() Policy {
 // session left it with or the watcher read; it returns their digest, or
 // why it keeps the old rules: errChangedMeanwhile for another digest.
 // Rules of digest want already served, as a reread just before this one
-// left them, are not reread again: changed reports whether the rules
-// served changed. New rules served end a pending refusal of content not
-// allowed (see refuseUnallowed).
-func (s *Server) rereadRules(want string) (digest string, changed bool, err error) {
+// left them, are not reread again, and record is not called for them: they
+// are served already, so an allow of them changes nothing the Server
+// serves; changed reports whether the rules served changed. record, when
+// not nil, records an allow of the content (see allowAddedRule): it is
+// called once the file is read, parsed and has the digest want, and
+// before the new rules are served, and if it fails the old rules stay and
+// its error is returned. New rules served end a pending refusal of
+// content not allowed (see refuseUnallowed).
+func (s *Server) rereadRules(want string, record func(digest string) error) (digest string, changed bool, err error) {
 	if s.rereadFile == nil {
 		return "", false, errors.New("this daemon does not reread its rules")
 	}
@@ -187,6 +193,11 @@ func (s *Server) rereadRules(want string) (digest string, changed bool, err erro
 	}
 	if digest != want {
 		return "", false, errChangedMeanwhile
+	}
+	if record != nil {
+		if err := record(digest); err != nil {
+			return "", false, err
+		}
 	}
 	s.mu.Lock()
 	s.policy, s.digest = p, digest

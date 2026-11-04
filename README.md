@@ -256,6 +256,16 @@ effect within about 2 s, without a restart (see [Rules](#rules)). With `--no-rer
 edit takes effect at the next `up`. Adding a rule (`a`) after a hand
 edit not allowed adds none, and the old rules stay.
 
+A rule added from the approval session to rules that are allowed is
+allowed with the content the session wrote: the daemon records the allow
+as `hostrunner allow` would and serves the rule at once, with or without
+`reread`, so the next `up` finds it allowed. Added to rules not allowed
+(after `hostrunner deny`, say), it is not: the daemon keeps the rules it
+serves, the change waits for `hostrunner allow` as above, the session
+says the daemon kept its old rules and the request runs once. The same
+happens if the allow cannot be recorded (`allow not recorded` in
+`daemon.log`).
+
 While rules or settings wait for an allow (the daemon found the rules
 file changed to content not allowed, or `up` armed it as above), every
 `hostrun` call, a run, `--ask`, a dry run or a refusal, prints one line
@@ -503,8 +513,10 @@ answer. Only the rule's lines change; the file is written at once, and
 only when it parses and allows the request, so an edit that does not is
 offered for editing again. The daemon then rereads the file and the
 request runs under the new rule; later runs need no approval, and the
-next container start keeps the daemon. If the reread fails, the old
-rules stay and the request runs once. It also runs once, and the session
+next container start keeps the daemon, as the rule is allowed with the
+content written (see [Allow](#allow)) when the rules were allowed before.
+If the reread fails, or the rules were not allowed, the old rules stay
+and the request runs once. It also runs once, and the session
 and the agent are told so, when a rule edited by hand still fails a
 later check (a fixed directory missing). For a rules file edited by hand
 since the daemon loaded it, the daemon rereads it first, and the diff is
@@ -708,8 +720,9 @@ rules:
   With `hostrunner up --no-reread`, changes apply on the
   next container start (reopen, restart or rebuild): `hostrunner up`
   notices that the file differs from what the running daemon loaded and
-  replaces the daemon; a rule added from the approval session, and a hand
-  edit the human agrees to have reread then, apply at once. The file
+  replaces the daemon; a rule added from the approval session (to rules
+  that are allowed), and a hand edit the human agrees to have reread
+  then, apply at once. The file
   lives in `.devcontainer/`,
   which is read-only inside the container, so the agent can read but not
   change its rules.
