@@ -558,3 +558,45 @@ func TestAllowHoldsAMissingRulesFileByItsCleanedPath(t *testing.T) {
 		t.Fatalf("Allow = %+v, want %+v", e, want)
 	}
 }
+
+// A workspace and a symbolic link to it are one workspace, as an allow
+// keys them; another directory is not.
+func TestSameWorkspaceFollowsSymbolicLinks(t *testing.T) {
+	base := t.TempDir()
+	real := filepath.Join(base, "real")
+	other := filepath.Join(base, "other")
+	for _, d := range []string{real, other} {
+		if err := os.Mkdir(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	for _, tt := range []struct {
+		a, b string
+		want bool
+	}{
+		{real, link, true},
+		{link, real + "/", true},
+		{real, other, false},
+		{link, other, false},
+	} {
+		if got, err := allow.SameWorkspace(tt.a, tt.b); err != nil || got != tt.want {
+			t.Errorf("SameWorkspace(%q, %q) = %v, %v; want %v", tt.a, tt.b, got, err, tt.want)
+		}
+	}
+}
+
+// A workspace that does not exist is compared by its cleaned absolute
+// path, as an allow keys it.
+func TestSameWorkspaceComparesAMissingWorkspaceByItsCleanedPath(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "gone")
+	if got, err := allow.SameWorkspace(missing, missing+"/sub/.."); err != nil || !got {
+		t.Errorf("SameWorkspace of one missing path = %v, %v; want true", got, err)
+	}
+	if got, err := allow.SameWorkspace(missing, missing+"2"); err != nil || got {
+		t.Errorf("SameWorkspace of two missing paths = %v, %v; want false", got, err)
+	}
+}

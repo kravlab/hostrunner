@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime/debug"
 	"strings"
 	"testing"
@@ -188,9 +189,12 @@ func TestParseServeRejectsPositionalArguments(t *testing.T) {
 	}
 }
 
+// up tells the human, on its output, what it says besides an error (see
+// launch.Config.Stderr).
 func TestParseUpBuildsLaunchConfig(t *testing.T) {
 	exe := "/home/u/.local/bin/hostrunner"
-	got, err := parseUp([]string{"--dir", "/run/user/1000/hostrunner/abc", "--workspace", "/home/u/app", "--container-workspace", "/workspaces/app"}, exe, withDataHome(noEnv), io.Discard)
+	var output strings.Builder
+	got, err := parseUp([]string{"--dir", "/run/user/1000/hostrunner/abc", "--workspace", "/home/u/app", "--container-workspace", "/workspaces/app"}, exe, withDataHome(noEnv), &output)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,6 +205,7 @@ func TestParseUpBuildsLaunchConfig(t *testing.T) {
 		Daemon:             exe,
 		Client:             filepath.Join("/home/u/.local/bin", "hostrun"),
 		Allows:             allow.Store{Dir: "/data/hostrunner/allow"},
+		Stderr:             &output,
 		Settings:           tuned("/home/u/app/.devcontainer/hostrunner-rules.yaml", 30*time.Minute, 15*time.Second, true),
 	}
 	if got.launch != want || got.restart || got.answer != stop.Ask {
@@ -1141,7 +1146,7 @@ func TestUpdateMessage(t *testing.T) {
 // serve listens for approval sessions beside its socket's directory, the
 // runtime directory, which the container mounts, so the container cannot
 // reach it; it removes the socket when it stops. Its hello reports the
-// build version it is given.
+// build version it is given and the daemon settings it runs with.
 func TestServeListensOnTheApprovalSocket(t *testing.T) {
 	cfg := watchConfig(t)
 	cfg.watch = false
@@ -1175,11 +1180,11 @@ func TestServeListensOnTheApprovalSocket(t *testing.T) {
 	if err != nil || f.Type != protocol.FrameDaemonInfo || protocol.DecodeJSON(f, &got) != nil {
 		t.Fatalf("hello: frame %v, err %v", f.Type, err)
 	}
-	want := protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: cfg.workspace, ContainerWorkspace: cfg.containerWorkspace, RulesFile: cfg.RulesFile, RulesDigest: "missing", Stops: true, Rereads: true, BuildVersion: "v1.2.0", Runs: true}
+	want := protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: cfg.workspace, ContainerWorkspace: cfg.containerWorkspace, RulesFile: cfg.RulesFile, RulesDigest: "missing", Stops: true, Rereads: true, BuildVersion: "v1.2.0", Runs: true, Settings: cfg.Settings.Daemon()}
 	if real, err := filepath.EvalSymlinks(cfg.workspace); err == nil {
 		want.Workspace = real
 	}
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("hello: got %+v, want %+v", got, want)
 	}
 	cancel()
@@ -1674,7 +1679,7 @@ func TestStopRestartAndApproveResolveTheirSettings(t *testing.T) {
 	}
 	for _, tt := range tests {
 		for _, name := range []string{"stop", "restart"} {
-			got, err := parseStop(name, tt.stopFlags, "/bin/hostrunner", envOf(tt.vars), io.Discard)
+			got, err := parseStop(name, tt.stopFlags, "/bin/hostrunner", withDataHome(envOf(tt.vars)), io.Discard)
 			if err != nil || got.Root != tt.root || got.StopTimeout != tt.stopTimeout {
 				t.Errorf("%s, %s: got %q and %v, %v; want %q and %v", name, tt.name, got.Root, got.StopTimeout, err, tt.root, tt.stopTimeout)
 			}
@@ -1740,7 +1745,7 @@ func TestStopRestartAndApproveRefuseInvalidSettings(t *testing.T) {
 }
 
 func TestParseRestartStartsTheInstalledHostrunner(t *testing.T) {
-	got, err := parseStop("restart", []string{"--all"}, "/home/u/.local/bin/hostrunner", xdgEnv, io.Discard)
+	got, err := parseStop("restart", []string{"--all"}, "/home/u/.local/bin/hostrunner", withDataHome(xdgEnv), io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1749,6 +1754,23 @@ func TestParseRestartStartsTheInstalledHostrunner(t *testing.T) {
 	}
 	if stopped, _ := parseStop("stop", nil, "/bin/hostrunner", xdgEnv, io.Discard); stopped.Restart != nil {
 		t.Fatal("stop restarts")
+	}
+}
+
+// restart checks the new daemon's rules and settings in the allow store
+// up checks, the one allow.Open opens; with no place to keep an allow
+// there is nothing to check against, which is an error of restart, not of
+// stop.
+func TestParseRestartFindsTheAllowStore(t *testing.T) {
+	got, err := parseStop("restart", []string{"--all"}, "/bin/hostrunner", envOf(map[string]string{"XDG_RUNTIME_DIR": "/run/user/1000", "HOME": "/home/u"}), io.Discard)
+	if want := "/home/u/.local/share/hostrunner/allow"; err != nil || got.Restart == nil || got.Restart.Allows.Dir != want {
+		t.Fatalf("got %+v, %v; want the allow store %q", got.Restart, err, want)
+	}
+	if _, err := parseStop("restart", []string{"--all"}, "/bin/hostrunner", xdgEnv, io.Discard); err == nil || !strings.Contains(err.Error(), "XDG_DATA_HOME") {
+		t.Fatalf("got %v, want an error naming XDG_DATA_HOME", err)
+	}
+	if _, err := parseStop("stop", []string{"--all"}, "/bin/hostrunner", xdgEnv, io.Discard); err != nil {
+		t.Fatalf("stop: %v", err)
 	}
 }
 
@@ -1762,7 +1784,7 @@ func TestParseRestartResolvesTheNewDaemonsSettings(t *testing.T) {
 	host := settingsFile(t, "stop_timeout: 1m\ngrace: 2m\nworkspaces:\n  "+ws+":\n    poll_interval: 3s\n")
 	wsFile := settingsFile(t, "ask_timeout: 4m\n")
 	vars := map[string]string{"XDG_RUNTIME_DIR": "/run/user/1000", "HOSTRUNNER_SETTINGS": host, "HOSTRUNNER_READY_TIMEOUT": "5s"}
-	got, err := parseStop("restart", []string{"--workspace-settings", wsFile, "--rules-file", "/r/hostrun.yaml"}, "/bin/hostrunner", envOf(vars), io.Discard)
+	got, err := parseStop("restart", []string{"--workspace-settings", wsFile, "--rules-file", "/r/hostrun.yaml"}, "/bin/hostrunner", withDataHome(envOf(vars)), io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1799,7 +1821,7 @@ func TestParseRestartRefusesTheDaemonsPathFlagsWithAll(t *testing.T) {
 			t.Errorf("--%s: got %v, want %q with the usage", flagName, err, want)
 		}
 	}
-	if _, err := parseStop("restart", []string{"--choose", "--rules-file", "/r/file.yaml"}, "/bin/hostrunner", xdgEnv, io.Discard); err != nil {
+	if _, err := parseStop("restart", []string{"--choose", "--rules-file", "/r/file.yaml"}, "/bin/hostrunner", withDataHome(xdgEnv), io.Discard); err != nil {
 		t.Errorf("--choose, which restarts one daemon: %v", err)
 	}
 }
@@ -1825,7 +1847,7 @@ func TestParseRestartRefusesAnEmptyConfig(t *testing.T) {
 // source.
 func TestParseRestartFindsAnInvalidDaemonSettingForTheNewDaemon(t *testing.T) {
 	bad := settingsFile(t, "grace: soon\n")
-	got, err := parseStop("restart", nil, "/bin/hostrunner", envOf(map[string]string{"XDG_RUNTIME_DIR": "/run/user/1000", "HOSTRUNNER_SETTINGS": bad}), io.Discard)
+	got, err := parseStop("restart", nil, "/bin/hostrunner", withDataHome(envOf(map[string]string{"XDG_RUNTIME_DIR": "/run/user/1000", "HOSTRUNNER_SETTINGS": bad})), io.Discard)
 	if err != nil {
 		t.Fatalf("parse: %v; want the setting found only for the new daemon", err)
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"maps"
 	"net"
 	"os"
 	"path/filepath"
@@ -13,8 +14,10 @@ import (
 	"time"
 
 	"github.com/kravlab/hostrunner/internal/daemon"
+	"github.com/kravlab/hostrunner/internal/daemonlist"
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
+	"github.com/kravlab/hostrunner/internal/transport"
 	"github.com/kravlab/hostrunner/internal/workspace"
 )
 
@@ -296,5 +299,33 @@ func TestServeStopsAfterAnsweringArmWithStepAside(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Serve kept running after stepping aside")
+	}
+}
+
+// The hello of the approval socket carries the daemon settings the Server
+// runs with, as WithSettings gives them, so `hostrunner up` can tell
+// whether they are allowed.
+func TestApprovalHelloCarriesTheDaemonSettings(t *testing.T) {
+	dir, err := os.MkdirTemp("", "hr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	socket := filepath.Join(dir, "a.sock")
+	al, err := transport.Unix{Path: socket}.Listen()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"reread": "true", "grace": "15s"}
+	srv := newServer(t, daemon.WithApprovals(al, ""), daemon.WithSettings(want))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.Serve(ctx, newChanListener())
+	info, err := daemonlist.Probe(context.Background(), socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !maps.Equal(info.Settings, want) {
+		t.Fatalf("hello settings %v, want %v", info.Settings, want)
 	}
 }

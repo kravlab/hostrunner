@@ -63,6 +63,7 @@ type Server struct {
 	containerStopped func() bool                                          // nil: the armed container is not known to have stopped
 	rereadEvery      time.Duration                                        // 0: the rules file is not watched; see WithRereadEvery
 	buildVersion     string                                               // "": unknown; see WithBuildVersion
+	settings         map[string]string                                    // nil: none reported; see WithSettings
 
 	// rereading makes rereads one at a time, so a slower one never
 	// replaces the rules a later one served.
@@ -110,6 +111,14 @@ func WithAskTimeout(d time.Duration) Option {
 // Server reports none, as a daemon older than the field does.
 func WithBuildVersion(v string) Option {
 	return func(s *Server) { s.buildVersion = v }
+}
+
+// WithSettings sets the daemon settings the Server runs with, keyed by
+// their names (settings.Settings.Daemon), which it tells approval sessions
+// and `hostrunner up` (protocol.DaemonInfo.Settings); without it the
+// Server reports none, as a daemon older than the field does.
+func WithSettings(daemonSettings map[string]string) Option {
+	return func(s *Server) { s.settings = daemonSettings }
 }
 
 // WithReread lets an approval session make the Server reread its rules

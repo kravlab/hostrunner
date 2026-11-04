@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kravlab/hostrunner/internal/allow"
 	"github.com/kravlab/hostrunner/internal/daemonlist"
 	"github.com/kravlab/hostrunner/internal/hostterm"
 	"github.com/kravlab/hostrunner/internal/launch"
@@ -98,9 +99,8 @@ type Config struct {
 // file and rereading. A daemon that saw its armed container stop, and so
 // is about to exit, is only stopped, its settings and rules unchecked,
 // and so is one that stops by itself meanwhile; the next `up` starts a
-// new one. `hostrunner restart` does not check the allow yet: it starts
-// the new daemon whether or not its rules and settings are allowed
-// (whether it should check is issue #138).
+// new one. Rules or settings not allowed in Allows fail the restart, as
+// they fail `up`, before the old daemon stops: it keeps running.
 type Restart struct {
 	Daemon string // hostrunner executable to start as the daemon
 	Client string // hostrun binary to install into the runtime directory
@@ -111,6 +111,9 @@ type Restart struct {
 	// Runtimes are asked whether the container of a daemon of an older
 	// hostrunner, which does not say, is running.
 	Runtimes []watch.Runtime
+	// Allows is the allow store the new daemon's rules and settings must
+	// be allowed in, as for `hostrunner up` (see launch.Config.Allows).
+	Allows allow.Store
 }
 
 // runtimeTimeout bounds asking one container runtime about a workspace.
@@ -337,18 +340,20 @@ func (t *term) stopDaemon(ctx context.Context, cfg Config, socket string) error 
 	return t.stopped(ctx, cfg, dir, e)
 }
 
-// ending returns what follows the daemon of dir, which said info of itself
-// (nil for a daemon from before approvals, which says nothing), stopping:
-// for a restart, a new daemon, prepared now so that invalid settings or
-// rules leave the old one running, unless the daemon saw its armed
-// container stop and is about to exit (for a daemon of an older
-// hostrunner, which does not say: unless no container of its workspace
-// runs), which is only stopped, its settings and rules unchecked as
-// nothing would use them. A daemon still waiting
-// for its container (after an arm, during a rebuild) is replaced by one
-// that waits for it the same way. Not knowing what to start, or whether
-// the container runs, is an error. A restart warns when the new settings
-// leave an older default rules file unread (see warnIgnoredRules).
+// ending returns what follows the daemon of dir, which said info of
+// itself (nil for a daemon from before approvals, which says nothing),
+// stopping: for a restart, a new daemon, prepared now so that invalid
+// settings or rules leave the old one running, unless the daemon saw
+// its armed container stop and is about to exit (for a daemon of an
+// older hostrunner, which does not say: unless no container of its
+// workspace runs), which is only stopped, its settings and rules
+// unchecked as nothing would use them. A daemon still waiting for its
+// container (after an arm, during a rebuild) is replaced by one that
+// waits for it the same way. Not knowing what to start, or whether the
+// container runs, is an error, and so are rules or settings not allowed
+// (a *launch.NotAllowedError, see launch.PrepareAllowed). A restart
+// warns when the new settings leave an older default rules file unread
+// (see warnIgnoredRules).
 func (t *term) ending(ctx context.Context, cfg Config, dir string, info *protocol.DaemonInfo) (ending, error) {
 	if cfg.up != nil {
 		return ending{kind: startNew, up: cfg.up}, nil
@@ -377,12 +382,13 @@ func (t *term) ending(ctx context.Context, cfg Config, dir string, info *protoco
 		return ending{}, fmt.Errorf("%s: %w; the daemon keeps running", name, err)
 	}
 	t.warnIgnoredRules(s)
-	p, err := launch.Prepare(launch.Config{
+	p, err := launch.PrepareAllowed(launch.Config{
 		Dir:                dir,
 		Workspace:          info.Workspace,
 		ContainerWorkspace: info.ContainerWorkspace,
 		Daemon:             r.Daemon,
 		Client:             r.Client,
+		Allows:             r.Allows,
 		Settings:           s.Settings,
 	})
 	if err != nil {

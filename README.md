@@ -218,10 +218,18 @@ hostrunner allow ~/src/app       # or the workspace given
 hostrunner deny ~/src/app        # withdraw the allow
 ```
 
-Without an allow of the current rules and settings, `up` fails, naming
-the rules file, its digest and `hostrunner allow`, so `devcontainer up`
-fails and the container does not start; it starts nothing and leaves a
-running daemon as it is. It also records what it asked for (the rules
+Without an allow of the current rules and settings, `up` keeps a
+running daemon that serves allowed ones: it arms that daemon, which
+goes on serving them, so a container restart or rebuild does not drop
+the allowed rules, and says on stderr that the rules file, with its
+digest, and the settings are not allowed, that a human on the host runs
+`hostrunner allow` to allow them, and that the daemon keeps serving the
+allowed rules. Without such a daemon (none runs, or it serves rules or
+settings not allowed either, or is of a hostrunner older than this
+check) `up` fails, naming the rules file, its digest and `hostrunner
+allow`, so `devcontainer up` fails and the container does not start; it
+starts nothing and leaves a running daemon as it is. It also records
+what it asked for (the rules
 file, its digest and the daemon settings, from every flag
 devcontainer.json gave it) in `$XDG_DATA_HOME/hostrunner/allow`
 (`~/.local/share/hostrunner/allow` when it is unset). `allow` allows
@@ -242,8 +250,10 @@ give `up` different settings flags overwrites one allow with the other
 allow of the workspace.
 
 The first `up` after upgrading to a hostrunner with allows fails the
-same way until the workspace is allowed. `up --restart` checks the
-allow before it stops the running daemon.
+same way until the workspace is allowed. `up --restart` and `hostrunner
+restart` check the allow before they stop the running daemon: content
+not allowed fails them, records the request as `up` does and leaves the
+daemon running.
 
 ### Settings
 
@@ -593,7 +603,8 @@ against the current directory and refused with `--all`, as they name one
 workspace's files; the other daemon settings have no flag here). It
 checks them and reads and checks the rules file before stopping anything
 (an invalid setting or invalid rules leave the daemon running, the error
-naming the source), then starts a new daemon, the installed
+naming the source, and so do rules or settings not allowed, see
+[Allow](#allow)), then starts a new daemon, the installed
 `hostrunner`, for the same workspace, with those settings, and waits
 `ready_timeout` for it to listen. It names what they change of the old
 daemon's rules file and rereading (`hostrunner: restarted <dir>;

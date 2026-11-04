@@ -25,8 +25,14 @@ func UpRestart(ctx context.Context, up launch.Config, commands Commands, in io.R
 	defer t.close()
 	err = t.stopDaemon(ctx, cfg, launch.ApprovalSocket(up.Dir))
 	if errors.Is(err, errGone) {
-		// No daemon to replace: as up.
-		return launch.Up(ctx, up)
+		// No daemon to replace: as up, with what was prepared and
+		// checked above.
+		unlock, err := launch.LockDir(up.Dir)
+		if err != nil {
+			return err
+		}
+		defer unlock()
+		return p.UpLocked(ctx)
 	}
 	return err
 }

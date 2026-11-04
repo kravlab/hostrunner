@@ -100,6 +100,22 @@ func key(workspace string) (string, error) {
 	return abs, nil
 }
 
+// SameWorkspace reports whether the paths a and b name one workspace as
+// the store keys it (see key): with symbolic links followed, so a link and
+// its target are one workspace, and a path that does not exist compared
+// by its cleaned absolute path.
+func SameWorkspace(a, b string) (bool, error) {
+	ka, err := key(a)
+	if err != nil {
+		return false, err
+	}
+	kb, err := key(b)
+	if err != nil {
+		return false, err
+	}
+	return ka == kb, nil
+}
+
 // canonical returns the identity of a rules file, as key returns that of a
 // workspace: its path made absolute with symbolic links followed, so a
 // link and its target are the same file. A path that cannot be resolved,

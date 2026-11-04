@@ -26,7 +26,9 @@ import (
 )
 
 // fakeDaemonEnv makes the test binary act as the daemon when Up spawns it.
-// Values: "serve" listens and answers FrameArm; "hang" never listens.
+// Values: "serve" listens and answers FrameArm; "older" does too, as a
+// daemon older than DaemonInfo.Settings, which does not say its settings;
+// "hang" never listens.
 const fakeDaemonEnv = "HOSTRUNNER_LAUNCH_FAKE_DAEMON"
 
 // runUpEnv makes the test binary run Up itself (as `hostrunner up` would),
@@ -64,9 +66,10 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// runFakeDaemon records its pid in fake.pids and, in "serve" mode,
-// listens on --socket and answers every FrameArm, logging it to
-// fake.armed. Like the real daemon (armHandler in cmd/hostrunner, which a
+// runFakeDaemon records its pid in fake.pids and, in "serve" and "older"
+// mode, answers hellos on its approval socket with what it serves (see
+// answerHellos), listens on --socket and answers every FrameArm, logging
+// it to fake.armed. Like the real daemon (armHandler in cmd/hostrunner, which a
 // change of the comparison must keep it in step with) it compares the
 // arm's rules digest with the rules it started with, the arm's
 // --no-reread with its own, and each setting the arm carries with the one
@@ -75,7 +78,7 @@ func TestMain(m *testing.M) {
 func runFakeDaemon(mode string) {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	socket := fs.String("socket", "", "")
-	fs.String("workspace", "", "")
+	workspace := fs.String("workspace", "", "")
 	fs.String("container-workspace", "", "")
 	var own settings.Settings
 	config := fs.String("rules-file", "", "")
@@ -102,6 +105,11 @@ func runFakeDaemon(mode string) {
 		time.Sleep(time.Minute)
 		os.Exit(0)
 	}
+	info := protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: *workspace, RulesFile: *config, RulesDigest: policy.Digest(), Stops: true, Rereads: !*noReread, NoReread: *noReread}
+	if mode != "older" {
+		info.Settings = ownSettings
+	}
+	answerHellos(ApprovalSocket(dir), info)
 	l, err := net.Listen("unix", *socket)
 	if err != nil {
 		os.Exit(1)
@@ -130,6 +138,33 @@ func runFakeDaemon(mode string) {
 		}
 		c.Close()
 	}
+}
+
+// answerHellos listens on the approval socket socket, removing the one a
+// fake daemon that stepped aside left behind, and answers every hello on
+// it with info until the process exits. It listens before it returns, so
+// the daemon answers hellos once it answers arms.
+func answerHellos(socket string, info protocol.DaemonInfo) {
+	os.Remove(socket)
+	l, err := net.Listen("unix", socket)
+	if err != nil {
+		os.Exit(1)
+	}
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				c.SetDeadline(time.Now().Add(5 * time.Second))
+				if f, err := protocol.ReadFrame(c); err == nil && f.Type == protocol.FrameHello {
+					_ = protocol.WriteJSON(c, protocol.FrameDaemonInfo, info)
+				}
+			}()
+		}
+	}()
 }
 
 func appendLine(path, line string) {
@@ -770,7 +805,7 @@ func TestArmCarriesTheDaemonSettings(t *testing.T) {
 				}
 				_ = protocol.WriteJSON(c, protocol.FrameArmed, protocol.Armed{Version: protocol.Version})
 			}()
-			if _, err := arm(context.Background(), socket, "digest", tt.s); err != nil {
+			if _, err := arm(context.Background(), socket, upArm("digest", tt.s)); err != nil {
 				t.Fatal(err)
 			}
 			a := <-got
@@ -958,9 +993,11 @@ func TestUpAfterAChangeOfTheReadyTimeoutNeedsNoNewAllow(t *testing.T) {
 	onlyPid(t, cfg.Dir)
 }
 
-// Not allowed is fail-closed: a daemon that is running is neither armed
-// nor stopped by an up whose rules are not allowed.
-func TestUpOfChangedRulesNotAllowedLeavesTheRunningDaemon(t *testing.T) {
+// An up whose rules are not allowed arms a running daemon that serves
+// allowed rules and settings, which keeps serving them, so a container
+// restart does not drop them; it says so on stderr and records its
+// request.
+func TestUpOfChangedRulesNotAllowedArmsTheDaemonServingAllowedRules(t *testing.T) {
 	cfg := fakeConfig(t, "serve")
 	if err := Up(context.Background(), cfg); err != nil {
 		t.Fatalf("first Up: %v", err)
@@ -969,15 +1006,82 @@ func TestUpOfChangedRulesNotAllowedLeavesTheRunningDaemon(t *testing.T) {
 	if err := os.WriteFile(cfg.RulesFile, []byte(gitStatusRules), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	notAllowed(t, Up(context.Background(), cfg), cfg, gitStatusDigest)
-	if !alivePid(first) {
-		t.Fatal("the running daemon was stopped")
+	var stderr strings.Builder
+	cfg.Stderr = &stderr
+	if err := Up(context.Background(), cfg); err != nil {
+		t.Fatalf("Up of rules not allowed: %v", err)
 	}
-	if pid := onlyPid(t, cfg.Dir); pid != first {
-		t.Fatalf("daemon pid %d, want %d", pid, first)
+	if pid := onlyPid(t, cfg.Dir); pid != first || !alivePid(first) {
+		t.Fatalf("daemon pid %d, alive %v; want %d kept", pid, alivePid(first), first)
 	}
-	if got := lines(t, filepath.Join(cfg.Dir, "fake.armed")); strings.Join(got, " ") != "armed" {
-		t.Fatalf("arms %q, want only the first Up's", got)
+	if got := lines(t, filepath.Join(cfg.Dir, "fake.armed")); strings.Join(got, " ") != "armed armed" {
+		t.Fatalf("arms %q, want the running daemon armed again", got)
+	}
+	want := "hostrunner: the rules file " + cfg.RulesFile + " (digest " + gitStatusDigest + ") and the daemon settings are not allowed for " + cfg.Workspace +
+		": a human on the host runs hostrunner allow " + cfg.Workspace + " to allow them; the daemon keeps serving the allowed rules (digest missing)\n"
+	if got := stderr.String(); got != want {
+		t.Errorf("stderr %q, want %q", got, want)
+	}
+	if _, ok, err := cfg.Allows.Pending(cfg.Workspace); err != nil || !ok {
+		t.Errorf("Pending = %v, %v, want the request recorded", ok, err)
+	}
+}
+
+// Not allowed is fail-closed: a running daemon whose own rules and
+// settings are not allowed either, that serves another workspace or that
+// does not say its settings is neither armed nor stopped by an up whose
+// rules are not allowed.
+func TestUpOfChangedRulesNotAllowedLeavesADaemonNotServingAllowedRules(t *testing.T) {
+	for _, tt := range []struct {
+		name, mode string
+		spoil      func(t *testing.T, cfg *Config)
+	}{
+		{"its allow denied", "serve", func(t *testing.T, cfg *Config) {
+			if _, err := cfg.Allows.Deny(cfg.Workspace); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"other rules allowed", "serve", func(t *testing.T, cfg *Config) {
+			if _, err := cfg.Allows.Allow(cfg.Workspace, cfg.RulesFile, "other", cfg.Settings.Daemon()); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"a daemon of another workspace", "serve", func(t *testing.T, cfg *Config) {
+			// The other workspace allows what the daemon serves, for the
+			// workspace it was started for.
+			cfg.Workspace = "/home/u/other"
+			if _, err := cfg.Allows.Allow(cfg.Workspace, cfg.RulesFile, "missing", cfg.Settings.Daemon()); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"an older daemon", "older", func(*testing.T, *Config) {}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := fakeConfig(t, tt.mode)
+			if err := Up(context.Background(), cfg); err != nil {
+				t.Fatalf("first Up: %v", err)
+			}
+			first := onlyPid(t, cfg.Dir)
+			if err := os.WriteFile(cfg.RulesFile, []byte(gitStatusRules), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			tt.spoil(t, &cfg)
+			var stderr strings.Builder
+			cfg.Stderr = &stderr
+			notAllowed(t, Up(context.Background(), cfg), cfg, gitStatusDigest)
+			if !alivePid(first) {
+				t.Fatal("the running daemon was stopped")
+			}
+			if pid := onlyPid(t, cfg.Dir); pid != first {
+				t.Fatalf("daemon pid %d, want %d", pid, first)
+			}
+			if got := lines(t, filepath.Join(cfg.Dir, "fake.armed")); strings.Join(got, " ") != "armed" {
+				t.Fatalf("arms %q, want only the first Up's", got)
+			}
+			if stderr.Len() != 0 {
+				t.Errorf("printed %q, want nothing", stderr.String())
+			}
+		})
 	}
 }
 

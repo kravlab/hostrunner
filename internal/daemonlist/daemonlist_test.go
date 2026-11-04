@@ -126,7 +126,7 @@ func TestListSkipsADaemonThatDoesNotAnswer(t *testing.T) {
 	if took := time.Since(start); took > 2*time.Second {
 		t.Fatalf("List took %v with a socket that does not answer", took)
 	}
-	if len(got) != 1 || got[0].Info != live {
+	if len(got) != 1 || !reflect.DeepEqual(got[0].Info, live) {
 		t.Fatalf("got %+v, want only the daemon that answers", got)
 	}
 }

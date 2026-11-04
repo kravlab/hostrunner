@@ -322,7 +322,8 @@ func parseFlags(fs *flag.FlagSet, args []string, usage string) error {
 // daemon; the client is the hostrun binary installed next to it. The
 // settings are resolved here, with getenv reading the environment, and
 // all of them given to the daemon. The allow store up checks is the one
-// allow.Open opens.
+// allow.Open opens. output, which receives the flags' help and errors, is
+// where up tells the human what it says besides an error.
 func parseUp(args []string, exe string, getenv func(string) string, output io.Writer) (upConfig, error) {
 	var (
 		dir        string
@@ -365,6 +366,7 @@ func parseUp(args []string, exe string, getenv func(string) string, output io.Wr
 	cfg := daemonBinaries(exe)
 	cfg.Dir, cfg.Workspace, cfg.ContainerWorkspace = dir, ws.workspace, ws.containerWorkspace
 	cfg.Allows = allows
+	cfg.Stderr = output
 	cfg.Settings = s.Settings
 	return upConfig{launch: cfg, ignored: s.IgnoredRules, restart: restart, answer: answer}, nil
 }
@@ -416,7 +418,8 @@ func parseAnswer(kill, wait bool, usage string) (stop.Answer, error) {
 // `hostrunner up` puts their runtime directories) unless a setting says;
 // the settings are resolved with getenv reading the environment, those
 // of a new daemon as up resolves them, for the old daemon's workspace,
-// when restart starts it.
+// when restart starts it. restart checks them in the allow store
+// allow.Open opens, as up does.
 func parseStop(name string, args []string, exe string, getenv func(string) string, output io.Writer) (stop.Config, error) {
 	usage := stopUsage
 	if name == "restart" {
@@ -480,8 +483,12 @@ func parseStop(name string, args []string, exe string, getenv func(string) strin
 		cfg.Root = s.RuntimeRoot
 	}
 	if name == "restart" {
+		allows, err := allow.Open(getenv)
+		if err != nil {
+			return stop.Config{}, err
+		}
 		b := daemonBinaries(exe)
-		cfg.Restart = &stop.Restart{Daemon: b.Daemon, Client: b.Client, Settings: func(workspace string) (settings.Resolved, error) {
+		cfg.Restart = &stop.Restart{Daemon: b.Daemon, Client: b.Client, Allows: allows, Settings: func(workspace string) (settings.Resolved, error) {
 			return sf.Resolve(getenv, workspace)
 		}}
 	}
@@ -821,6 +828,7 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 		daemon.WithAskTimeout(cfg.AskTimeout),
 		daemon.WithRequestTimeout(cfg.RequestTimeout),
 		daemon.WithBuildVersion(cfg.version),
+		daemon.WithSettings(cfg.Settings.Daemon()),
 	}
 	if cfg.Reread {
 		opts = append(opts, daemon.WithRereadEvery(cfg.PollInterval))

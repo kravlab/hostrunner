@@ -407,19 +407,24 @@ type Hello struct {
 // Runs says the daemon sends the frames of approved runs to a session
 // that asks for them (Serve.Runs); a daemon older than the field reports
 // it not, and a session then gets no run output.
+// Settings are the daemon settings the daemon runs with, keyed by their
+// names as an arm carries them (settings.Settings.Daemon), so that
+// `hostrunner up` can tell whether what it serves is allowed; a daemon
+// older than the field reports none, and an older session ignores it.
 type DaemonInfo struct {
-	Version            int    `json:"version"`
-	Workspace          string `json:"workspace"`
-	ContainerWorkspace string `json:"container_workspace"`
-	RulesFile          string `json:"rules_file"`
-	RulesDigest        string `json:"rules_digest,omitempty"`
-	Served             bool   `json:"served,omitempty"`
-	Stops              bool   `json:"stops,omitempty"`
-	ContainerStopped   bool   `json:"container_stopped,omitempty"`
-	Rereads            bool   `json:"rereads,omitempty"`
-	NoReread           bool   `json:"no_reread,omitempty"`
-	BuildVersion       string `json:"build_version,omitempty"`
-	Runs               bool   `json:"runs,omitempty"`
+	Version            int               `json:"version"`
+	Workspace          string            `json:"workspace"`
+	ContainerWorkspace string            `json:"container_workspace"`
+	RulesFile          string            `json:"rules_file"`
+	RulesDigest        string            `json:"rules_digest,omitempty"`
+	Served             bool              `json:"served,omitempty"`
+	Stops              bool              `json:"stops,omitempty"`
+	ContainerStopped   bool              `json:"container_stopped,omitempty"`
+	Rereads            bool              `json:"rereads,omitempty"`
+	NoReread           bool              `json:"no_reread,omitempty"`
+	BuildVersion       string            `json:"build_version,omitempty"`
+	Runs               bool              `json:"runs,omitempty"`
+	Settings           map[string]string `json:"settings,omitempty"`
 }
 
 // RunningList answers FrameRunning: the commands the daemon runs, and
