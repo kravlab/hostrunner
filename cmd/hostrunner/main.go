@@ -92,8 +92,10 @@ import (
 	"github.com/kravlab/hostrunner/internal/hostterm"
 	"github.com/kravlab/hostrunner/internal/instructions"
 	"github.com/kravlab/hostrunner/internal/launch"
+	"github.com/kravlab/hostrunner/internal/mountcheck"
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
+	"github.com/kravlab/hostrunner/internal/rulesfile"
 	"github.com/kravlab/hostrunner/internal/settings"
 	"github.com/kravlab/hostrunner/internal/stop"
 	"github.com/kravlab/hostrunner/internal/transport"
@@ -321,7 +323,9 @@ func parseFlags(fs *flag.FlagSet, args []string, usage string) error {
 // paths are required. exe is the running hostrunner, which becomes the
 // daemon; the client is the hostrun binary installed next to it. The
 // settings are resolved here, with getenv reading the environment, and
-// all of them given to the daemon. The allow store up checks is the one
+// all of them given to the daemon, with the workspace settings file they
+// were read from (see settings.Flags.WorkspaceFile), which the daemon
+// protects in its mount check. The allow store up checks is the one
 // allow.Open opens. output, which receives the flags' help and errors, is
 // where up tells the human what it says besides an error.
 func parseUp(args []string, exe string, getenv func(string) string, output io.Writer) (upConfig, error) {
@@ -359,6 +363,10 @@ func parseUp(args []string, exe string, getenv func(string) string, output io.Wr
 	if err != nil {
 		return upConfig{}, err
 	}
+	wsSettings, err := sf.WorkspaceFile(getenv, ws.workspace)
+	if err != nil {
+		return upConfig{}, err
+	}
 	allows, err := allow.Open(getenv)
 	if err != nil {
 		return upConfig{}, err
@@ -367,6 +375,7 @@ func parseUp(args []string, exe string, getenv func(string) string, output io.Wr
 	cfg.Dir, cfg.Workspace, cfg.ContainerWorkspace = dir, ws.workspace, ws.containerWorkspace
 	cfg.Allows = allows
 	cfg.Stderr = output
+	cfg.WorkspaceSettings = wsSettings
 	cfg.Settings = s.Settings
 	return upConfig{launch: cfg, ignored: s.IgnoredRules, restart: restart, answer: answer}, nil
 }
@@ -490,6 +499,8 @@ func parseStop(name string, args []string, exe string, getenv func(string) strin
 		b := daemonBinaries(exe)
 		cfg.Restart = &stop.Restart{Daemon: b.Daemon, Client: b.Client, Allows: allows, Settings: func(workspace string) (settings.Resolved, error) {
 			return sf.Resolve(getenv, workspace)
+		}, WorkspaceSettings: func(workspace string) (string, error) {
+			return sf.WorkspaceFile(getenv, workspace)
 		}}
 	}
 	return cfg, nil
@@ -518,6 +529,7 @@ type serveConfig struct {
 	socket string // Unix socket to listen on
 	workspaceFlags
 	watch             bool        // exit once the armed container stops
+	workspaceSettings string      // the workspace settings file, absolute (see settings.Flags.WorkspaceFile)
 	version           string      // the build version the daemon reports (see buildVersion)
 	allows            allow.Store // where a hand edit of the rules file is checked as allowed
 	settings.Settings             // the daemon's settings
@@ -527,7 +539,10 @@ type serveConfig struct {
 // workspace paths are required. The settings no flag gives are resolved
 // like `up` does, with getenv reading the environment, so a hand-started
 // serve runs like one `up` starts; given all of them, as `up` does, it
-// reads no other source. The allow store a hand edit of the rules file
+// reads no other source. The workspace settings file, which a --watch
+// daemon protects in its mount check, is named by the rule `up` follows
+// (see settings.Flags.WorkspaceFile), so the one `up` passes with
+// --workspace-settings. The allow store a hand edit of the rules file
 // is checked in is the one allow.Open opens, as `up` checks.
 func parseServe(args []string, getenv func(string) string, output io.Writer) (serveConfig, error) {
 	var cfg serveConfig
@@ -555,6 +570,9 @@ func parseServe(args []string, getenv func(string) string, output io.Writer) (se
 		return cfg, err
 	}
 	cfg.Settings = s
+	if cfg.workspaceSettings, err = sf.WorkspaceFile(getenv, cfg.workspace); err != nil {
+		return cfg, err
+	}
 	if cfg.allows, err = allow.Open(getenv); err != nil {
 		return cfg, err
 	}
@@ -779,6 +797,12 @@ func isTerminal(f *os.File) bool {
 // a rule makes the daemon reread the file, and one that found the file
 // edited by hand has it reread once allowed. The digest of the rules
 // reread is the one arms compare.
+//
+// With watch, the daemon also checks the mounts of the armed container on
+// every attach (see protectedPaths and daemon.WithMountCheck): it refuses
+// every command until the first check of each arm, and while the latest one finds
+// that the container can write its configuration. Without watch there is
+// no container to check, and no check.
 func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []watch.Runtime) error {
 	policy, err := rules.Load(cfg.RulesFile)
 	if err != nil {
@@ -808,7 +832,10 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	var watcher *watch.Watcher
+	var (
+		watcher *watch.Watcher
+		srv     *daemon.Server // set before the watcher runs, which calls Attached
+	)
 	if cfg.watch {
 		watcher = watch.New(runtimes, watch.Config{
 			Workspace:      cfg.workspace,
@@ -816,13 +843,12 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 			QueryTimeout:   queryTimeout,
 			StartupTimeout: cfg.StartupTimeout,
 			Grace:          cfg.Grace,
+			Attached: func(armedAt time.Time, armed []watch.Container) {
+				srv.MountChecked(armedAt, mountcheck.Check(armed, protectedPaths(cfg)))
+			},
+			// Before `up` gets its reply, so before its container starts.
+			Armed: func(armedAt time.Time) { srv.MountRearmed(armedAt) },
 		}, log)
-		go func() {
-			defer cancel()
-			if err := watcher.Run(ctx); err != nil && ctx.Err() == nil {
-				log.Warn("stopping", "reason", err)
-			}
-		}()
 	}
 	reread := func() (daemon.Policy, string, error) {
 		p, err := rules.Load(cfg.RulesFile)
@@ -845,10 +871,26 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 		opts = append(opts, daemon.WithRereadEvery(cfg.PollInterval))
 	}
 	if watcher != nil {
-		opts = append(opts, daemon.WithContainerStopped(watcher.ContainerStopped))
+		opts = append(opts, daemon.WithContainerStopped(watcher.ContainerStopped), daemon.WithMountCheck())
 	}
-	srv := daemon.New(mapper, policy, log, opts...)
+	srv = daemon.New(mapper, policy, log, opts...)
+	if watcher != nil {
+		go func() {
+			defer cancel()
+			if err := watcher.Run(ctx); err != nil && ctx.Err() == nil {
+				log.Warn("stopping", "reason", err)
+			}
+		}()
+	}
 	return srv.Serve(ctx, l)
+}
+
+// protectedPaths are the host paths of cfg's daemon configuration that the
+// armed container must not be able to write (see mountcheck.Check): the
+// workspace's .devcontainer directory, the rules file and the workspace
+// settings file, wherever these two lie.
+func protectedPaths(cfg serveConfig) []string {
+	return []string{filepath.Join(cfg.workspace, rulesfile.Dir), cfg.RulesFile, cfg.workspaceSettings}
 }
 
 // allowOptions returns the options that have the daemon of cfg reread

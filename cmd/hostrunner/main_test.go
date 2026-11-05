@@ -146,10 +146,11 @@ func TestParseServeAcceptsAllFlags(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := serveConfig{
-		socket:         "/run/h.sock",
-		workspaceFlags: workspaceFlags{workspace: "/home/u/app", containerWorkspace: "/workspaces/app"},
-		allows:         allow.Store{Dir: "/data/hostrunner/allow"},
-		Settings:       tuned("/home/u/app/.devcontainer/hostrunner-rules.yaml", 30*time.Minute, 15*time.Second, true),
+		socket:            "/run/h.sock",
+		workspaceFlags:    workspaceFlags{workspace: "/home/u/app", containerWorkspace: "/workspaces/app"},
+		workspaceSettings: "/home/u/app/.devcontainer/hostrunner.yaml",
+		allows:            allow.Store{Dir: "/data/hostrunner/allow"},
+		Settings:          tuned("/home/u/app/.devcontainer/hostrunner-rules.yaml", 30*time.Minute, 15*time.Second, true),
 	}
 	if got != want {
 		t.Fatalf("got %+v, want %+v", got, want)
@@ -222,6 +223,7 @@ func TestParseUpBuildsLaunchConfig(t *testing.T) {
 		Client:             filepath.Join("/home/u/.local/bin", "hostrun"),
 		Allows:             allow.Store{Dir: "/data/hostrunner/allow"},
 		Stderr:             &output,
+		WorkspaceSettings:  "/home/u/app/.devcontainer/hostrunner.yaml",
 		Settings:           tuned("/home/u/app/.devcontainer/hostrunner-rules.yaml", 30*time.Minute, 15*time.Second, true),
 	}
 	if got.launch != want || got.restart || got.answer != stop.Ask {
@@ -535,6 +537,77 @@ func TestUpAndServeReadTheWorkspaceSettings(t *testing.T) {
 		}
 		if _, err := resolve([]string{"--workspace", without}, envOf(map[string]string{"HOSTRUNNER_WORKSPACE_SETTINGS": "missing.yaml"})); err == nil || !strings.Contains(err.Error(), missing) {
 			t.Errorf("%s, missing HOSTRUNNER_WORKSPACE_SETTINGS file: got %v, want an error naming %s", name, err, missing)
+		}
+	}
+}
+
+// up and serve name the same workspace settings file, the one they read,
+// absolute: up passes it to the daemon it starts (see launch.Config), and
+// serve protects it in its mount check, whether or not it exists.
+func TestUpAndServeNameTheWorkspaceSettingsFile(t *testing.T) {
+	ws, cwd := t.TempDir(), t.TempDir()
+	t.Chdir(cwd)
+	tests := []struct {
+		name  string
+		flags []string
+		vars  map[string]string
+		want  string
+	}{
+		{"default", nil, nil, filepath.Join(ws, ".devcontainer", "hostrunner.yaml")},
+		{"HOSTRUNNER_WORKSPACE_SETTINGS", nil, map[string]string{"HOSTRUNNER_WORKSPACE_SETTINGS": "var.yaml"}, filepath.Join(ws, "var.yaml")},
+		{"--workspace-settings", []string{"--workspace-settings", "flag.yaml"}, map[string]string{"HOSTRUNNER_WORKSPACE_SETTINGS": "var.yaml"}, filepath.Join(cwd, "flag.yaml")},
+	}
+	for _, named := range []string{filepath.Join(ws, "var.yaml"), filepath.Join(cwd, "flag.yaml")} {
+		if err := os.WriteFile(named, nil, 0o600); err != nil { // a named file must exist
+			t.Fatal(err)
+		}
+	}
+	for _, tt := range tests {
+		up, err := parseUp(append([]string{"--dir", "/d", "--workspace", ws, "--container-workspace", "/c"}, tt.flags...), "/bin/hostrunner", withDataHome(envOf(tt.vars)), io.Discard)
+		if err != nil || up.launch.WorkspaceSettings != tt.want {
+			t.Errorf("up, %s: got %q, %v; want %q", tt.name, up.launch.WorkspaceSettings, err, tt.want)
+		}
+		sv, err := parseServe(append([]string{"--socket", "/run/h.sock", "--workspace", ws, "--container-workspace", "/c"}, tt.flags...), withDataHome(envOf(tt.vars)), io.Discard)
+		if err != nil || sv.workspaceSettings != tt.want {
+			t.Errorf("serve, %s: got %q, %v; want %q", tt.name, sv.workspaceSettings, err, tt.want)
+		}
+	}
+}
+
+// restart names the workspace settings file for the old daemon's
+// workspace as up does for the same flag, variable or default, so the
+// daemon it starts protects the file its settings were read from.
+func TestRestartNamesTheSameWorkspaceSettingsFileAsUp(t *testing.T) {
+	ws, cwd := t.TempDir(), t.TempDir()
+	t.Chdir(cwd)
+	tests := []struct {
+		name  string
+		flags []string
+		vars  map[string]string
+		want  string
+	}{
+		{"default", nil, nil, filepath.Join(ws, ".devcontainer", "hostrunner.yaml")},
+		{"HOSTRUNNER_WORKSPACE_SETTINGS", nil, map[string]string{"HOSTRUNNER_WORKSPACE_SETTINGS": "var.yaml"}, filepath.Join(ws, "var.yaml")},
+		{"--workspace-settings", []string{"--workspace-settings", "flag.yaml"}, map[string]string{"HOSTRUNNER_WORKSPACE_SETTINGS": "var.yaml"}, filepath.Join(cwd, "flag.yaml")},
+	}
+	for _, named := range []string{filepath.Join(ws, "var.yaml"), filepath.Join(cwd, "flag.yaml")} {
+		if err := os.WriteFile(named, nil, 0o600); err != nil { // a named file must exist
+			t.Fatal(err)
+		}
+	}
+	for _, tt := range tests {
+		env := withDataHome(envOf(tt.vars))
+		up, err := parseUp(append([]string{"--dir", "/d", "--workspace", ws, "--container-workspace", "/c"}, tt.flags...), "/bin/hostrunner", env, io.Discard)
+		if err != nil || up.launch.WorkspaceSettings != tt.want {
+			t.Errorf("up, %s: got %q, %v; want %q", tt.name, up.launch.WorkspaceSettings, err, tt.want)
+		}
+		got, err := parseStop("restart", append([]string{"--dir", "/d"}, tt.flags...), "/bin/hostrunner", env, io.Discard)
+		if err != nil || got.Restart == nil || got.Restart.WorkspaceSettings == nil {
+			t.Errorf("restart, %s: got %+v, %v; want a restart naming the workspace settings file", tt.name, got.Restart, err)
+			continue
+		}
+		if path, err := got.Restart.WorkspaceSettings(ws); err != nil || path != tt.want {
+			t.Errorf("restart, %s: got %q, %v; want %q", tt.name, path, err, tt.want)
 		}
 	}
 }

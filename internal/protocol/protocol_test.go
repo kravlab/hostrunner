@@ -99,11 +99,11 @@ func TestDecodeJSONRejectsMalformedPayload(t *testing.T) {
 }
 
 func TestReadFrameAcceptsUpToTheLastFrameType(t *testing.T) {
-	if _, err := ReadFrame(bytes.NewReader([]byte{byte(FrameRunEnded), 0, 0, 0, 0})); err != nil {
-		t.Fatalf("FrameRunEnded: %v", err)
+	if _, err := ReadFrame(bytes.NewReader([]byte{byte(FrameMountCheckFailed), 0, 0, 0, 0})); err != nil {
+		t.Fatalf("FrameMountCheckFailed: %v", err)
 	}
-	if _, err := ReadFrame(bytes.NewReader([]byte{byte(FrameRunEnded) + 1, 0, 0, 0, 0})); !errors.Is(err, ErrUnknownFrameType) {
-		t.Fatalf("the type after FrameRunEnded: got %v, want ErrUnknownFrameType", err)
+	if _, err := ReadFrame(bytes.NewReader([]byte{byte(FrameMountCheckFailed) + 1, 0, 0, 0, 0})); !errors.Is(err, ErrUnknownFrameType) {
+		t.Fatalf("the type after FrameMountCheckFailed: got %v, want ErrUnknownFrameType", err)
 	}
 }
 
@@ -114,6 +114,7 @@ func TestFrameTypesKeepTheirWireValues(t *testing.T) {
 		FrameRequest: 1, FrameApproved: 15, FrameHello: 16, FrameTakenOver: 30,
 		FrameRunning: 31, FrameRunningList: 32, FrameStop: 33, FrameStopping: 34,
 		FrameRulesReread: 35, FrameRunStarted: 36, FrameRunOutput: 37, FrameRunEnded: 38,
+		FrameMountCheckFailed: 39,
 	} {
 		if byte(typ) != want {
 			t.Errorf("frame %v has value %d, want %d", typ, byte(typ), want)
@@ -166,6 +167,32 @@ func TestRereadWireFormat(t *testing.T) {
 	}
 	if want := (RulesReread{Digest: "d", Error: "e"}); n != want {
 		t.Fatalf("got %+v, want %+v", n, want)
+	}
+}
+
+// The JSON names of the mount check are the contract between versions: a
+// daemon's DaemonInfo, a session's Serve and the frame of a failed check.
+func TestMountCheckWireFormat(t *testing.T) {
+	var info DaemonInfo
+	if err := DecodeJSON(Frame{Type: FrameDaemonInfo, Payload: []byte(`{"version":1,"mount_check_failed":"e"}`)}, &info); err != nil {
+		t.Fatal(err)
+	}
+	if info.MountCheckFailed != "e" {
+		t.Fatalf("got MountCheckFailed %q, want %q", info.MountCheckFailed, "e")
+	}
+	var sv Serve
+	if err := DecodeJSON(Frame{Type: FrameServe, Payload: []byte(`{"mount_check":true}`)}, &sv); err != nil {
+		t.Fatal(err)
+	}
+	if want := (Serve{MountCheck: true}); sv != want {
+		t.Fatalf("got %+v, want %+v", sv, want)
+	}
+	var m MountCheckFailed
+	if err := DecodeJSON(Frame{Type: FrameMountCheckFailed, Payload: []byte(`{"error":"e"}`)}, &m); err != nil {
+		t.Fatal(err)
+	}
+	if want := (MountCheckFailed{Error: "e"}); m != want {
+		t.Fatalf("got %+v, want %+v", m, want)
 	}
 }
 

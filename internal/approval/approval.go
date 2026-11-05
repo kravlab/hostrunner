@@ -282,8 +282,9 @@ const (
 // alike. When the daemon has gone (nextAwait), it also returns what the
 // session said of that, the prompt of the wait for the next one (see
 // awaitDaemon). Serving it, it says the daemon's build version and warns
-// when it is not the session's (see hostterm.OtherVersion), and says so
-// when the daemon does not report approved runs (noRunOutput).
+// when it is not the session's (see hostterm.OtherVersion), says so
+// when the daemon does not report approved runs (noRunOutput), and when
+// its mount check has failed (see mountCheckFailedText).
 // Without takeOver, a daemon another session serves is not served
 // (nextServedElsewhere, errServed).
 func (t *term) serveDaemon(ctx context.Context, socket string, takeOver, canList bool) (next, string, error) {
@@ -320,6 +321,9 @@ func (t *term) serveDaemon(ctx context.Context, socket string, takeOver, canList
 	}
 	if !info.Runs {
 		fmt.Fprintln(t.out, noRunOutput)
+	}
+	if info.MountCheckFailed != "" {
+		fmt.Fprintln(t.out, mountCheckFailedText(info.MountCheckFailed))
 	}
 	fmt.Fprintf(t.out, "waiting for requests · %s\n", idleCommands)
 
@@ -373,10 +377,11 @@ func halfClose(conn net.Conn) {
 
 // serve makes the session the one that serves the daemon, taking it over
 // from the session serving it with takeOver; the session reads the
-// daemon's notices of a reread (see rulesReread) and the frames of the
-// approved runs (see runs).
+// daemon's notices of a reread (see rulesReread), of a failed mount check
+// (see mountCheckFailedText) and the frames of the approved runs (see
+// runs).
 func serve(conn io.ReadWriter, takeOver bool) error {
-	if err := protocol.WriteJSON(conn, protocol.FrameServe, protocol.Serve{TakeOver: takeOver, Notices: true, Runs: true}); err != nil {
+	if err := protocol.WriteJSON(conn, protocol.FrameServe, protocol.Serve{TakeOver: takeOver, Notices: true, Runs: true, MountCheck: true}); err != nil {
 		return err
 	}
 	f, err := protocol.ReadFrame(conn)
@@ -642,6 +647,12 @@ func (s *session) daemonFrame(f protocol.Frame) error {
 			return err
 		}
 		s.rulesReread(r)
+	case protocol.FrameMountCheckFailed:
+		var m protocol.MountCheckFailed
+		if err := protocol.DecodeJSON(f, &m); err != nil {
+			return err
+		}
+		s.notify(mountCheckFailedText(m.Error))
 	case protocol.FrameRunStarted:
 		var m protocol.RunStarted
 		if err := protocol.DecodeJSON(f, &m); err != nil {
@@ -923,6 +934,12 @@ func (s *session) rulesReread(r protocol.RulesReread) {
 	}
 	s.daemon.RulesDigest = r.Digest
 	s.notify("the rules file changed; the daemon reread it")
+}
+
+// mountCheckFailedText says that the daemon's check of its container's
+// mounts failed for why, the daemon's error: it refuses every command.
+func mountCheckFailedText(why string) string {
+	return "the mount check failed, so the daemon refuses every command: " + hostterm.Display(why)
 }
 
 // notify prints text, a notice, on lines of its own, adding the newline

@@ -88,6 +88,11 @@ type Config struct {
 	// kept a running daemon serving allowed rules (see Up). nil prints
 	// nothing.
 	Stderr io.Writer
+	// WorkspaceSettings is the workspace settings file up resolved
+	// (settings.Flags.WorkspaceFile), given to the daemon, which protects
+	// it in its mount check; empty gives none, and the daemon resolves it
+	// itself.
+	WorkspaceSettings string
 	// Settings are the settings up, or restart, resolved. Each the daemon
 	// takes is given to it as its flag and carried in every arm;
 	// ReadyTimeout, up's own, is how long to wait for the daemon's socket
@@ -550,15 +555,20 @@ func startDaemon(ctx context.Context, cfg Config, socket string, a protocol.Arm)
 // serveArgs is the command line of the daemon cfg describes, listening
 // on socket. Every setting serve takes is an explicit flag, so the
 // daemon's argv shows what it runs with and it resolves none again;
-// rereading is given both ways (--reread or --no-reread).
+// rereading is given both ways (--reread or --no-reread). The workspace
+// settings file, when cfg names one, is given too, so the daemon protects
+// the file up read.
 func serveArgs(cfg Config, socket string) []string {
 	args := []string{"serve",
 		"--socket", socket,
 		"--workspace", cfg.Workspace,
-		"--container-workspace", cfg.ContainerWorkspace,
-		"--rules-file", cfg.RulesFile,
-		"--watch"}
+		"--container-workspace", cfg.ContainerWorkspace}
+	if cfg.WorkspaceSettings != "" {
+		args = append(args, "--workspace-settings", cfg.WorkspaceSettings)
+	}
 	args = append(args,
+		"--rules-file", cfg.RulesFile,
+		"--watch",
 		"--startup-timeout", cfg.StartupTimeout.String(),
 		"--grace", cfg.Grace.String(),
 		"--poll-interval", cfg.PollInterval.String(),

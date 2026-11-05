@@ -223,6 +223,35 @@ func TestWorkspaceFileIsNamedByFlagThenVariableThenTheWorkspace(t *testing.T) {
 	}
 }
 
+// WorkspaceFile names the workspace settings file Resolve reads, by the
+// same rule, made absolute: whether or not it exists, since a daemon
+// protects the file a workspace may add later.
+func TestWorkspaceFileNamesTheFileResolveReads(t *testing.T) {
+	ws, cwd := t.TempDir(), t.TempDir()
+	t.Chdir(cwd)
+	tests := []struct {
+		name  string
+		flags []string
+		vars  map[string]string
+		want  string
+	}{
+		{"flag, relative to the current directory", []string{"--workspace-settings", "flag.yaml"}, nil, filepath.Join(cwd, "flag.yaml")},
+		{"flag, absolute", []string{"--workspace-settings", "/etc/ws.yaml"}, nil, "/etc/ws.yaml"},
+		{"variable, relative to the workspace", nil, map[string]string{"HOSTRUNNER_WORKSPACE_SETTINGS": "var.yaml"}, filepath.Join(ws, "var.yaml")},
+		{"variable, absolute", nil, map[string]string{"HOSTRUNNER_WORKSPACE_SETTINGS": "/etc/var.yaml"}, "/etc/var.yaml"},
+		{"flag beats variable", []string{"--workspace-settings", "flag.yaml"}, map[string]string{"HOSTRUNNER_WORKSPACE_SETTINGS": "var.yaml"}, filepath.Join(cwd, "flag.yaml")},
+		{"default, missing", nil, nil, filepath.Join(ws, ".devcontainer", "hostrunner.yaml")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parse(t, tt.flags...).WorkspaceFile(env(tt.vars), ws)
+			if err != nil || got != tt.want {
+				t.Fatalf("got %q, %v; want %q", got, err, tt.want)
+			}
+		})
+	}
+}
+
 func TestMissingDefaultWorkspaceFileSetsNothing(t *testing.T) {
 	ws := newWorkspace(t, "")
 	got, err := parse(t).Resolve(env(nil), ws)

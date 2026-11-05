@@ -33,6 +33,16 @@ type Container struct {
 	ID        string
 	Running   bool
 	StartedAt time.Time // last start; zero if never started
+	Mounts    []Mount   // meaningful only if MountsErr is nil
+	MountsErr error     // why the mounts could not be read; nil when they were
+}
+
+// Mount is one of a container's mounts as its runtime reports it.
+type Mount struct {
+	Type        string // the runtime's mount type: "bind", "volume" or "tmpfs"; empty if it names none
+	Source      string // on the host; empty for a mount without one, as tmpfs
+	Destination string // in the container
+	ReadOnly    bool
 }
 
 // Runtime lists a workspace's containers, stopped ones included: a stopped
@@ -49,6 +59,24 @@ type Config struct {
 	QueryTimeout   time.Duration // how long one runtime query may take
 	StartupTimeout time.Duration // how long to wait for the armed container (covers image builds)
 	Grace          time.Duration // how long the armed container must be seen absent
+
+	// Attached, when set, is called on each attach to an armed container,
+	// and again whenever a container that started after the arm joins an
+	// attached arm (e.g. one a Compose devcontainer recreated), so its
+	// mounts are seen too. It gets all armed containers, the new one
+	// included, as the runtimes reported them in the poll that changed the
+	// armed set, mounts included; Run calls it before it polls again.
+	// Polls that bring no new armed container do not call it. The
+	// containers are copies the callback may keep. armedAt is the time of
+	// the arm it attached for (see Armed): a call may come after a later
+	// arm, from a poll that was under way when it came.
+	Attached func(armedAt time.Time, armed []Container)
+
+	// Armed, when set, is called by each Arm that the watcher follows, with
+	// the arm's time, before Arm returns: so before the caller lets the
+	// container start. Concurrent arms may call it out of order. The arm
+	// New makes is not reported.
+	Armed func(armedAt time.Time)
 }
 
 // Watcher follows one workspace's armed container: the container the last
@@ -117,12 +145,26 @@ func New(runtimes []Runtime, cfg Config, log *slog.Logger) *Watcher {
 // cancelled, Arm refuses and returns why it ended: the watcher will not
 // follow the arm, and the daemon must step aside. Arm never waits for
 // runtime queries; the arm's time is taken here, before the caller lets the
-// container start.
+// container start, and reported to Config.Armed before Arm returns.
 func (w *Watcher) Arm() error {
+	armedAt, err := w.arm()
+	if err != nil {
+		return err
+	}
+	// Outside w.mu: the callback must not hold up Run or ContainerStopped.
+	if w.cfg.Armed != nil {
+		w.cfg.Armed(armedAt)
+	}
+	return nil
+}
+
+// arm records an arm now and signals Run, or refuses once the watch has
+// ended; it returns the arm's time.
+func (w *Watcher) arm() (time.Time, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.ended != nil {
-		return fmt.Errorf("the watch has ended: %w", w.ended)
+		return time.Time{}, fmt.Errorf("the watch has ended: %w", w.ended)
 	}
 	w.armedAt = time.Now()
 	w.stopped = false // waiting from the arm on
@@ -130,7 +172,7 @@ func (w *Watcher) Arm() error {
 	case w.armSignal <- struct{}{}:
 	default: // an arm is already pending; it reads the latest time
 	}
-	return nil
+	return w.armedAt, nil
 }
 
 // lastArm returns the time of the last arm.
@@ -199,8 +241,15 @@ func (w *Watcher) Run(ctx context.Context) error {
 		containers, answered := w.query(ctx)
 		if answered {
 			lastAnswer = now
-			if arm.observe(containers, now, w.cfg.Grace) {
-				w.log.Info("attached to the armed container", "workspace", w.cfg.Workspace)
+			if justAttached, changed := arm.observe(containers, now, w.cfg.Grace); changed {
+				if justAttached {
+					w.log.Info("attached to the armed container", "workspace", w.cfg.Workspace)
+				} else {
+					w.log.Info("a container joined the armed containers", "workspace", w.cfg.Workspace)
+				}
+				if w.cfg.Attached != nil {
+					w.cfg.Attached(arm.at, arm.armed(containers))
+				}
 			}
 			w.setStopped(arm.at, arm.attached() && !arm.absentSince.IsZero())
 		} else {
@@ -257,23 +306,26 @@ type arming struct {
 func (a *arming) attached() bool { return a.ids != nil }
 
 // observe takes the containers the runtimes answered with and reports
-// whether the watcher has just attached. Absence counts from the attach at
-// the earliest.
-func (a *arming) observe(containers []Container, now time.Time, grace time.Duration) (justAttached bool) {
+// whether the watcher has just attached, and whether the armed set changed:
+// that attach, or a container that joined it. Absence counts from the attach
+// at the earliest.
+func (a *arming) observe(containers []Container, now time.Time, grace time.Duration) (justAttached, changed bool) {
 	if !a.attached() {
 		a.ids = findArmed(containers, a.at, now, grace)
 		justAttached = a.attached()
 	}
 	if !a.attached() {
-		return false
+		return false, false
 	}
 	// A container started after the arm is the armed container too, e.g.
 	// one a Compose devcontainer recreated.
 	for _, c := range containers {
-		if c.StartedAt.After(a.at) {
+		if c.StartedAt.After(a.at) && !a.ids[c.ID] {
 			a.ids[c.ID] = true
+			changed = true
 		}
 	}
+	changed = changed || justAttached
 	running := slices.ContainsFunc(containers, func(c Container) bool { return c.Running && a.ids[c.ID] })
 	switch {
 	case running:
@@ -281,7 +333,20 @@ func (a *arming) observe(containers []Container, now time.Time, grace time.Durat
 	case a.absentSince.IsZero():
 		a.absentSince = now
 	}
-	return justAttached
+	return justAttached, changed
+}
+
+// armed returns copies of the armed containers among containers, in their
+// order.
+func (a *arming) armed(containers []Container) []Container {
+	var out []Container
+	for _, c := range containers {
+		if a.ids[c.ID] {
+			c.Mounts = slices.Clone(c.Mounts)
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // findArmed returns the IDs of the armed container among containers, or
@@ -355,7 +420,7 @@ func (c CLI) Containers(ctx context.Context, workspace string) ([]Container, err
 	}
 	// json renders docker's string and podman's time.Time alike, as RFC 3339.
 	args := append([]string{"inspect", "--type", "container", "--format",
-		"{{.Id}} {{.State.Running}} {{json .State.StartedAt}}"}, ids...)
+		"{{.Id}} {{.State.Running}} {{json .State.StartedAt}} {{json .Mounts}}"}, ids...)
 	out, stderr, err := c.run(ctx, args...)
 	// A container removed since the listing fails the inspection but not
 	// the others: it is absent. Any other failure is the runtime's.
@@ -364,15 +429,25 @@ func (c CLI) Containers(ctx context.Context, workspace string) ([]Container, err
 	}
 	var found []Container
 	for line := range strings.Lines(out) {
-		fields := strings.Fields(line)
-		if len(fields) != 3 {
+		// The mounts are JSON and may hold spaces, so they are the rest of the line.
+		fields := strings.SplitN(strings.TrimRight(line, "\r\n"), " ", 4)
+		if len(fields) < 3 {
 			return nil, fmt.Errorf("%s inspect: unexpected line %q", c.Binary, line)
 		}
 		started, perr := parseStartedAt(fields[2])
 		if perr != nil {
 			return nil, fmt.Errorf("%s inspect: %w", c.Binary, perr)
 		}
-		found = append(found, Container{ID: fields[0], Running: fields[1] == "true", StartedAt: started})
+		container := Container{ID: fields[0], Running: fields[1] == "true", StartedAt: started}
+		if len(fields) == 4 {
+			container.Mounts, container.MountsErr = parseMounts(fields[3])
+		} else {
+			container.MountsErr = errors.New("no mounts reported")
+		}
+		if container.MountsErr != nil {
+			container.MountsErr = fmt.Errorf("%s inspect: mounts of %s: %w", c.Binary, container.ID, container.MountsErr)
+		}
+		found = append(found, container)
 	}
 	return found, nil
 }
@@ -397,6 +472,26 @@ func parseStartedAt(raw string) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("start time %s: %w", raw, err)
 	}
 	return t, nil
+}
+
+// parseMounts reads mounts as {{json .Mounts}} renders them: docker and
+// podman both name a mount's keys Type, Source, Destination and RW. null is
+// no mounts.
+func parseMounts(raw string) ([]Mount, error) {
+	var parsed []struct {
+		Type        string
+		Source      string
+		Destination string
+		RW          bool
+	}
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+		return nil, err
+	}
+	var mounts []Mount
+	for _, m := range parsed {
+		mounts = append(mounts, Mount{Type: m.Type, Source: m.Source, Destination: m.Destination, ReadOnly: !m.RW})
+	}
+	return mounts, nil
 }
 
 // String names the runtime in logs.

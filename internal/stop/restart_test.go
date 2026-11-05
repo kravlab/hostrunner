@@ -104,6 +104,22 @@ func resolving(t *testing.T, vars map[string]string, args ...string) func(worksp
 	}
 }
 
+// workspaceFile returns how a test's restart names the new daemon's
+// workspace settings file: from restart's flags args and the variables
+// vars alone, as the terminal running restart would give them.
+func workspaceFile(t *testing.T, vars map[string]string, args ...string) func(workspace string) (string, error) {
+	t.Helper()
+	var f settings.Flags
+	fs := flag.NewFlagSet("restart", flag.ContinueOnError)
+	f.RegisterRestart(fs)
+	if err := fs.Parse(args); err != nil {
+		t.Fatal(err)
+	}
+	return func(workspace string) (string, error) {
+		return f.WorkspaceFile(func(name string) string { return vars[name] }, workspace)
+	}
+}
+
 // besideRules are the variables of a restart whose new daemon takes the
 // rules file hostrun.yaml in its workspace, as a current daemon of the
 // tests does.
@@ -125,7 +141,7 @@ func restartConfig(t *testing.T, runtimes ...watch.Runtime) *stop.Restart {
 		t.Fatal(err)
 	}
 	t.Setenv(newDaemonEnv, "1")
-	return &stop.Restart{Daemon: exe, Client: client, Settings: resolving(t, besideRules), Runtimes: runtimes, Allows: allow.Store{Dir: filepath.Join(t.TempDir(), "allow")}}
+	return &stop.Restart{Daemon: exe, Client: client, Settings: resolving(t, besideRules), WorkspaceSettings: workspaceFile(t, besideRules), Runtimes: runtimes, Allows: allow.Store{Dir: filepath.Join(t.TempDir(), "allow")}}
 }
 
 // allowRestart allows, as a human running `hostrunner allow` would, what
@@ -278,13 +294,54 @@ func TestRestartReplacesTheDaemon(t *testing.T) {
 	}
 	d.waitStopped(t)
 	args := newDaemonArgs(t, d.dir)
-	want := []string{"serve", "--socket", filepath.Join(d.dir, launch.SocketName), "--workspace", d.workspace, "--container-workspace", "/workspaces/app", "--rules-file", d.rulesFile, "--watch",
+	want := []string{"serve", "--socket", filepath.Join(d.dir, launch.SocketName), "--workspace", d.workspace, "--container-workspace", "/workspaces/app", "--workspace-settings", filepath.Join(d.workspace, ".devcontainer", "hostrunner.yaml"), "--rules-file", d.rulesFile, "--watch",
 		"--startup-timeout", "30m0s", "--grace", "15s", "--poll-interval", "2s", "--ask-timeout", "10m0s", "--request-timeout", "10s", "--reread"}
 	if strings.Join(args, " ") != strings.Join(want, " ") {
 		t.Fatalf("the new daemon runs %q, want %q", args, want)
 	}
 	if _, err := os.Stat(filepath.Join(d.dir, launch.ClientName)); err != nil {
 		t.Fatalf("the client was not installed: %v", err)
+	}
+}
+
+// The new daemon is given the workspace settings file the restart
+// resolves for the old daemon's workspace, as up gives its daemon the
+// one it resolved, so that it protects, and reads, the named file and
+// not the default one.
+func TestRestartGivesTheNewDaemonTheWorkspaceSettingsFile(t *testing.T) {
+	d := startCurrentDaemon(t, validRules, false, rereading...)
+	named := filepath.Join(t.TempDir(), "named.yaml")
+	if err := os.WriteFile(named, []byte("ask_timeout: 4m\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r := restartConfig(t)
+	r.Settings = resolving(t, besideRules, "--workspace-settings", named)
+	r.WorkspaceSettings = workspaceFile(t, besideRules, "--workspace-settings", named)
+	allowRestart(t, r, d.workspace)
+	if out, err := runStop(t, stop.Config{Dir: d.dir, Restart: r}, ""); err != nil {
+		t.Fatalf("restart: %v; printed %q", err, out)
+	}
+	d.waitStopped(t)
+	args := newDaemonArgs(t, d.dir)
+	i := slices.Index(args, "--workspace-settings")
+	if i < 0 || i+1 >= len(args) || args[i+1] != named {
+		t.Fatalf("the new daemon runs %q, want --workspace-settings %s", args, named)
+	}
+}
+
+// A workspace settings file that cannot be named leaves the old daemon
+// running, the error naming the source.
+func TestRestartWithUnnamableWorkspaceSettingsLeavesTheDaemonRunning(t *testing.T) {
+	d := startCurrentDaemon(t, validRules, false)
+	r := restartConfig(t)
+	r.WorkspaceSettings = func(string) (string, error) { return "", errors.New("workspace settings source is broken") }
+	_, err := runStop(t, stop.Config{Dir: d.dir, Restart: r}, "")
+	if err == nil || !strings.Contains(err.Error(), "workspace settings source is broken") || !strings.Contains(err.Error(), "keeps running") {
+		t.Fatalf("got %v, want the source named and the daemon kept running", err)
+	}
+	d.stillServes(t)
+	if args := newDaemonArgs(t, d.dir); args != nil {
+		t.Fatalf("a new daemon started: %q", args)
 	}
 }
 

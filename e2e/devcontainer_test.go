@@ -4,7 +4,8 @@
 // examples/devcontainer through the devcontainer CLI with freshly built
 // binaries, once per available container runtime, and walks the container
 // through its lifecycle (re-up, rebuild with a slow image build, stop,
-// restart).
+// restart). It also brings up a variant of the example without the read-only
+// .devcontainer mount and checks that the daemon refuses every command.
 package e2e
 
 import (
@@ -15,7 +16,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -80,10 +83,17 @@ const testRules = `
       allow: [-c]
 `
 
+// readOnlyMount is the example's mount that keeps .devcontainer read-only
+// in the container, with the comma that separates it from the mount before
+// it.
+var readOnlyMount = regexp.MustCompile(`,\s*//[^\n]*\n\s*"source=\$\{localWorkspaceFolder\}/\.devcontainer,[^"]*"`)
+
 // newWorkspace copies the example devcontainer into a fresh git workspace
-// whose path contains a space, switching it from a prebuilt image to a slow
-// build and adding testRules to the example rules.
-func newWorkspace(t *testing.T) string {
+// whose path contains a space, adding testRules to the example rules. With
+// writable false it switches the example from a prebuilt image to a slow
+// build; with writable true it drops the read-only .devcontainer mount, so
+// the container can write the daemon's configuration.
+func newWorkspace(t *testing.T, writable bool) string {
 	t.Helper()
 	ws := filepath.Join(shortTemp(t, "hrws"), "my app")
 	if err := os.MkdirAll(filepath.Join(ws, ".devcontainer"), 0o755); err != nil {
@@ -101,12 +111,25 @@ func newWorkspace(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const image = `"image": "docker.io/library/alpine:3",`
-	if !bytes.Contains(cfg, []byte(image)) {
-		t.Fatalf("example devcontainer.json no longer contains %s", image)
+	files := map[string][]byte{"hostrunner-rules.yaml": rules}
+	if writable {
+		if !readOnlyMount.Match(cfg) {
+			t.Fatal("example devcontainer.json no longer contains the read-only .devcontainer mount")
+		}
+		cfg = readOnlyMount.ReplaceAll(cfg, nil)
+		if bytes.Contains(cfg, []byte("/.devcontainer,")) {
+			t.Fatal("the variant still mounts .devcontainer")
+		}
+	} else {
+		const image = `"image": "docker.io/library/alpine:3",`
+		if !bytes.Contains(cfg, []byte(image)) {
+			t.Fatalf("example devcontainer.json no longer contains %s", image)
+		}
+		cfg = bytes.Replace(cfg, []byte(image), []byte(`"build": { "dockerfile": "Dockerfile" },`), 1)
+		files["Dockerfile"] = []byte(slowBuild)
 	}
-	cfg = bytes.Replace(cfg, []byte(image), []byte(`"build": { "dockerfile": "Dockerfile" },`), 1)
-	for name, data := range map[string][]byte{"devcontainer.json": cfg, "Dockerfile": []byte(slowBuild), "hostrunner-rules.yaml": rules} {
+	files["devcontainer.json"] = cfg
+	for name, data := range files {
 		if err := os.WriteFile(filepath.Join(ws, ".devcontainer", name), data, 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -180,10 +203,33 @@ func (e env) up(t *testing.T, flags ...string) string {
 	return result.ContainerID
 }
 
-// exec runs a command in the container through the devcontainer CLI.
+// pendingPoll and pendingWait bound the retry of exec while the daemon has
+// not yet checked the container's mounts.
+const (
+	pendingPoll = 500 * time.Millisecond
+	pendingWait = 30 * time.Second
+	// pendingMessage is the daemon's refusal (exit 125) until it has
+	// attached to the armed container, which it does on its next poll after
+	// the container starts, or, for a running container `up` reused, on its
+	// first poll a grace (15 s) after the arm: within pendingWait.
+	pendingMessage = "the mount check has not run yet"
+)
+
+// exec runs a command in the container through the devcontainer CLI. It
+// retries, for up to pendingWait, while the daemon refuses with the
+// pending mount check message (and only that one): the container may have
+// started before the daemon attached to it.
 func (e env) exec(t *testing.T, args ...string) (string, error) {
 	t.Helper()
-	return run(t, e.vars(), "devcontainer", append([]string{"exec", "--workspace-folder", e.ws, "--docker-path", e.runtime}, args...)...)
+	full := append([]string{"exec", "--workspace-folder", e.ws, "--docker-path", e.runtime}, args...)
+	deadline := time.Now().Add(pendingWait)
+	for {
+		out, err := run(t, e.vars(), "devcontainer", full...)
+		if err == nil || !strings.Contains(err.Error(), pendingMessage) || time.Now().After(deadline) {
+			return out, err
+		}
+		time.Sleep(pendingPoll)
+	}
 }
 
 // expectHostrunWorks checks that hostrun reaches the daemon and runs in the
@@ -242,7 +288,10 @@ func eventually(t *testing.T, timeout time.Duration, cond func() bool, describe 
 	}
 }
 
-func TestDevcontainerIntegration(t *testing.T) {
+// eachRuntime runs test once per available container runtime, in a
+// workspace that newWs makes.
+func eachRuntime(t *testing.T, newWs func(*testing.T) string, test func(*testing.T, env)) {
+	t.Helper()
 	if _, err := exec.LookPath("devcontainer"); err != nil {
 		t.Skip("devcontainer CLI not installed")
 	}
@@ -262,9 +311,20 @@ func TestDevcontainerIntegration(t *testing.T) {
 			if runtime == "podman" && os.Getenv("HOSTRUNNER_E2E_PODMAN") != "1" {
 				t.Skip("podman e2e is opt-in (HOSTRUNNER_E2E_PODMAN=1): devcontainer up sometimes hangs on podman events")
 			}
-			testLifecycle(t, env{bin: bin, runtime: rtPath, ws: newWorkspace(t), data: shortTemp(t, "hrdata")})
+			test(t, env{bin: bin, runtime: rtPath, ws: newWs(t), data: shortTemp(t, "hrdata")})
 		})
 	}
+}
+
+func TestDevcontainerIntegration(t *testing.T) {
+	eachRuntime(t, func(t *testing.T) string { return newWorkspace(t, false) }, testLifecycle)
+}
+
+// TestDevcontainerWritableMount brings up the example without its read-only
+// .devcontainer mount: the daemon must refuse every command, naming the
+// container path only.
+func TestDevcontainerWritableMount(t *testing.T) {
+	eachRuntime(t, func(t *testing.T) string { return newWorkspace(t, true) }, testWritableMount)
 }
 
 // cleanUp removes everything a run left behind for the workspace, whether
@@ -506,6 +566,33 @@ func testLifecycle(t *testing.T, e env) {
 	t.Run("daemon exits after the restarted container stops at once", func(t *testing.T) {
 		e.stopAndExpectDaemonExit(t, container, socket)
 	})
+}
+
+func testWritableMount(t *testing.T, e env) {
+	t.Cleanup(func() { e.cleanUp(t) })
+	e.allow(t)
+	e.up(t)
+
+	// devcontainer's default workspace mount puts the workspace at
+	// /workspaces/<its directory name>.
+	want := "the container can write " + path.Join("/workspaces", filepath.Base(e.ws), ".devcontainer") + ","
+	// --ask is refused by the same mount gate, before the daemon looks for an
+	// approval session.
+	for _, args := range [][]string{{"pwd"}, {"--dry-run", "pwd"}, {"--ask", "pwd"}} {
+		_, err := e.exec(t, append([]string{"hostrun"}, args...)...)
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 126 {
+			t.Fatalf("hostrun %v = %v, want exit 126", args, err)
+		}
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("hostrun %v = %v, want a refusal containing %q", args, err, want)
+		}
+		// The refusal names container paths only: nothing of the host's
+		// workspace path, which holds the test's temp directory.
+		if strings.Contains(err.Error(), filepath.Dir(e.ws)) {
+			t.Fatalf("hostrun %v = %v, want no host path", args, err)
+		}
+	}
 }
 
 // stopAndExpectDaemonExit stops the container and waits for the daemon

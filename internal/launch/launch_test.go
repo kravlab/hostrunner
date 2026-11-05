@@ -611,14 +611,15 @@ func TestUpReplacesDaemonWhoseRereadingDiffers(t *testing.T) {
 }
 
 // The daemon `up` starts gets every setting as an explicit flag, so its
-// argv shows them and it resolves none again; rereading is explicit both
+// argv shows them and it resolves none again, and the workspace settings
+// file up resolved, which the daemon protects; rereading is explicit both
 // ways, and ready_timeout, up's own, is no flag.
 func TestServeArgsGiveEverySetting(t *testing.T) {
-	base := Config{Workspace: "/home/u/app", ContainerWorkspace: "/workspaces/app", Settings: settings.Settings{
+	base := Config{Workspace: "/home/u/app", ContainerWorkspace: "/workspaces/app", WorkspaceSettings: "/home/u/app/.devcontainer/hostrunner.yaml", Settings: settings.Settings{
 		RulesFile: "/home/u/app/.devcontainer/hostrun.yaml", StartupTimeout: 30 * time.Minute, Grace: 15 * time.Second,
 		PollInterval: 2 * time.Second, AskTimeout: 10 * time.Minute, RequestTimeout: 10 * time.Second, ReadyTimeout: time.Minute,
 	}}
-	start := []string{"serve", "--socket", "/run/h.sock", "--workspace", "/home/u/app", "--container-workspace", "/workspaces/app", "--rules-file", "/home/u/app/.devcontainer/hostrun.yaml", "--watch",
+	start := []string{"serve", "--socket", "/run/h.sock", "--workspace", "/home/u/app", "--container-workspace", "/workspaces/app", "--workspace-settings", "/home/u/app/.devcontainer/hostrunner.yaml", "--rules-file", "/home/u/app/.devcontainer/hostrun.yaml", "--watch",
 		"--startup-timeout", "30m0s", "--grace", "15s", "--poll-interval", "2s", "--ask-timeout", "10m0s", "--request-timeout", "10s"}
 	for _, tt := range []struct {
 		reread bool
@@ -633,6 +634,15 @@ func TestServeArgsGiveEverySetting(t *testing.T) {
 		if got := serveArgs(cfg, "/run/h.sock"); !slices.Equal(got, want) {
 			t.Errorf("reread %v: got %q, want %q", tt.reread, got, want)
 		}
+	}
+}
+
+// Without a workspace settings file in the Config, as restart gives none,
+// the daemon gets no --workspace-settings and resolves the file itself.
+func TestServeArgsOmitAnUnnamedWorkspaceSettingsFile(t *testing.T) {
+	cfg := Config{Workspace: "/home/u/app", ContainerWorkspace: "/workspaces/app", Settings: settings.Settings{RulesFile: "/r.yaml"}}
+	if got := serveArgs(cfg, "/run/h.sock"); slices.Contains(got, "--workspace-settings") {
+		t.Fatalf("got %q, want no --workspace-settings", got)
 	}
 }
 

@@ -108,6 +108,12 @@ type Restart struct {
 	// host workspace workspace (ready_timeout bounding the wait for its
 	// socket); an error names the source.
 	Settings func(workspace string) (settings.Resolved, error)
+	// WorkspaceSettings names the workspace settings file Settings read
+	// for the host workspace workspace, an absolute path (see
+	// settings.Flags.WorkspaceFile). The new daemon is given it, as up
+	// gives it, so that it protects the file in its mount check; an error
+	// names the source.
+	WorkspaceSettings func(workspace string) (string, error)
 	// Runtimes are asked whether the container of a daemon of an older
 	// hostrunner, which does not say, is running.
 	Runtimes []watch.Runtime
@@ -381,6 +387,10 @@ func (t *term) ending(ctx context.Context, cfg Config, dir string, info *protoco
 	if err != nil {
 		return ending{}, fmt.Errorf("%s: %w; the daemon keeps running", name, err)
 	}
+	workspaceSettings, err := r.WorkspaceSettings(info.Workspace)
+	if err != nil {
+		return ending{}, fmt.Errorf("%s: %w; the daemon keeps running", name, err)
+	}
 	t.warnIgnoredRules(s)
 	p, err := launch.PrepareAllowed(launch.Config{
 		Dir:                dir,
@@ -389,6 +399,7 @@ func (t *term) ending(ctx context.Context, cfg Config, dir string, info *protoco
 		Daemon:             r.Daemon,
 		Client:             r.Client,
 		Allows:             r.Allows,
+		WorkspaceSettings:  workspaceSettings,
 		Settings:           s.Settings,
 	})
 	if err != nil {

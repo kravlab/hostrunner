@@ -38,6 +38,7 @@ type harness struct {
 	rulesFile      string // the rules file a session adds rules to
 	stop           func() // shuts the daemon down; safe to call more than once
 	served         *serveResult
+	srv            *daemon.Server // the daemon, for what serve tells it besides its sockets (e.g. MountChecked)
 }
 
 // allowAll is a policy that allows every command, for tests about
@@ -124,7 +125,7 @@ func startHarnessAt(t *testing.T, log *slog.Logger, base string, setup func(rule
 		}
 	})
 	t.Cleanup(stop)
-	return harness{transport: tr, hostRoot: hostRoot, runtimeDir: base, approvalSocket: approvalSocket, rulesFile: rulesFile, stop: stop, served: served}
+	return harness{transport: tr, hostRoot: hostRoot, runtimeDir: base, approvalSocket: approvalSocket, rulesFile: rulesFile, stop: stop, served: served, srv: srv}
 }
 
 // serveResult is what the harness's Serve returned, once done is closed.

@@ -17,6 +17,8 @@ import (
 type Runtime struct {
 	mu         sync.Mutex
 	containers []watch.Container
+	mounts     map[string][]watch.Mount // by container ID; outlives Remove
+	mountsErr  map[string]bool          // IDs whose mounts fail to read
 	failing    bool
 	hold       *hold // the next Containers call waits on it; nil: none
 }
@@ -42,7 +44,37 @@ func (r *Runtime) Containers(context.Context, string) ([]watch.Container, error)
 	if r.failing {
 		return nil, errors.New("runtime unavailable")
 	}
-	return slices.Clone(r.containers), nil
+	out := slices.Clone(r.containers)
+	for i := range out {
+		out[i].Mounts = slices.Clone(r.mounts[out[i].ID])
+		if r.mountsErr[out[i].ID] {
+			out[i].Mounts, out[i].MountsErr = nil, errors.New("mounts unavailable")
+		}
+	}
+	return out, nil
+}
+
+// SetMounts sets the mounts Containers reports for the container id. They
+// are kept across Start and Stop; for an id that does not exist yet they are
+// remembered and apply once it starts.
+func (r *Runtime) SetMounts(id string, mounts ...watch.Mount) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.mounts == nil {
+		r.mounts = make(map[string][]watch.Mount)
+	}
+	r.mounts[id] = slices.Clone(mounts)
+}
+
+// FailMounts makes Containers report the container id with a MountsErr
+// instead of its mounts, or report them again.
+func (r *Runtime) FailMounts(id string, failing bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.mountsErr == nil {
+		r.mountsErr = make(map[string]bool)
+	}
+	r.mountsErr[id] = failing
 }
 
 // Start starts the container id, creating it if needed: it runs and its

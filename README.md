@@ -203,6 +203,29 @@ without one, `--append` still adds the text to a file that lacks it and
 refuses otherwise. The file is written in place, so a symlink keeps
 pointing to it.
 
+### Mount check
+
+A daemon that watches its container (`hostrunner up`, that is
+`serve --watch`) checks the container's mounts, so that the container
+cannot rewrite the configuration it is served by. Once the daemon attaches
+to the armed container, and again whenever a new container joins the armed
+ones (a Compose recreate, say), it checks that the container cannot write
+`.devcontainer/`, the rules file or the workspace settings file. These are
+host paths with symlinks followed, and a deeper mount shadows a shallower
+one, so the read-only `.devcontainer` mount in the example above passes.
+
+- Until the first check has run, every request (a run, `--ask`, a dry
+  run) is refused with 125 `the mount check has not run yet`; retry. Each
+  `hostrunner up` (an arm) puts the check back to pending until the daemon
+  attaches again, so when `up` reuses the running container `hostrun` gets
+  125 (retry) for up to the grace period (about 15 s).
+- If the container can write any of them, or its mounts cannot be read,
+  every request is refused with 126. The message names the container path
+  only, never a host path. Waiting `--ask` requests are withdrawn. The
+  daemon log and the approval session report the failure, the log with the
+  host path.
+- The next check that passes serves requests again.
+
 ### Allow
 
 `hostrunner up` starts a daemon only for rules and settings a human on
@@ -979,6 +1002,9 @@ How it works:
   the nearest `.devcontainer/` above its working directory, or the
   rules file in it (`hostrunner-rules.yaml`, else `hostrun.yaml`), is
   writable (the default location only, not a `--rules-file` file).
+  The daemon itself checks the armed container's mounts and refuses every
+  command while that container can write `.devcontainer/`, the rules file
+  or the workspace settings file (see [Mount check](#mount-check)).
 - The working directory (the mirrored directory, or the rule's `dir`) is
   opened, not re-resolved, when the command starts, so a symlink swapped
   in by the container cannot redirect it.
@@ -997,8 +1023,8 @@ How it works:
 | command's own | the command ran |
 | 0 | `--dry-run`: the command would run |
 | 128+N | the command was killed by signal N |
-| 125 | hostrun failed: daemon unreachable, protocol error, no command given, `--dry-run` and `--ask` combined, or an argument or the current directory not valid UTF-8 |
-| 126 | refused: denied by the rules, an argument not a workspace file, current directory outside the workspace, a rule's `dir` missing, not a directory or inside the workspace, or not executable; with `--ask`, not approved on the host (refused, unanswered, no approval session, too large to show, the daemon stopping) |
+| 125 | hostrun failed: daemon unreachable, protocol error, no command given, `--dry-run` and `--ask` combined, or an argument or the current directory not valid UTF-8; also, the [mount check](#mount-check) has not run yet (retry) |
+| 126 | refused: denied by the rules, an argument not a workspace file, current directory outside the workspace, a rule's `dir` missing, not a directory or inside the workspace, or not executable; every command while the [mount check](#mount-check) finds the container able to write the configuration or cannot read its mounts; with `--ask`, not approved on the host (refused, unanswered, no approval session, too large to show, the daemon stopping) |
 | 127 | command not found on the host |
 | 130 | interrupted (Ctrl+C); the host command is killed |
 

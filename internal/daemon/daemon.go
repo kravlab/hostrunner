@@ -67,6 +67,8 @@ type Server struct {
 	allowRecorder    func(digest string) error                                     // nil: no allow is recorded; see WithAllow
 	buildVersion     string                                                        // "": unknown; see WithBuildVersion
 	settings         map[string]string                                             // nil: none reported; see WithSettings
+	mountCheck       bool                                                          // false: the mounts are not checked; see WithMountCheck
+	mountResult      mountState                                                    // the latest result of the mount check; see MountChecked
 
 	// rereading makes rereads one at a time, so a slower one never
 	// replaces the rules a later one served.
@@ -373,6 +375,10 @@ var dryRunLogArgs = []any{"dry_run", true}
 // checks opened, never starting the command or reading stdin. The answer
 // carries the warning of the daemon (see pendingAllowWarning).
 func (s *Server) dryRun(out *frameWriter, req protocol.Request) {
+	if r := s.mountRefusal(); r != nil {
+		s.reject(out, r.code, r.message, r.err, dryRunLogArgs...)
+		return
+	}
 	p, r := s.prepare(req, true)
 	if r == nil {
 		r = lookupStart(p, req)
@@ -569,6 +575,10 @@ type exchange struct {
 // initial credit it sends once the command started carries the warning of
 // the daemon (see pendingAllowWarning).
 func (s *Server) run(ctx context.Context, x exchange, req protocol.Request) {
+	if r := s.mountRefusal(); r != nil {
+		s.reject(x.out, r.code, r.message, r.err)
+		return
+	}
 	p, r := s.prepare(req, false)
 	if r != nil {
 		r = s.withAskHint(req, r)
