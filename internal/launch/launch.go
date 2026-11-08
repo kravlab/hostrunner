@@ -555,9 +555,10 @@ func startDaemon(ctx context.Context, cfg Config, socket string, a protocol.Arm)
 // serveArgs is the command line of the daemon cfg describes, listening
 // on socket. Every setting serve takes is an explicit flag, so the
 // daemon's argv shows what it runs with and it resolves none again;
-// rereading is given both ways (--reread or --no-reread). The workspace
-// settings file, when cfg names one, is given too, so the daemon protects
-// the file up read.
+// rereading and the mount check are given both ways (--reread or
+// --no-reread, --mount-check or --no-mount-check). The workspace settings
+// file, when cfg names one, is given too, so the daemon protects the file
+// up read.
 func serveArgs(cfg Config, socket string) []string {
 	args := []string{"serve",
 		"--socket", socket,
@@ -566,18 +567,25 @@ func serveArgs(cfg Config, socket string) []string {
 	if cfg.WorkspaceSettings != "" {
 		args = append(args, "--workspace-settings", cfg.WorkspaceSettings)
 	}
-	args = append(args,
+	return append(args,
 		"--rules-file", cfg.RulesFile,
 		"--watch",
 		"--startup-timeout", cfg.StartupTimeout.String(),
 		"--grace", cfg.Grace.String(),
 		"--poll-interval", cfg.PollInterval.String(),
 		"--ask-timeout", cfg.AskTimeout.String(),
-		"--request-timeout", cfg.RequestTimeout.String())
-	if cfg.Reread {
-		return append(args, "--reread")
+		"--request-timeout", cfg.RequestTimeout.String(),
+		boolFlag("reread", cfg.Reread),
+		boolFlag("mount-check", cfg.MountCheck))
+}
+
+// boolFlag is the flag of serve that gives the bool setting whose flag is
+// --name as on: --name, or --no-name when off.
+func boolFlag(name string, on bool) string {
+	if on {
+		return "--" + name
 	}
-	return append(args, "--no-reread")
+	return "--no-" + name
 }
 
 // openLog opens the daemon log for appending. It refuses anything but a

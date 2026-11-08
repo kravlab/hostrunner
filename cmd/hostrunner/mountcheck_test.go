@@ -105,7 +105,7 @@ func TestServeWatchRunsCommandsWhenTheContainerCannotWriteItsConfig(t *testing.T
 // Once attached to a container that can write the .devcontainer directory,
 // the rules file or the workspace settings file, serve --watch refuses
 // every run with 126, naming the path writable in the container, not the
-// host's.
+// host's, and how a human on the host turns the check off.
 func TestServeWatchRefusesCommandsWhenTheContainerCanWriteItsConfig(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -153,7 +153,25 @@ func TestServeWatchRefusesCommandsWhenTheContainerCanWriteItsConfig(t *testing.T
 			if strings.Contains(stderr, cfg.workspace) {
 				t.Fatalf("the refusal %q names the host workspace %s", stderr, cfg.workspace)
 			}
+			if !strings.Contains(stderr, "mount_check: false in the host settings file, HOSTRUNNER_MOUNT_CHECK=false or --no-mount-check") {
+				t.Fatalf("the refusal %q does not say how to turn the check off", stderr)
+			}
 		})
+	}
+}
+
+// With the mount check off (mount_check false), serve --watch runs the
+// commands its rules allow in a container that can write its config, at
+// once: no check is pending.
+func TestServeWatchWithTheMountCheckOffRunsCommandsInAWritableContainer(t *testing.T) {
+	cfg := mountCheckConfig(t)
+	cfg.MountCheck = false
+	rt := &watchtest.Runtime{}
+	startServe(t, cfg, rt)
+	rt.SetMounts("c", workspaceMount(cfg))
+	rt.Start("c")
+	if code, stderr := runServedOutput(cfg, "true"); code != 0 {
+		t.Fatalf("got %d, %q; want 0", code, stderr)
 	}
 }
 

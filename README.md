@@ -226,6 +226,21 @@ one, so the read-only `.devcontainer` mount in the example above passes.
   host path.
 - The next check that passes serves requests again.
 
+A devcontainer that cannot mount `.devcontainer/` read-only can have
+the check turned off by a human on the host: `mount_check: false` in
+the host settings file (its common part or the workspace's section),
+`HOSTRUNNER_MOUNT_CHECK=false` or `--no-mount-check` for `up`,
+`restart` and `serve` (see [Settings](#settings)). The refusals of a
+failed check say so. The container cannot turn it off: the workspace
+settings file refuses `mount_check`. Like the other daemon settings it
+is part of what an allow covers and what an arm compares, so turning it
+off needs a new `hostrunner allow` and applies on the next `up`. With
+the check off, the daemon serves the container whatever it can write:
+an agent in the container that rewrites the rules file or the
+workspace settings file changes what the daemon allows, held back only
+by the allow (a rewrite takes effect only once a human allows it) and
+by what the human reads before allowing.
+
 ### Allow
 
 `hostrunner up` starts a daemon only for rules and settings a human on
@@ -299,7 +314,10 @@ goes back to the rules served, or a later `up` arms none); undoing a
 settings change alone is seen only at the next `up`.
 
 The first `up` after upgrading to a hostrunner with allows fails the
-same way until the workspace is allowed. `up --restart` and `hostrunner
+same way until the workspace is allowed. So does the first `up` after an
+upgrade that adds a daemon setting, such as `mount_check`: the allow
+covers the resolved daemon settings, so it needs a new `hostrunner
+allow`. `up --restart` and `hostrunner
 restart` check the allow before they stop the running daemon: content
 not allowed fails them, records the request as `up` does and leaves the
 daemon running.
@@ -317,6 +335,7 @@ Besides its rules, a daemon has settings:
 | `poll_interval` | `HOSTRUNNER_POLL_INTERVAL` | `--poll-interval` | `2s` | how often it asks the container runtimes about its container and looks at the rules file |
 | `ask_timeout` | `HOSTRUNNER_ASK_TIMEOUT` | `--ask-timeout` | `10m` | how long an `--ask` request waits for an answer when hostrun sets no limit |
 | `request_timeout` | `HOSTRUNNER_REQUEST_TIMEOUT` | `--request-timeout` | `10s` | how long a new connection may take to send its request |
+| `mount_check` | `HOSTRUNNER_MOUNT_CHECK` | `--mount-check`, `--no-mount-check` | `true` | whether it checks that its container cannot write its configuration (see [Mount check](#mount-check)); not in the workspace settings file |
 | `ready_timeout` | `HOSTRUNNER_READY_TIMEOUT` | `--ready-timeout` (`up` only) | `10s` | how long `up` waits for the daemon it starts to listen |
 
 `hostrunner stop`, `restart` and `approve` have settings of their own:
@@ -374,6 +393,7 @@ workspaces:
     grace: 5m
   /home/u/other:
     reread: true
+    mount_check: false
 ```
 
 A section applies to the workspace whose `--workspace` path is its path
@@ -386,9 +406,11 @@ The workspace settings file is `.devcontainer/hostrunner.yaml` in the
 workspace, or the file `--workspace-settings` (relative to the current
 directory) or else `HOSTRUNNER_WORKSPACE_SETTINGS` (relative to the
 workspace) names; the default file may be missing, a named one may not.
-It holds the keys at the top level, with no `workspaces` and none of
-the keys of `stop`, `restart` and `approve`, and wins over the host
-settings file.
+It holds the keys at the top level, with no `workspaces`, none of the
+keys of `stop`, `restart` and `approve`, and no `mount_check`, which the
+container could otherwise turn off by writing the file (`settings file
+<path>: mount_check: only allowed in the host settings file`), and wins
+over the host settings file.
 
 A relative `rules_file` from a settings file or a variable is read
 against the workspace (after `~` expansion), so one `rules_file` in the
@@ -417,7 +439,8 @@ as for changed rules; it compares only the settings the arm carries.
 `hostrunner restart` applies a settings edit at once: it resolves the
 new daemon's settings the same way, for the workspace of the daemon it
 replaces (see [Stop and restart](#stop-and-restart)). `--reread` and
-`--no-reread` exclude each other.
+`--no-reread` exclude each other, as do `--mount-check` and
+`--no-mount-check`.
 
 ### Approvals on the host
 
@@ -651,7 +674,8 @@ workspace the daemon serves: from the settings files as they are now,
 the variables of the terminal it runs in and its own flags
 (`--workspace-settings`, and `--rules-file` or `--config`, both read
 against the current directory and refused with `--all`, as they name one
-workspace's files; the other daemon settings have no flag here). It
+workspace's files, and `--mount-check` or `--no-mount-check`; the other
+daemon settings have no flag here). It
 checks them and reads and checks the rules file before stopping anything
 (an invalid setting or invalid rules leave the daemon running, the error
 naming the source, and so do rules or settings not allowed, see

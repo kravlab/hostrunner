@@ -303,6 +303,7 @@ func tuned(rulesFile string, startupTimeout, grace time.Duration, reread bool) s
 		AskTimeout:     10 * time.Minute,
 		RequestTimeout: 10 * time.Second,
 		ReadyTimeout:   10 * time.Second,
+		MountCheck:     true,
 	}
 }
 
@@ -470,7 +471,7 @@ func TestServeGivenEverySettingReadsNoOtherSource(t *testing.T) {
 		t.Errorf("read %s", name)
 		return ""
 	}
-	flags := []string{"--settings", settingsFile(t, "grase: [\n"), "--workspace-settings", settingsFile(t, "grase: [\n"), "--rules-file", "/r.yaml", "--startup-timeout", "1h", "--grace", "1m", "--reread", "--poll-interval", "1s", "--ask-timeout", "1m", "--request-timeout", "1s"}
+	flags := []string{"--settings", settingsFile(t, "grase: [\n"), "--workspace-settings", settingsFile(t, "grase: [\n"), "--rules-file", "/r.yaml", "--startup-timeout", "1h", "--grace", "1m", "--reread", "--poll-interval", "1s", "--ask-timeout", "1m", "--request-timeout", "1s", "--mount-check"}
 	got, err := resolveServe(flags, getenv)
 	want := tuned("/r.yaml", time.Hour, time.Minute, true)
 	want.PollInterval, want.AskTimeout, want.RequestTimeout = time.Second, time.Minute, time.Second
@@ -751,6 +752,7 @@ func watchConfig(t *testing.T) serveConfig {
 			PollInterval:   5 * time.Millisecond,
 			AskTimeout:     10 * time.Minute,
 			RequestTimeout: 10 * time.Second,
+			MountCheck:     true,
 		},
 	}
 }
@@ -1096,6 +1098,23 @@ func TestArmHandlerComparesRereadingAmongTheSettings(t *testing.T) {
 	}
 	if got := logged.String(); !strings.Contains(got, "stepping aside: the settings changed") || !strings.Contains(got, `reread="true → false"`) {
 		t.Fatalf("logged %q, want the change of reread among the settings", got)
+	}
+}
+
+// An arm whose mount check differs from the daemon's makes it step aside,
+// so turning the check off or on on the host applies on the next `up`.
+func TestArmHandlerStepsAsideWhenTheMountCheckDiffers(t *testing.T) {
+	var logged bytes.Buffer
+	own := map[string]string{"reread": "true", "mount_check": "true"}
+	onArm := armHandler("rules.yaml", true, own, nil, slog.New(slog.NewTextHandler(&logged, nil)))
+	if onArm(protocol.Arm{ConfigDigest: "digest", Settings: own}, "digest") {
+		t.Fatal("stepped aside for an arm with the daemon's mount check")
+	}
+	if !onArm(protocol.Arm{ConfigDigest: "digest", Settings: with(own, "mount_check", "false")}, "digest") {
+		t.Fatal("kept running for an arm with the mount check off")
+	}
+	if got := logged.String(); !strings.Contains(got, `mount_check="true → false"`) {
+		t.Fatalf("logged %q, want the change of mount_check", got)
 	}
 }
 

@@ -17,11 +17,15 @@ import (
 	"github.com/kravlab/hostrunner/internal/transport"
 )
 
+// mountCheckOffHint is how a human on the host turns the mount check off,
+// as the daemon is given it (see daemon.WithMountCheck).
+const mountCheckOffHint = "mount_check: false in the host settings file, HOSTRUNNER_MOUNT_CHECK=false or --no-mount-check"
+
 // What hostrun prints for a command the mount check refuses.
 const (
 	mountCheckPendingText    = "hostrun: the mount check has not run yet: the daemon has not attached to the container; retry\n"
-	mountCheckWritableText   = "hostrun: the container can write /workspaces/app/.devcontainer, so it could change the daemon's configuration: every command is refused until it is mounted read-only\n"
-	mountCheckUnreadableText = "hostrun: the daemon cannot read the container's mounts to check them: every command is refused\n"
+	mountCheckWritableText   = "hostrun: the container can write /workspaces/app/.devcontainer, so it could change the daemon's configuration: every command is refused until it is mounted read-only; a human on the host can turn the mount check off: " + mountCheckOffHint + "\n"
+	mountCheckUnreadableText = "hostrun: the daemon cannot read the container's mounts to check them: every command is refused; a human on the host can turn the mount check off: " + mountCheckOffHint + "\n"
 	mountCheckFailedNotice   = "the mount check failed, so the daemon refuses every command: "
 )
 
@@ -30,7 +34,7 @@ const (
 // to log.
 func startMountCheckingDaemon(t *testing.T, log *lockedBuffer) harness {
 	t.Helper()
-	return startDaemonWith(t, slog.New(slog.NewTextHandler(log, nil)), policy(t, echoOnly), daemon.WithMountCheck())
+	return startDaemonWith(t, slog.New(slog.NewTextHandler(log, nil)), policy(t, echoOnly), daemon.WithMountCheck(mountCheckOffHint))
 }
 
 // writableConfig is the failed check of a container that can write the
@@ -124,7 +128,7 @@ func TestMountCheckUnreadableRefusesCommands(t *testing.T) {
 // A mount the daemon cannot resolve, or any other failure, refuses every
 // command.
 func TestMountCheckOtherFailuresRefuseCommands(t *testing.T) {
-	const text = "hostrun: the daemon cannot check the container's mounts: every command is refused\n"
+	const text = "hostrun: the daemon cannot check the container's mounts: every command is refused; a human on the host can turn the mount check off: " + mountCheckOffHint + "\n"
 	for _, failure := range []error{
 		&mountcheck.UnresolvableError{Container: "c0ffee", Path: "/srv/missing", Err: os.ErrNotExist},
 		errors.New("the runtime failed"),

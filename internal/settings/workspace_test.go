@@ -323,6 +323,32 @@ func TestCommonOnlyKeysAreRefusedOutsideTheCommonPart(t *testing.T) {
 	}
 }
 
+// mount_check comes from the common part of the host settings file and
+// from a workspace section, but the workspace settings file, which the
+// container could write, refuses it.
+func TestMountCheckIsSetFromTheHostSettingsFileAlone(t *testing.T) {
+	ws := t.TempDir()
+	for _, tt := range []struct {
+		name, host string
+		want       bool
+	}{
+		{"default", "", true},
+		{"common part", "mount_check: false\n", false},
+		{"section over common part", "mount_check: true\n" + section(ws, "mount_check: false"), false},
+	} {
+		got, err := parse(t, "--settings", writeFile(t, tt.host)).Resolve(env(nil), ws)
+		if err != nil || got.MountCheck != tt.want {
+			t.Errorf("%s: got mount check %v, %v; want %v", tt.name, got.MountCheck, err, tt.want)
+		}
+	}
+	ws = newWorkspace(t, "mount_check: false\n")
+	path := filepath.Join(ws, ".devcontainer", "hostrunner.yaml")
+	_, err := parse(t).Resolve(env(nil), ws)
+	if want := "settings file " + path + ": mount_check: only allowed in the host settings file"; err == nil || err.Error() != want {
+		t.Fatalf("workspace file: got %v, want %q", err, want)
+	}
+}
+
 // ResolveAsGiven given every key as a flag does not read the workspace
 // settings file either: a broken one is not even opened.
 func TestResolveAsGivenReadsNoWorkspaceFileWhenFlagsSetEveryKey(t *testing.T) {

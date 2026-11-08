@@ -1,7 +1,8 @@
 // Package settings resolves what tunes a daemon besides its rules: its
-// rules file, its timeouts and whether it rereads the rules file; and
-// what tunes stop, restart and approve: where they look for daemons, how
-// long they wait for one to stop, and how many tail lines approve shows.
+// rules file, its timeouts, whether it rereads the rules file and whether
+// it checks its container's mounts; and what tunes stop, restart and
+// approve: where they look for daemons, how long they wait for one to
+// stop, and how many tail lines approve shows.
 //
 // Each key comes from the highest source that sets it (ADR 0008): the
 // command's flags (Flags), the HOSTRUNNER_* variables, the workspace
@@ -9,9 +10,12 @@
 // host settings file's common, top-level part, then the built-in
 // default. Every source is read into a layer, a partial set of values,
 // and resolve stacks the layers; a new source is one more layer, a new
-// key one more entry of keys and one more field of Settings. An unknown
-// key or an invalid value in any source is an error naming the source
-// and the key: a daemon must not start with settings nobody chose.
+// key one more entry of keys and one more field of Settings. Some keys
+// are refused in some parts of the settings files (see key.allowedIn):
+// a key the container must not set, such as mount_check, only the host
+// settings file may set (see key.hostOnly). An unknown key or an invalid
+// value in any source is an error naming the source and the key: a
+// daemon must not start with settings nobody chose.
 package settings
 
 import (
@@ -64,6 +68,10 @@ type Settings struct {
 	// run's last lines of output approve shows under its summary; 0 shows
 	// the summary alone. It is 0 for the commands that do not take it.
 	ApproveTailLines int
+	// MountCheck (mount_check) is whether, with --watch, the daemon checks
+	// that its armed container cannot write its configuration (the mount
+	// check); only a human on the host may turn it off.
+	MountCheck bool
 }
 
 // Resolved is what resolving settings found: the Settings and, besides
@@ -80,6 +88,11 @@ type Resolved struct {
 // apart from the others: only it has a default that depends on files.
 const RulesFileKey = "rules_file"
 
+// mountCheckKey is the name of the key mount_check, which restart also
+// takes and the refusals of a failed mount check name (see
+// MountCheckOffHint).
+const mountCheckKey = "mount_check"
+
 // defaults are the settings no source sets, for the workspace at the
 // host path workspace. Its rules file is the default name, which looks at
 // no file: the value where nothing chooses (flagDefaults, and
@@ -95,6 +108,7 @@ func defaults(workspace string) Settings {
 		AskTimeout:     10 * time.Minute, // time for a human to come to the host and answer
 		RequestTimeout: 10 * time.Second, // so idle connections cannot pile up
 		ReadyTimeout:   10 * time.Second, // a daemon listens at once, unless something is wrong
+		MountCheck:     true,
 	}
 }
 
@@ -189,15 +203,20 @@ func (s scope) commonOnly() bool {
 }
 
 // key is one setting: its name in a settings file, from which its
-// variable and flag are named, the commands that take its flag, the
-// field of Settings it sets and, for some, its default.
+// variable and flag are named, the commands that take its flag, whether
+// only the host settings file may set it, the field of Settings it sets
+// and, for some, its default.
 type key struct {
 	name  string
 	kind  kind
 	scope scope
-	usage string                // the flag's help
-	field func(s *Settings) any // a *string, *time.Duration, *bool or *int into s
-	def   any                   // the value no source sets, of the kind; nil when defaults or hostDefaults give it
+	// hostOnly keeps the key out of the workspace settings file, which the
+	// container could write: only the host settings file, its common part
+	// or a workspace section, may set it, besides the flags and variables.
+	hostOnly bool
+	usage    string                // the flag's help
+	field    func(s *Settings) any // a *string, *time.Duration, *bool or *int into s
+	def      any                   // the value no source sets, of the kind; nil when defaults or hostDefaults give it
 }
 
 // get returns the value of k in s: a string, a time.Duration, a bool or
@@ -271,6 +290,11 @@ var keys = []key{
 		field: func(s *Settings) any { return &s.RequestTimeout },
 	},
 	{
+		name: mountCheckKey, kind: kindBool, scope: scopeDaemon, hostOnly: true,
+		usage: "check, with --watch, that the container cannot write its configuration",
+		field: func(s *Settings) any { return &s.MountCheck },
+	},
+	{
 		name: "ready_timeout", kind: kindDuration, scope: scopeUp,
 		usage: "how long to wait for the daemon to listen",
 		field: func(s *Settings) any { return &s.ReadyTimeout },
@@ -324,10 +348,20 @@ func (in scopes) workspaceSettable() scopes {
 // and those of up for the new daemon, which it starts as up does.
 var restartScopes = []scope{scopeRuntimeRoot, scopeStop, scopeDaemon, scopeUp}
 
-// restartKeys are the keys restart has flags for: the rules file of the
-// new daemon and the keys of stop.
+// restartKeys are the keys restart has flags for: the rules file and the
+// mount check of the new daemon, and the keys of stop.
 func restartKeys() []key {
-	return append([]key{mustLookup(RulesFileKey)}, keysOf(scopeRuntimeRoot, scopeStop)...)
+	return append([]key{mustLookup(RulesFileKey), mustLookup(mountCheckKey)}, keysOf(scopeRuntimeRoot, scopeStop)...)
+}
+
+// MountCheckOffHint is how a human on the host turns the mount check off,
+// as the refusals of a failed check name it: `mount_check: false in the
+// host settings file, HOSTRUNNER_MOUNT_CHECK=false or --no-mount-check`.
+// The workspace settings file, which the container could write, is not
+// among them.
+func MountCheckOffHint() string {
+	k := mustLookup(mountCheckKey)
+	return fmt.Sprintf("%s: false in the host settings file, %s=false or --no-%s", k.name, k.variable(), k.flagName())
 }
 
 // keysOf returns the keys whose flags the commands of in take.
@@ -387,7 +421,8 @@ func StopUsage() string { return usageOf(keysOf(scopeRuntimeRoot, scopeStop)) }
 func ApproveUsage() string { return usageOf(keysOf(scopeRuntimeRoot, scopeApprove)) }
 
 // RestartUsage is the usage of the flags RegisterRestart adds: those of
-// StopUsage, [--workspace-settings <path>] and [--rules-file <path>].
+// StopUsage, [--workspace-settings <path>], [--rules-file <path>] and
+// [--mount-check | --no-mount-check].
 func RestartUsage() string { return usageOf(restartKeys()) }
 
 // usageOf is the usage of the flags of a command with a flag for each
@@ -655,7 +690,7 @@ func hostDefaults(in scopes, getenv func(string) string) Settings {
 func resolveHost(in scopes, flags layer, hostNamed string, getenv func(string) string) (Settings, error) {
 	var common sourced
 	if file, required := hostFile(hostNamed, getenv); file != "" {
-		l, _, err := readNamed(in, file, required, true)
+		l, _, err := readNamed(in, file, required, commonPart)
 		if err != nil {
 			return Settings{}, err
 		}

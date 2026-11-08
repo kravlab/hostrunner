@@ -5,7 +5,8 @@
 // binaries, once per available container runtime, and walks the container
 // through its lifecycle (re-up, rebuild with a slow image build, stop,
 // restart). It also brings up a variant of the example without the read-only
-// .devcontainer mount and checks that the daemon refuses every command.
+// .devcontainer mount and checks that the daemon refuses every command, and
+// that it runs them once the host turns the mount check off.
 package e2e
 
 import (
@@ -45,9 +46,10 @@ const (
 // would leave containers that later podman calls cannot stop.
 type env struct {
 	bin     string
-	runtime string // docker or podman binary
-	ws      string // host workspace
-	data    string // XDG_DATA_HOME, which holds the allow store
+	runtime string   // docker or podman binary
+	ws      string   // host workspace
+	data    string   // XDG_DATA_HOME, which holds the allow store
+	extra   []string // more variables, NAME=value, for every command the test runs on the host
 }
 
 // shortTemp makes a temp dir with a short path.
@@ -171,8 +173,12 @@ func lastLines(s string, n int) string {
 	return strings.Join(lines, "\n")
 }
 
+// vars is the environment of the commands the test runs on the host: the
+// test's own, with the fresh binaries first in PATH, XDG_DATA_HOME and
+// extra.
 func (e env) vars() []string {
-	return append(os.Environ(), "PATH="+e.bin+string(os.PathListSeparator)+os.Getenv("PATH"), "XDG_DATA_HOME="+e.data)
+	out := append(os.Environ(), "PATH="+e.bin+string(os.PathListSeparator)+os.Getenv("PATH"), "XDG_DATA_HOME="+e.data)
+	return append(out, e.extra...)
 }
 
 // allow runs `hostrunner allow` for the workspace, as the human on the
@@ -325,6 +331,18 @@ func TestDevcontainerIntegration(t *testing.T) {
 // container path only.
 func TestDevcontainerWritableMount(t *testing.T) {
 	eachRuntime(t, func(t *testing.T) string { return newWorkspace(t, true) }, testWritableMount)
+}
+
+// TestDevcontainerWritableMountWithTheCheckOff brings up the same variant
+// with the mount check turned off on the host (HOSTRUNNER_MOUNT_CHECK=false
+// for `hostrunner allow` and for the `hostrunner up` the devcontainer CLI
+// runs, so the allow covers it): the daemon runs the commands its rules
+// allow.
+func TestDevcontainerWritableMountWithTheCheckOff(t *testing.T) {
+	eachRuntime(t, func(t *testing.T) string { return newWorkspace(t, true) }, func(t *testing.T, e env) {
+		e.extra = []string{"HOSTRUNNER_MOUNT_CHECK=false"}
+		testWritableMountWithTheCheckOff(t, e)
+	})
 }
 
 // cleanUp removes everything a run left behind for the workspace, whether
@@ -592,7 +610,17 @@ func testWritableMount(t *testing.T, e env) {
 		if strings.Contains(err.Error(), filepath.Dir(e.ws)) {
 			t.Fatalf("hostrun %v = %v, want no host path", args, err)
 		}
+		if off := "mount_check: false in the host settings file, HOSTRUNNER_MOUNT_CHECK=false or --no-mount-check"; !strings.Contains(err.Error(), off) {
+			t.Fatalf("hostrun %v = %v, want a refusal saying how to turn the check off", args, err)
+		}
 	}
+}
+
+func testWritableMountWithTheCheckOff(t *testing.T, e env) {
+	t.Cleanup(func() { e.cleanUp(t) })
+	e.allow(t)
+	e.up(t)
+	e.expectHostrunWorks(t)
 }
 
 // stopAndExpectDaemonExit stops the container and waits for the daemon

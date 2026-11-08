@@ -200,6 +200,7 @@ workspace, with sections that apply to single workspaces.
 **Workspace settings file**:
 The settings file of one workspace, kept in the workspace unless
 its path is given; what it sets overrides the host settings file.
+It cannot turn the mount check off.
 
 ### Config protection
 
@@ -214,7 +215,8 @@ others.
 
 **Mount check**:
 The daemon's check that its armed container cannot write the files that
-configure the workspace's devcontainer and daemon.
+configure the workspace's devcontainer and daemon. A human on the host
+may turn it off for a workspace (`mount_check`); the container cannot.
 _Avoid_: read-only check, writable warning
 
 ### Approvals

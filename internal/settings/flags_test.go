@@ -45,6 +45,39 @@ func TestNoRereadOverTheDefault(t *testing.T) {
 	}
 }
 
+// up, serve and restart take --mount-check and --no-mount-check, each
+// over the host settings file, and refuse both given.
+func TestMountCheckFlags(t *testing.T) {
+	file := writeFile(t, "mount_check: false\n")
+	for name, register := range map[string]func(*settings.Flags, *flag.FlagSet){
+		"serve":   (*settings.Flags).Register,
+		"up":      (*settings.Flags).RegisterUp,
+		"restart": (*settings.Flags).RegisterRestart,
+	} {
+		for _, tt := range []struct {
+			args []string
+			want bool
+		}{
+			{nil, false},
+			{[]string{"--mount-check"}, true},
+			{[]string{"--no-mount-check"}, false},
+			{[]string{"--no-mount-check=false"}, true},
+		} {
+			got, err := parseWith(t, register, append(tt.args, "--settings", file)...).Resolve(env(nil), noWorkspace)
+			if err != nil || got.MountCheck != tt.want {
+				t.Errorf("%s %q: got mount check %v, %v; want %v", name, tt.args, got.MountCheck, err, tt.want)
+			}
+		}
+		_, err := parseWith(t, register, "--mount-check", "--no-mount-check").Resolve(env(nil), noWorkspace)
+		if want := "--mount-check and --no-mount-check exclude each other"; err == nil || err.Error() != want {
+			t.Errorf("%s: got %v, want %q", name, err, want)
+		}
+		if _, ok := errors.AsType[*settings.FlagError](err); !ok {
+			t.Errorf("%s: got %v, want a flag error", name, err)
+		}
+	}
+}
+
 func TestFlagsRejectNonPositiveDurations(t *testing.T) {
 	for _, args := range [][]string{{"--grace", "0s"}, {"--startup-timeout", "-1m"}, {"--poll-interval", "0s"}, {"--ask-timeout", "-1s"}, {"--request-timeout", "0s"}} {
 		_, err := parse(t, args...).Resolve(env(nil), noWorkspace)

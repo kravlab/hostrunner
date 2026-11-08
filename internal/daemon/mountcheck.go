@@ -12,13 +12,19 @@ import (
 )
 
 // Messages of the refusals of the mount check, for the client: they name
-// container paths only.
+// container paths only. Those of a failed check end with mountOffForm.
 const (
 	mountPendingMessage      = "the mount check has not run yet: the daemon has not attached to the container; retry"
 	mountUnreadableMessage   = "the daemon cannot read the container's mounts to check them: every command is refused"
 	mountUncheckableMessage  = "the daemon cannot check the container's mounts: every command is refused"
 	mountWritableMessageForm = "the container can write %s, so it could change the daemon's configuration: every command is refused until it is mounted read-only"
 )
+
+// mountOffForm ends the refusals of a failed mount check with how a human
+// on the host turns the check off (the hint WithMountCheck is given) for a
+// devcontainer that cannot mount its configuration read-only: the
+// container itself cannot.
+const mountOffForm = "; a human on the host can turn the mount check off: %s"
 
 // errMountPending is why a command is refused before the first mount
 // check of the latest arm.
@@ -62,10 +68,12 @@ func (m *mountState) snapshot() mountSnapshot {
 // armed for, as a `serve --watch` daemon does: it refuses every run, dry
 // run and --ask until the first result of the check of the latest arm
 // arrives (see MountRearmed and MountChecked), as a hostrun failure the
-// client may retry, and while the latest result is a failure. Without it
+// client may retry, and while the latest result is a failure; offHint,
+// how a human on the host turns the check off (`mount_check: false in the
+// host settings file, …`), ends the refusals of a failed check. Without it
 // the Server ignores MountRearmed and MountChecked.
-func WithMountCheck() Option {
-	return func(s *Server) { s.mountCheck = true }
+func WithMountCheck(offHint string) Option {
+	return func(s *Server) { s.mountCheck, s.mountOffHint = true, offHint }
 }
 
 // MountRearmed puts the mount check back to pending for the arm at
@@ -130,7 +138,7 @@ func (s *Server) MountChecked(armedAt time.Time, err error) {
 		s.log.Info("mount check passed")
 	default:
 		s.log.Warn("mount check failed: every command is refused", "error", err)
-		s.approvals.mountCheckFailed(err)
+		s.approvals.mountCheckFailed(err, s.mountFailureRefusal(err))
 	}
 }
 
@@ -164,18 +172,20 @@ func (s *Server) mountRefusal() *refusal {
 	case r.failure == nil:
 		return nil
 	}
-	return mountFailureRefusal(r.failure)
+	return s.mountFailureRefusal(r.failure)
 }
 
 // mountFailureRefusal returns the refusal of every run, dry run and --ask
-// for failure, the error of a failed mount check (see mountRefusal).
-func mountFailureRefusal(failure error) *refusal {
+// for failure, the error of a failed mount check (see mountRefusal); its
+// message ends with how to turn the check off (see WithMountCheck).
+func (s *Server) mountFailureRefusal(failure error) *refusal {
 	message := mountUncheckableMessage
 	if w, ok := errors.AsType[*mountcheck.WritableError](failure); ok {
 		message = fmt.Sprintf(mountWritableMessageForm, w.ContainerPath)
 	} else if _, ok := errors.AsType[*mountcheck.UnreadableError](failure); ok {
 		message = mountUnreadableMessage
 	}
+	message += fmt.Sprintf(mountOffForm, s.mountOffHint)
 	return &refusal{protocol.ExitRejected, message, fmt.Errorf("mount check failed: %w", failure)}
 }
 
@@ -199,14 +209,14 @@ func (s *Server) mountRecheck(id uint64, r *approvalRequest) (outcome, bool) {
 // mountCheckFailed tells the session serving the daemon, if it reads the
 // frame (protocol.Serve.MountCheck), that the mount check failed with
 // failure, and ends every request waiting for an answer for it, their
-// clients refused as a new request would be (mountFailureRefusal); the
-// session is told of their ends after the failure, in the order of their
-// ids. A session that does not take the frames is gone, as in enqueue.
-func (a *approvals) mountCheckFailed(failure error) {
+// clients refused with refused, as a new request would be
+// (Server.mountFailureRefusal); the session is told of their ends after
+// the failure, in the order of their ids. A session that does not take the
+// frames is gone, as in enqueue.
+func (a *approvals) mountCheckFailed(failure error, refused *refusal) {
 	if a == nil {
 		return
 	}
-	refused := mountFailureRefusal(failure)
 	told, _ := endedMountCheck.withdrawn()
 	var ids []uint64
 	a.mu.Lock()

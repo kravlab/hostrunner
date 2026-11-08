@@ -6,9 +6,9 @@ workspace settings file (`.devcontainer/hostrunner.yaml` unless
 and the host settings file (`$XDG_CONFIG_HOME/hostrunner/settings.yaml`
 unless `--settings` or `HOSTRUNNER_SETTINGS` names another; its section
 for the workspace, then its common part), in that order. The workspace
-settings file may set every setting a daemon applies, the rules file and
-the ask timeout (`ask_timeout`) included, and wins over the host
-settings file.
+settings file may set every setting a daemon applies but `mount_check`,
+the rules file and the ask timeout (`ask_timeout`) included, and wins
+over the host settings file.
 
 ## Considered Options
 
@@ -29,6 +29,11 @@ settings file.
   the workspace file and in workspace sections: only `stop`, `restart`
   and `approve` read them, before they know a workspace (an approval
   session may serve several daemons in turn).
+- `mount_check` is refused in the workspace settings file, which the
+  container could write, so that the container cannot turn off the
+  daemon's check of its mounts: only the host settings file (its common
+  part or the workspace's section), `HOSTRUNNER_MOUNT_CHECK` or
+  `--no-mount-check` sets it.
 - `ready_timeout` tunes `up`, not the daemon: `up` reads it from every
   source like the daemon's settings, while `serve` neither reads nor
   checks it.

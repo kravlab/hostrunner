@@ -23,12 +23,12 @@ func TestDaemonNamesEverySettingServeTakes(t *testing.T) {
 				RulesFile: "/w/rules.yaml", StartupTimeout: time.Hour, Grace: 90 * time.Second,
 				Reread: false, PollInterval: 5 * time.Second, AskTimeout: 30 * time.Minute,
 				RequestTimeout: 30 * time.Second, ReadyTimeout: time.Minute, RuntimeRoot: "/r",
-				StopTimeout: time.Minute,
+				StopTimeout: time.Minute, MountCheck: true,
 			},
 			want: map[string]string{
 				"rules_file": "/w/rules.yaml", "startup_timeout": "1h0m0s", "grace": "1m30s",
 				"reread": "false", "poll_interval": "5s", "ask_timeout": "30m0s",
-				"request_timeout": "30s",
+				"request_timeout": "30s", "mount_check": "true",
 			},
 		},
 		{
@@ -37,6 +37,7 @@ func TestDaemonNamesEverySettingServeTakes(t *testing.T) {
 			want: map[string]string{
 				"rules_file": "", "startup_timeout": "1h0m0s", "grace": "1s", "reread": "false",
 				"poll_interval": "1s", "ask_timeout": "1m0s", "request_timeout": "1s",
+				"mount_check": "false",
 			},
 		},
 	} {

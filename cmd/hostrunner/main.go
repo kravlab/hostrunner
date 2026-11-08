@@ -802,7 +802,8 @@ func isTerminal(f *os.File) bool {
 // every attach (see protectedPaths and daemon.WithMountCheck): it refuses
 // every command until the first check of each arm, and while the latest one finds
 // that the container can write its configuration. Without watch there is
-// no container to check, and no check.
+// no container to check, and no check; with MountCheck off, which only a
+// human on the host can set, none either.
 func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []watch.Runtime) error {
 	policy, err := rules.Load(cfg.RulesFile)
 	if err != nil {
@@ -828,27 +829,25 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 		l.Close()
 		return err
 	}
-	log.Info("listening", "socket", cfg.socket, "approval_socket", approvalSocket, "workspace", cfg.workspace, "container_workspace", cfg.containerWorkspace, "rules_file", cfg.RulesFile, "rules_digest", policy.Digest(), "watch", cfg.watch, "no_reread", !cfg.Reread)
+	log.Info("listening", "socket", cfg.socket, "approval_socket", approvalSocket, "workspace", cfg.workspace, "container_workspace", cfg.containerWorkspace, "rules_file", cfg.RulesFile, "rules_digest", policy.Digest(), "watch", cfg.watch, "no_reread", !cfg.Reread, "mount_check", cfg.MountCheck)
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var (
-		watcher *watch.Watcher
-		srv     *daemon.Server // set before the watcher runs, which calls Attached
+		watcher   *watch.Watcher
+		srv       *daemon.Server  // set before the watcher runs, which calls Attached
+		mountOpts []daemon.Option // the mount check's, see wireMountCheck
 	)
 	if cfg.watch {
-		watcher = watch.New(runtimes, watch.Config{
+		wc := watch.Config{
 			Workspace:      cfg.workspace,
 			PollInterval:   cfg.PollInterval,
 			QueryTimeout:   queryTimeout,
 			StartupTimeout: cfg.StartupTimeout,
 			Grace:          cfg.Grace,
-			Attached: func(armedAt time.Time, armed []watch.Container) {
-				srv.MountChecked(armedAt, mountcheck.Check(armed, protectedPaths(cfg)))
-			},
-			// Before `up` gets its reply, so before its container starts.
-			Armed: func(armedAt time.Time) { srv.MountRearmed(armedAt) },
-		}, log)
+		}
+		mountOpts = wireMountCheck(cfg, &wc, &srv)
+		watcher = watch.New(runtimes, wc, log)
 	}
 	reread := func() (daemon.Policy, string, error) {
 		p, err := rules.Load(cfg.RulesFile)
@@ -871,7 +870,8 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 		opts = append(opts, daemon.WithRereadEvery(cfg.PollInterval))
 	}
 	if watcher != nil {
-		opts = append(opts, daemon.WithContainerStopped(watcher.ContainerStopped), daemon.WithMountCheck())
+		opts = append(opts, daemon.WithContainerStopped(watcher.ContainerStopped))
+		opts = append(opts, mountOpts...)
 	}
 	srv = daemon.New(mapper, policy, log, opts...)
 	if watcher != nil {
@@ -883,6 +883,24 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 		}()
 	}
 	return srv.Serve(ctx, l)
+}
+
+// wireMountCheck sets up the mount check of a `serve --watch` of cfg, the
+// one place that looks at cfg.MountCheck: with it on, it sets in wc the
+// callbacks that bring the Server, which *srv points to before the
+// watcher runs, each arm and the check of each attach, and returns the
+// option that has the Server refuse commands by the check's results; with
+// it off, it leaves wc as it is and returns none.
+func wireMountCheck(cfg serveConfig, wc *watch.Config, srv **daemon.Server) []daemon.Option {
+	if !cfg.MountCheck {
+		return nil
+	}
+	wc.Attached = func(armedAt time.Time, armed []watch.Container) {
+		(*srv).MountChecked(armedAt, mountcheck.Check(armed, protectedPaths(cfg)))
+	}
+	// Before `up` gets its reply, so before its container starts.
+	wc.Armed = func(armedAt time.Time) { (*srv).MountRearmed(armedAt) }
+	return []daemon.Option{daemon.WithMountCheck(settings.MountCheckOffHint())}
 }
 
 // protectedPaths are the host paths of cfg's daemon configuration that the

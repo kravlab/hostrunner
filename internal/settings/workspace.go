@@ -9,11 +9,12 @@ import (
 )
 
 // readWorkspaceFile reads the workspace settings file workspaceFile
-// names, which holds the keys at its top level and no sections. A missing
+// names, which holds the keys at its top level and no sections, and none
+// only the host settings file may set (see key.hostOnly). A missing
 // default file sets nothing, a missing named one is an error.
 func readWorkspaceFile(in scopes, named, workspace string, getenv func(string) string) (sourced, error) {
 	path, required := workspaceFile(named, workspace, getenv)
-	l, _, err := readNamed(in, path, required, false)
+	l, _, err := readNamed(in, path, required, workspacePart)
 	return sourced{l, inFile(path, "")}, err
 }
 

@@ -10,18 +10,19 @@ import (
 	"github.com/kravlab/hostrunner/internal/settings"
 )
 
-// restart takes the flags of stop and the paths of the new daemon's
-// settings files: --workspace-settings and --rules-file, with --config.
+// restart takes the flags of stop, the paths of the new daemon's
+// settings files, --workspace-settings and --rules-file with --config,
+// and the new daemon's --mount-check and --no-mount-check.
 func TestRegisterRestartAddsTheFlagsOfStopAndTheDaemonsPaths(t *testing.T) {
 	var f settings.Flags
 	fs := flag.NewFlagSet("restart", flag.ContinueOnError)
 	f.RegisterRestart(fs)
 	var got []string
 	fs.VisitAll(func(fl *flag.Flag) { got = append(got, fl.Name) })
-	if want := []string{"config", "rules-file", "runtime-root", "settings", "stop-timeout", "workspace-settings"}; !slices.Equal(got, want) {
+	if want := []string{"config", "mount-check", "no-mount-check", "rules-file", "runtime-root", "settings", "stop-timeout", "workspace-settings"}; !slices.Equal(got, want) {
 		t.Fatalf("got %q, want %q", got, want)
 	}
-	if got, want := settings.RestartUsage(), "[--settings <path>] [--workspace-settings <path>] [--rules-file <path>] [--runtime-root <path>] [--stop-timeout <duration>]"; got != want {
+	if got, want := settings.RestartUsage(), "[--settings <path>] [--workspace-settings <path>] [--rules-file <path>] [--mount-check | --no-mount-check] [--runtime-root <path>] [--stop-timeout <duration>]"; got != want {
 		t.Fatalf("RestartUsage: got %q, want %q", got, want)
 	}
 }

@@ -108,6 +108,7 @@ func TestAllowRecordsTheCurrentDirectoryAndPrintsWhatItAllowed(t *testing.T) {
 		"  settings:\n" +
 		"    ask_timeout: 10m0s\n" +
 		"    grace: 15s\n" +
+		"    mount_check: true\n" +
 		"    poll_interval: 2s\n" +
 		"    request_timeout: 10s\n" +
 		"    reread: true\n" +
@@ -177,6 +178,34 @@ func TestAllowAllowsWhatTheRefusedUpAskedFor(t *testing.T) {
 	}
 	if err := upAllowCheck(t, ws); !errors.As(err, &notAllowed) {
 		t.Errorf("up without --grace after the allow: got %v, want a *launch.NotAllowedError", err)
+	}
+}
+
+// An allow covers the mount check it was recorded with: one of the
+// default settings, the check on, does not let an up with the check off
+// pass, and the other way round.
+func TestAllowCoversTheMountCheck(t *testing.T) {
+	isolate(t)
+	ws, _ := devcontainerWith(t, allowRules, "hostrunner-rules.yaml")
+	if _, _, err := runAllowCmd(t, "allow", ws); err != nil {
+		t.Fatal(err)
+	}
+	var notAllowed *launch.NotAllowedError
+	if err := upAllowCheck(t, ws); err != nil {
+		t.Fatalf("up after the allow: %v", err)
+	}
+	if err := upAllowCheck(t, ws, "--no-mount-check"); !errors.As(err, &notAllowed) {
+		t.Fatalf("up --no-mount-check after an allow with the check on: got %v, want a *launch.NotAllowedError", err)
+	}
+	t.Chdir(ws)
+	if _, _, err := runAllowCmd(t, "allow"); err != nil {
+		t.Fatal(err)
+	}
+	if err := upAllowCheck(t, ws, "--no-mount-check"); err != nil {
+		t.Errorf("up --no-mount-check after its allow: %v", err)
+	}
+	if err := upAllowCheck(t, ws); !errors.As(err, &notAllowed) {
+		t.Errorf("up with the check on after an allow with it off: got %v, want a *launch.NotAllowedError", err)
 	}
 }
 

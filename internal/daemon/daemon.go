@@ -68,6 +68,7 @@ type Server struct {
 	buildVersion     string                                                        // "": unknown; see WithBuildVersion
 	settings         map[string]string                                             // nil: none reported; see WithSettings
 	mountCheck       bool                                                          // false: the mounts are not checked; see WithMountCheck
+	mountOffHint     string                                                        // how a human on the host turns the check off; see WithMountCheck
 	mountResult      mountState                                                    // the latest result of the mount check; see MountChecked
 
 	// rereading makes rereads one at a time, so a slower one never

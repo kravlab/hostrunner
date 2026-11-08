@@ -91,10 +91,12 @@ func runFakeDaemon(mode string) {
 	fs.DurationVar(&own.RequestTimeout, "request-timeout", 0, "")
 	fs.Bool("reread", false, "") // reread is !--no-reread: up passes one of the two
 	noReread := fs.Bool("no-reread", false, "")
+	fs.Bool("mount-check", false, "") // likewise, the mount check is !--no-mount-check
+	noMountCheck := fs.Bool("no-mount-check", false, "")
 	if len(os.Args) < 2 || os.Args[1] != "serve" || fs.Parse(os.Args[2:]) != nil || !*watch || *config == "" {
 		os.Exit(2)
 	}
-	own.RulesFile, own.Reread = *config, !*noReread
+	own.RulesFile, own.Reread, own.MountCheck = *config, !*noReread, !*noMountCheck
 	ownSettings := own.Daemon() // without a duration up did not pass, which is then not compared
 	policy, err := rules.Load(*config)
 	if err != nil {
@@ -612,8 +614,8 @@ func TestUpReplacesDaemonWhoseRereadingDiffers(t *testing.T) {
 
 // The daemon `up` starts gets every setting as an explicit flag, so its
 // argv shows them and it resolves none again, and the workspace settings
-// file up resolved, which the daemon protects; rereading is explicit both
-// ways, and ready_timeout, up's own, is no flag.
+// file up resolved, which the daemon protects; rereading and the mount
+// check are explicit both ways, and ready_timeout, up's own, is no flag.
 func TestServeArgsGiveEverySetting(t *testing.T) {
 	base := Config{Workspace: "/home/u/app", ContainerWorkspace: "/workspaces/app", WorkspaceSettings: "/home/u/app/.devcontainer/hostrunner.yaml", Settings: settings.Settings{
 		RulesFile: "/home/u/app/.devcontainer/hostrun.yaml", StartupTimeout: 30 * time.Minute, Grace: 15 * time.Second,
@@ -622,17 +624,18 @@ func TestServeArgsGiveEverySetting(t *testing.T) {
 	start := []string{"serve", "--socket", "/run/h.sock", "--workspace", "/home/u/app", "--container-workspace", "/workspaces/app", "--workspace-settings", "/home/u/app/.devcontainer/hostrunner.yaml", "--rules-file", "/home/u/app/.devcontainer/hostrun.yaml", "--watch",
 		"--startup-timeout", "30m0s", "--grace", "15s", "--poll-interval", "2s", "--ask-timeout", "10m0s", "--request-timeout", "10s"}
 	for _, tt := range []struct {
-		reread bool
-		flag   string
+		reread, mountCheck bool
+		flags              []string
 	}{
-		{reread: true, flag: "--reread"},
-		{reread: false, flag: "--no-reread"},
+		{reread: true, mountCheck: true, flags: []string{"--reread", "--mount-check"}},
+		{reread: false, mountCheck: true, flags: []string{"--no-reread", "--mount-check"}},
+		{reread: true, mountCheck: false, flags: []string{"--reread", "--no-mount-check"}},
 	} {
 		cfg := base
-		cfg.Reread = tt.reread
-		want := append(slices.Clone(start), tt.flag)
+		cfg.Reread, cfg.MountCheck = tt.reread, tt.mountCheck
+		want := append(slices.Clone(start), tt.flags...)
 		if got := serveArgs(cfg, "/run/h.sock"); !slices.Equal(got, want) {
-			t.Errorf("reread %v: got %q, want %q", tt.reread, got, want)
+			t.Errorf("reread %v, mount check %v: got %q, want %q", tt.reread, tt.mountCheck, got, want)
 		}
 	}
 }
@@ -795,10 +798,11 @@ func TestArmCarriesTheDaemonSettings(t *testing.T) {
 			s: settings.Settings{
 				RulesFile: "/w/rules.yaml", StartupTimeout: time.Hour, Grace: time.Minute, Reread: false,
 				PollInterval: time.Second, AskTimeout: time.Minute, RequestTimeout: time.Second, ReadyTimeout: time.Minute,
+				MountCheck: true,
 			},
 			want: map[string]string{
 				"rules_file": "/w/rules.yaml", "startup_timeout": "1h0m0s", "grace": "1m0s", "reread": "false",
-				"poll_interval": "1s", "ask_timeout": "1m0s", "request_timeout": "1s",
+				"poll_interval": "1s", "ask_timeout": "1m0s", "request_timeout": "1s", "mount_check": "true",
 			},
 			wantNoReread: true,
 		},
@@ -844,10 +848,11 @@ func TestServeArgsResolveToUpsSettings(t *testing.T) {
 	full := settings.Settings{
 		RulesFile: "/home/u/app/.devcontainer/hostrun.yaml", StartupTimeout: 30 * time.Minute, Grace: 15 * time.Second,
 		Reread: true, PollInterval: 2 * time.Second, AskTimeout: 10 * time.Minute, RequestTimeout: 10 * time.Second,
-		ReadyTimeout: 10 * time.Second,
+		ReadyTimeout: 10 * time.Second, MountCheck: true,
 	}
 	elsewhere := full
 	elsewhere.RulesFile, elsewhere.Reread, elsewhere.Grace = "/home/u/rules/hostrun.yaml", false, 90*time.Second
+	elsewhere.MountCheck = false
 	for _, tt := range []struct {
 		name string
 		s    settings.Settings
