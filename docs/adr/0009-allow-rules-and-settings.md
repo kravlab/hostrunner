@@ -16,10 +16,10 @@ together with the daemon settings resolved for it in
 
 ## Considered Options
 
-- **Denying every command once the rules change unallowed**: the agent
-  sees the change at once, but a human's own edit stops the work until
-  the allow. Rejected: a running daemon keeps serving the allowed rules
-  and reports the pending change.
+- **Denying every command once the rules change to content not
+  allowed**: the agent sees the change at once, but a human's own edit
+  stops the work until the allow. Rejected: a running daemon keeps
+  serving the allowed rules and reports the pending change.
 - **Keeping a copy of the allowed rules on the host** so that `up` could
   start a daemon with them: one more store to keep in step with the
   rules file. Rejected for now; `up` fails instead.
@@ -28,6 +28,15 @@ together with the daemon settings resolved for it in
 - **Allowing the rules file alone**: the workspace settings file could
   still change the timeouts, `reread` and `ask_timeout` unasked.
   Rejected: the allow covers the resolved daemon settings.
+- **`hostrunner allow` resolving the settings itself, with no request
+  from `up`**: the settings flags `up` gets from `initializeCommand`
+  (`--grace`, `--no-mount-check`, a `--rules-file`) cannot be reproduced
+  by a plain `hostrunner allow`, and a human retyping them would get
+  them wrong. Rejected: a refused `up` records what it asked for and
+  `allow` allows exactly that. The risk is that the human allows flags
+  they did not type, which whoever can write `devcontainer.json` chose;
+  `allow` prints every setting that differs from its default with the
+  default (`mount_check: false (default true)`), so they see them.
 
 ## Consequences
 
@@ -39,6 +48,11 @@ together with the daemon settings resolved for it in
   off, it takes effect on the next `up`.
 - The daemon log, the approval session and every `hostrun` call report
   rules or settings changed but not allowed.
+- Only the host arms a daemon: `up` arms it on its approval socket, and
+  the container's socket refuses an arm, so the container cannot report
+  a change not allowed of its own, end one, or put the mount check back
+  to pending. A daemon from before this refuses the arm, and `up` fails
+  until it is stopped.
 - A rule added from the approval session is allowed with the content the
   session wrote, provided the file was allowed before the write.
 - ADR 0008's "hostrunner does not protect the workspace settings file or

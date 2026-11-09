@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os/exec"
 	"slices"
 	"strings"
@@ -37,12 +38,41 @@ type Container struct {
 	MountsErr error     // why the mounts could not be read; nil when they were
 }
 
-// Mount is one of a container's mounts as its runtime reports it.
+// The Mount.Type of a volume mount, the Volume.Driver of the runtime's
+// own volumes, and the Volume.Options key that names the host path a
+// local volume binds.
+const (
+	MountTypeVolume    = "volume"
+	DriverLocal        = "local"
+	VolumeOptionDevice = "device"
+)
+
+// Mount is one of a container's mounts as its runtime reports it. A
+// volume's Source lies in the runtime's storage; where its content comes
+// from, a host directory a local volume binds, say, only the volume's
+// driver and options tell (Volume).
 type Mount struct {
-	Type        string // the runtime's mount type: "bind", "volume" or "tmpfs"; empty if it names none
+	Type        string // the runtime's mount type: "bind", "volume" (MountTypeVolume) or "tmpfs"; empty if it names none
+	Name        string // the volume's name, for a "volume" mount; empty otherwise or if the runtime names none
 	Source      string // on the host; empty for a mount without one, as tmpfs
 	Destination string // in the container
 	ReadOnly    bool
+	// Volume is, for a "volume" mount, the volume as the runtime's
+	// inspection of it reports it; nil for other mounts and when VolumeErr
+	// says why it could not be inspected. Copies of a Mount share it.
+	Volume *Volume
+	// VolumeErr is, for a "volume" mount, why the volume could not be
+	// inspected; nil when it was, and for other mounts.
+	VolumeErr error
+}
+
+// Volume is a volume as its runtime's inspection reports it: its driver
+// (DriverLocal for the runtime's own) and the options it was created with,
+// such as a local volume's type, o and device (VolumeOptionDevice); nil
+// Options for none.
+type Volume struct {
+	Driver  string
+	Options map[string]string
 }
 
 // Runtime lists a workspace's containers, stopped ones included: a stopped
@@ -337,12 +367,19 @@ func (a *arming) observe(containers []Container, now time.Time, grace time.Durat
 }
 
 // armed returns copies of the armed containers among containers, in their
-// order.
+// order, their mounts' volumes copied too.
 func (a *arming) armed(containers []Container) []Container {
 	var out []Container
 	for _, c := range containers {
 		if a.ids[c.ID] {
 			c.Mounts = slices.Clone(c.Mounts)
+			for i, m := range c.Mounts {
+				if m.Volume != nil {
+					v := *m.Volume
+					v.Options = maps.Clone(v.Options)
+					c.Mounts[i].Volume = &v
+				}
+			}
 			out = append(out, c)
 		}
 	}
@@ -408,7 +445,8 @@ type CLI struct {
 }
 
 // Containers lists the containers carrying the workspace's
-// devcontainer.local_folder label, in every state, then inspects them.
+// devcontainer.local_folder label, in every state, then inspects them and
+// the volumes their mounts name (see inspectVolumes).
 func (c CLI) Containers(ctx context.Context, workspace string) ([]Container, error) {
 	out, _, err := c.run(ctx, "ps", "-aq", "--filter", "label=devcontainer.local_folder="+workspace)
 	if err != nil {
@@ -449,7 +487,86 @@ func (c CLI) Containers(ctx context.Context, workspace string) ([]Container, err
 		}
 		found = append(found, container)
 	}
+	c.inspectVolumes(ctx, found)
 	return found, nil
+}
+
+// inspectVolumes sets the Volume of every "volume" mount of containers
+// whose mounts were read, from one inspection of all the volumes they
+// name, each once; docker and podman both name a volume's keys Name,
+// Driver and Options. A volume the inspection does not report (one
+// removed meanwhile, which makes it fail), or a mount that names none,
+// gets a VolumeErr instead: the caller decides what an unknown volume
+// means.
+func (c CLI) inspectVolumes(ctx context.Context, containers []Container) {
+	volumes, inspectErr := c.inspectVolumeNames(ctx, volumeNames(containers))
+	c.setVolumes(containers, volumes, inspectErr)
+}
+
+// volumeNames returns the names of the volumes the "volume" mounts of
+// containers name, each once, in the order they are first named; a mount
+// that names none adds nothing.
+func volumeNames(containers []Container) []string {
+	var names []string
+	for _, ct := range containers {
+		for _, m := range ct.Mounts {
+			if m.Type == MountTypeVolume && m.Name != "" && !slices.Contains(names, m.Name) {
+				names = append(names, m.Name)
+			}
+		}
+	}
+	return names
+}
+
+// inspectVolumeNames runs one `volume inspect` of the volumes named and
+// returns those it reports, by name, and its failure, err. A line of its
+// output that is not a volume is skipped. A failed command still returns
+// the volumes it reported: one removed meanwhile makes it fail, and the
+// others are reported all the same. No names run nothing.
+func (c CLI) inspectVolumeNames(ctx context.Context, names []string) (volumes map[string]Volume, err error) {
+	volumes = make(map[string]Volume, len(names))
+	if len(names) == 0 {
+		return volumes, nil
+	}
+	out, _, err := c.run(ctx, append([]string{"volume", "inspect", "--format", "{{json .}}"}, names...)...)
+	for line := range strings.Lines(out) {
+		var v struct {
+			Name    string
+			Driver  string
+			Options map[string]string
+		}
+		if json.Unmarshal([]byte(line), &v) == nil && v.Name != "" {
+			volumes[v.Name] = Volume{Driver: v.Driver, Options: v.Options}
+		}
+	}
+	return volumes, err
+}
+
+// setVolumes sets the Volume of every "volume" mount of containers from
+// volumes, the volumes the inspection reported, or its VolumeErr: that
+// the mount names no volume, or, for a volume volumes lacks, inspectErr,
+// the failure of the inspection, when there was one, else that the
+// inspection did not report it.
+func (c CLI) setVolumes(containers []Container, volumes map[string]Volume, inspectErr error) {
+	for i := range containers {
+		for j := range containers[i].Mounts {
+			m := &containers[i].Mounts[j]
+			if m.Type != MountTypeVolume {
+				continue
+			}
+			v, ok := volumes[m.Name]
+			switch {
+			case m.Name == "":
+				m.VolumeErr = fmt.Errorf("%s inspect: a volume mount of %s at %s names no volume", c.Binary, containers[i].ID, m.Destination)
+			case ok:
+				m.Volume = &v
+			case inspectErr != nil:
+				m.VolumeErr = fmt.Errorf("volume %s: %w", m.Name, inspectErr)
+			default:
+				m.VolumeErr = fmt.Errorf("%s volume inspect: volume %s not reported", c.Binary, m.Name)
+			}
+		}
+	}
 }
 
 // run runs the runtime's CLI and returns its stdout and stderr.
@@ -475,11 +592,12 @@ func parseStartedAt(raw string) (time.Time, error) {
 }
 
 // parseMounts reads mounts as {{json .Mounts}} renders them: docker and
-// podman both name a mount's keys Type, Source, Destination and RW. null is
-// no mounts.
+// podman both name a mount's keys Type, Name (a volume's), Source,
+// Destination and RW. null is no mounts.
 func parseMounts(raw string) ([]Mount, error) {
 	var parsed []struct {
 		Type        string
+		Name        string
 		Source      string
 		Destination string
 		RW          bool
@@ -489,7 +607,11 @@ func parseMounts(raw string) ([]Mount, error) {
 	}
 	var mounts []Mount
 	for _, m := range parsed {
-		mounts = append(mounts, Mount{Type: m.Type, Source: m.Source, Destination: m.Destination, ReadOnly: !m.RW})
+		mount := Mount{Type: m.Type, Source: m.Source, Destination: m.Destination, ReadOnly: !m.RW}
+		if m.Type == MountTypeVolume {
+			mount.Name = m.Name
+		}
+		mounts = append(mounts, mount)
 	}
 	return mounts, nil
 }

@@ -81,12 +81,20 @@ type mount struct {
 // dangling ones included; a path that does not exist is resolved through
 // its nearest existing ancestor, so a writable parent of a missing file
 // fails the check. Mounts without an absolute host source (tmpfs, an empty
-// or relative source) are ignored, and so are volumes, by their Type: their
-// source lies in the runtime's storage, which the daemon may not read, and
-// holds only what the runtime puts there. A path or a bind mount source with
-// a component that cannot be read, other than one that does not exist, fails
-// the check with an *UnresolvableError, as what an unreadable link leads to is
-// unknown. A writable mount reaches a protected path when one
+// or relative source) are ignored. A volume (by its Type) is not judged by
+// its source, which lies in the runtime's storage, which the daemon may not
+// read, but by its inspection (watch.Mount.Volume): a local volume whose
+// options name an absolute device, as one created with type=none, o=bind
+// (or rbind) and a host directory binds it, is checked as a mount of that
+// device, resolved, with the mount's own read-only flag; one whose device
+// is no host path (a tmpfs, an NFS export) or that names none holds only
+// what the runtime puts there and is ignored. A volume that could not be
+// inspected, or of another driver whose options name a device, which the
+// daemon cannot tell the content of, gives an *UnreadableError. A path, a
+// bind mount source or a device with a component that cannot be read,
+// other than one that does not exist, fails the check with an
+// *UnresolvableError, as what an unreadable link leads to is unknown. A
+// writable mount reaches a protected path when one
 // lies under the other, unless a deeper mount of the same container covers
 // the container path it would be reached at.
 func Check(containers []watch.Container, paths []string) error {
@@ -115,16 +123,25 @@ func Check(containers []watch.Container, paths []string) error {
 	return nil
 }
 
-// hostMounts resolves the mounts that have an absolute host source and
-// drops the others, and volumes. The error is an *UnresolvableError, naming
-// container id, for the first source that cannot be resolved.
+// hostMounts resolves the mounts that have an absolute host source, a
+// volume's being its device (see volumeSource), and drops the others. The
+// error is an *UnreadableError, naming container id, for the first volume
+// it cannot tell the content of, or an *UnresolvableError, naming it too,
+// for the first source that cannot be resolved.
 func hostMounts(id string, ms []watch.Mount) ([]mount, error) {
 	var out []mount
 	for _, m := range ms {
-		if m.Type == "volume" || !filepath.IsAbs(m.Source) {
+		src := m.Source
+		if m.Type == watch.MountTypeVolume {
+			var err error
+			if src, err = volumeSource(m); err != nil {
+				return nil, &UnreadableError{Container: id, Err: err}
+			}
+		}
+		if !filepath.IsAbs(src) {
 			continue
 		}
-		source, err := resolve(m.Source)
+		source, err := resolve(src)
 		if err != nil {
 			if u, ok := errors.AsType[*UnresolvableError](err); ok {
 				u.Container = id
@@ -134,6 +151,28 @@ func hostMounts(id string, ms []watch.Mount) ([]mount, error) {
 		out = append(out, mount{source: source, dest: path.Clean(m.Destination), readOnly: m.ReadOnly})
 	}
 	return out, nil
+}
+
+// volumeSource returns the host source of the volume mount m: the device
+// its options name, for a local volume ("" when it names none, which
+// hostMounts drops as it does a device that is not an absolute path), or
+// why the content of the volume is unknown: it was not inspected, or it is
+// of another driver and names a device. Whatever its type and o options
+// say, block devices included, every local volume with an absolute device
+// is judged as a bind of that path: a safe superset, as no volume that
+// could show a protected path through its device goes unchecked.
+func volumeSource(m watch.Mount) (string, error) {
+	switch {
+	case m.VolumeErr != nil:
+		return "", m.VolumeErr
+	case m.Volume == nil:
+		return "", fmt.Errorf("volume %s at %s was not inspected", m.Name, m.Destination)
+	}
+	device, ok := m.Volume.Options[watch.VolumeOptionDevice]
+	if ok && m.Volume.Driver != watch.DriverLocal {
+		return "", fmt.Errorf("volume %s at %s, of driver %s, names the device %s, whose content the daemon cannot tell", m.Name, m.Destination, m.Volume.Driver, device)
+	}
+	return device, nil
 }
 
 // checkPath returns a *WritableError for the first of mounts that makes the

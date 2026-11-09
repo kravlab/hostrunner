@@ -3,8 +3,10 @@ package client_test
 import (
 	"errors"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -37,27 +39,27 @@ func newAllowStore(t *testing.T) allowStore {
 }
 
 // check is the allow check a daemon of these tests runs (see
-// daemon.WithAllowed): whether the store allows digest and settings for
-// the workspace.
-func (a allowStore) check(digest string, settings map[string]string) (bool, error) {
-	return a.store.Allowed(a.workspace, digest, settings)
+// daemon.WithAllowed): whether the store allows the Scope for the
+// workspace.
+func (a allowStore) check(sc allow.Scope) (bool, error) {
+	return a.store.Allowed(a.workspace, sc)
 }
 
 // allow records an allow of content for the workspace, as `hostrunner
 // allow` does.
 func (a allowStore) allow(t *testing.T, rulesFile, content string) {
 	t.Helper()
-	if _, err := a.store.Allow(a.workspace, rulesFile, rules.ContentDigest([]byte(content)), allowSettings); err != nil {
+	if _, err := a.store.Allow(a.workspace, allow.Target{RulesFile: rulesFile, Scope: allow.Scope{Digest: rules.ContentDigest([]byte(content)), Settings: allowSettings}}); err != nil {
 		t.Fatal(err)
 	}
 }
 
 // record is the allow a daemon of these tests records (see
-// daemon.WithAllow) for a rule added from the approval session: an allow
+// daemon.WithAllowRecorder) for a rule added from the approval session: an allow
 // of content of the given digest for the workspace, as `hostrunner allow`
 // does.
 func (a allowStore) record(digest string) error {
-	_, err := a.store.Allow(a.workspace, a.rulesFile, digest, allowSettings)
+	_, err := a.store.Allow(a.workspace, allow.Target{RulesFile: a.rulesFile, Scope: allow.Scope{Digest: digest, Settings: allowSettings}})
 	return err
 }
 
@@ -67,7 +69,7 @@ func (a allowStore) record(digest string) error {
 // allow of a rule added from the approval session.
 func (a allowStore) startDaemon(t *testing.T, log *slog.Logger, content string) harness {
 	t.Helper()
-	return startRereadingDaemon(t, log, content, daemon.WithSettings(allowSettings), daemon.WithAllowed(a.check), daemon.WithAllow(a.record))
+	return startRereadingDaemon(t, log, content, daemon.WithSettings(allowSettings), daemon.WithAllowed(a.check), daemon.WithAllowRecorder(a.record))
 }
 
 // notAllowedLog is how the daemon logs a change of its rules file to
@@ -75,10 +77,87 @@ func (a allowStore) startDaemon(t *testing.T, log *slog.Logger, content string) 
 const notAllowedLog = "msg=\"rules changed but not allowed: the old rules stay until `hostrunner allow`\" file="
 
 // notAllowedNotice is how the session shows a change of the rules file to
-// content of the given digest not allowed.
+// content of the given digest not allowed: in the words of hostrun's
+// warning, on a line of its own.
 func notAllowedNotice(digest string) string {
-	return "\nthe rules file changed, but the daemon cannot reread it, so the old rules stay: its content (digest " +
-		digest + ") is not allowed; run `hostrunner allow` on the host\n"
+	return "\n" + strings.TrimPrefix(notAllowedWarningLine(digest), "hostrun: warning: ")
+}
+
+// notCheckedNotice is how the session shows a change of the rules file to
+// content of the given digest whose allow cannot be checked.
+func notCheckedNotice(digest string) string {
+	return "\n" + strings.TrimPrefix(notCheckedWarningLine(digest), "hostrun: warning: ")
+}
+
+// readsNotAllowedOnly is how the raw sessions of these tests serve: they read
+// the notice of a change not allowed, and no other notice.
+var readsNotAllowedOnly = protocol.Serve{RulesNotAllowed: true}
+
+// readNotAllowed reads the next frame the daemon sends conn, a serving
+// session's that reads only the notice of a change not allowed, and checks
+// it is that notice.
+func readNotAllowed(t *testing.T, conn net.Conn) protocol.RulesNotAllowed {
+	t.Helper()
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	f, err := protocol.ReadFrame(conn)
+	var n protocol.RulesNotAllowed
+	if err == nil && f.Type == protocol.FrameRulesNotAllowed {
+		err = protocol.DecodeJSON(f, &n)
+	}
+	if err != nil || f.Type != protocol.FrameRulesNotAllowed {
+		t.Fatalf("frame %v %q, err %v; want the notice of a change not allowed", f.Type, f.Payload, err)
+	}
+	return n
+}
+
+// noticesUntil reads the notices of a change not allowed the daemon sends
+// conn (see readNotAllowed) up to the one of the given digest, and returns
+// them, that one included.
+func noticesUntil(t *testing.T, conn net.Conn, digest string) []protocol.RulesNotAllowed {
+	t.Helper()
+	var got []protocol.RulesNotAllowed
+	for {
+		n := readNotAllowed(t, conn)
+		got = append(got, n)
+		if n.Digest == digest {
+			return got
+		}
+	}
+}
+
+// noticesBeforeStandingList asks the daemon for the standing list on conn, a
+// serving session's that reads only the notice of a change not allowed, and
+// returns the notices it sent before the list.
+func noticesBeforeStandingList(t *testing.T, conn net.Conn) []protocol.RulesNotAllowed {
+	t.Helper()
+	if err := protocol.WriteFrame(conn, protocol.Frame{Type: protocol.FrameStanding}); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	var got []protocol.RulesNotAllowed
+	for {
+		f, err := protocol.ReadFrame(conn)
+		if err == nil && f.Type == protocol.FrameStandingList {
+			return got
+		}
+		var n protocol.RulesNotAllowed
+		if err == nil && f.Type == protocol.FrameRulesNotAllowed {
+			err = protocol.DecodeJSON(f, &n)
+		}
+		if err != nil || f.Type != protocol.FrameRulesNotAllowed {
+			t.Fatalf("frame %v %q, err %v; want notices of a change not allowed, then the standing list", f.Type, f.Payload, err)
+		}
+		got = append(got, n)
+	}
+}
+
+// checkNotices checks that the notices of a change not allowed a session
+// got are want, in that order.
+func checkNotices(t *testing.T, got []protocol.RulesNotAllowed, want ...protocol.RulesNotAllowed) {
+	t.Helper()
+	if !slices.Equal(got, want) {
+		t.Fatalf("the session got the notices %+v, want %+v", got, want)
+	}
 }
 
 // An edit to content not allowed keeps the old rules, is logged once
@@ -168,7 +247,7 @@ func TestRereadKeepsTheOldRulesWhenTheAllowCannotBeChecked(t *testing.T) {
 	)
 	broken.Store(true)
 	h := startRereadingDaemon(t, slog.New(slog.NewTextHandler(&log, nil)), echoRules,
-		daemon.WithAllowed(func(string, map[string]string) (bool, error) {
+		daemon.WithAllowed(func(allow.Scope) (bool, error) {
 			if broken.Load() {
 				return false, errors.New("the allow store is broken")
 			}
@@ -280,7 +359,7 @@ func TestRereadReportsAnotherReasonAgain(t *testing.T) {
 		broken atomic.Bool
 	)
 	h := startRereadingDaemon(t, slog.New(slog.NewTextHandler(&log, nil)), echoRules,
-		daemon.WithAllowed(func(string, map[string]string) (bool, error) {
+		daemon.WithAllowed(func(allow.Scope) (bool, error) {
 			if broken.Load() {
 				return false, errors.New("the allow store is broken")
 			}
@@ -291,7 +370,7 @@ func TestRereadReportsAnotherReasonAgain(t *testing.T) {
 	digest := rules.ContentDigest([]byte(touchRules))
 	s.waitFor(t, notAllowedNotice(digest))
 	broken.Store(true)
-	s.waitFor(t, "so the old rules stay: the allow of its content (digest "+digest+") cannot be checked: the allow store is broken\n")
+	s.waitFor(t, notCheckedNotice(digest))
 	broken.Store(false)
 	s.waitFor(t, notAllowedNotice(digest))
 	const notChecked = `msg="rules change not checked: the old rules stay"`
@@ -324,4 +403,134 @@ func TestRereadRecordsAnAllowRequestOnce(t *testing.T) {
 	if got := h.run(t, containerRoot, "", "echo", "old"); got != (result{stdout: "old\n", stderr: notAllowedWarningLine(rules.ContentDigest([]byte(touchRules)))}) {
 		t.Fatalf("a command of the old rules: got %+v, want it to run, with the warning", got)
 	}
+}
+
+// A session that reads the notices of a reread but not that of a change
+// not allowed, as one older than it, takes an unknown frame for an error,
+// so it is sent none.
+func TestRulesNotAllowedIsNotSentToAnOlderSession(t *testing.T) {
+	var log lockedBuffer
+	a := newAllowStore(t)
+	h := a.startDaemon(t, slog.New(slog.NewTextHandler(&log, nil)), echoRules)
+	conn := helloThenServe(t, h, func() {}, protocol.Serve{Notices: true, Runs: true, MountCheck: true})
+	writeRules(t, h.rulesFile, touchRules)
+	waitForLog(t, &log, notAllowedLog+h.rulesFile+" digest="+rules.ContentDigest([]byte(touchRules)))
+	assertNoFrameBeforeStandingList(t, conn)
+}
+
+// A session that starts serving after the daemon refused an edit, with no
+// session serving, is told of the refusal pending as it starts, once: the
+// daemon told only the session serving as it refused the edit, and that
+// edit is not refused again.
+func TestRereadTellsASessionStartingAfterAnEditNotAllowed(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		allowed func(allow.Scope) (bool, error)
+		logged  string
+		notice  func(digest string) string
+	}{
+		{"not allowed", func(allow.Scope) (bool, error) { return false, nil }, notAllowedLog, notAllowedNotice},
+		{"not checked", func(allow.Scope) (bool, error) { return false, errors.New("the allow store is broken") },
+			`msg="rules change not checked: the old rules stay" file=`, notCheckedNotice},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var log lockedBuffer
+			h := startRereadingDaemon(t, slog.New(slog.NewTextHandler(&log, nil)), echoRules, daemon.WithAllowed(tt.allowed))
+			writeRules(t, h.rulesFile, touchRules)
+			digest := rules.ContentDigest([]byte(touchRules))
+			waitForLog(t, &log, tt.logged+h.rulesFile+" digest="+digest)
+			s := h.startSession(t)
+			s.waitFor(t, tt.notice(digest))
+			// The notice is not repeated: a later edit's is the next one.
+			time.Sleep(20 * rereadEvery)
+			writeRules(t, h.rulesFile, handDate)
+			got := s.waitFor(t, tt.notice(rules.ContentDigest([]byte(handDate))))
+			if strings.Contains(got, digest) {
+				t.Fatalf("the session is told of the first edit again: %q", got)
+			}
+		})
+	}
+}
+
+// A session that does not read the notice of a change not allowed, as one
+// older than it, is not sent the refusal pending as it starts serving
+// either.
+func TestRulesNotAllowedPendingIsNotSentToAnOlderSession(t *testing.T) {
+	h, _, _, _ := pendingEdit(t)
+	conn := helloThenServe(t, h, func() {}, protocol.Serve{Notices: true, Runs: true, MountCheck: true})
+	assertNoFrameBeforeStandingList(t, conn)
+}
+
+// rereadNoticed sends rr on conn, a serving session's that reads only the
+// notice of a change not allowed, as sendReread does, and returns the
+// notices the daemon sent before its answer, and the answer.
+func rereadNoticed(t *testing.T, conn net.Conn, rr protocol.Reread) ([]protocol.RulesNotAllowed, protocol.RereadResult) {
+	t.Helper()
+	if err := protocol.WriteJSON(conn, protocol.FrameReread, rr); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	var notices []protocol.RulesNotAllowed
+	for {
+		f, err := protocol.ReadFrame(conn)
+		var res protocol.RereadResult
+		if err == nil && f.Type == protocol.FrameRereadResult && protocol.DecodeJSON(f, &res) == nil {
+			return notices, res
+		}
+		var n protocol.RulesNotAllowed
+		if err == nil && f.Type == protocol.FrameRulesNotAllowed {
+			err = protocol.DecodeJSON(f, &n)
+		}
+		if err != nil || f.Type != protocol.FrameRulesNotAllowed {
+			t.Fatalf("reread: frame %v %q, err %v; want notices of a change not allowed, then the result", f.Type, f.Payload, err)
+		}
+		notices = append(notices, n)
+	}
+}
+
+// startQuietAllowDaemon starts a daemon serving echoRules with
+// allowSettings, whose allow of the rules file is checked in a's store, and
+// which rereads by itself, but does not look at the file before the test is
+// over: only a session's reread refuses an edit.
+func startQuietAllowDaemon(t *testing.T, a allowStore) harness {
+	t.Helper()
+	return startRereadingDaemon(t, slog.New(slog.DiscardHandler), echoRules,
+		daemon.WithSettings(allowSettings), daemon.WithAllowed(a.check), daemon.WithRereadEvery(time.Hour))
+}
+
+// A hand edit not allowed that a session's reread refuses, before the
+// daemon looked at the file, is noticed to that session, once however
+// often it rereads, and to a session that starts serving later.
+func TestASessionsRereadOfAnEditNotAllowedIsNoticed(t *testing.T) {
+	a := newAllowStore(t)
+	h := startQuietAllowDaemon(t, a)
+	conn := helloThenServe(t, h, func() {}, readsNotAllowedOnly)
+	writeRules(t, h.rulesFile, touchRules)
+	digest := rules.ContentDigest([]byte(touchRules))
+	want := protocol.RulesNotAllowed{Digest: digest}
+	for _, wantNotices := range [][]protocol.RulesNotAllowed{{want}, nil} {
+		notices, res := rereadNoticed(t, conn, protocol.Reread{Digest: digest})
+		if res.Error == "" {
+			t.Fatalf("reread: got %+v, want the edit refused", res)
+		}
+		checkNotices(t, notices, wantNotices...)
+	}
+	later := helloThenServe(t, h, func() {}, protocol.Serve{TakeOver: true, RulesNotAllowed: true})
+	checkNotices(t, noticesBeforeStandingList(t, later), want)
+}
+
+// A session that starts serving after an edit refused as not allowed was
+// allowed, before the daemon served it, is not told of it: the allow is
+// checked again as the session starts.
+func TestAnEditAllowedSinceIsNotNoticedToASessionStartingLater(t *testing.T) {
+	a := newAllowStore(t)
+	h := startQuietAllowDaemon(t, a)
+	conn := h.serveRaw(t)
+	writeRules(t, h.rulesFile, touchRules)
+	if res := sendReread(t, conn, protocol.Reread{Digest: rules.ContentDigest([]byte(touchRules))}); res.Error == "" {
+		t.Fatalf("reread: got %+v, want the edit refused", res)
+	}
+	a.allow(t, h.rulesFile, touchRules)
+	later := helloThenServe(t, h, func() {}, protocol.Serve{TakeOver: true, RulesNotAllowed: true})
+	checkNotices(t, noticesBeforeStandingList(t, later))
 }

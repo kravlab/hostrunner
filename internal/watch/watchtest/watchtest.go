@@ -5,6 +5,8 @@ package watchtest
 import (
 	"context"
 	"errors"
+	"fmt"
+	"maps"
 	"slices"
 	"sync"
 	"time"
@@ -13,12 +15,15 @@ import (
 )
 
 // Runtime is a watch.Runtime whose containers a test starts, stops and
-// removes, as docker would. Its zero value has no containers.
+// removes, as docker would, and whose volumes it sets. Its zero value has
+// no containers and no volumes.
 type Runtime struct {
 	mu         sync.Mutex
 	containers []watch.Container
 	mounts     map[string][]watch.Mount // by container ID; outlives Remove
 	mountsErr  map[string]bool          // IDs whose mounts fail to read
+	volumes    map[string]watch.Volume  // by name
+	volumesErr map[string]bool          // names of the volumes that fail to inspect
 	failing    bool
 	hold       *hold // the next Containers call waits on it; nil: none
 }
@@ -29,7 +34,9 @@ type hold struct {
 
 // Containers returns the containers in every state, or an error while the
 // runtime is failing. A call that Hold catches answers once released, with
-// the state at that time.
+// the state at that time. Each "volume" mount carries a copy of the volume
+// SetVolume set for its name, or, for a volume none set or one FailVolume
+// fails, a VolumeErr, as watch.CLI reports a volume it cannot inspect.
 func (r *Runtime) Containers(context.Context, string) ([]watch.Container, error) {
 	r.mu.Lock()
 	h := r.hold
@@ -50,8 +57,49 @@ func (r *Runtime) Containers(context.Context, string) ([]watch.Container, error)
 		if r.mountsErr[out[i].ID] {
 			out[i].Mounts, out[i].MountsErr = nil, errors.New("mounts unavailable")
 		}
+		for j, m := range out[i].Mounts {
+			if m.Type == watch.MountTypeVolume {
+				out[i].Mounts[j].Volume, out[i].Mounts[j].VolumeErr = r.volume(m.Name)
+			}
+		}
 	}
 	return out, nil
+}
+
+// volume returns a copy of the volume name as Containers reports it, or
+// why it cannot be inspected. The caller holds r.mu.
+func (r *Runtime) volume(name string) (*watch.Volume, error) {
+	v, ok := r.volumes[name]
+	switch {
+	case r.volumesErr[name]:
+		return nil, fmt.Errorf("volume %s: inspection failed", name)
+	case !ok:
+		return nil, fmt.Errorf("volume %s: no such volume", name)
+	}
+	v.Options = maps.Clone(v.Options)
+	return &v, nil
+}
+
+// SetVolume sets the volume name, which the "volume" mounts naming it
+// carry (see Containers).
+func (r *Runtime) SetVolume(name string, v watch.Volume) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.volumes == nil {
+		r.volumes = make(map[string]watch.Volume)
+	}
+	v.Options = maps.Clone(v.Options)
+	r.volumes[name] = v
+}
+
+// FailVolume makes the volume name fail to inspect, or inspect again.
+func (r *Runtime) FailVolume(name string, failing bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.volumesErr == nil {
+		r.volumesErr = make(map[string]bool)
+	}
+	r.volumesErr[name] = failing
 }
 
 // SetMounts sets the mounts Containers reports for the container id. They

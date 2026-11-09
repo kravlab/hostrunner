@@ -138,7 +138,9 @@ from `protocol.Version` of the container's socket.
   requests nor other sessions.
 - Session frames (answer, revoke a standing approval, reread the rules,
   take over) are accepted only there and refused on the container's
-  socket; the approval socket accepts no container frames.
+  socket; the approval socket accepts no container frames. So is
+  `FrameArm`, which `hostrunner up` sends in place of a hello: the
+  container's socket refuses it with a protocol error (125).
 - Hello: the daemon answers with its approval protocol version, the host
   and container workspaces, the rules file path, whether a session
   serves it, its build version (`build_version`, optional; see

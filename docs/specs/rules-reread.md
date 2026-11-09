@@ -41,16 +41,17 @@ the daemon rereads the file by itself once it changes, without stopping.
   content like any other, of digest `missing`: until it is allowed the
   old rules stay. Content not allowed keeps the rules served, logged as
   ``rules changed but not allowed: the old rules stay until `hostrunner
-  allow` `` with the file and the digest, and the session gets the error
-  ``its content (digest <digest>) is not allowed; run `hostrunner allow`
-  on the host``. The daemon also records an allow request, as a refused
+  allow` `` with the file and the digest, and the session gets the
+  notice of a change not allowed (see Approval session). The daemon also
+  records an allow request, as a refused
   `up` does, with its own rules file, the digest and its daemon
   settings, so `hostrunner allow` without flags allows exactly what the
   daemon checks, settings flags `up` was given included; a request that
   cannot be recorded is logged as `allow request not recorded` and
   changes nothing else. An allow store that cannot be read allows nothing:
   logged as `rules change not checked: the old rules stay` with the
-  error, the session getting it too.
+  error, the session getting the notice of a change whose allow cannot be
+  checked, which points to the daemon log.
 - Each refusal is reported once each time the file changes to that
   content: the daemon remembers the one refusal pending, its content and
   its reason, for its own looks and the session's `a` alike. The same
@@ -82,7 +83,17 @@ the daemon rereads the file by itself once it changes, without stopping.
   arm reports none, or, with the same settings, the rules file goes back
   to the served content. Undoing a settings change alone is seen only at
   the next `up`. Both sources pending: both texts on one line, joined by
-  "; ". An older daemon ignores `not_allowed`.
+  "; ". An older daemon ignores `not_allowed`. The daemon logs such an
+  arm as ``hostrunner up reported a change not allowed: the daemon keeps
+  the old rules and settings until `hostrunner allow` `` with the digest
+  and `settings_differ` (its settings differ from the daemon's), and the
+  session is told of it as of any change not allowed (see Approval
+  session): of the rules or the daemon settings when the settings
+  differ, else of the rules file. With the daemon's own settings and the
+  digest of the refusal pending it is that refusal, so the session is
+  told of it once, whether the daemon refused the content before the arm
+  or after it. An arm whose digest is empty, with no refusal pending, is
+  not taken for the refusal pending.
 - Content allowed that does not load is a file that does not load, as
   above.
 
@@ -97,6 +108,51 @@ the daemon rereads the file by itself once it changes, without stopping.
   rules stay: <error>`, a notice, printed as the host approvals spec
   says (held while a request is shown, at once at the idle prompt). It
   keeps the new digest for later proposals at once.
+- A change not allowed, of the rules file or of the settings an arm
+  reports, has a frame of its own, `FrameRulesNotAllowed`
+  (`RulesNotAllowed`: `digest`, `settings` when the daemon settings
+  changed too, `not_checked` when the allow cannot be checked), sent only
+  to a session that said so in `Serve` (`rules_not_allowed`); an older
+  session gets none, as for unknown notices: one from a hostrunner that
+  predates the frame shows no notice of rules changed but not allowed,
+  while the `hostrun` warning and `daemon.log` still report it. The
+  session prints it in the words of the `hostrun` warning: `the rules
+  file changed (digest
+  <digest>), but the change is not allowed, so the daemon keeps the old
+  rules; a human on the host runs hostrunner allow to allow it` (`the
+  rules or the daemon settings changed …, so the daemon keeps the old
+  ones`; `its allow cannot be checked …; a human on the host looks at
+  the daemon log`).
+- The session is told what the `hostrun` warning names. The daemon keeps
+  one state of the changes not allowed pending (the refusal of the rules
+  file's content, then the change the last arm reported, merged as the
+  warning merges them) and of what the session serving was told of
+  them. Every source of such a change updates that state: the daemon's
+  look at the file, a session's reread (`a` after a hand edit, or a rule
+  written over rules not allowed), an allow of a rule that cannot be
+  recorded, the end of a refusal and an arm. The session serving is
+  then told of each change pending it was not told of: a new digest,
+  scope (the rules file, or the rules or the daemon settings) or check
+  (not allowed, or not checked); a session whose reread was refused is
+  told too, besides the error its reread gets. A change no longer pending
+  (the refusal ended, the arm's change allowed or reported no more, or,
+  with the daemon's own settings, the file back to the rules served)
+  is dropped without a notice at the next update of the state (a
+  refusal, the end of one, an arm, or a session starting to serve), and
+  the same change made again after it is told again. A change undone or
+  allowed, then made or disallowed again with no update in between, is
+  not told again, nor is the same change an arm reports again.
+- A session that starts serving (it started after the change, or the
+  change was made while none served) is sent the notice of each change
+  pending, its allow checked again, so none of a change allowed by now,
+  if it said `rules_not_allowed`, right after `FrameServing` (and the
+  notice of a failed mount check, if any), before the runs going and the
+  requests a take-over passes to it. The state is updated and the session
+  told under the lock a session takes as it starts serving, so a session
+  is told of a change once, either as it is made or as the session
+  starts. The allow store and the rules file are looked at as the state
+  is updated; a change allowed or undone with no update since is dropped
+  at the next.
 - `DaemonInfo` says `rereads` (the daemon rereads by itself) or
   `no_reread` (it was started with `--no-reread`); an older daemon says
   neither.
@@ -170,14 +226,24 @@ hostrunner serve --socket … --workspace … --container-workspace … [--rules
   again; `a` after a hand edit not allowed adds no rule, and `a` after
   the daemon reported it logs nothing more; a session's reread of the
   pending content is not logged as undone; the allow request is
-  recorded once per refusal, and one that fails is logged. The warning
+  recorded once per refusal, and one that fails is logged; a session that
+  starts serving after an edit not allowed (or not checked) is sent its
+  notice once, also when an arm then reports the same edit, and an older
+  session is sent none. The notice of a change not allowed is sent once
+  in every order of its sources: the daemon's refusal then an arm and
+  the reverse, arms reporting the same change again, a session's reread
+  refusing a hand edit (to that session and to one that starts later);
+  a session that starts later gets an arm's change, and none of an edit
+  allowed since; an edit undone and made again, also after an arm, is
+  told again. The warning
   (`rereadwarning_test.go`, `armwarning_test.go`, `warning_test.go`):
   every call prints it on stderr while a change is pending, from a
   reread and from an arm, without changing output or exit code, and it
   goes once allowed or undone.
 - `internal/protocol`: the frame's wire value and the JSON names of
   `DaemonInfo`, `Serve` and `RulesReread`, and of `warning` and
-  `not_allowed`.
+  `not_allowed`; `FrameRulesNotAllowed`'s wire value, the JSON names of
+  `RulesNotAllowed` and its four texts.
 - `internal/launch`: an `up` with another `--no-reread` replaces the
   daemon, and the next such `up` arms the new one; an `up` keeping a
   daemon reports what is not allowed in the arm.

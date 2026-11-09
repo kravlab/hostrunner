@@ -160,6 +160,69 @@ func TestServeWatchRefusesCommandsWhenTheContainerCanWriteItsConfig(t *testing.T
 	}
 }
 
+// devcontainerVolume mounts the volume named name writable over the
+// .devcontainer directory of cfg's workspace.
+func devcontainerVolume(cfg serveConfig, name string) watch.Mount {
+	return watch.Mount{Type: "volume", Name: name, Source: "/var/lib/example/volumes/" + name + "/_data", Destination: cfg.containerWorkspace + "/.devcontainer"}
+}
+
+// A volume over .devcontainer, the workspace mounted read-only, is judged
+// by what the runtime says of it: a local volume that binds the
+// workspace's .devcontainer directory makes it writable, and every run is
+// refused with 126 naming the container path; one the runtime cannot
+// inspect is refused as unreadable mounts are; a local volume of the
+// runtime's own storage holds none of the config, and commands run.
+func TestServeWatchJudgesAVolumeByItsDevice(t *testing.T) {
+	tests := []struct {
+		name     string
+		volume   *watch.Volume // nil: the volume cannot be inspected
+		wantCode int
+		want     string // in the refusal
+	}{
+		{
+			name:     "a volume that binds .devcontainer",
+			volume:   &watch.Volume{Driver: "local", Options: map[string]string{"type": "none", "o": "bind", "device": ".devcontainer"}},
+			wantCode: protocol.ExitRejected,
+			want:     "/.devcontainer, so it could change the daemon's configuration",
+		},
+		{
+			name:     "a volume that cannot be inspected",
+			wantCode: protocol.ExitRejected,
+			want:     "the daemon cannot read the container's mounts to check them",
+		},
+		{
+			name:     "a volume of the runtime's storage",
+			volume:   &watch.Volume{Driver: "local"},
+			wantCode: 0,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := mountCheckConfig(t)
+			rt := &watchtest.Runtime{}
+			if tt.volume != nil {
+				v := *tt.volume
+				if d, ok := v.Options["device"]; ok {
+					v.Options = map[string]string{"type": "none", "o": "bind", "device": filepath.Join(cfg.workspace, d)}
+				}
+				rt.SetVolume("dc", v)
+			}
+			startServe(t, cfg, rt)
+			ws := workspaceMount(cfg)
+			ws.ReadOnly = true
+			rt.SetMounts("c", ws, devcontainerVolume(cfg, "dc"))
+			rt.Start("c")
+			code, stderr := runOnceChecked(t, cfg, "true")
+			if code != tt.wantCode || !strings.Contains(stderr, tt.want) {
+				t.Fatalf("got %d, %q; want %d with %q", code, stderr, tt.wantCode, tt.want)
+			}
+			if strings.Contains(stderr, cfg.workspace) {
+				t.Fatalf("the refusal %q names the host workspace %s", stderr, cfg.workspace)
+			}
+		})
+	}
+}
+
 // With the mount check off (mount_check false), serve --watch runs the
 // commands its rules allow in a container that can write its config, at
 // once: no check is pending.
@@ -251,6 +314,37 @@ func TestServeWatchMountCheckIsPendingAfterARearm(t *testing.T) {
 				t.Fatalf("got %d, %q once attached again; want %d", code, stderr, tt.wantCode)
 			}
 		})
+	}
+}
+
+// An arm on the container's socket, as a process in the container could
+// send, is refused: it does not put the mount check back to pending, and
+// serve --watch keeps running the commands its rules allow.
+func TestServeWatchRefusesAnArmOnTheContainersSocket(t *testing.T) {
+	cfg := mountCheckConfig(t)
+	rt := &watchtest.Runtime{}
+	startServe(t, cfg, rt)
+	rt.SetMounts("c", workspaceMount(cfg), readOnlyDevcontainer(cfg))
+	rt.Start("c")
+	if code, stderr := runOnceChecked(t, cfg, "true"); code != 0 {
+		t.Fatalf("got %d, %q; want 0 before the arm", code, stderr)
+	}
+	c, err := transport.Unix{Path: cfg.socket}.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+	if err := protocol.WriteJSON(c, protocol.FrameArm, protocol.Arm{Version: protocol.Version, ConfigDigest: "forged"}); err != nil {
+		t.Fatal(err)
+	}
+	f, err := protocol.ReadFrame(c)
+	var e protocol.Error
+	if err != nil || f.Type != protocol.FrameError || protocol.DecodeJSON(f, &e) != nil || e.Code != protocol.ExitHostrunError {
+		t.Fatalf("frame %v %+v, err %v; want an error %d", f.Type, e, err, protocol.ExitHostrunError)
+	}
+	if code, stderr := runServedOutput(cfg, "true"); code != 0 || stderr != "" {
+		t.Fatalf("got %d, %q after the arm; want 0 and nothing on stderr", code, stderr)
 	}
 }
 

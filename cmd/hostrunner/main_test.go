@@ -957,8 +957,8 @@ func rulesDigest(t *testing.T, cfg serveConfig) string {
 	return p.Digest()
 }
 
-// armServe arms the daemon as `hostrunner up` would and returns whether it
-// stepped aside.
+// armServe arms the daemon as `hostrunner up` would, on its approval
+// socket, and returns whether it stepped aside.
 func armServe(t *testing.T, cfg serveConfig, digest string) bool {
 	t.Helper()
 	return armServeWith(t, cfg, digest, nil)
@@ -968,7 +968,7 @@ func armServe(t *testing.T, cfg serveConfig, digest string) bool {
 // settings.
 func armServeWith(t *testing.T, cfg serveConfig, digest string, carried map[string]string) bool {
 	t.Helper()
-	c, err := transport.Unix{Path: cfg.socket}.Dial(context.Background())
+	c, err := transport.Unix{Path: launch.ApprovalSocket(filepath.Dir(cfg.socket))}.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1413,7 +1413,7 @@ func TestServeRereadsItsRulesOnceARuleIsAdded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Allow(cfg.workspace, cfg.RulesFile, rules.ContentDigest(loaded), cfg.Settings.Daemon()); err != nil {
+	if _, err := store.Allow(cfg.workspace, allow.Target{RulesFile: cfg.RulesFile, Scope: allow.Scope{Digest: rules.ContentDigest(loaded), Settings: cfg.Settings.Daemon()}}); err != nil {
 		t.Fatal(err)
 	}
 	cfg.allows = store
@@ -1456,7 +1456,7 @@ func TestServeRereadsItsRulesOnceARuleIsAdded(t *testing.T) {
 	if res.Error != "" || res.Digest != p.Digest() {
 		t.Fatalf("reread: got %+v, want the new file's digest %s", res, p.Digest())
 	}
-	if ok, err := store.Allowed(cfg.workspace, p.Digest(), cfg.Settings.Daemon()); err != nil || !ok {
+	if ok, err := store.Allowed(cfg.workspace, allow.Scope{Digest: p.Digest(), Settings: cfg.Settings.Daemon()}); err != nil || !ok {
 		t.Fatalf("the store allows the file as written: %v, %v; want it allowed", ok, err)
 	}
 	if stepAside := armServe(t, cfg, p.Digest()); stepAside {
@@ -1539,7 +1539,7 @@ func TestServeRereadsAHandEditOnceAllowed(t *testing.T) {
 	if code := runServed(cfg, "sh", "-c", "exit 3"); code != protocol.ExitRejected {
 		t.Fatalf("a command of the edit not allowed exited %d, want %d", code, protocol.ExitRejected)
 	}
-	if _, err := store.Allow(cfg.workspace, cfg.RulesFile, rules.ContentDigest([]byte(handEdited)), cfg.Settings.Daemon()); err != nil {
+	if _, err := store.Allow(cfg.workspace, allow.Target{RulesFile: cfg.RulesFile, Scope: allow.Scope{Digest: rules.ContentDigest([]byte(handEdited)), Settings: cfg.Settings.Daemon()}}); err != nil {
 		t.Fatal(err)
 	}
 	waitServed(t, cfg)
@@ -1567,7 +1567,7 @@ func TestServeWithoutRereadLeavesAnAllowedHandEditToTheNextUp(t *testing.T) {
 		t.Fatal(err)
 	}
 	digest := rules.ContentDigest([]byte(handEdited))
-	if _, err := store.Allow(cfg.workspace, cfg.RulesFile, digest, cfg.Settings.Daemon()); err != nil {
+	if _, err := store.Allow(cfg.workspace, allow.Target{RulesFile: cfg.RulesFile, Scope: allow.Scope{Digest: digest, Settings: cfg.Settings.Daemon()}}); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(20 * cfg.PollInterval)

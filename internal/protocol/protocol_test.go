@@ -99,11 +99,11 @@ func TestDecodeJSONRejectsMalformedPayload(t *testing.T) {
 }
 
 func TestReadFrameAcceptsUpToTheLastFrameType(t *testing.T) {
-	if _, err := ReadFrame(bytes.NewReader([]byte{byte(FrameMountCheckFailed), 0, 0, 0, 0})); err != nil {
-		t.Fatalf("FrameMountCheckFailed: %v", err)
+	if _, err := ReadFrame(bytes.NewReader([]byte{byte(FrameRulesNotAllowed), 0, 0, 0, 0})); err != nil {
+		t.Fatalf("FrameRulesNotAllowed: %v", err)
 	}
-	if _, err := ReadFrame(bytes.NewReader([]byte{byte(FrameMountCheckFailed) + 1, 0, 0, 0, 0})); !errors.Is(err, ErrUnknownFrameType) {
-		t.Fatalf("the type after FrameMountCheckFailed: got %v, want ErrUnknownFrameType", err)
+	if _, err := ReadFrame(bytes.NewReader([]byte{byte(FrameRulesNotAllowed) + 1, 0, 0, 0, 0})); !errors.Is(err, ErrUnknownFrameType) {
+		t.Fatalf("the type after FrameRulesNotAllowed: got %v, want ErrUnknownFrameType", err)
 	}
 }
 
@@ -114,7 +114,7 @@ func TestFrameTypesKeepTheirWireValues(t *testing.T) {
 		FrameRequest: 1, FrameApproved: 15, FrameHello: 16, FrameTakenOver: 30,
 		FrameRunning: 31, FrameRunningList: 32, FrameStop: 33, FrameStopping: 34,
 		FrameRulesReread: 35, FrameRunStarted: 36, FrameRunOutput: 37, FrameRunEnded: 38,
-		FrameMountCheckFailed: 39,
+		FrameMountCheckFailed: 39, FrameRulesNotAllowed: 40,
 	} {
 		if byte(typ) != want {
 			t.Errorf("frame %v has value %d, want %d", typ, byte(typ), want)
@@ -193,6 +193,50 @@ func TestMountCheckWireFormat(t *testing.T) {
 	}
 	if want := (MountCheckFailed{Error: "e"}); m != want {
 		t.Fatalf("got %+v, want %+v", m, want)
+	}
+}
+
+// The JSON names of a change not allowed are the contract between
+// versions: a session's Serve and the frame that reports the change.
+func TestRulesNotAllowedWireFormat(t *testing.T) {
+	var sv Serve
+	if err := DecodeJSON(Frame{Type: FrameServe, Payload: []byte(`{"rules_not_allowed":true}`)}, &sv); err != nil {
+		t.Fatal(err)
+	}
+	if want := (Serve{RulesNotAllowed: true}); sv != want {
+		t.Fatalf("got %+v, want %+v", sv, want)
+	}
+	var n RulesNotAllowed
+	if err := DecodeJSON(Frame{Type: FrameRulesNotAllowed, Payload: []byte(`{"digest":"d","settings":true,"not_checked":true}`)}, &n); err != nil {
+		t.Fatal(err)
+	}
+	if want := (RulesNotAllowed{Digest: "d", Settings: true, NotChecked: true}); n != want {
+		t.Fatalf("got %+v, want %+v", n, want)
+	}
+}
+
+// The text of a change not allowed says what changed, why the daemon
+// keeps the old rules or settings and what a human on the host does.
+func TestRulesNotAllowedText(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		n    RulesNotAllowed
+		want string
+	}{
+		{"the rules file, not allowed", RulesNotAllowed{Digest: "d"},
+			"the rules file changed (digest d), but the change is not allowed, so the daemon keeps the old rules; a human on the host runs hostrunner allow to allow it"},
+		{"the rules file, not checked", RulesNotAllowed{Digest: "d", NotChecked: true},
+			"the rules file changed (digest d), but its allow cannot be checked, so the daemon keeps the old rules; a human on the host looks at the daemon log"},
+		{"the settings, not allowed", RulesNotAllowed{Digest: "d", Settings: true},
+			"the rules or the daemon settings changed (digest d), but the change is not allowed, so the daemon keeps the old ones; a human on the host runs hostrunner allow to allow it"},
+		{"the settings, not checked", RulesNotAllowed{Digest: "d", Settings: true, NotChecked: true},
+			"the rules or the daemon settings changed (digest d), but its allow cannot be checked, so the daemon keeps the old ones; a human on the host looks at the daemon log"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.n.Text(); got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 

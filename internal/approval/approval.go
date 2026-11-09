@@ -377,11 +377,12 @@ func halfClose(conn net.Conn) {
 
 // serve makes the session the one that serves the daemon, taking it over
 // from the session serving it with takeOver; the session reads the
-// daemon's notices of a reread (see rulesReread), of a failed mount check
-// (see mountCheckFailedText) and the frames of the approved runs (see
-// runs).
+// daemon's notices of a reread (see rulesReread), of rules or settings
+// changed but not allowed (protocol.RulesNotAllowed.Text), of a failed
+// mount check (see mountCheckFailedText) and the frames of the approved
+// runs (see runs).
 func serve(conn io.ReadWriter, takeOver bool) error {
-	if err := protocol.WriteJSON(conn, protocol.FrameServe, protocol.Serve{TakeOver: takeOver, Notices: true, Runs: true, MountCheck: true}); err != nil {
+	if err := protocol.WriteJSON(conn, protocol.FrameServe, protocol.Serve{TakeOver: takeOver, Notices: true, Runs: true, MountCheck: true, RulesNotAllowed: true}); err != nil {
 		return err
 	}
 	f, err := protocol.ReadFrame(conn)
@@ -647,6 +648,12 @@ func (s *session) daemonFrame(f protocol.Frame) error {
 			return err
 		}
 		s.rulesReread(r)
+	case protocol.FrameRulesNotAllowed:
+		var n protocol.RulesNotAllowed
+		if err := protocol.DecodeJSON(f, &n); err != nil {
+			return err
+		}
+		s.notify(hostterm.Display(n.Text()))
 	case protocol.FrameMountCheckFailed:
 		var m protocol.MountCheckFailed
 		if err := protocol.DecodeJSON(f, &m); err != nil {

@@ -271,10 +271,133 @@ func TestCheckIgnoresMountsWithoutHostSource(t *testing.T) {
 	}
 }
 
-// volume is a named volume as a runtime reports it: its source is an
-// absolute path under the runtime's storage.
+// volume is a named volume as a runtime reports it, a local one without
+// options, as the runtime makes it by default: its source is an absolute
+// path under the runtime's storage.
 func volume(source, dest string) watch.Mount {
-	return watch.Mount{Type: "volume", Source: source, Destination: dest}
+	return watch.Mount{Type: "volume", Name: "v", Source: source, Destination: dest, Volume: &watch.Volume{Driver: "local"}}
+}
+
+// bindVolume is a writable mount at dest of a volume of driver whose
+// options name the device device, as a local volume created with type=none,
+// o=bind and that device binds it; its source lies in the runtime's
+// storage.
+func bindVolume(driver, device, dest string) watch.Mount {
+	return watch.Mount{
+		Type: "volume", Name: "v", Source: "/var/lib/example/volumes/v/_data", Destination: dest,
+		Volume: &watch.Volume{Driver: driver, Options: map[string]string{"type": "none", "o": "bind", "device": device}},
+	}
+}
+
+// A local volume that names a host directory as its device is checked as
+// a bind mount of that directory, resolved, with the mount's own
+// read-only flag: one writable over a protected path fails the check.
+func TestCheckFailsAWritableVolumeOfAProtectedDevice(t *testing.T) {
+	tr := newTree(t)
+	link := filepath.Join(tr.base, "link")
+	symlink(t, tr.dc, link)
+	tests := []struct {
+		name   string
+		mounts []watch.Mount
+		want   mountcheck.WritableError
+	}{
+		{
+			name:   "the .devcontainer directory over a read-only workspace",
+			mounts: []watch.Mount{ro(tr.ws, "/workspaces/ws"), bindVolume("local", tr.dc, "/workspaces/ws/.devcontainer")},
+			want:   mountcheck.WritableError{Container: "c1", Path: tr.dc, Source: tr.dc, ContainerPath: "/workspaces/ws/.devcontainer"},
+		},
+		{
+			name:   "the .devcontainer directory through a link",
+			mounts: []watch.Mount{bindVolume("local", link, "/dc")},
+			want:   mountcheck.WritableError{Container: "c1", Path: tr.dc, Source: tr.dc, ContainerPath: "/dc"},
+		},
+		{
+			name:   "the workspace",
+			mounts: []watch.Mount{bindVolume("local", tr.ws, "/workspaces/ws")},
+			want:   mountcheck.WritableError{Container: "c1", Path: tr.dc, Source: tr.ws, ContainerPath: "/workspaces/ws/.devcontainer"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			wantWritable(t, mountcheck.Check([]watch.Container{container("c1", tt.mounts...)}, []string{tr.dc}), tt.want)
+		})
+	}
+}
+
+// The same volume mounted read-only, or shadowed by a deeper read-only
+// mount, passes, as a bind mount would.
+func TestCheckPassesAVolumeOfAProtectedDeviceMountedReadOnly(t *testing.T) {
+	tr := newTree(t)
+	readOnly := bindVolume("local", tr.dc, "/workspaces/ws/.devcontainer")
+	readOnly.ReadOnly = true
+	for name, mounts := range map[string][]watch.Mount{
+		"read-only": {readOnly},
+		"shadowed":  {bindVolume("local", tr.ws, "/workspaces/ws"), ro(tr.dc, "/workspaces/ws/.devcontainer")},
+	} {
+		if err := mountcheck.Check([]watch.Container{container("c1", mounts...)}, []string{tr.dc}); err != nil {
+			t.Errorf("%s: Check = %v, want nil", name, err)
+		}
+	}
+}
+
+// A volume whose device is no host path (a tmpfs, an NFS export) or that
+// names none, whatever its driver, holds no protected path: it is skipped.
+func TestCheckIgnoresVolumesWithoutAHostDevice(t *testing.T) {
+	tr := newTree(t)
+	for name, v := range map[string]watch.Volume{
+		"local, no options":   {Driver: "local"},
+		"local tmpfs":         {Driver: "local", Options: map[string]string{"type": "tmpfs", "device": "tmpfs"}},
+		"local nfs":           {Driver: "local", Options: map[string]string{"type": "nfs", "o": "addr=192.0.2.1,rw", "device": ":/export"}},
+		"local, empty device": {Driver: "local", Options: map[string]string{"device": ""}},
+		"another driver":      {Driver: "example", Options: map[string]string{"size": "1G"}},
+	} {
+		m := watch.Mount{Type: "volume", Name: "v", Source: tr.ws, Destination: "/workspaces/ws", Volume: &v}
+		if err := mountcheck.Check([]watch.Container{container("c1", m)}, []string{tr.dc}); err != nil {
+			t.Errorf("%s: Check = %v, want nil", name, err)
+		}
+	}
+}
+
+// A volume the runtime could not inspect, one reported without its
+// inspection, or one of another driver whose options name a device, which
+// the daemon cannot tell the content of, fails the check as unreadable
+// mounts do.
+func TestCheckFailsVolumesItCannotTell(t *testing.T) {
+	tr := newTree(t)
+	cause := errors.New("no such volume")
+	for _, tt := range []struct {
+		name  string
+		mount watch.Mount
+		text  string // in the error's message
+	}{
+		{"not inspected", watch.Mount{Type: "volume", Name: "v", Destination: "/v", VolumeErr: cause}, cause.Error()},
+		{"no inspection reported", watch.Mount{Type: "volume", Name: "v", Destination: "/v"}, "volume v"},
+		{"another driver with a device", bindVolume("example", tr.dc, "/v"), "example"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			fine := container("c1", ro(tr.ws, "/workspaces/ws"))
+			err := mountcheck.Check([]watch.Container{fine, container("c2", tt.mount)}, []string{tr.dc})
+			got, ok := errors.AsType[*mountcheck.UnreadableError](err)
+			if !ok {
+				t.Fatalf("Check = %v, want an *UnreadableError", err)
+			}
+			if got.Container != "c2" || !strings.Contains(err.Error(), tt.text) {
+				t.Fatalf("Check = %v, want one of container c2 naming %q", err, tt.text)
+			}
+			if tt.mount.VolumeErr != nil && !errors.Is(err, cause) {
+				t.Errorf("errors.Is(%v, cause) = false, want true", err)
+			}
+		})
+	}
+}
+
+// A device that cannot be resolved fails the check as a bind mount source
+// does, naming the container.
+func TestCheckFailsOnAnUnresolvableDevice(t *testing.T) {
+	tr := newTree(t)
+	device := filepath.Join(tr.dcRules, "sub")
+	err := mountcheck.Check([]watch.Container{container("c1", bindVolume("local", device, "/data"))}, []string{tr.dc})
+	wantUnresolvable(t, err, "c1", device, syscall.ENOTDIR)
 }
 
 func TestCheckIgnoresVolumeMounts(t *testing.T) {

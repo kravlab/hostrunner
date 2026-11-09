@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kravlab/hostrunner/internal/allow"
 	"github.com/kravlab/hostrunner/internal/daemon"
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
@@ -150,7 +151,7 @@ func TestNoWarningRightAfterTheEditIsAllowed(t *testing.T) {
 func TestRunWarnsWhenTheAllowOfAnEditCannotBeChecked(t *testing.T) {
 	var log lockedBuffer
 	h := startRereadingDaemon(t, slog.New(slog.NewTextHandler(&log, nil)), echoRules,
-		daemon.WithAllowed(func(string, map[string]string) (bool, error) { return false, errors.New("the allow store is broken") }))
+		daemon.WithAllowed(func(allow.Scope) (bool, error) { return false, errors.New("the allow store is broken") }))
 	writeRules(t, h.rulesFile, touchRules)
 	digest := rules.ContentDigest([]byte(touchRules))
 	waitForLog(t, &log, `msg="rules change not checked: the old rules stay" file=`+h.rulesFile+" digest="+digest)

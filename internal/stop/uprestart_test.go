@@ -46,7 +46,7 @@ func allowedUpConfig(t *testing.T, dir, workspace, rulesFile string) launch.Conf
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := cfg.Allows.Allow(workspace, rulesFile, policy.Digest(), cfg.Settings.Daemon()); err != nil {
+	if _, err := cfg.Allows.Allow(workspace, allow.Target{RulesFile: rulesFile, Scope: allow.Scope{Digest: policy.Digest(), Settings: cfg.Settings.Daemon()}}); err != nil {
 		t.Fatal(err)
 	}
 	return cfg

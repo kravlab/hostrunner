@@ -154,6 +154,22 @@ func (s Settings) Daemon() map[string]string {
 	return out
 }
 
+// DaemonDefaults returns the daemon settings no source sets for the
+// workspace at the host path workspace, written as Daemon writes them:
+// what up without settings flags, files or variables resolves there,
+// its rules file chosen as resolve chooses it (see rulesfile.Choose).
+// `hostrunner allow` marks the settings it allows that differ from them.
+// The rules file is a path under workspace as given, links not followed:
+// the allow store keeps it canonical, so a caller compares the two through
+// allow.CanonicalSettings.
+func DaemonDefaults(workspace string) map[string]string {
+	s := defaults(workspace)
+	// Choose's second result is the older rules file it leaves unread,
+	// not an error, and says nothing of the default.
+	s.RulesFile, _ = rulesfile.Choose(filepath.Join(workspace, rulesfile.Dir))
+	return s.Daemon()
+}
+
 // layer is what one source sets: values by key name (as in a settings
 // file), each a string, a time.Duration, a bool or an int as its key's
 // kind says. A key the source does not set is absent.

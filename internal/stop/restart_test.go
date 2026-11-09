@@ -31,8 +31,9 @@ import (
 
 // newDaemonEnv makes the test binary, started by a restart as
 // `<it> serve …`, act as the new daemon: it records its arguments in
-// new.args and its pid in new.pid beside its socket, and answers every
-// arm request on the socket.
+// new.args and its pid in new.pid beside its socket, listens on the
+// socket, and answers every arm request on its approval socket, where
+// `up` arms it.
 const newDaemonEnv = "HOSTRUNNER_STOP_TEST_NEW_DAEMON"
 
 // runNewDaemon is the process a newDaemonEnv test binary runs.
@@ -50,8 +51,13 @@ func runNewDaemon() {
 	if err != nil {
 		os.Exit(3)
 	}
+	defer l.Close() // listening until the process exits; nothing on it is answered
+	al, err := transport.Unix{Path: launch.ApprovalSocket(dir)}.Listen()
+	if err != nil {
+		os.Exit(3)
+	}
 	for {
-		c, err := l.Accept()
+		c, err := al.Accept()
 		if err != nil {
 			os.Exit(0)
 		}
@@ -157,7 +163,7 @@ func allowRestart(t *testing.T, r *stop.Restart, workspace string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.Allows.Allow(workspace, s.RulesFile, policy.Digest(), s.Settings.Daemon()); err != nil {
+	if _, err := r.Allows.Allow(workspace, allow.Target{RulesFile: s.RulesFile, Scope: allow.Scope{Digest: policy.Digest(), Settings: s.Settings.Daemon()}}); err != nil {
 		t.Fatal(err)
 	}
 }

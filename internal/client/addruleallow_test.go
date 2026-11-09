@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kravlab/hostrunner/internal/allow"
 	"github.com/kravlab/hostrunner/internal/daemon"
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
@@ -31,7 +32,7 @@ const notRecordedLog = "msg=\"allow not recorded\" file="
 func startAddRuleDaemon(t *testing.T, a allowStore, log *slog.Logger, record func(digest string) error) harness {
 	t.Helper()
 	return startRulesDaemon(t, log, addRuleRules, false,
-		daemon.WithSettings(allowSettings), daemon.WithAllowed(a.check), daemon.WithAllow(record))
+		daemon.WithSettings(allowSettings), daemon.WithAllowed(a.check), daemon.WithAllowRecorder(record))
 }
 
 // addRuleKeptOld adds a rule as addRule does, waits for the session to say
@@ -64,7 +65,7 @@ func TestAddRuleToAnAllowedFileIsAllowed(t *testing.T) {
 		t.Fatalf("got %+v, want the request to run", got)
 	}
 	digest := rules.ContentDigest([]byte(readFile(t, h.rulesFile)))
-	if ok, err := a.store.Allowed(a.workspace, digest, allowSettings); err != nil || !ok {
+	if ok, err := a.store.Allowed(a.workspace, allow.Scope{Digest: digest, Settings: allowSettings}); err != nil || !ok {
 		t.Fatalf("the store allows the file as written (digest %s): %v, %v; want it allowed", digest, ok, err)
 	}
 	waitForLog(t, &log, `msg="rules reread" file=`+h.rulesFile+" digest="+digest)
@@ -88,7 +89,7 @@ func TestAddRuleToAFileNotAllowedRecordsNoAllow(t *testing.T) {
 	if got := awaitResult(t, ch); got.code != 0 {
 		t.Fatalf("got %+v, want the request to run once", got)
 	}
-	if ok, err := a.store.Allowed(a.workspace, digest, allowSettings); err != nil || ok {
+	if ok, err := a.store.Allowed(a.workspace, allow.Scope{Digest: digest, Settings: allowSettings}); err != nil || ok {
 		t.Fatalf("the store allows the file as written (digest %s): %v, %v; want it not allowed", digest, ok, err)
 	}
 	waitForLog(t, &log, notAllowedLog+h.rulesFile+" digest="+digest)
@@ -172,7 +173,7 @@ func TestAddRuleRecordsNoAllowWhenTheFileHoldsOtherContent(t *testing.T) {
 		t.Fatalf("got %+v, want an error: the daemon keeps its old rules", res)
 	}
 	for _, digest := range []string{reported, rules.ContentDigest([]byte(other))} {
-		if ok, err := a.store.Allowed(a.workspace, digest, allowSettings); err != nil || ok {
+		if ok, err := a.store.Allowed(a.workspace, allow.Scope{Digest: digest, Settings: allowSettings}); err != nil || ok {
 			t.Fatalf("the store allows content of digest %s: %v, %v; want it not allowed", digest, ok, err)
 		}
 	}
@@ -197,7 +198,7 @@ func TestAddRuleRecordsNoAllowWhenTheFileDoesNotParse(t *testing.T) {
 	if res.Error == "" || res.Digest != "" {
 		t.Fatalf("got %+v, want an error: the daemon keeps its old rules", res)
 	}
-	if ok, err := a.store.Allowed(a.workspace, digest, allowSettings); err != nil || ok {
+	if ok, err := a.store.Allowed(a.workspace, allow.Scope{Digest: digest, Settings: allowSettings}); err != nil || ok {
 		t.Fatalf("the store allows content of digest %s: %v, %v; want it not allowed", digest, ok, err)
 	}
 	if got := h.run(t, containerRoot, "", "echo", "old"); got != (result{stdout: "old\n"}) {
@@ -206,7 +207,7 @@ func TestAddRuleRecordsNoAllowWhenTheFileDoesNotParse(t *testing.T) {
 }
 
 // A daemon that checks the allow of its rules file but records none (no
-// WithAllow) treats a rule added from the approval session as a hand edit,
+// WithAllowRecorder) treats a rule added from the approval session as a hand edit,
 // even when the file written over is allowed: no allow is recorded, the
 // written file is a change not allowed, the request runs once, and a later
 // run of the rule's command is refused.
@@ -223,7 +224,7 @@ func TestAddRuleWithoutAnAllowRecordIsAHandEdit(t *testing.T) {
 	if got := awaitResult(t, ch); got.code != 0 {
 		t.Fatalf("got %+v, want the request to run once", got)
 	}
-	if ok, err := a.store.Allowed(a.workspace, digest, allowSettings); err != nil || ok {
+	if ok, err := a.store.Allowed(a.workspace, allow.Scope{Digest: digest, Settings: allowSettings}); err != nil || ok {
 		t.Fatalf("the store allows the file as written (digest %s): %v, %v; want it not allowed", digest, ok, err)
 	}
 	if got := h.run(t, containerRoot, "", "touch", "-a", "marker"); got.code != protocol.ExitRejected {

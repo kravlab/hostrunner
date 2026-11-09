@@ -108,7 +108,10 @@ rereads them otherwise): then the new version takes over. The first
 `hostrunner up` after it has exited runs the new version, and
 `hostrunner restart` (see [Stop and restart](#stop-and-restart))
 switches a running daemon at once. A `hostrunner up` already in progress
-during the update may fail; run it again.
+during the update may fail; run it again. A daemon of a hostrunner that
+still took arms on the container's socket refuses the arm `up` now sends
+on its approval socket, and `up` fails with `stop the process serving
+<socket> and retry`: run `hostrunner restart` or `hostrunner stop` once.
 
 ## Use in a devcontainer
 
@@ -213,10 +216,23 @@ ones (a Compose recreate, say), it checks that the container cannot write
 `.devcontainer/`, the rules file or the workspace settings file. These are
 host paths with symlinks followed, and a deeper mount shadows a shallower
 one, so the read-only `.devcontainer` mount in the example above passes.
+A named volume is judged by what `docker volume inspect` (`podman volume
+inspect`) reports of it: a `local` volume whose `device` option is an
+absolute path (one created with `--opt type=none --opt o=bind --opt
+device=<dir>` binds that host directory) is checked as a mount of that
+directory, with the mount's own read-only flag. Any local volume whose
+device is an absolute path is judged as a bind of that path, whatever its
+`type` and `o` options say, a block device included, so no volume that
+could show a protected path through its device goes unchecked. A volume
+whose device is no host path (a tmpfs, an NFS export), or that names
+none, holds only what the runtime keeps and is skipped. A volume the runtime cannot
+inspect, or of another driver whose options name a device, fails the
+check as unreadable mounts do.
 
 - Until the first check has run, every request (a run, `--ask`, a dry
   run) is refused with 125 `the mount check has not run yet`; retry. Each
-  `hostrunner up` (an arm) puts the check back to pending until the daemon
+  `hostrunner up` (an arm, which the daemon takes on its approval socket
+  only, so the container cannot send one) puts the check back to pending until the daemon
   attaches again, so when `up` reuses the running container `hostrun` gets
   125 (retry) for up to the grace period (about 15 s).
 - If the container can write any of them, or its mounts cannot be read,
@@ -262,7 +278,13 @@ goes on serving them, so a container restart or rebuild does not drop
 the allowed rules, and says on stderr that the rules file, with its
 digest, and the settings are not allowed, that a human on the host runs
 `hostrunner allow` to allow them, and that the daemon keeps serving the
-allowed rules. Without such a daemon (none runs, or it serves rules or
+allowed rules. The daemon logs that arm (`hostrunner up reported a change
+not allowed`, with the digest and whether the settings differ) and tells
+the approval session serving it, in the words of the `hostrun` warning
+below, once: not again for the same change, whether the daemon found it
+in the rules file first or `up` reported it first, and a session that
+starts serving later is told of it as it starts, unless it is allowed by
+then. Without such a daemon (none runs, or it serves rules or
 settings not allowed either, or is of a hostrunner older than this
 check) `up` fails, naming the rules file, its digest and `hostrunner
 allow`, so `devcontainer up` fails and the container does not start; it
@@ -274,7 +296,12 @@ devcontainer.json gave it) in `$XDG_DATA_HOME/hostrunner/allow`
 exactly that request after checking that the rules file still has the
 digest `up` saw (if it changed since, `allow` fails and allows nothing:
 run `up` again), and prints the rules file, the digest and the settings
-it allowed; the next `up` passes. Without a request, `allow` allows the
+it allowed, each setting that differs from its default with the default
+(`mount_check: false (default true)`), since the flags came from
+devcontainer.json rather than from the human (a rules file is compared
+with its symbolic links followed, as the allow keeps it; if the defaults
+cannot be worked out, no setting is marked and a last line, `defaults not
+shown`, says why); the next `up` passes. Without a request, `allow` allows the
 rules file and the settings as `up` without settings flags resolves
 them for the workspace (variables, the workspace settings file, the
 host settings file), after checking the rules; a missing rules file is
@@ -293,6 +320,11 @@ settings, so plain `hostrunner allow` allows exactly that and takes
 effect within about 2 s, without a restart (see [Rules](#rules)). With `--no-reread` an allowed
 edit takes effect at the next `up`. Adding a rule (`a`) after a hand
 edit not allowed adds none, and the old rules stay.
+
+An approval session from a hostrunner older than the notice of a change
+not allowed shows no notice of rules changed but not allowed, whether the
+daemon found a hand edit or `up` armed it with one; the `hostrun` warning
+above and `daemon.log` still report it.
 
 A rule added from the approval session to rules that are allowed is
 allowed with the content the session wrote: the daemon records the allow
@@ -761,7 +793,11 @@ rules:
   `missing`) among them, keeps the rules served, and `daemon.log` and the approval session say
   so, with its digest and `hostrunner allow`, once each time the file
   changes to that content (again if the reason changes: not allowed, or
-  the allow store unreadable); after `hostrunner allow` the daemon
+  the allow store unreadable; the session in the words of the `hostrun`
+  warning of [Allow](#allow), a session older than this notice gets
+  none; an edit refused when the session adds a rule is shown too; a
+  session that starts serving while the refusal is pending is shown it
+  as it starts, unless it is allowed by then); after `hostrunner allow` the daemon
   rereads it within about 2 s, standing and session approvals kept, and
   the file going back to the rules served ends it without an allow.
   With `hostrunner up --no-reread`, changes apply on the
@@ -1008,8 +1044,9 @@ How it works:
 
 - `hostrunner up` runs on the host before every container start. It
   creates the per-container runtime directory and either arms the daemon
-  already serving it or copies `hostrun` into it and starts a detached
-  daemon.
+  already serving it, over the daemon's approval socket, or copies
+  `hostrun` into it and starts a detached daemon. The socket the container
+  reaches refuses an arm.
 - The directory is mounted read-only at `/run/hostrunner`; the client
   talks to the daemon over the Unix socket in it.
 - The daemon follows its armed container, the one the latest `up` started

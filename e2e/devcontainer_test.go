@@ -39,14 +39,21 @@ const (
 )
 
 // env is the environment the devcontainer CLI (and so initializeCommand)
-// runs with: the fresh binaries first in PATH, and XDG_DATA_HOME in a
+// runs with: the runtime's wrapper and the fresh binaries first in PATH,
+// and XDG_DATA_HOME in a
 // directory of the test's, so the allows the suite records stay out of the
 // host's own allow store. XDG_RUNTIME_DIR is left as
 // is: rootless podman keeps its own container state there, so overriding it
-// would leave containers that later podman calls cannot stop.
+// would leave containers that later podman calls cannot stop. The container
+// runtime must not see the test's XDG_DATA_HOME either: rootless podman
+// keeps its whole storage under it, so its containers would be created in a
+// storage of the test's, out of reach of the calls the test makes outside
+// the devcontainer CLI. The runtime is therefore run through a wrapper (see
+// runtimeWrapper) that restores the host's XDG_DATA_HOME, and every runtime
+// call, the CLI's and hostrunner's included, uses the host's storage.
 type env struct {
 	bin     string
-	runtime string   // docker or podman binary
+	runtime string   // wrapper of the docker or podman binary, see runtimeWrapper
 	ws      string   // host workspace
 	data    string   // XDG_DATA_HOME, which holds the allow store
 	extra   []string // more variables, NAME=value, for every command the test runs on the host
@@ -61,6 +68,34 @@ func shortTemp(t *testing.T, prefix string) string {
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
 	return dir
+}
+
+// runtimeWrapper writes an executable POSIX sh script, named name as the
+// runtime is (so hostrunner finds it in PATH under the runtime's name; the
+// devcontainer CLI tells docker from podman by the output of `-v`, which
+// the script passes through), alone in its directory, that runs the runtime binary at real with the host's own
+// XDG_DATA_HOME, as it is now (unset when it is unset), and passes the
+// arguments, the standard streams and the exit code through. It returns the
+// script's path. Call it before the test changes any variable for the
+// commands it runs: real is an absolute path, and the quoting keeps paths
+// with spaces or quotes intact.
+func runtimeWrapper(t *testing.T, name, real string) string {
+	t.Helper()
+	setup := "unset XDG_DATA_HOME"
+	if data, ok := os.LookupEnv("XDG_DATA_HOME"); ok {
+		setup = "XDG_DATA_HOME=" + shellQuote(data) + "\nexport XDG_DATA_HOME"
+	}
+	script := "#!/bin/sh\n" + setup + "\nexec " + shellQuote(real) + " \"$@\"\n"
+	path := filepath.Join(shortTemp(t, "hrrt"), name)
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// shellQuote quotes s as one word for a POSIX shell.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 func buildBinaries(t *testing.T) string {
@@ -97,6 +132,14 @@ var readOnlyMount = regexp.MustCompile(`,\s*//[^\n]*\n\s*"source=\$\{localWorksp
 // the container can write the daemon's configuration.
 func newWorkspace(t *testing.T, writable bool) string {
 	t.Helper()
+	return newWorkspaceWith(t, writable, nil)
+}
+
+// newWorkspaceWith is newWorkspace whose writable variant, with edit not
+// nil, has its devcontainer.json edited by edit, given the workspace,
+// instead of the read-only .devcontainer mount dropped.
+func newWorkspaceWith(t *testing.T, writable bool, edit func(ws string, cfg []byte) []byte) string {
+	t.Helper()
 	ws := filepath.Join(shortTemp(t, "hrws"), "my app")
 	if err := os.MkdirAll(filepath.Join(ws, ".devcontainer"), 0o755); err != nil {
 		t.Fatal(err)
@@ -118,8 +161,9 @@ func newWorkspace(t *testing.T, writable bool) string {
 		if !readOnlyMount.Match(cfg) {
 			t.Fatal("example devcontainer.json no longer contains the read-only .devcontainer mount")
 		}
-		cfg = readOnlyMount.ReplaceAll(cfg, nil)
-		if bytes.Contains(cfg, []byte("/.devcontainer,")) {
+		if edit != nil {
+			cfg = edit(ws, cfg)
+		} else if cfg = readOnlyMount.ReplaceAll(cfg, nil); bytes.Contains(cfg, []byte("/.devcontainer,")) {
 			t.Fatal("the variant still mounts .devcontainer")
 		}
 	} else {
@@ -174,10 +218,18 @@ func lastLines(s string, n int) string {
 }
 
 // vars is the environment of the commands the test runs on the host: the
-// test's own, with the fresh binaries first in PATH, XDG_DATA_HOME and
-// extra.
+// test's own, with the runtime's wrapper and then the fresh binaries first
+// in PATH, XDG_DATA_HOME set to the test's directory, and extra. It is for
+// hostrunner and the devcontainer CLI only: the container runtime restores
+// the host's XDG_DATA_HOME itself (see runtimeWrapper), so the commands the
+// test runs on the runtime take os.Environ(). The wrapper comes first in
+// PATH because hostrunner finds the runtime there (watch.Detect): its own
+// runtime calls must use the host's storage too, where the CLI created the
+// container.
 func (e env) vars() []string {
-	out := append(os.Environ(), "PATH="+e.bin+string(os.PathListSeparator)+os.Getenv("PATH"), "XDG_DATA_HOME="+e.data)
+	sep := string(os.PathListSeparator)
+	path := filepath.Dir(e.runtime) + sep + e.bin + sep + os.Getenv("PATH")
+	out := append(os.Environ(), "PATH="+path, "XDG_DATA_HOME="+e.data)
 	return append(out, e.extra...)
 }
 
@@ -311,13 +363,16 @@ func eachRuntime(t *testing.T, newWs func(*testing.T) string, test func(*testing
 			if err != nil {
 				t.Skipf("%s not installed", runtime)
 			}
+			if rtPath, err = filepath.Abs(rtPath); err != nil {
+				t.Fatal(err)
+			}
 			// devcontainer CLI 0.89 waits for the container's start event from
 			// `podman events`, which sometimes never arrives (also without
 			// hostrunner, ~1 run in 4), hanging `devcontainer up`. Opt in.
 			if runtime == "podman" && os.Getenv("HOSTRUNNER_E2E_PODMAN") != "1" {
 				t.Skip("podman e2e is opt-in (HOSTRUNNER_E2E_PODMAN=1): devcontainer up sometimes hangs on podman events")
 			}
-			test(t, env{bin: bin, runtime: rtPath, ws: newWs(t), data: shortTemp(t, "hrdata")})
+			test(t, env{bin: bin, runtime: runtimeWrapper(t, runtime, rtPath), ws: newWs(t), data: shortTemp(t, "hrdata")})
 		})
 	}
 }
@@ -331,6 +386,59 @@ func TestDevcontainerIntegration(t *testing.T) {
 // container path only.
 func TestDevcontainerWritableMount(t *testing.T) {
 	eachRuntime(t, func(t *testing.T) string { return newWorkspace(t, true) }, testWritableMount)
+}
+
+// TestDevcontainerWritableVolumeMount brings up the example with its
+// workspace mounted read-only and its .devcontainer mounted, in place of
+// the read-only bind mount, from a writable local volume that binds the
+// workspace's .devcontainer directory (type=none, o=bind), which the test
+// creates and removes: only the volume lets the container write the
+// daemon's configuration, so the daemon must tell it from the volume's
+// options and refuse every command as for a writable bind mount.
+func TestDevcontainerWritableVolumeMount(t *testing.T) {
+	eachRuntime(t, func(t *testing.T) string { return newWorkspaceWith(t, true, volumeConfig(t)) }, func(t *testing.T, e env) {
+		vol := volumeName(e.ws)
+		// In the storage devcontainer runs the runtime with, the host's:
+		// rootless podman keeps its volumes under XDG_DATA_HOME, and would
+		// make a volume of its own of that name for the container otherwise.
+		if _, err := run(t, os.Environ(), e.runtime, "volume", "create", "--driver", "local",
+			"--opt", "type=none", "--opt", "o=bind", "--opt", "device="+filepath.Join(e.ws, ".devcontainer"), vol); err != nil {
+			t.Fatalf("volume create: %v", err)
+		}
+		// Registered before testWritableMount's clean-up, so it runs after
+		// the containers using the volume are gone.
+		t.Cleanup(func() {
+			if _, err := run(t, os.Environ(), e.runtime, "volume", "rm", "-f", vol); err != nil {
+				t.Errorf("volume rm: %v", err)
+			}
+		})
+		testWritableMount(t, e)
+	})
+}
+
+// volumeConfig returns the edit of TestDevcontainerWritableVolumeMount's
+// devcontainer.json: the read-only .devcontainer mount replaced by one of
+// the workspace's volume (see volumeName), and the workspace mounted
+// read-only where devcontainer mounts it by default,
+// /workspaces/<its directory name>.
+func volumeConfig(t *testing.T) func(ws string, cfg []byte) []byte {
+	return func(ws string, cfg []byte) []byte {
+		mount := "source=" + volumeName(ws) + ",target=${containerWorkspaceFolder}/.devcontainer,type=volume"
+		cfg = readOnlyMount.ReplaceAllLiteral(cfg, []byte(",\n    "+strconv.Quote(mount)))
+		const mounts = `"mounts": [`
+		if !bytes.Contains(cfg, []byte(mounts)) {
+			t.Fatalf("example devcontainer.json no longer contains %s", mounts)
+		}
+		workspace := `"workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/${localWorkspaceFolderBasename},type=bind,readonly",` + "\n" +
+			`  "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",` + "\n  "
+		return bytes.Replace(cfg, []byte(mounts), []byte(workspace+mounts), 1)
+	}
+}
+
+// volumeName is the name of the volume TestDevcontainerWritableVolumeMount
+// creates for the workspace ws: unique as ws's temp directory is.
+func volumeName(ws string) string {
+	return "hrvol-" + filepath.Base(filepath.Dir(ws))
 }
 
 // TestDevcontainerWritableMountWithTheCheckOff brings up the same variant

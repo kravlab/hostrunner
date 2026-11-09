@@ -71,3 +71,38 @@ func TestFailMountsReportsAnErrorForThatContainerOnly(t *testing.T) {
 		t.Fatalf("got %+v; want a's mounts back without an error", got[0])
 	}
 }
+
+// A volume mount carries the volume SetVolume gives for its name, as a
+// copy; a volume no SetVolume names, or one FailVolume fails, is reported
+// as one that cannot be inspected.
+func TestVolumeMountsCarryTheirVolumes(t *testing.T) {
+	r := &watchtest.Runtime{}
+	r.Start("c")
+	r.SetMounts("c",
+		watch.Mount{Type: "volume", Name: "v", Destination: "/v"},
+		watch.Mount{Type: "volume", Name: "unknown", Destination: "/u"},
+		watch.Mount{Source: "/home/u/app", Destination: "/workspace"})
+	r.SetVolume("v", watch.Volume{Driver: "local", Options: map[string]string{"device": "/home/u/v"}})
+	got := containers(t, r)[0].Mounts
+	if v := got[0].Volume; v == nil || v.Driver != "local" || v.Options["device"] != "/home/u/v" || got[0].VolumeErr != nil {
+		t.Fatalf("v: got %+v; want its volume", got[0])
+	}
+	if got[1].Volume != nil || got[1].VolumeErr == nil {
+		t.Fatalf("unknown: got %+v; want an error", got[1])
+	}
+	if got[2].Volume != nil || got[2].VolumeErr != nil {
+		t.Fatalf("the bind mount: got %+v; want no volume", got[2])
+	}
+	got[0].Volume.Options["device"] = "/changed by the caller of Containers"
+	if v := containers(t, r)[0].Mounts[0].Volume; v.Options["device"] != "/home/u/v" {
+		t.Fatalf("got %+v; want the volume unchanged", v)
+	}
+	r.FailVolume("v", true)
+	if m := containers(t, r)[0].Mounts[0]; m.Volume != nil || m.VolumeErr == nil {
+		t.Fatalf("failed v: got %+v; want an error", m)
+	}
+	r.FailVolume("v", false)
+	if m := containers(t, r)[0].Mounts[0]; m.Volume == nil || m.VolumeErr != nil {
+		t.Fatalf("v again: got %+v; want its volume", m)
+	}
+}

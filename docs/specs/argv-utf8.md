@@ -111,9 +111,9 @@ and the rules a session adds keep seeing only valid UTF-8.
   approval request is made.
 - The daemon logs it as `request rejected`, as other malformed
   requests.
-- Other frames (`FrameArm`, the approval socket's frames) are not
-  checked: hostrunner sends them from the host, and they carry no argv
-  from the container.
+- Other frames (the approval socket's frames, `FrameArm` among them
+  since only the approval socket takes it) are not checked: hostrunner
+  sends them from the host, and they carry no argv from the container.
 
 ### Protocol
 

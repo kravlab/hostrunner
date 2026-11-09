@@ -67,21 +67,40 @@ func (s Store) check() error {
 	return nil
 }
 
-// Entry is one allow: what a human trusted for a workspace.
-type Entry struct {
-	// Workspace is the key of the workspace, see Store.Allow.
-	Workspace string `json:"workspace"`
-	// RulesFile is the rules file when allowed, as path made absolute with
-	// symbolic links followed (see canonical), or empty when none was
-	// named; it is kept for the human to read and is not part of the
-	// comparison. The rules_file setting in Settings is held the same way.
-	RulesFile string `json:"rules_file"`
+// Scope is what an allow covers: the digest of the rules file's content
+// together with the daemon settings.
+type Scope struct {
 	// Digest is the rules digest as package rules computes it, "missing"
 	// for a missing file.
 	Digest string `json:"digest"`
 	// Settings are the daemon settings by key name, as
 	// settings.Settings.Daemon() returns them.
 	Settings map[string]string `json:"settings"`
+}
+
+// Target is what an allow, or the request for one, is recorded for: the
+// Scope with the rules file it is of.
+type Target struct {
+	// RulesFile is the rules file when allowed, as path made absolute with
+	// symbolic links followed (see canonical), or empty when none was
+	// named; it is kept for the human to read and is not part of the
+	// comparison. The rules_file setting in Settings is held the same way.
+	RulesFile string `json:"rules_file"`
+	Scope
+}
+
+// NewTarget returns the Target of rulesFile with the Scope of digest, the
+// digest of its content, and settings, the daemon settings (see Scope).
+func NewTarget(rulesFile, digest string, settings map[string]string) Target {
+	return Target{RulesFile: rulesFile, Scope: Scope{Digest: digest, Settings: settings}}
+}
+
+// Entry is one allow: what a human trusted for a workspace. Its fields are
+// stored flat: workspace, rules_file, digest and settings.
+type Entry struct {
+	// Workspace is the key of the workspace, see Store.Allow.
+	Workspace string `json:"workspace"`
+	Target
 }
 
 // key returns the identity of a workspace: its path made absolute with
@@ -128,10 +147,12 @@ func canonical(path string) (string, error) {
 	return key(path)
 }
 
-// canonicalSettings returns a clone of the daemon settings whose
-// rules_file, when present, is canonical; the caller's map is not changed.
-// A nil map stays nil.
-func canonicalSettings(in map[string]string) (map[string]string, error) {
+// CanonicalSettings returns a clone of the daemon settings whose
+// rules_file, when present, is canonical, as the store holds and compares
+// it (see Store.Allow); the caller's map is not changed. A nil map stays
+// nil. Settings that did not come from the store, such as
+// settings.DaemonDefaults, are compared with those of an allow through it.
+func CanonicalSettings(in map[string]string) (map[string]string, error) {
 	out := maps.Clone(in)
 	if v, ok := out[settings.RulesFileKey]; ok {
 		c, err := canonical(v)
@@ -143,18 +164,35 @@ func canonicalSettings(in map[string]string) (map[string]string, error) {
 	return out, nil
 }
 
-// canonicalArgs returns the rules file and the daemon settings in the form
-// the store holds and compares them (see canonical, canonicalSettings).
-func canonicalArgs(rulesFile string, in map[string]string) (string, map[string]string, error) {
-	rf, err := canonical(rulesFile)
+// canonicalTarget returns t in the form the store holds and compares it
+// (see canonical, CanonicalSettings).
+func canonicalTarget(t Target) (Target, error) {
+	rf, err := canonical(t.RulesFile)
 	if err != nil {
-		return "", nil, err
+		return Target{}, err
 	}
-	st, err := canonicalSettings(in)
+	st, err := CanonicalSettings(t.Settings)
 	if err != nil {
-		return "", nil, err
+		return Target{}, err
 	}
-	return rf, st, nil
+	return Target{RulesFile: rf, Scope: Scope{Digest: t.Digest, Settings: st}}, nil
+}
+
+// prepare is the start of Allow and Request: it checks the store, and
+// returns the key of the workspace and t in its canonical form.
+func (s Store) prepare(workspace string, t Target) (k string, canon Target, err error) {
+	if err := s.check(); err != nil {
+		return "", Target{}, err
+	}
+	k, err = key(workspace)
+	if err != nil {
+		return "", Target{}, err
+	}
+	canon, err = canonicalTarget(t)
+	if err != nil {
+		return "", Target{}, err
+	}
+	return k, canon, nil
 }
 
 // file returns the path of the allow file of a workspace key: the hex
@@ -176,26 +214,19 @@ func name(k string) string {
 }
 
 // Allow records that the content of the workspace's rules file, with the
-// given digest, and the given daemon settings are trusted, and returns
-// the Entry it recorded. It replaces any earlier allow of the workspace
-// and then removes its request, if any, which the allow answers.
+// digest and the daemon settings of t, is trusted, and returns the Entry
+// it recorded. It replaces any earlier allow of the workspace and then
+// removes its request, if any, which the allow answers.
 // The file is written to a temporary file and renamed over the target, so
 // a reader sees the whole old allow or the whole new one, never a part,
-// and is readable by its owner only. rulesFile, like the rules_file
-// setting, is stored in its canonical form (see canonical).
-func (s Store) Allow(workspace, rulesFile, digest string, settings map[string]string) (Entry, error) {
-	if err := s.check(); err != nil {
-		return Entry{}, err
-	}
-	k, err := key(workspace)
+// and is readable by its owner only. The rules file of t, like the
+// rules_file setting, is stored in its canonical form (see canonical).
+func (s Store) Allow(workspace string, t Target) (Entry, error) {
+	k, t, err := s.prepare(workspace, t)
 	if err != nil {
 		return Entry{}, err
 	}
-	rulesFile, settings, err = canonicalArgs(rulesFile, settings)
-	if err != nil {
-		return Entry{}, err
-	}
-	e, err := s.record(s.file(k), k, rulesFile, digest, settings)
+	e, err := s.record(s.file(k), k, t)
 	if err != nil {
 		return Entry{}, err
 	}
@@ -205,33 +236,27 @@ func (s Store) Allow(workspace, rulesFile, digest string, settings map[string]st
 	return e, nil
 }
 
-// Request records what an `up` refused for want of an allow asked for:
+// Request records what an `up` refused for want of an allow asked for: t,
 // the workspace's rules file, the digest of its content and the daemon
 // settings, for a human on the host to allow (see Pending). Each
 // workspace has one request: a new one replaces the old, so the request
 // is always that of the latest refused `up`. It is written as Allow
 // writes an allow, rules file and settings in the canonical form included,
 // next to it, and is no allow: Allowed does not read it.
-func (s Store) Request(workspace, rulesFile, digest string, settings map[string]string) error {
-	if err := s.check(); err != nil {
-		return err
-	}
-	k, err := key(workspace)
+func (s Store) Request(workspace string, t Target) error {
+	k, t, err := s.prepare(workspace, t)
 	if err != nil {
 		return err
 	}
-	rulesFile, settings, err = canonicalArgs(rulesFile, settings)
-	if err != nil {
-		return err
-	}
-	_, err = s.record(s.requestFile(k), k, rulesFile, digest, settings)
+	_, err = s.record(s.requestFile(k), k, t)
 	return err
 }
 
-// record writes the Entry of the workspace key k to path in the store,
-// creating the store directory, and returns it.
-func (s Store) record(path, k, rulesFile, digest string, settings map[string]string) (Entry, error) {
-	e := Entry{Workspace: k, RulesFile: rulesFile, Digest: digest, Settings: maps.Clone(settings)}
+// record writes the Entry of the workspace key k and t to path in the
+// store, creating the store directory, and returns it.
+func (s Store) record(path, k string, t Target) (Entry, error) {
+	e := Entry{Workspace: k, Target: t}
+	e.Settings = maps.Clone(t.Settings)
 	if e.Settings == nil {
 		e.Settings = map[string]string{}
 	}
@@ -299,13 +324,14 @@ func (s Store) Deny(workspace string) (removed bool, err error) {
 }
 
 // Allowed reports whether the workspace has an allow that covers exactly
-// the given digest and daemon settings: the same keys with the same
-// values, none added or missing; the rules_file value is compared in its
-// canonical form (see canonical). A workspace never allowed, or a store
-// directory that does not exist, is not allowed and not an error. An allow
-// file that cannot be read or is not valid is an error naming the file,
-// not a silent denial, so that damage to the store is noticed.
-func (s Store) Allowed(workspace, digest string, settings map[string]string) (bool, error) {
+// the given Scope: the same digest and the same daemon settings, the same
+// keys with the same values, none added or missing; the rules_file value is
+// compared in its canonical form (see canonical). A workspace never
+// allowed, or a store directory that does not exist, is not allowed and not
+// an error. An allow file that cannot be read or is not valid is an error
+// naming the file, not a silent denial, so that damage to the store is
+// noticed.
+func (s Store) Allowed(workspace string, sc Scope) (bool, error) {
 	if err := s.check(); err != nil {
 		return false, err
 	}
@@ -313,7 +339,7 @@ func (s Store) Allowed(workspace, digest string, settings map[string]string) (bo
 	if err != nil {
 		return false, err
 	}
-	settings, err = canonicalSettings(settings)
+	settings, err := CanonicalSettings(sc.Settings)
 	if err != nil {
 		return false, err
 	}
@@ -321,7 +347,7 @@ func (s Store) Allowed(workspace, digest string, settings map[string]string) (bo
 	if !ok || err != nil {
 		return false, err
 	}
-	return e.Workspace == k && e.Digest == digest && maps.Equal(e.Settings, settings), nil
+	return e.Workspace == k && e.Digest == sc.Digest && maps.Equal(e.Settings, settings), nil
 }
 
 // Pending returns the request of the workspace, which the latest `up`

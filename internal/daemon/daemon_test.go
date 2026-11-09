@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -187,31 +188,66 @@ func TestServeStopsRunningCommandsOnPermanentAcceptError(t *testing.T) {
 	}
 }
 
+// approvalListener listens on an approval socket in a new short
+// temporary directory, for WithApprovals, and returns it and its path.
+func approvalListener(t *testing.T) (net.Listener, string) {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "hr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	socket := filepath.Join(dir, "a.sock")
+	l, err := transport.Unix{Path: socket}.Listen()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return l, socket
+}
+
+// sendArm sends a, with the protocol version set unless a sets one, on
+// the socket at path, as `hostrunner up` does, and returns the daemon's
+// answer.
+func sendArm(t *testing.T, path string, a protocol.Arm) protocol.Frame {
+	t.Helper()
+	c, err := transport.Unix{Path: path}.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	if a.Version == 0 {
+		a.Version = protocol.Version
+	}
+	if err := protocol.WriteJSON(c, protocol.FrameArm, a); err != nil {
+		t.Fatal(err)
+	}
+	f, err := protocol.ReadFrame(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
+// An arm on the approval socket, which only the host reaches, calls the
+// arm handler with the digest of the rules served.
 func TestServeCallsArmHandlerOnArmRequest(t *testing.T) {
 	digests := make(chan string, 1)
-	srv := newServer(t, daemon.WithReread("served", nil), daemon.WithArmHandler(func(a protocol.Arm, digest string) bool {
+	al, socket := approvalListener(t)
+	srv := newServer(t, daemon.WithApprovals(al, ""), daemon.WithReread("served", nil), daemon.WithArmHandler(func(a protocol.Arm, digest string) bool {
 		if a.ConfigDigest == "abc" {
 			digests <- digest
 		}
 		return false
 	}))
-	client, server := net.Pipe()
-	defer client.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go srv.Serve(ctx, newChanListener(acceptResult{conn: server}))
+	go srv.Serve(ctx, newChanListener())
 
-	client.SetDeadline(time.Now().Add(5 * time.Second))
-	if err := protocol.WriteJSON(client, protocol.FrameArm, protocol.Arm{Version: protocol.Version, ConfigDigest: "abc"}); err != nil {
-		t.Fatal(err)
-	}
-	f, err := protocol.ReadFrame(client)
-	if err != nil || f.Type != protocol.FrameArmed {
-		t.Fatalf("got frame %v, err %v; want FrameArmed", f.Type, err)
-	}
+	f := sendArm(t, socket, protocol.Arm{ConfigDigest: "abc"})
 	var reply protocol.Armed
-	if err := protocol.DecodeJSON(f, &reply); err != nil || reply.Restart {
-		t.Fatalf("reply %+v, err %v; want no step aside", reply, err)
+	if f.Type != protocol.FrameArmed || protocol.DecodeJSON(f, &reply) != nil || reply.Restart {
+		t.Fatalf("got frame %v %+v; want Armed without step aside", f.Type, reply)
 	}
 	select {
 	case got := <-digests:
@@ -224,22 +260,51 @@ func TestServeCallsArmHandlerOnArmRequest(t *testing.T) {
 }
 
 func TestServeRejectsArmWithOtherVersion(t *testing.T) {
-	srv := newServer(t, daemon.WithArmHandler(func(protocol.Arm, string) bool {
+	al, socket := approvalListener(t)
+	srv := newServer(t, daemon.WithApprovals(al, ""), daemon.WithArmHandler(func(protocol.Arm, string) bool {
 		t.Error("arm handler called for a bad version")
 		return false
+	}))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.Serve(ctx, newChanListener())
+
+	if f := sendArm(t, socket, protocol.Arm{Version: protocol.Version + 1}); f.Type != protocol.FrameError {
+		t.Fatalf("got frame type %d, want FrameError", f.Type)
+	}
+}
+
+// The container's socket, which the container reaches, refuses an arm as
+// a protocol error: the arm handler is not called, so a process in the
+// container cannot re-arm the daemon or make it step aside.
+func TestServeRefusesAnArmOnTheContainersSocket(t *testing.T) {
+	srv := newServer(t, daemon.WithArmHandler(func(protocol.Arm, string) bool {
+		t.Error("arm handler called for an arm on the container's socket")
+		return true
 	}))
 	client, server := net.Pipe()
 	defer client.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go srv.Serve(ctx, newChanListener(acceptResult{conn: server}))
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(ctx, newChanListener(acceptResult{conn: server})) }()
 
 	client.SetDeadline(time.Now().Add(5 * time.Second))
-	if err := protocol.WriteJSON(client, protocol.FrameArm, protocol.Arm{Version: protocol.Version + 1}); err != nil {
+	if err := protocol.WriteJSON(client, protocol.FrameArm, protocol.Arm{Version: protocol.Version, ConfigDigest: "abc"}); err != nil {
 		t.Fatal(err)
 	}
-	if f := statusFrame(t, client); f.Type != protocol.FrameError {
-		t.Fatalf("got frame type %d, want FrameError", f.Type)
+	f := statusFrame(t, client)
+	var e protocol.Error
+	if f.Type != protocol.FrameError || protocol.DecodeJSON(f, &e) != nil || e.Code != protocol.ExitHostrunError {
+		t.Fatalf("got frame %d %+v, want Error %d", f.Type, e, protocol.ExitHostrunError)
+	}
+	if want := "an arm is taken on the approval socket only"; !strings.Contains(e.Message, want) {
+		t.Fatalf("message %q, want it to contain %q", e.Message, want)
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("Serve stopped (%v) after an arm on the container's socket", err)
+	case <-time.After(100 * time.Millisecond):
 	}
 }
 
@@ -277,20 +342,15 @@ func TestServeSurvivesAPanickingRequest(t *testing.T) {
 }
 
 func TestServeStopsAfterAnsweringArmWithStepAside(t *testing.T) {
-	srv := newServer(t, daemon.WithArmHandler(func(protocol.Arm, string) bool { return true }))
-	client, server := net.Pipe()
-	defer client.Close()
+	al, socket := approvalListener(t)
+	srv := newServer(t, daemon.WithApprovals(al, ""), daemon.WithArmHandler(func(protocol.Arm, string) bool { return true }))
 	done := make(chan error, 1)
-	go func() { done <- srv.Serve(context.Background(), newChanListener(acceptResult{conn: server})) }()
+	go func() { done <- srv.Serve(context.Background(), newChanListener()) }()
 
-	client.SetDeadline(time.Now().Add(5 * time.Second))
-	if err := protocol.WriteJSON(client, protocol.FrameArm, protocol.Arm{Version: protocol.Version}); err != nil {
-		t.Fatal(err)
-	}
-	f, err := protocol.ReadFrame(client)
+	f := sendArm(t, socket, protocol.Arm{})
 	var reply protocol.Armed
-	if err != nil || f.Type != protocol.FrameArmed || protocol.DecodeJSON(f, &reply) != nil || !reply.Restart {
-		t.Fatalf("got frame %v %+v, err %v; want Armed with step aside", f.Type, reply, err)
+	if f.Type != protocol.FrameArmed || protocol.DecodeJSON(f, &reply) != nil || !reply.Restart {
+		t.Fatalf("got frame %v %+v; want Armed with step aside", f.Type, reply)
 	}
 	select {
 	case err := <-done:

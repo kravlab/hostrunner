@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -555,6 +556,10 @@ const (
 		`{"Type":"volume","Name":"data","Source":"/var/lib/example/volumes/data/_data","Destination":"/data","Driver":"local","Mode":"z","RW":true,"Propagation":""},` +
 		`{"Type":"tmpfs","Source":"","Destination":"/tmp","Mode":"","RW":true,"Propagation":""}]`
 	noMounts = "null"
+	// dataVolume is how the runtime answers the inspection of the volume
+	// data that a mounts: a local volume that binds a host directory, as
+	// `volume inspect --format {{json .}}` prints it.
+	dataVolume = `echo '{"CreatedAt":"2026-10-09T10:00:00Z","Driver":"local","Labels":null,"Mountpoint":"/var/lib/example/volumes/data/_data","Name":"data","Options":{"device":"/home/u/data","o":"bind","type":"none"},"Scope":"local"}'`
 )
 
 // fakeCLI writes an executable that answers a container listing for
@@ -570,6 +575,13 @@ func fakeCLI(t *testing.T, workspace, bErr string) string {
 // fakeCLIMounts is fakeCLI with the mounts field of a and b given verbatim.
 func fakeCLIMounts(t *testing.T, workspace, bErr, mountsA, mountsB string) string {
 	t.Helper()
+	return fakeCLIVolumes(t, workspace, bErr, mountsA, mountsB, dataVolume)
+}
+
+// fakeCLIVolumes is fakeCLIMounts with volume, the shell commands that
+// answer the inspection of the volume data, given verbatim.
+func fakeCLIVolumes(t *testing.T, workspace, bErr, mountsA, mountsB, volume string) string {
+	t.Helper()
 	path := filepath.Join(t.TempDir(), "fakert")
 	inspectB := `echo 'b false "2026-10-09T12:00:05.5+02:00" ` + mountsB + `'`
 	if bErr != "" {
@@ -584,6 +596,8 @@ case "$*" in
 "inspect --type container --format {{.Id}} {{.State.Running}} {{json .State.StartedAt}} {{json .Mounts}} a b")
 	echo 'a true "2026-10-09T10:00:00.123456789Z" ` + mountsA + `'
 	` + inspectB + ` ;;
+"volume inspect --format {{json .}} data")
+	` + volume + ` ;;
 *) echo "unexpected: $*" >&2; exit 2 ;;
 esac
 exit $status
@@ -615,10 +629,11 @@ func TestCLIRuntimeReportsMounts(t *testing.T) {
 	want := []watch.Mount{
 		{Type: "bind", Source: "/home/u/my app", Destination: "/workspace"},
 		{Type: "bind", Source: "/etc/ro", Destination: "/ro", ReadOnly: true},
-		{Type: "volume", Source: "/var/lib/example/volumes/data/_data", Destination: "/data"},
+		{Type: "volume", Name: "data", Source: "/var/lib/example/volumes/data/_data", Destination: "/data",
+			Volume: &watch.Volume{Driver: "local", Options: map[string]string{"device": "/home/u/data", "o": "bind", "type": "none"}}},
 		{Type: "tmpfs", Destination: "/tmp"},
 	}
-	if !slices.Equal(got[0].Mounts, want) || got[0].MountsErr != nil {
+	if !slices.EqualFunc(got[0].Mounts, want, sameMount) || got[0].MountsErr != nil {
 		t.Fatalf("a: got %v, %v; want %v, nil", got[0].Mounts, got[0].MountsErr, want)
 	}
 	if len(got[1].Mounts) != 0 || got[1].MountsErr != nil {
@@ -683,6 +698,56 @@ func TestCLIRuntimeReportsOtherInspectionFailure(t *testing.T) {
 	if got, err := rt.Containers(context.Background(), "/home/u/app"); err == nil {
 		t.Fatalf("got %v, nil; want the runtime's error", got)
 	}
+}
+
+// A volume the runtime cannot inspect, or whose inspection leaves it out,
+// is reported on its mount, naming it; the container's other mounts stay.
+func TestCLIRuntimeReportsAVolumeItCannotInspect(t *testing.T) {
+	for _, tt := range []struct{ name, volume string }{
+		{"an inspection that fails", `echo 'Error: no such volume data' >&2; exit 1`},
+		{"an inspection that leaves it out", `:`},
+		{"an inspection it cannot parse", `echo '{not json'`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			rt := watch.CLI{Binary: fakeCLIVolumes(t, "/home/u/app", "", mountsOfA, noMounts, tt.volume)}
+			got, err := rt.Containers(context.Background(), "/home/u/app")
+			if err != nil || len(got) != 2 || got[0].MountsErr != nil || len(got[0].Mounts) != 4 {
+				t.Fatalf("got %+v, %v; want a with its four mounts, nil", got, err)
+			}
+			m := got[0].Mounts[2]
+			if m.Name != "data" || m.Volume != nil || m.VolumeErr == nil || !strings.Contains(m.VolumeErr.Error(), "data") {
+				t.Fatalf("the volume mount: got %+v; want no volume and an error naming data", m)
+			}
+			if got[0].Mounts[0].VolumeErr != nil {
+				t.Fatalf("the bind mount: got %+v; want no volume error", got[0].Mounts[0])
+			}
+		})
+	}
+}
+
+// A volume mount that names no volume cannot be inspected: it is reported
+// as such, and nothing is asked of the runtime for it.
+func TestCLIRuntimeReportsAVolumeMountWithoutAName(t *testing.T) {
+	mounts := `[{"Type":"volume","Source":"/var/lib/example/volumes/x/_data","Destination":"/x","RW":true}]`
+	rt := watch.CLI{Binary: fakeCLIVolumes(t, "/home/u/app", "", mounts, noMounts, `echo unexpected >&2; exit 2`)}
+	got, err := rt.Containers(context.Background(), "/home/u/app")
+	if err != nil || len(got) != 2 || len(got[0].Mounts) != 1 {
+		t.Fatalf("got %+v, %v; want a with its mount, nil", got, err)
+	}
+	if m := got[0].Mounts[0]; m.Volume != nil || m.VolumeErr == nil {
+		t.Fatalf("got %+v; want no volume and an error", m)
+	}
+}
+
+// sameMount reports whether a and b are the same mount, their volumes
+// compared by value.
+func sameMount(a, b watch.Mount) bool {
+	va, vb := a.Volume, b.Volume
+	a.Volume, b.Volume = nil, nil
+	if a != b || (va == nil) != (vb == nil) {
+		return false
+	}
+	return va == nil || va.Driver == vb.Driver && maps.Equal(va.Options, vb.Options)
 }
 
 func sameContainer(a, b watch.Container) bool {
@@ -990,7 +1055,8 @@ func (r *sharedRuntime) set(running bool) {
 }
 
 func TestAttachedContainersAreCopiesTheCallbackMayChange(t *testing.T) {
-	want := []watch.Mount{{Source: "/home/u/app", Destination: "/workspace"}, {Destination: "/tmp"}}
+	want := []watch.Mount{{Source: "/home/u/app", Destination: "/workspace"}, {Destination: "/tmp"},
+		{Type: "volume", Name: "v", Destination: "/v", Volume: &watch.Volume{Driver: "local", Options: map[string]string{"device": "/home/u/v"}}}}
 	rt := &sharedRuntime{c: watch.Container{ID: "c", Mounts: slices.Clone(want)}}
 	var mu sync.Mutex
 	var seen [][]watch.Mount
@@ -998,8 +1064,14 @@ func TestAttachedContainersAreCopiesTheCallbackMayChange(t *testing.T) {
 	cfg.Attached = func(_ time.Time, armed []watch.Container) {
 		mu.Lock()
 		defer mu.Unlock()
-		seen = append(seen, slices.Clone(armed[0].Mounts))
+		mounts := slices.Clone(armed[0].Mounts)
+		v := *mounts[2].Volume
+		v.Options = maps.Clone(v.Options)
+		mounts[2].Volume = &v
+		seen = append(seen, mounts)
 		armed[0].Mounts[0].Destination = "/changed by the callback"
+		armed[0].Mounts[2].Volume.Options["device"] = "/changed by the callback"
+		armed[0].Mounts[2].Volume.Driver = "changed by the callback"
 		armed[0].Mounts = append(armed[0].Mounts, watch.Mount{Destination: "/added by the callback"})
 	}
 	count := func() int { mu.Lock(); defer mu.Unlock(); return len(seen) }
@@ -1015,7 +1087,7 @@ func TestAttachedContainersAreCopiesTheCallbackMayChange(t *testing.T) {
 	mu.Lock()
 	got := seen[1]
 	mu.Unlock()
-	if !slices.Equal(got, want) {
+	if !slices.EqualFunc(got, want, sameMount) {
 		t.Fatalf("second attach got mounts %v; want %v unchanged by the first callback", got, want)
 	}
 	rt.set(false)

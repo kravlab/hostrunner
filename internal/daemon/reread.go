@@ -3,12 +3,12 @@ package daemon
 import (
 	"context"
 	"errors"
-	"maps"
 	"os"
 	"path/filepath"
 	"syscall"
 	"time"
 
+	"github.com/kravlab/hostrunner/internal/allow"
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
 )
@@ -27,15 +27,16 @@ func WithRereadEvery(interval time.Duration) Option {
 }
 
 // WithAllowed makes the Server reread its rules file by itself (see
-// WithRereadEvery) only to content allowed reports allowed, by its
-// digest and the daemon settings (those of WithSettings): one a human on
-// the host allowed for the daemon's workspace with those settings
-// (allow.Store.Allowed). A change to content not allowed keeps the rules
-// served and is logged, and noticed to the session serving the daemon,
-// once for its content. Without it every content is allowed. The Server
-// also checks through it a change an arm reports not allowed (see
-// protocol.ArmNotAllowed and pendingAllowWarning), with the arm's settings.
-func WithAllowed(allowed func(digest string, settings map[string]string) (bool, error)) Option {
+// WithRereadEvery) only to content allowed reports allowed, by the
+// allow.Scope of its digest and the daemon settings (those of
+// WithSettings): one a human on the host allowed for the daemon's
+// workspace with those settings (allow.Store.Allowed). A change to content
+// not allowed keeps the rules served and is logged, and noticed to the
+// session serving the daemon, once for its content. Without it every
+// content is allowed. The Server also checks through it a change an arm
+// reports not allowed (see protocol.ArmNotAllowed and
+// pendingAllowWarning), with the arm's settings.
+func WithAllowed(allowed func(allow.Scope) (bool, error)) Option {
 	return func(s *Server) { s.allowed = allowed }
 }
 
@@ -49,17 +50,14 @@ func WithAllowRequest(request func(digest string) error) Option {
 	return func(s *Server) { s.allowRequest = request }
 }
 
-// WithAllow makes the Server record an allow of the rules file content of
-// the given digest through allow (e.g. allow.Store.Allow with its
-// workspace, rules file and settings), as the human who approved a rule
-// added from the approval session allows what that session writes.
-func WithAllow(allow func(digest string) error) Option {
-	return func(s *Server) { s.allowRecorder = allow }
+// WithAllowRecorder makes the Server record an allow of the rules file
+// content of the given digest through record (e.g. allow.Store.Allow with
+// its workspace, rules file and settings), as the human who approved a rule
+// added from the approval session allows what that session writes. It is
+// not WithAllowRequest, which records what a human is asked to allow.
+func WithAllowRecorder(record func(digest string) error) Option {
+	return func(s *Server) { s.allowRecorder = record }
 }
-
-// allowCommand is the command a human on the host runs to allow the
-// content of the rules file (see WithAllowed).
-const allowCommand = "hostrunner allow"
 
 // errChangedMeanwhile is why rereadRules keeps the old rules when the file
 // it rereads is not the one it was asked to.
@@ -115,7 +113,7 @@ func (s *Server) watchRules(ctx context.Context) {
 			return
 		case <-tick.C:
 		}
-		if now := statRules(path); now != last || s.pendingUnallowed() != "" {
+		if now := statRules(path); now != last || s.pendingNotAllowed() != "" {
 			last = now
 			failedContent = s.rereadChanged(path, failedContent)
 		}
@@ -127,7 +125,8 @@ func (s *Server) watchRules(ctx context.Context) {
 //   - the rules served: nothing to do; a pending change not allowed ends,
 //     logged as undone unless a session's reread served it;
 //   - failedContent: nothing to do, it was logged;
-//   - content not allowed: the rules served stay (see refuseUnallowed);
+//   - content not allowed: the rules served stay, and the session is told
+//     once (see refuseNotAllowed);
 //   - otherwise it is reread, and a failure is logged and kept as
 //     failedContent.
 //
@@ -140,7 +139,7 @@ func (s *Server) rereadChanged(path, failedContent string) string {
 		content = "unreadable: " + readErr.Error()
 	}
 	if content == s.rulesDigest() {
-		if pending := s.endUnallowed(); pending != "" && pending != content {
+		if pending := s.endNotAllowed(); pending != "" && pending != content {
 			s.log.Info("rules change undone: the file holds the rules served", "file", path)
 		}
 		return ""
@@ -149,10 +148,7 @@ func (s *Server) rereadChanged(path, failedContent string) string {
 		return failedContent
 	}
 	if readErr == nil {
-		if first, err := s.refuseUnallowed(content); err != nil {
-			if first {
-				s.approvals.notice(protocol.RulesReread{Error: err.Error()})
-			}
+		if err := s.refuseNotAllowed(content); err != nil {
 			return ""
 		}
 	}
@@ -183,74 +179,89 @@ func (s *Server) logReread(digest string, err error) {
 // its rules file no human on the host allowed (see WithAllowed).
 var errNotAllowed = errors.New("not allowed")
 
-// unallowedError is why the Server keeps its rules against content of
+// notAllowedError is why the Server keeps its rules against content of
 // its rules file, of digest: err is errNotAllowed, or why the allow
-// could not be checked, which allows nothing. Its message is what the
+// could not be checked, which allows nothing. So it covers both "not
+// allowed" and "allow not checked" (see allowCheck). Its message is what the
 // approval session shows.
-type unallowedError struct {
+type notAllowedError struct {
 	digest string
 	err    error
 }
 
 // Error says why the content is refused and, when it is not allowed, how
 // a human on the host allows it.
-func (e *unallowedError) Error() string {
+func (e *notAllowedError) Error() string {
 	if errors.Is(e.err, errNotAllowed) {
-		return "its content (digest " + e.digest + ") is not allowed; run `" + allowCommand + "` on the host"
+		return "its content (digest " + e.digest + ") is not allowed; run `" + protocol.AllowCommand + "` on the host"
 	}
 	return "the allow of its content (digest " + e.digest + ") cannot be checked: " + e.err.Error()
 }
 
 // Unwrap returns errNotAllowed or the error of the check.
-func (e *unallowedError) Unwrap() error { return e.err }
+func (e *notAllowedError) Unwrap() error { return e.err }
 
-// unallowedReport is the content of the rules file the Server last
-// refused as not allowed (see refuseUnallowed), pending until the file
+// notAllowedReport is the content of the rules file the Server last
+// refused as not allowed (see refuseNotAllowed), pending until the file
 // holds the rules served or a reread serves new ones.
-type unallowedReport struct {
-	digest     string // the content's digest; "" for none
-	notAllowed bool   // the check found it not allowed; false: the check failed
+type notAllowedReport struct {
+	digest string     // the content's digest; "" for none
+	check  allowCheck // why the content was refused: not allowed, or not checked
 }
 
-// refuseUnallowed returns nil when the Server may serve rules of the
-// given digest (see WithAllowed), or why not, an *unallowedError. The
+// refuseNotAllowed returns nil when the Server may serve rules of the
+// given digest (see WithAllowed), or why not, a *notAllowedError. The
 // refusal becomes the one pending; when its content or its reason (not
 // allowed, or not checked) differs from the one pending before, it is
 // logged, content not allowed gets an allow request (see
-// WithAllowRequest), and first is true, for the caller to tell the
-// session. Both the
-// watcher and a session's reread of a hand edit check through it, so
-// each refusal is reported once.
-func (s *Server) refuseUnallowed(digest string) (first bool, err error) {
+// WithAllowRequest), and the session serving the daemon is told of it
+// unless it was told already (see noticeChanges). The watcher, a session's
+// reread of a hand edit or of a rule it added, and an allow that cannot be
+// recorded all refuse through it, so each refusal is reported once.
+func (s *Server) refuseNotAllowed(digest string) error {
 	if s.allowed == nil {
-		return false, nil
+		return nil
 	}
-	s.unallowedMu.Lock()
-	defer s.unallowedMu.Unlock()
-	ok, checkErr := s.allowed(digest, s.settings)
-	if checkErr == nil && ok {
-		return false, nil
+	refusal, changed := s.recordRefusal(digest)
+	if changed {
+		s.noticeChanges()
 	}
-	refusal := &unallowedError{digest: digest, err: errNotAllowed}
+	if refusal == nil {
+		return nil
+	}
+	return refusal
+}
+
+// recordRefusal is refuseNotAllowed but for the notice: it returns the
+// refusal, nil when the content is allowed, and whether the refusal pending
+// changed. It holds notAllowedMu, which it releases before it returns.
+func (s *Server) recordRefusal(digest string) (refusal *notAllowedError, changed bool) {
+	s.notAllowedMu.Lock()
+	defer s.notAllowedMu.Unlock()
+	ok, checkErr := s.askAllowed(allow.Scope{Digest: digest, Settings: s.settings})
+	if ok {
+		return nil, false
+	}
+	refusal = &notAllowedError{digest: digest, err: errNotAllowed}
 	if checkErr != nil {
 		refusal.err = checkErr
 	}
-	report := unallowedReport{digest: digest, notAllowed: checkErr == nil}
-	if s.unallowed == report {
-		return false, refusal
+	report := notAllowedReport{digest: digest, check: allowCheckOf(checkErr)}
+	if s.notAllowed == report {
+		return refusal, false
 	}
-	s.unallowed = report
+	s.notAllowed = report
 	if checkErr != nil {
 		s.log.Warn("rules change not checked: the old rules stay", "file", s.approvals.rulesFile, "digest", digest, "error", checkErr)
-		return true, refusal
+		return refusal, true
 	}
-	s.log.Warn("rules changed but not allowed: the old rules stay until `"+allowCommand+"`", "file", s.approvals.rulesFile, "digest", digest)
+	s.log.Warn("rules changed but not allowed: the old rules stay until `"+protocol.AllowCommand+"`", "file", s.approvals.rulesFile, "digest", digest)
 	if s.allowRequest != nil {
 		if err := s.allowRequest(digest); err != nil {
 			s.log.Warn("allow request not recorded", "file", s.approvals.rulesFile, "digest", digest, "error", err)
 		}
 	}
-	return true, refusal
+	return refusal, true
 }
 
 // allowAddedRule decides whether the Server rereads the rules file a
@@ -260,143 +271,51 @@ func (s *Server) refuseUnallowed(digest string) (first bool, err error) {
 // content is allowed, and none is recorded. A rule added to a file the
 // Server allowed (rr.WrittenOver, the content the session wrote over, is
 // allowed with the daemon settings) is allowed too, as the human approving
-// it reviewed it: its allow is recorded through WithAllow, and only once
-// the reread has read the content of rr.Digest, so no allow of content the
-// Server never loaded is left. A failure to record it keeps the old rules,
-// is logged as a warning, and leaves the written content pending as a
-// change not allowed (see refuseUnallowed). In any other case (the file
+// it reviewed it: its allow is recorded through WithAllowRecorder, and only
+// once the reread has read the content of rr.Digest, so no allow of content
+// the Server never loaded is left. A failure to record it keeps the old
+// rules, is logged as a warning, and leaves the written content pending as
+// a change not allowed (see refuseNotAllowed). In any other case (the file
 // written over was not allowed or its allow cannot be checked, no
 // written-over digest was given, or no allow can be recorded) the written
 // content is treated as a hand edit: it is reread only if it is allowed by
-// itself (see refuseUnallowed), and no allow is recorded.
+// itself (see refuseNotAllowed), and no allow is recorded.
 func (s *Server) allowAddedRule(rr protocol.Reread) (record func(digest string) error, err error) {
 	if s.allowed == nil {
 		return nil, nil
 	}
 	if s.allowRecorder != nil && rr.WrittenOver != "" {
 		// A failed check of the file written over is one not allowed:
-		// refuseUnallowed checks the written content too, and reports a
+		// refuseNotAllowed checks the written content too, and reports a
 		// check that fails.
-		if ok, err := s.allowed(rr.WrittenOver, s.settings); err == nil && ok {
+		if _, ok := s.recheckAllowed(allow.Scope{Digest: rr.WrittenOver, Settings: s.settings}, checkNotAllowed); ok {
 			return s.recordAllow, nil
 		}
 	}
-	_, err = s.refuseUnallowed(rr.Digest)
-	return nil, err
+	return nil, s.refuseNotAllowed(rr.Digest)
 }
 
-// recordAllow records through WithAllow an allow of the rules file content
-// of the given digest, which a session wrote and the reread loaded. A
-// failure is logged as a warning, and the content is marked pending as a
-// change not allowed, so it is reported as any other (see refuseUnallowed).
+// recordAllow records through WithAllowRecorder an allow of the rules file
+// content of the given digest, which a session wrote and the reread loaded.
+// A failure is logged as a warning, and the content is marked pending as a
+// change not allowed, so it is reported as any other (see
+// refuseNotAllowed).
 func (s *Server) recordAllow(digest string) error {
 	if err := s.allowRecorder(digest); err != nil {
 		s.log.Warn("allow not recorded", "file", s.approvals.rulesFile, "digest", digest, "error", err)
-		_, _ = s.refuseUnallowed(digest)
+		_ = s.refuseNotAllowed(digest)
 		return err
 	}
 	s.log.Info("rule allowed", "file", s.approvals.rulesFile, "digest", digest)
 	return nil
 }
 
-// pendingUnallowed returns the digest of the content refuseUnallowed
+// pendingNotAllowed returns the digest of the content refuseNotAllowed
 // last refused, while it is pending; "" for none.
-func (s *Server) pendingUnallowed() string {
-	s.unallowedMu.Lock()
-	defer s.unallowedMu.Unlock()
-	return s.unallowed.digest
-}
-
-// notAllowedWarning returns the warning that the rules file changed to
-// content refuseUnallowed refused, while that refusal is pending, with
-// the digest of the content and what a human on the host does about it;
-// "" for none. The allow of the content is checked as the warning is
-// asked for (see WithAllowed), not taken from the refusal: once the store
-// allows it there is no warning, even before the next look of the
-// watcher; a check that fails gives the warning of a change not checked.
-func (s *Server) notAllowedWarning() string {
-	s.unallowedMu.Lock()
-	pending := s.unallowed
-	s.unallowedMu.Unlock()
-	if pending.digest == "" {
-		return ""
-	}
-	notAllowed := pending.notAllowed
-	if s.allowed != nil {
-		ok, err := s.allowed(pending.digest, s.settings)
-		if err == nil && ok {
-			return ""
-		}
-		notAllowed = err == nil
-	}
-	return changeWarning(pending.digest, false, notAllowed)
-}
-
-// changeWarning returns the warning that the rules file, or with
-// withSettings the rules or the daemon settings, changed to content of
-// digest, but the change is not allowed, or with !notAllowed its allow
-// cannot be checked, so the daemon keeps the old rules, or ones, and what
-// a human on the host does about it. It defines the texts of all four
-// variants.
-func changeWarning(digest string, withSettings, notAllowed bool) string {
-	subject, kept := "the rules file", "rules"
-	if withSettings {
-		subject, kept = "the rules or the daemon settings", "ones"
-	}
-	cause, remedy := "the change is not allowed", "runs "+allowCommand+" to allow it"
-	if !notAllowed {
-		cause, remedy = "its allow cannot be checked", "looks at the daemon log"
-	}
-	return subject + " changed (digest " + digest + "), but " + cause + ", so the daemon keeps the old " + kept + "; a human on the host " + remedy
-}
-
-// armWarning returns the warning of the change the last arm reported not
-// allowed (see protocol.ArmNotAllowed), checked as it is asked for; ""
-// for none. The change is no longer warned of once the allow store allows
-// it (see WithAllowed; a Server without WithAllowed cannot check it, and
-// keeps it), nor, when it has the daemon's own settings (see
-// WithSettings), once the rules file holds the rules served again. A check
-// that fails keeps the change, warned of as one not checked. With the
-// daemon's own settings it is a change of the rules file, warned of as
-// notAllowedWarning does, and not at all when refusedDigest, the digest
-// of the refusal pending (see pendingUnallowed), is its digest, which
-// notAllowedWarning warns of already. Without WithApprovals there is no
-// rules file (see rulesFileServed), so such a change is not seen undone:
-// it ends only on an allow or the next arm.
-func (s *Server) armWarning(refusedDigest string) string {
-	s.armMu.Lock()
-	na := s.armNotAllowed
-	s.armMu.Unlock()
-	if na == nil {
-		return ""
-	}
-	notAllowed := true
-	if s.allowed != nil {
-		ok, err := s.allowed(na.Digest, na.Settings)
-		if err == nil && ok {
-			return ""
-		}
-		notAllowed = err == nil
-	}
-	if !maps.Equal(na.Settings, s.settings) {
-		return changeWarning(na.Digest, true, notAllowed)
-	}
-	if na.Digest == refusedDigest || s.rulesFileServed() {
-		return ""
-	}
-	return changeWarning(na.Digest, false, notAllowed)
-}
-
-// rulesFileServed reports whether the rules file (see WithApprovals)
-// holds the rules the Server serves; false without a rules file, so
-// without WithApprovals a change with the daemon's own settings is not
-// seen undone (see armWarning), or when it cannot be read.
-func (s *Server) rulesFileServed() bool {
-	if s.approvals == nil || s.approvals.rulesFile == "" {
-		return false
-	}
-	content, err := rulesFileDigest(s.approvals.rulesFile)
-	return err == nil && content == s.rulesDigest()
+func (s *Server) pendingNotAllowed() string {
+	s.notAllowedMu.Lock()
+	defer s.notAllowedMu.Unlock()
+	return s.notAllowed.digest
 }
 
 // rulesFileDigest returns the digest of the rules file at path, as
@@ -406,12 +325,17 @@ func rulesFileDigest(path string) (string, error) {
 	return digest, err
 }
 
-// endUnallowed ends the pending refusal, if any, and returns the digest
-// it was pending for; "" for none.
-func (s *Server) endUnallowed() string {
-	s.unallowedMu.Lock()
-	defer s.unallowedMu.Unlock()
-	pending := s.unallowed.digest
-	s.unallowed = unallowedReport{}
+// endNotAllowed ends the pending refusal, if any, and returns the digest
+// it was pending for; "" for none. What the session serving the daemon was
+// told then drops the refusal (see noticeChanges), so the same content
+// refused again is told again; the session is not told of the end.
+func (s *Server) endNotAllowed() string {
+	s.notAllowedMu.Lock()
+	pending := s.notAllowed.digest
+	s.notAllowed = notAllowedReport{}
+	s.notAllowedMu.Unlock()
+	if pending != "" {
+		s.noticeChanges()
+	}
 	return pending
 }

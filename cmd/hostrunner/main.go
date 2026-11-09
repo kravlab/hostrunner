@@ -920,15 +920,20 @@ func protectedPaths(cfg serveConfig) []string {
 // checks. They also have it allow, as `hostrunner allow` does, a rule added
 // from the approval session to a rules file that was allowed.
 func allowOptions(cfg serveConfig) []daemon.Option {
+	// target is what the daemon's own rules file and settings, with the
+	// given digest of its content, are allowed as.
+	target := func(digest string) allow.Target {
+		return allow.NewTarget(cfg.RulesFile, digest, cfg.Settings.Daemon())
+	}
 	return []daemon.Option{
-		daemon.WithAllowed(func(digest string, settings map[string]string) (bool, error) {
-			return cfg.allows.Allowed(cfg.workspace, digest, settings)
+		daemon.WithAllowed(func(sc allow.Scope) (bool, error) {
+			return cfg.allows.Allowed(cfg.workspace, sc)
 		}),
 		daemon.WithAllowRequest(func(digest string) error {
-			return cfg.allows.Request(cfg.workspace, cfg.RulesFile, digest, cfg.Settings.Daemon())
+			return cfg.allows.Request(cfg.workspace, target(digest))
 		}),
-		daemon.WithAllow(func(digest string) error {
-			_, err := cfg.allows.Allow(cfg.workspace, cfg.RulesFile, digest, cfg.Settings.Daemon())
+		daemon.WithAllowRecorder(func(digest string) error {
+			_, err := cfg.allows.Allow(cfg.workspace, target(digest))
 			return err
 		}),
 	}

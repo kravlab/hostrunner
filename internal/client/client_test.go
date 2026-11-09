@@ -148,11 +148,11 @@ func (h harness) waitServed(t *testing.T) {
 	}
 }
 
-// arm arms the daemon of h as `hostrunner up` does, with a, waits for its
-// answer and returns it.
+// arm arms the daemon of h as `hostrunner up` does, on its approval
+// socket, with a, waits for its answer and returns it.
 func (h harness) arm(t *testing.T, a protocol.Arm) protocol.Armed {
 	t.Helper()
-	conn, err := h.transport.Dial(t.Context())
+	conn, err := transport.Unix{Path: h.approvalSocket}.Dial(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}

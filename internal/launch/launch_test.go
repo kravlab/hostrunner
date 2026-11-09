@@ -27,9 +27,9 @@ import (
 )
 
 // fakeDaemonEnv makes the test binary act as the daemon when Up spawns it.
-// Values: "serve" listens and answers FrameArm; "older" does too, as a
-// daemon older than DaemonInfo.Settings, which does not say its settings;
-// "hang" never listens.
+// Values: "serve" listens and answers FrameArm on its approval socket;
+// "older" does too, as a daemon older than DaemonInfo.Settings, which does
+// not say its settings; "hang" never listens.
 const fakeDaemonEnv = "HOSTRUNNER_LAUNCH_FAKE_DAEMON"
 
 // runUpEnv makes the test binary run Up itself (as `hostrunner up` would),
@@ -49,7 +49,7 @@ func TestMain(m *testing.M) {
 			Settings: settings.Settings{RulesFile: filepath.Join(dir, "missing-rules.yaml"), Reread: true, ReadyTimeout: 5 * time.Second},
 		}
 		// The rules file is missing, which has the digest "missing".
-		if _, err := cfg.Allows.Allow(cfg.Workspace, cfg.RulesFile, "missing", cfg.Settings.Daemon()); err != nil {
+		if _, err := cfg.Allows.Allow(cfg.Workspace, allow.Target{RulesFile: cfg.RulesFile, Scope: allow.Scope{Digest: "missing", Settings: cfg.Settings.Daemon()}}); err != nil {
 			os.Exit(1)
 		}
 		if err := Up(context.Background(), cfg); err != nil {
@@ -68,14 +68,10 @@ func TestMain(m *testing.M) {
 }
 
 // runFakeDaemon records its pid in fake.pids and, in "serve" and "older"
-// mode, answers hellos on its approval socket with what it serves (see
-// answerHellos), listens on --socket and answers every FrameArm, logging
-// it to fake.armed. Like the real daemon (armHandler in cmd/hostrunner, which a
-// change of the comparison must keep it in step with) it compares the
-// arm's rules digest with the rules it started with, the arm's
-// --no-reread with its own, and each setting the arm carries with the one
-// it parsed from its flags, and, on a mismatch, steps aside and exits. It
-// insists on --watch, which `up` must always pass.
+// mode, listens on --socket, where it refuses every arm as the real
+// daemon does, and on its approval socket, where it answers hellos with
+// what it serves and arms (see answerApprovalSocket). It insists on
+// --watch, which `up` must always pass.
 func runFakeDaemon(mode string) {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	socket := fs.String("socket", "", "")
@@ -97,7 +93,6 @@ func runFakeDaemon(mode string) {
 		os.Exit(2)
 	}
 	own.RulesFile, own.Reread, own.MountCheck = *config, !*noReread, !*noMountCheck
-	ownSettings := own.Daemon() // without a duration up did not pass, which is then not compared
 	policy, err := rules.Load(*config)
 	if err != nil {
 		os.Exit(3)
@@ -108,15 +103,20 @@ func runFakeDaemon(mode string) {
 		time.Sleep(time.Minute)
 		os.Exit(0)
 	}
-	info := protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: *workspace, RulesFile: *config, RulesDigest: policy.Digest(), Stops: true, Rereads: !*noReread, NoReread: *noReread}
-	if mode != "older" {
-		info.Settings = ownSettings
-	}
-	answerHellos(ApprovalSocket(dir), info)
 	l, err := net.Listen("unix", *socket)
 	if err != nil {
 		os.Exit(1)
 	}
+	d := fakeDaemon{
+		dir: dir, digest: policy.Digest(), noReread: *noReread,
+		settings: own.Daemon(), // without a duration up did not pass, which is then not compared
+		socket:   l,
+	}
+	d.info = protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: *workspace, RulesFile: *config, RulesDigest: d.digest, Stops: true, Rereads: !*noReread, NoReread: *noReread}
+	if mode != "older" {
+		d.info.Settings = d.settings
+	}
+	d.answerApprovalSocket(ApprovalSocket(dir))
 	for {
 		c, err := l.Accept()
 		if err != nil {
@@ -124,37 +124,31 @@ func runFakeDaemon(mode string) {
 		}
 		c.SetDeadline(time.Now().Add(5 * time.Second))
 		if f, err := protocol.ReadFrame(c); err == nil && f.Type == protocol.FrameArm {
-			var a protocol.Arm
-			_ = protocol.DecodeJSON(f, &a)
-			stepAside := a.ConfigDigest != policy.Digest() || a.NoReread != *noReread
-			for name, v := range a.Settings {
-				got, ok := ownSettings[name]
-				stepAside = stepAside || !ok || got != v
-			}
-			appendLine(filepath.Join(dir, "fake.armed"), map[bool]string{false: "armed", true: "step aside"}[stepAside])
-			// What the arm reports not allowed, for the tests to read:
-			// the real daemon warns hostrun of it (see armWarning).
-			if a.NotAllowed != nil {
-				if b, err := json.Marshal(a.NotAllowed); err == nil {
-					appendLine(filepath.Join(dir, "fake.notallowed"), string(b))
-				}
-			}
-			_ = protocol.WriteJSON(c, protocol.FrameArmed, protocol.Armed{Version: protocol.Version, Restart: stepAside})
-			if stepAside {
-				c.Close()
-				l.Close()
-				os.Exit(0)
-			}
+			_ = protocol.WriteJSON(c, protocol.FrameError, protocol.Error{Code: protocol.ExitHostrunError, Message: "an arm is taken on the approval socket only"})
 		}
 		c.Close()
 	}
 }
 
-// answerHellos listens on the approval socket socket, removing the one a
-// fake daemon that stepped aside left behind, and answers every hello on
-// it with info until the process exits. It listens before it returns, so
-// the daemon answers hellos once it answers arms.
-func answerHellos(socket string, info protocol.DaemonInfo) {
+// fakeDaemon is what a fake daemon serves: its runtime directory, where
+// it records what it is told, the digest of its rules, its --no-reread,
+// its daemon settings, what it answers hellos with, and its socket, which
+// it closes as it steps aside.
+type fakeDaemon struct {
+	dir      string
+	digest   string
+	noReread bool
+	settings map[string]string
+	info     protocol.DaemonInfo
+	socket   net.Listener
+}
+
+// answerApprovalSocket listens on the approval socket socket, removing
+// the one a fake daemon that stepped aside left behind, and answers every
+// hello on it with d.info and every arm (see arm) until the process
+// exits. It listens before it returns, so the daemon answers hellos and
+// arms once it has returned.
+func (d fakeDaemon) answerApprovalSocket(socket string) {
 	os.Remove(socket)
 	l, err := net.Listen("unix", socket)
 	if err != nil {
@@ -169,12 +163,49 @@ func answerHellos(socket string, info protocol.DaemonInfo) {
 			go func() {
 				defer c.Close()
 				c.SetDeadline(time.Now().Add(5 * time.Second))
-				if f, err := protocol.ReadFrame(c); err == nil && f.Type == protocol.FrameHello {
-					_ = protocol.WriteJSON(c, protocol.FrameDaemonInfo, info)
+				f, err := protocol.ReadFrame(c)
+				switch {
+				case err != nil:
+				case f.Type == protocol.FrameHello:
+					_ = protocol.WriteJSON(c, protocol.FrameDaemonInfo, d.info)
+				case f.Type == protocol.FrameArm:
+					d.arm(c, f, l)
 				}
 			}()
 		}
 	}()
+}
+
+// arm answers the arm f on c, logging it to fake.armed. Like the real
+// daemon (armHandler in cmd/hostrunner, which a change of the comparison
+// must keep it in step with) it compares the arm's rules digest with the
+// rules it started with, the arm's --no-reread with its own, and each
+// setting the arm carries with the one it parsed from its flags, and, on
+// a mismatch, steps aside: it closes its sockets, approval first, and
+// exits.
+func (d fakeDaemon) arm(c net.Conn, f protocol.Frame, approval net.Listener) {
+	var a protocol.Arm
+	_ = protocol.DecodeJSON(f, &a)
+	stepAside := a.ConfigDigest != d.digest || a.NoReread != d.noReread
+	for name, v := range a.Settings {
+		got, ok := d.settings[name]
+		stepAside = stepAside || !ok || got != v
+	}
+	appendLine(filepath.Join(d.dir, "fake.armed"), map[bool]string{false: "armed", true: "step aside"}[stepAside])
+	// What the arm reports not allowed, for the tests to read: the real
+	// daemon warns hostrun of it (see pendingChanges).
+	if a.NotAllowed != nil {
+		if b, err := json.Marshal(a.NotAllowed); err == nil {
+			appendLine(filepath.Join(d.dir, "fake.notallowed"), string(b))
+		}
+	}
+	_ = protocol.WriteJSON(c, protocol.FrameArmed, protocol.Armed{Version: protocol.Version, Restart: stepAside})
+	if stepAside {
+		c.Close()
+		approval.Close()
+		d.socket.Close()
+		os.Exit(0)
+	}
 }
 
 func appendLine(path, line string) {
@@ -278,7 +309,7 @@ func allowCurrent(t *testing.T, cfg Config) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := cfg.Allows.Allow(cfg.Workspace, cfg.RulesFile, policy.Digest(), cfg.Settings.Daemon()); err != nil {
+	if _, err := cfg.Allows.Allow(cfg.Workspace, allow.Target{RulesFile: cfg.RulesFile, Scope: allow.Scope{Digest: policy.Digest(), Settings: cfg.Settings.Daemon()}}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -409,6 +440,78 @@ func TestUpReportsSocketThatDoesNotArm(t *testing.T) {
 	if err := Up(context.Background(), cfg); err == nil || !strings.Contains(err.Error(), "arm") {
 		t.Fatalf("got %v, want an arming error", err)
 	}
+}
+
+// An approval socket that does not answer arms, as a foreign listener, is
+// an arming error, and up starts nothing.
+func TestUpReportsAnApprovalSocketThatDoesNotArm(t *testing.T) {
+	cfg := fakeConfig(t, "serve")
+	if err := os.MkdirAll(cfg.Dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	listenClosing(t, ApprovalSocket(cfg.Dir))
+	if err := Up(context.Background(), cfg); err == nil || !strings.Contains(err.Error(), "the arm request") {
+		t.Fatalf("got %v, want an arming error", err)
+	}
+	if pids := lines(t, filepath.Join(cfg.Dir, "fake.pids")); len(pids) != 0 {
+		t.Fatalf("a daemon was started: %v", pids)
+	}
+}
+
+// A daemon older than arms on the approval socket answers the arm there
+// with an error, as for any frame but a hello: up fails as for any arm
+// that fails, naming the socket to free, and starts nothing.
+func TestUpFailsForADaemonThatRefusesTheArmOnItsApprovalSocket(t *testing.T) {
+	cfg := fakeConfig(t, "serve")
+	if err := os.MkdirAll(cfg.Dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	listenClosing(t, Socket(cfg.Dir))
+	l, err := net.Listen("unix", ApprovalSocket(cfg.Dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			if f, err := protocol.ReadFrame(c); err == nil {
+				_ = protocol.WriteJSON(c, protocol.FrameError, protocol.Error{Code: protocol.ExitHostrunError, Message: "expected a hello on the approval socket, got frame type " + strconv.Itoa(int(f.Type))})
+			}
+			c.Close()
+		}
+	}()
+	err = Up(context.Background(), cfg)
+	want := "refused to arm: expected a hello on the approval socket, got frame type 9; stop the process serving " + Socket(cfg.Dir) + " and retry"
+	if err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("got %v, want an error containing %q", err, want)
+	}
+	if pids := lines(t, filepath.Join(cfg.Dir, "fake.pids")); len(pids) != 0 {
+		t.Fatalf("a daemon was started: %v", pids)
+	}
+}
+
+// listenClosing listens on socket until the test ends and closes every
+// connection at once, as a listener that does not speak Arm.
+func listenClosing(t *testing.T, socket string) {
+	t.Helper()
+	l, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
 }
 
 func TestUpDoesNotHoldCallerOutputOpen(t *testing.T) {
@@ -1124,7 +1227,7 @@ func TestUpOfChangedRulesNotAllowedLeavesADaemonNotServingAllowedRules(t *testin
 			}
 		}},
 		{"other rules allowed", "serve", func(t *testing.T, cfg *Config) {
-			if _, err := cfg.Allows.Allow(cfg.Workspace, cfg.RulesFile, "other", cfg.Settings.Daemon()); err != nil {
+			if _, err := cfg.Allows.Allow(cfg.Workspace, allow.Target{RulesFile: cfg.RulesFile, Scope: allow.Scope{Digest: "other", Settings: cfg.Settings.Daemon()}}); err != nil {
 				t.Fatal(err)
 			}
 		}},
@@ -1132,7 +1235,7 @@ func TestUpOfChangedRulesNotAllowedLeavesADaemonNotServingAllowedRules(t *testin
 			// The other workspace allows what the daemon serves, for the
 			// workspace it was started for.
 			cfg.Workspace = "/home/u/other"
-			if _, err := cfg.Allows.Allow(cfg.Workspace, cfg.RulesFile, "missing", cfg.Settings.Daemon()); err != nil {
+			if _, err := cfg.Allows.Allow(cfg.Workspace, allow.Target{RulesFile: cfg.RulesFile, Scope: allow.Scope{Digest: "missing", Settings: cfg.Settings.Daemon()}}); err != nil {
 				t.Fatal(err)
 			}
 		}},

@@ -74,7 +74,7 @@ func upAllowCheck(t *testing.T, ws string, extra ...string) error {
 // storeAllows reports whether the store holds ws with digest and settings.
 func storeAllows(t *testing.T, ws, digest string, settings map[string]string) bool {
 	t.Helper()
-	ok, err := allowStore(t).Allowed(ws, digest, settings)
+	ok, err := allowStore(t).Allowed(ws, allow.Scope{Digest: digest, Settings: settings})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +167,7 @@ func TestAllowAllowsWhatTheRefusedUpAskedFor(t *testing.T) {
 	for _, want := range []string{
 		"  rules file: " + filepath.Join(dir, "hostrunner-rules.yaml") + "\n" +
 			"  digest: " + allowRulesDigest + "\n",
-		"    grace: 1m0s\n",
+		"    grace: 1m0s (default 15s)\n",
 	} {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("stdout lacks %q:\n%s", want, stdout)
@@ -178,6 +178,91 @@ func TestAllowAllowsWhatTheRefusedUpAskedFor(t *testing.T) {
 	}
 	if err := upAllowCheck(t, ws); !errors.As(err, &notAllowed) {
 		t.Errorf("up without --grace after the allow: got %v, want a *launch.NotAllowedError", err)
+	}
+}
+
+// The store holds the rules file of an allow with symbolic links followed,
+// so allow compares it with the default the same way: a workspace
+// reached through a link has the default rules file, which it does not
+// mark as one that differs.
+func TestAllowDoesNotMarkTheDefaultRulesFileOfAWorkspaceReachedThroughALink(t *testing.T) {
+	isolate(t)
+	ws, dir := devcontainerWith(t, allowRules, "hostrunner-rules.yaml")
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(ws, link); err != nil {
+		t.Fatal(err)
+	}
+	realRules, err := filepath.EvalSymlinks(filepath.Join(dir, "hostrunner-rules.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, _, err := runAllowCmd(t, "allow", link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "    rules_file: " + realRules + "\n"; !strings.Contains(stdout, want) {
+		t.Errorf("stdout lacks %q:\n%s", want, stdout)
+	}
+	if strings.Contains(stdout, "(default") {
+		t.Errorf("stdout marks a setting as differing from its default:\n%s", stdout)
+	}
+}
+
+// Defaults that cannot be made canonical (here a relative workspace in a
+// current directory that was removed, which cannot be made absolute) mark
+// no setting, and a last line says why, rather than printing a mark with
+// an empty default.
+func TestAllowMarksNoDefaultsThatCannotBeResolved(t *testing.T) {
+	gone := filepath.Join(t.TempDir(), "gone")
+	if err := os.Mkdir(gone, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(gone)
+	if err := os.Remove(gone); err != nil {
+		t.Fatal(err)
+	}
+	e := allow.Entry{Workspace: "ws", Target: allow.NewTarget("/r/rules.yaml", "d1",
+		map[string]string{"grace": "1m0s", "rules_file": "/r/rules.yaml"})}
+	got := allowMessage("ws", e)
+	if strings.Contains(got, "(default") {
+		t.Errorf("a setting is marked though no default is known:\n%s", got)
+	}
+	if want := "    grace: 1m0s\n    rules_file: /r/rules.yaml\n  defaults not shown: "; !strings.Contains(got, want) {
+		t.Errorf("message lacks %q:\n%s", want, got)
+	}
+}
+
+// allow marks each setting it allows that differs from its default, with
+// the default, so the human sees which flags of the refused up, given by
+// initializeCommand rather than typed, the allow takes; a setting at its
+// default is printed bare.
+func TestAllowMarksTheSettingsThatDifferFromTheirDefaults(t *testing.T) {
+	isolate(t)
+	ws, dir := devcontainerWith(t, allowRules, "hostrunner-rules.yaml")
+	other := filepath.Join(dir, "other-rules.yaml")
+	if err := os.WriteFile(other, []byte(allowRules), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var notAllowed *launch.NotAllowedError
+	flags := []string{"--no-mount-check", "--no-reread", "--grace", "1m", "--rules-file", other}
+	if err := upAllowCheck(t, ws, flags...); !errors.As(err, &notAllowed) {
+		t.Fatalf("up %v before the allow: got %v, want a *launch.NotAllowedError", flags, err)
+	}
+	stdout, _, err := runAllowCmd(t, "allow", ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "  settings:\n" +
+		"    ask_timeout: 10m0s\n" +
+		"    grace: 1m0s (default 15s)\n" +
+		"    mount_check: false (default true)\n" +
+		"    poll_interval: 2s\n" +
+		"    request_timeout: 10s\n" +
+		"    reread: false (default true)\n" +
+		"    rules_file: " + other + " (default " + filepath.Join(dir, "hostrunner-rules.yaml") + ")\n" +
+		"    startup_timeout: 30m0s\n"
+	if !strings.HasSuffix(stdout, want) {
+		t.Errorf("stdout:\n%s\nwant it to end with:\n%s", stdout, want)
 	}
 }
 
@@ -269,7 +354,7 @@ func TestAllowHonoursTheWorkspaceSettingsFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(stdout, "    grace: 2m0s\n") {
+	if !strings.Contains(stdout, "    grace: 2m0s (default 15s)\n") {
 		t.Errorf("stdout lacks the grace of the settings file:\n%s", stdout)
 	}
 	if !storeAllows(t, ws, allowRulesDigest, upSettings(t, ws)) {

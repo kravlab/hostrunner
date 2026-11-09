@@ -1,20 +1,23 @@
 // Package daemon runs host commands on behalf of hostrun clients.
 //
-// Each connection carries exactly one command. The daemon maps the client's
-// current directory onto the host workspace (the mirrored directory),
-// starts the command there, or in the fixed directory its rule names, with
-// the host's environment, streams its stdio over the connection and
-// finishes with the exit code. If the client disconnects, the command's process group is killed.
+// Each connection carries exactly one command. The daemon maps the
+// client's current directory onto the host workspace (the mirrored
+// directory), starts the command there, or in the fixed directory its
+// rule names, with the host's environment, streams its stdio over the
+// connection and finishes with the exit code. If the client disconnects,
+// the command's process group is killed.
 //
 // With an approval socket (WithApprovals), a command the rules refuse can
 // be approved by a human: the client asks with FrameAsk, and the request
-// waits for the answer of the approval session that serves the daemon (see
-// approvals.go). The approval socket lies outside what the container
-// mounts, and takes no frames from the container's socket, nor that socket
-// any of its frames. A session that adds a rule to the rules file makes the
-// daemon reread it (WithReread), and with WithRereadEvery the daemon
-// rereads it by itself once it changes (see reread.go). The session that
-// asks for them learns how the runs a human approved go (see runs.go).
+// waits for the answer of the approval session that serves the daemon
+// (see approvals.go). The approval socket lies outside what the container
+// mounts, and takes no frames from the container's socket, nor that
+// socket any of its frames; `hostrunner up` arms the daemon (FrameArm) on
+// the approval socket too, so only the host arms it. A session that adds
+// a rule to the rules file makes the daemon reread it (WithReread), and
+// with WithRereadEvery the daemon rereads it by itself once it changes
+// (see reread.go). The session that asks for them learns how the runs a
+// human approved go (see runs.go).
 package daemon
 
 import (
@@ -24,6 +27,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"maps"
 	"net"
 	"os"
 	"os/exec"
@@ -35,6 +39,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/kravlab/hostrunner/internal/allow"
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
 	"github.com/kravlab/hostrunner/internal/workspace"
@@ -57,25 +62,39 @@ type Server struct {
 	log              *slog.Logger
 	requestTimeout   time.Duration
 	askTimeout       time.Duration
-	onArm            func(a protocol.Arm, digest string) (stepAside bool)          // nil: arming changes nothing
-	rereadFile       func() (Policy, string, error)                                // nil: the rules are never reread
-	approvals        *approvals                                                    // nil: no approval socket, so nothing is approved
-	containerStopped func() bool                                                   // nil: the armed container is not known to have stopped
-	rereadEvery      time.Duration                                                 // 0: the rules file is not watched; see WithRereadEvery
-	allowed          func(digest string, settings map[string]string) (bool, error) // nil: every content of the rules file is allowed; see WithAllowed
-	allowRequest     func(digest string) error                                     // nil: no allow request is recorded; see WithAllowRequest
-	allowRecorder    func(digest string) error                                     // nil: no allow is recorded; see WithAllow
-	buildVersion     string                                                        // "": unknown; see WithBuildVersion
-	settings         map[string]string                                             // nil: none reported; see WithSettings
-	mountCheck       bool                                                          // false: the mounts are not checked; see WithMountCheck
-	mountOffHint     string                                                        // how a human on the host turns the check off; see WithMountCheck
-	mountResult      mountState                                                    // the latest result of the mount check; see MountChecked
+	onArm            func(a protocol.Arm, digest string) (stepAside bool) // nil: arming changes nothing
+	rereadFile       func() (Policy, string, error)                       // nil: the rules are never reread
+	approvals        *approvals                                           // nil: no approval socket, so nothing is approved
+	containerStopped func() bool                                          // nil: the armed container is not known to have stopped
+	rereadEvery      time.Duration                                        // 0: the rules file is not watched; see WithRereadEvery
+	allowed          func(allow.Scope) (bool, error)                      // nil: every content of the rules file is allowed; see WithAllowed
+	allowRequest     func(digest string) error                            // nil: no allow request is recorded; see WithAllowRequest
+	allowRecorder    func(digest string) error                            // nil: no allow is recorded; see WithAllowRecorder
+	buildVersion     string                                               // "": unknown; see WithBuildVersion
+	settings         map[string]string                                    // nil: none reported; see WithSettings
+	mount            mountChecker                                         // the mount check: noMountCheck unless WithMountCheck; see MountChecked
+	mountOffHint     *string                                              // nil: the mount check is off; see WithMountCheck
+
+	// The order of the locks: a goroutine takes one only while it holds
+	// none listed after it, so they never wait for each other in a cycle.
+	// approvals.takeovers, then the mount check's hold (see serveSession);
+	// rereading; noticing; then notAllowedMu, armMu and mu, each held
+	// alone; then the locks of the approvals and of the sessions'
+	// frameWriters, which take none of these. refuseNotAllowed and
+	// endNotAllowed release notAllowedMu before they take noticing (see
+	// noticeChanges), and a reread holding rereading may take noticing
+	// (see rereadRules).
 
 	// rereading makes rereads one at a time, so a slower one never
 	// replaces the rules a later one served.
-	rereading      sync.Mutex
-	unallowedMu    sync.Mutex      // guards unallowed; held across an allow check, so each refusal is reported once
-	unallowed      unallowedReport // the refusal pending; see refuseUnallowed
+	rereading    sync.Mutex
+	notAllowedMu sync.Mutex       // guards notAllowed; held across an allow check, so each refusal is reported once
+	notAllowed   notAllowedReport // the refusal pending; see refuseNotAllowed
+	// noticing guards noticed, and is held while the session serving is told
+	// of a change not allowed (see noticeChanges) and while a session starts
+	// serving (see serveSession), so a session is told of each change once.
+	noticing       sync.Mutex
+	noticed        []protocol.RulesNotAllowed // the changes not allowed pending, as the session serving was last told of them; see noticeChanges
 	mu             sync.Mutex
 	stopServe      context.CancelFunc                 // stops the running Serve; nil when not serving
 	closeListeners func()                             // closes the running Serve's sockets; nil when not serving
@@ -87,7 +106,7 @@ type Server struct {
 	confirming     bool                               // a drain began and is not confirmed yet; see drain
 	draining       chan struct{}                      // closed once a stop drains the daemon
 	armMu          sync.Mutex                         // guards armNotAllowed
-	armNotAllowed  *protocol.ArmNotAllowed            // the change the last arm reported not allowed; nil for none; see armWarning
+	armNotAllowed  *protocol.ArmNotAllowed            // the change the last arm reported not allowed; nil for none; see pendingChanges
 }
 
 // Policy decides whether a command may run; rules.Policy implements it. A
@@ -180,7 +199,8 @@ func (s *Server) rules() Policy {
 // called once the file is read, parsed and has the digest want, and
 // before the new rules are served, and if it fails the old rules stay and
 // its error is returned. New rules served end a pending refusal of
-// content not allowed (see refuseUnallowed).
+// content not allowed (see refuseNotAllowed and endNotAllowed), which
+// takes noticing while rereading is held.
 func (s *Server) rereadRules(want string, record func(digest string) error) (digest string, changed bool, err error) {
 	if s.rereadFile == nil {
 		return "", false, errors.New("this daemon does not reread its rules")
@@ -205,7 +225,7 @@ func (s *Server) rereadRules(want string, record func(digest string) error) (dig
 	s.mu.Lock()
 	s.policy, s.digest = p, digest
 	s.mu.Unlock()
-	s.endUnallowed()
+	s.endNotAllowed()
 	return digest, true, nil
 }
 
@@ -220,9 +240,15 @@ func New(mapper *workspace.Mapper, policy Policy, log *slog.Logger, opts ...Opti
 		mapper: mapper, policy: policy, log: log,
 		requestTimeout: defaultRequestTimeout, askTimeout: defaultAskTimeout,
 		running: map[uint64]protocol.RunningCommand{}, draining: make(chan struct{}),
+		mount: noMountCheck{},
 	}
 	for _, opt := range opts {
 		opt(s)
+	}
+	// After the options, so that WithMountCheck and WithApprovals work in
+	// any order.
+	if s.mountOffHint != nil {
+		s.mount = &mountState{log: s.log, approvals: s.approvals, offHint: *s.mountOffHint}
 	}
 	return s
 }
@@ -311,7 +337,9 @@ func isTemporary(err error) bool {
 	return false
 }
 
-// handle serves one connection: an arm request, a dry run or one command.
+// handle serves one connection to the container's socket: a dry run or
+// one command. An arm is refused (see readOpening): only the approval
+// socket takes it (see handleSession).
 // Cancelling ctx, or the client going away, kills the command without
 // reporting a result.
 func (s *Server) handle(ctx context.Context, conn net.Conn) {
@@ -340,10 +368,6 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 	_ = conn.SetReadDeadline(time.Time{})
 	if err != nil {
 		s.reject(out, protocol.ExitHostrunError, err.Error(), err)
-		return
-	}
-	if f.Type == protocol.FrameArm {
-		s.arm(out, f)
 		return
 	}
 	if f.Type == protocol.FrameAsk {
@@ -376,7 +400,7 @@ var dryRunLogArgs = []any{"dry_run", true}
 // checks opened, never starting the command or reading stdin. The answer
 // carries the warning of the daemon (see pendingAllowWarning).
 func (s *Server) dryRun(out *frameWriter, req protocol.Request) {
-	if r := s.mountRefusal(); r != nil {
+	if r := s.mount.refusal(); r != nil {
 		s.reject(out, r.code, r.message, r.err, dryRunLogArgs...)
 		return
 	}
@@ -394,11 +418,15 @@ func (s *Server) dryRun(out *frameWriter, req protocol.Request) {
 	_ = out.writeJSON(protocol.FrameAllowed, protocol.Allowed{Rule: p.rule, Dir: p.fixedDir, Secrets: p.secrets, Approval: p.approval, Warning: s.pendingAllowWarning()})
 }
 
-// arm handles FrameArm from `hostrunner up`. When the handler steps aside,
-// the answer is written before Serve is stopped, since stopping
+// arm handles FrameArm from `hostrunner up`, which reaches the daemon on
+// its approval socket only (see handleSession). When the handler steps
+// aside, the answer is written before Serve is stopped, since stopping
 // closes every connection. The change the arm reports not allowed
 // (protocol.Arm.NotAllowed) replaces the one an earlier arm reported, and
-// an arm without one ends it (see armWarning).
+// an arm without one ends it (see pendingChanges); it is logged with its
+// digest and whether its settings differ from the daemon's, and the
+// session serving the daemon is told of it unless it was told of it
+// already, or the allow store allows it by now (see noticeChanges).
 func (s *Server) arm(out *frameWriter, f protocol.Frame) {
 	var a protocol.Arm
 	if err := protocol.DecodeJSON(f, &a); err != nil {
@@ -415,6 +443,11 @@ func (s *Server) arm(out *frameWriter, f protocol.Frame) {
 	s.armMu.Unlock()
 	stepAside := s.onArm != nil && s.onArm(a, s.rulesDigest())
 	s.log.Info("armed by hostrunner up", "step_aside", stepAside)
+	if na != nil {
+		s.log.Warn("hostrunner up reported a change not allowed: the daemon keeps the old rules and settings until `"+protocol.AllowCommand+"`",
+			"digest", na.Digest, "settings_differ", !maps.Equal(na.Settings, s.settings))
+	}
+	s.noticeChanges()
 	_ = out.writeJSON(protocol.FrameArmed, protocol.Armed{Version: protocol.Version, Restart: stepAside})
 	if stepAside {
 		s.mu.Lock()
@@ -576,7 +609,7 @@ type exchange struct {
 // initial credit it sends once the command started carries the warning of
 // the daemon (see pendingAllowWarning).
 func (s *Server) run(ctx context.Context, x exchange, req protocol.Request) {
-	if r := s.mountRefusal(); r != nil {
+	if r := s.mount.refusal(); r != nil {
 		s.reject(x.out, r.code, r.message, r.err)
 		return
 	}
@@ -702,15 +735,14 @@ func (s *Server) reject(out *frameWriter, code int, message string, err error, l
 // pendingAllowWarning returns the warning the daemon gives a hostrun
 // client in the first answer of an exchange (the initial credit, waiting,
 // allowed or error frame; see protocol.Credit), computed as the frame is
-// written; "" when there is none. It joins, with "; ", the warnings of the pending
-// refusal of the rules file's content (see notAllowedWarning) and of the
-// change the last arm reported not allowed (see armWarning).
+// written; "" when there is none. It joins, with "; ", the texts of the
+// changes not allowed pending (see pendingChanges): of the refusal of the
+// rules file's content, then of the change the last arm reported, so it
+// names what the session serving the daemon is told of.
 func (s *Server) pendingAllowWarning() string {
 	var texts []string
-	for _, w := range []string{s.notAllowedWarning(), s.armWarning(s.pendingUnallowed())} {
-		if w != "" {
-			texts = append(texts, w)
-		}
+	for _, n := range s.pendingChanges() {
+		texts = append(texts, n.Text())
 	}
 	return strings.Join(texts, "; ")
 }
@@ -845,35 +877,53 @@ func pathMessage(name string, err error) string {
 }
 
 // readOpening reads the opening frame of a connection to the container's
-// socket (FrameRequest, FrameDryRun, FrameAsk or FrameArm) and checks its
-// protocol version before anything else, so a frame shaped by a newer
-// protocol is reported as a version mismatch rather than a decoding error.
-// A request whose JSON would decode with U+FFFD in place of what its
-// client wrote is refused next (errNotUTF8). Every other frame, the
-// approval socket's included, is refused.
+// socket (FrameRequest, FrameDryRun or FrameAsk) and checks its protocol
+// version before anything else (see checkVersion). A request whose JSON
+// would decode with U+FFFD in place of what its client wrote is refused
+// next (errNotUTF8). FrameArm is refused (errArmOnContainerSocket): the
+// container reaches this socket, and an arm from it could forge or end
+// the warning of a change not allowed, put the mount check back to
+// pending or make the daemon step aside. Every other frame, the approval
+// socket's included, is refused.
 func readOpening(conn net.Conn) (protocol.Frame, error) {
 	f, err := protocol.ReadFrame(conn)
 	if err != nil {
 		return f, fmt.Errorf("read request: %w", err)
 	}
 	switch f.Type {
-	case protocol.FrameRequest, protocol.FrameDryRun, protocol.FrameAsk, protocol.FrameArm:
+	case protocol.FrameRequest, protocol.FrameDryRun, protocol.FrameAsk:
+	case protocol.FrameArm:
+		return f, errArmOnContainerSocket
 	default:
 		return f, fmt.Errorf("expected a request frame, got type %d", f.Type)
 	}
+	if err := checkVersion(f); err != nil {
+		return f, err
+	}
+	if !protocol.DecodesLosslessly(f.Payload) {
+		return f, errNotUTF8
+	}
+	return f, nil
+}
+
+// errArmOnContainerSocket refuses an arm on the container's socket: only
+// the approval socket, which only the host reaches, takes one.
+var errArmOnContainerSocket = errors.New("an arm is taken on the approval socket only, from hostrunner up on the host")
+
+// checkVersion checks the protocol version of f, a request or an arm,
+// before anything else is decoded, so a frame shaped by a newer protocol
+// is reported as a version mismatch rather than a decoding error.
+func checkVersion(f protocol.Frame) error {
 	var header struct {
 		Version int `json:"version"`
 	}
 	if err := protocol.DecodeJSON(f, &header); err != nil {
-		return f, err
+		return err
 	}
 	if header.Version != protocol.Version {
-		return f, fmt.Errorf("protocol version mismatch: client %d, daemon %d", header.Version, protocol.Version)
+		return fmt.Errorf("protocol version mismatch: client %d, daemon %d", header.Version, protocol.Version)
 	}
-	if f.Type != protocol.FrameArm && !protocol.DecodesLosslessly(f.Payload) {
-		return f, errNotUTF8
-	}
-	return f, nil
+	return nil
 }
 
 // errNotUTF8 refuses a request that would decode to another argv or

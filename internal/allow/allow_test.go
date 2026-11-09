@@ -17,6 +17,21 @@ func daemonSettings() map[string]string {
 	return map[string]string{"reread": "true", "ask_timeout": "5m"}
 }
 
+// target returns the Target of a rules file, digest and daemon settings.
+func target(rulesFile, digest string, settings map[string]string) allow.Target {
+	return allow.NewTarget(rulesFile, digest, settings)
+}
+
+// TestNewTarget checks that NewTarget puts each argument in its field.
+func TestNewTarget(t *testing.T) {
+	settings := daemonSettings()
+	got := allow.NewTarget("/w/rules.yaml", "d1", settings)
+	want := allow.Target{RulesFile: "/w/rules.yaml", Scope: allow.Scope{Digest: "d1", Settings: settings}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("NewTarget = %+v, want %+v", got, want)
+	}
+}
+
 // fakeGetenv returns a getenv over env; every other variable is empty.
 func fakeGetenv(env map[string]string) func(string) string {
 	return func(k string) string { return env[k] }
@@ -33,7 +48,7 @@ func newStore(t *testing.T) allow.Store {
 // failing the test on an error.
 func mustAllowed(t *testing.T, s allow.Store, ws, digest string, settings map[string]string) bool {
 	t.Helper()
-	ok, err := s.Allowed(ws, digest, settings)
+	ok, err := s.Allowed(ws, allow.Scope{Digest: digest, Settings: settings})
 	if err != nil {
 		t.Fatalf("Allowed(%q): %v", ws, err)
 	}
@@ -69,15 +84,13 @@ func TestOpenFailsWithoutXDGDataHomeAndHome(t *testing.T) {
 func TestAllowedWorkspaceWithSameDigestAndSettingsIsAllowed(t *testing.T) {
 	s := newStore(t)
 	ws := t.TempDir()
-	e, err := s.Allow(ws, "/ws/.devcontainer/hostrunner-rules.yaml", "abc123", daemonSettings())
+	e, err := s.Allow(ws, target("/ws/.devcontainer/hostrunner-rules.yaml", "abc123", daemonSettings()))
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := allow.Entry{
 		Workspace: evalDir(t, ws),
-		RulesFile: "/ws/.devcontainer/hostrunner-rules.yaml",
-		Digest:    "abc123",
-		Settings:  map[string]string{"reread": "true", "ask_timeout": "5m"},
+		Target:    target("/ws/.devcontainer/hostrunner-rules.yaml", "abc123", map[string]string{"reread": "true", "ask_timeout": "5m"}),
 	}
 	if !reflect.DeepEqual(e, want) {
 		t.Fatalf("Entry = %+v, want %+v", e, want)
@@ -90,7 +103,7 @@ func TestAllowedWorkspaceWithSameDigestAndSettingsIsAllowed(t *testing.T) {
 func TestDifferentDigestIsNotAllowed(t *testing.T) {
 	s := newStore(t)
 	ws := t.TempDir()
-	if _, err := s.Allow(ws, "rules.yaml", "abc123", daemonSettings()); err != nil {
+	if _, err := s.Allow(ws, target("rules.yaml", "abc123", daemonSettings())); err != nil {
 		t.Fatal(err)
 	}
 	if mustAllowed(t, s, ws, "def456", daemonSettings()) {
@@ -101,7 +114,7 @@ func TestDifferentDigestIsNotAllowed(t *testing.T) {
 func TestChangedSettingsAreNotAllowed(t *testing.T) {
 	s := newStore(t)
 	ws := t.TempDir()
-	if _, err := s.Allow(ws, "rules.yaml", "abc123", daemonSettings()); err != nil {
+	if _, err := s.Allow(ws, target("rules.yaml", "abc123", daemonSettings())); err != nil {
 		t.Fatal(err)
 	}
 	changed := daemonSettings()
@@ -118,7 +131,7 @@ func TestChangedSettingsAreNotAllowed(t *testing.T) {
 
 func TestWorkspaceNeverAllowedIsNotAllowedWithoutStoreDir(t *testing.T) {
 	s := newStore(t)
-	ok, err := s.Allowed(t.TempDir(), "abc123", daemonSettings())
+	ok, err := s.Allowed(t.TempDir(), allow.Scope{Digest: "abc123", Settings: daemonSettings()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,10 +143,10 @@ func TestWorkspaceNeverAllowedIsNotAllowedWithoutStoreDir(t *testing.T) {
 func TestAllowReplacesTheEarlierAllowOfTheWorkspace(t *testing.T) {
 	s := newStore(t)
 	ws := t.TempDir()
-	if _, err := s.Allow(ws, "rules.yaml", "contentA", daemonSettings()); err != nil {
+	if _, err := s.Allow(ws, target("rules.yaml", "contentA", daemonSettings())); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Allow(ws, "rules.yaml", "contentB", daemonSettings()); err != nil {
+	if _, err := s.Allow(ws, target("rules.yaml", "contentB", daemonSettings())); err != nil {
 		t.Fatal(err)
 	}
 	if !mustAllowed(t, s, ws, "contentB", daemonSettings()) {
@@ -147,7 +160,7 @@ func TestAllowReplacesTheEarlierAllowOfTheWorkspace(t *testing.T) {
 func TestAllowOfOneWorkspaceDoesNotAllowAnother(t *testing.T) {
 	s := newStore(t)
 	x, y := t.TempDir(), t.TempDir()
-	if _, err := s.Allow(x, "rules.yaml", "abc123", daemonSettings()); err != nil {
+	if _, err := s.Allow(x, target("rules.yaml", "abc123", daemonSettings())); err != nil {
 		t.Fatal(err)
 	}
 	if mustAllowed(t, s, y, "abc123", daemonSettings()) {
@@ -158,7 +171,7 @@ func TestAllowOfOneWorkspaceDoesNotAllowAnother(t *testing.T) {
 func TestDenyRemovesTheAllow(t *testing.T) {
 	s := newStore(t)
 	ws := t.TempDir()
-	if _, err := s.Allow(ws, "rules.yaml", "abc123", daemonSettings()); err != nil {
+	if _, err := s.Allow(ws, target("rules.yaml", "abc123", daemonSettings())); err != nil {
 		t.Fatal(err)
 	}
 	removed, err := s.Deny(ws)
@@ -192,7 +205,7 @@ func TestWorkspaceReachedThroughSymlinkIsTheSameWorkspace(t *testing.T) {
 	if err := os.Symlink(real, link); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Allow(real, "rules.yaml", "abc123", daemonSettings()); err != nil {
+	if _, err := s.Allow(real, target("rules.yaml", "abc123", daemonSettings())); err != nil {
 		t.Fatal(err)
 	}
 	if !mustAllowed(t, s, link, "abc123", daemonSettings()) {
@@ -210,7 +223,7 @@ func TestWorkspaceReachedThroughSymlinkIsTheSameWorkspace(t *testing.T) {
 func TestUnresolvableWorkspaceIsKeyedByItsCleanedPath(t *testing.T) {
 	s := newStore(t)
 	ws := filepath.Join(t.TempDir(), "gone", "..", "missing")
-	if _, err := s.Allow(ws, "rules.yaml", "abc123", daemonSettings()); err != nil {
+	if _, err := s.Allow(ws, target("rules.yaml", "abc123", daemonSettings())); err != nil {
 		t.Fatal(err)
 	}
 	if !mustAllowed(t, s, filepath.Clean(ws), "abc123", daemonSettings()) {
@@ -222,7 +235,7 @@ func TestStoreDirIs0700AndAllowFileIs0600WithNoTempFilesLeft(t *testing.T) {
 	s := newStore(t)
 	ws := t.TempDir()
 	for _, d := range []string{"contentA", "contentB"} {
-		if _, err := s.Allow(ws, "rules.yaml", d, daemonSettings()); err != nil {
+		if _, err := s.Allow(ws, target("rules.yaml", d, daemonSettings())); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -255,7 +268,7 @@ func TestStoreDirIs0700AndAllowFileIs0600WithNoTempFilesLeft(t *testing.T) {
 func TestCorruptAllowFileIsAnErrorNamingTheFile(t *testing.T) {
 	s := newStore(t)
 	ws := t.TempDir()
-	if _, err := s.Allow(ws, "rules.yaml", "abc123", daemonSettings()); err != nil {
+	if _, err := s.Allow(ws, target("rules.yaml", "abc123", daemonSettings())); err != nil {
 		t.Fatal(err)
 	}
 	ents, err := os.ReadDir(s.Dir)
@@ -266,7 +279,7 @@ func TestCorruptAllowFileIsAnErrorNamingTheFile(t *testing.T) {
 	if err := os.WriteFile(file, []byte("not json"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	ok, err := s.Allowed(ws, "abc123", daemonSettings())
+	ok, err := s.Allowed(ws, allow.Scope{Digest: "abc123", Settings: daemonSettings()})
 	if err == nil {
 		t.Fatal("Allowed returned no error for a corrupt file")
 	}
@@ -320,7 +333,7 @@ func requestFile(t *testing.T, s allow.Store) string {
 func TestPendingReturnsTheRequestRecorded(t *testing.T) {
 	s := newStore(t)
 	ws := t.TempDir()
-	if err := s.Request(ws, "/ws/.devcontainer/hostrunner-rules.yaml", "abc123", daemonSettings()); err != nil {
+	if err := s.Request(ws, target("/ws/.devcontainer/hostrunner-rules.yaml", "abc123", daemonSettings())); err != nil {
 		t.Fatal(err)
 	}
 	e, ok := mustPending(t, s, ws)
@@ -329,9 +342,7 @@ func TestPendingReturnsTheRequestRecorded(t *testing.T) {
 	}
 	want := allow.Entry{
 		Workspace: evalDir(t, ws),
-		RulesFile: "/ws/.devcontainer/hostrunner-rules.yaml",
-		Digest:    "abc123",
-		Settings:  map[string]string{"reread": "true", "ask_timeout": "5m"},
+		Target:    target("/ws/.devcontainer/hostrunner-rules.yaml", "abc123", map[string]string{"reread": "true", "ask_timeout": "5m"}),
 	}
 	if e.Workspace != want.Workspace || e.RulesFile != want.RulesFile || e.Digest != want.Digest || !maps.Equal(e.Settings, want.Settings) {
 		t.Fatalf("Pending = %+v, want %+v", e, want)
@@ -344,7 +355,7 @@ func TestPendingWithoutARequestIsNone(t *testing.T) {
 	if _, ok := mustPending(t, s, ws); ok {
 		t.Fatal("a request is pending in an empty store")
 	}
-	if _, err := s.Allow(ws, "rules.yaml", "abc123", daemonSettings()); err != nil {
+	if _, err := s.Allow(ws, target("rules.yaml", "abc123", daemonSettings())); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := mustPending(t, s, ws); ok {
@@ -355,10 +366,10 @@ func TestPendingWithoutARequestIsNone(t *testing.T) {
 func TestASecondRequestReplacesTheFirst(t *testing.T) {
 	s := newStore(t)
 	ws := t.TempDir()
-	if err := s.Request(ws, "rules.yaml", "contentA", daemonSettings()); err != nil {
+	if err := s.Request(ws, target("rules.yaml", "contentA", daemonSettings())); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Request(ws, "other.yaml", "contentB", map[string]string{"grace": "1m0s"}); err != nil {
+	if err := s.Request(ws, target("other.yaml", "contentB", map[string]string{"grace": "1m0s"})); err != nil {
 		t.Fatal(err)
 	}
 	other, err := filepath.Abs("other.yaml")
@@ -375,7 +386,7 @@ func TestASecondRequestReplacesTheFirst(t *testing.T) {
 func TestRequestOfOneWorkspaceIsNotPendingForAnother(t *testing.T) {
 	s := newStore(t)
 	x, y := t.TempDir(), t.TempDir()
-	if err := s.Request(x, "rules.yaml", "abc123", daemonSettings()); err != nil {
+	if err := s.Request(x, target("rules.yaml", "abc123", daemonSettings())); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := mustPending(t, s, y); ok {
@@ -386,10 +397,10 @@ func TestRequestOfOneWorkspaceIsNotPendingForAnother(t *testing.T) {
 func TestAllowRemovesTheRequest(t *testing.T) {
 	s := newStore(t)
 	ws := t.TempDir()
-	if err := s.Request(ws, "rules.yaml", "abc123", daemonSettings()); err != nil {
+	if err := s.Request(ws, target("rules.yaml", "abc123", daemonSettings())); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Allow(ws, "rules.yaml", "abc123", daemonSettings()); err != nil {
+	if _, err := s.Allow(ws, target("rules.yaml", "abc123", daemonSettings())); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := mustPending(t, s, ws); ok {
@@ -403,10 +414,10 @@ func TestAllowRemovesTheRequest(t *testing.T) {
 func TestDenyLeavesTheRequest(t *testing.T) {
 	s := newStore(t)
 	ws := t.TempDir()
-	if _, err := s.Allow(ws, "rules.yaml", "abc123", daemonSettings()); err != nil {
+	if _, err := s.Allow(ws, target("rules.yaml", "abc123", daemonSettings())); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Request(ws, "rules.yaml", "def456", daemonSettings()); err != nil {
+	if err := s.Request(ws, target("rules.yaml", "def456", daemonSettings())); err != nil {
 		t.Fatal(err)
 	}
 	if removed, err := s.Deny(ws); err != nil || !removed {
@@ -421,7 +432,7 @@ func TestDenyLeavesTheRequest(t *testing.T) {
 func TestCorruptRequestFileIsAnErrorNamingTheFile(t *testing.T) {
 	s := newStore(t)
 	ws := t.TempDir()
-	if err := s.Request(ws, "rules.yaml", "abc123", daemonSettings()); err != nil {
+	if err := s.Request(ws, target("rules.yaml", "abc123", daemonSettings())); err != nil {
 		t.Fatal(err)
 	}
 	file := requestFile(t, s)
@@ -442,7 +453,7 @@ func TestCorruptRequestFileIsAnErrorNamingTheFile(t *testing.T) {
 
 func TestStoreDirIs0700AndRequestFileIs0600(t *testing.T) {
 	s := newStore(t)
-	if err := s.Request(t.TempDir(), "rules.yaml", "abc123", daemonSettings()); err != nil {
+	if err := s.Request(t.TempDir(), target("rules.yaml", "abc123", daemonSettings())); err != nil {
 		t.Fatal(err)
 	}
 	di, err := os.Stat(s.Dir)
@@ -472,16 +483,16 @@ func TestStoreWithoutAnAbsoluteDirFails(t *testing.T) {
 	t.Chdir(cwd)
 	ws := t.TempDir()
 	for _, s := range []allow.Store{{}, {Dir: "allow"}} {
-		if _, err := s.Allow(ws, "rules.yaml", "abc123", daemonSettings()); err == nil {
+		if _, err := s.Allow(ws, target("rules.yaml", "abc123", daemonSettings())); err == nil {
 			t.Errorf("Store%+v.Allow: got no error", s)
 		}
-		if err := s.Request(ws, "rules.yaml", "abc123", daemonSettings()); err == nil {
+		if err := s.Request(ws, target("rules.yaml", "abc123", daemonSettings())); err == nil {
 			t.Errorf("Store%+v.Request: got no error", s)
 		}
 		if _, err := s.Deny(ws); err == nil {
 			t.Errorf("Store%+v.Deny: got no error", s)
 		}
-		if _, err := s.Allowed(ws, "abc123", daemonSettings()); err == nil {
+		if _, err := s.Allowed(ws, allow.Scope{Digest: "abc123", Settings: daemonSettings()}); err == nil {
 			t.Errorf("Store%+v.Allowed: got no error", s)
 		}
 		if _, _, err := s.Pending(ws); err == nil {
@@ -513,19 +524,17 @@ func TestAllowedMatchesARulesFileNamedThroughALink(t *testing.T) {
 	if err := os.WriteFile(realRules, nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Request(link, linkRules, "abc123", map[string]string{"rules_file": linkRules, "grace": "15s"}); err != nil {
+	if err := s.Request(link, target(linkRules, "abc123", map[string]string{"rules_file": linkRules, "grace": "15s"})); err != nil {
 		t.Fatal(err)
 	}
 	want := allow.Entry{
 		Workspace: real,
-		RulesFile: realRules,
-		Digest:    "abc123",
-		Settings:  map[string]string{"rules_file": realRules, "grace": "15s"},
+		Target:    target(realRules, "abc123", map[string]string{"rules_file": realRules, "grace": "15s"}),
 	}
 	if e, ok := mustPending(t, s, link); !ok || !reflect.DeepEqual(e, want) {
 		t.Fatalf("Pending = %+v, %v, want %+v", e, ok, want)
 	}
-	e, err := s.Allow(link, linkRules, "abc123", map[string]string{"rules_file": linkRules, "grace": "15s"})
+	e, err := s.Allow(link, target(linkRules, "abc123", map[string]string{"rules_file": linkRules, "grace": "15s"}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -548,12 +557,12 @@ func TestAllowHoldsAMissingRulesFileByItsCleanedPath(t *testing.T) {
 	s := newStore(t)
 	ws := t.TempDir()
 	missing := evalDir(t, ws) + "/gone/../missing.yaml"
-	e, err := s.Allow(ws, missing, "missing", map[string]string{"rules_file": missing})
+	e, err := s.Allow(ws, target(missing, "missing", map[string]string{"rules_file": missing}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	clean := filepath.Join(evalDir(t, ws), "missing.yaml")
-	want := allow.Entry{Workspace: evalDir(t, ws), RulesFile: clean, Digest: "missing", Settings: map[string]string{"rules_file": clean}}
+	want := allow.Entry{Workspace: evalDir(t, ws), Target: target(clean, "missing", map[string]string{"rules_file": clean})}
 	if !reflect.DeepEqual(e, want) {
 		t.Fatalf("Allow = %+v, want %+v", e, want)
 	}

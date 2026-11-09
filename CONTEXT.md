@@ -102,10 +102,10 @@ The host process that runs one devcontainer's commands and
 lives as long as its armed container.
 
 **Arm**:
-The signal `hostrunner up` gives the daemon each time the
-devcontainer tooling brings a container of its workspace up,
-carrying the digest of the rules and the daemon settings it
-resolved.
+The signal `hostrunner up` gives the daemon, on its approval
+socket, each time the devcontainer tooling brings a container
+of its workspace up, carrying the digest of the rules and the
+daemon settings it resolved; the container cannot give one.
 _Avoid_: rearm
 
 **Armed container**:
@@ -215,7 +215,8 @@ others.
 
 **Mount check**:
 The daemon's check that its armed container cannot write the files that
-configure the workspace's devcontainer and daemon. A human on the host
+configure the workspace's devcontainer and daemon, through a bind mount
+or a volume that binds a host directory. A human on the host
 may turn it off for a workspace (`mount_check`); the container cannot.
 _Avoid_: read-only check, writable warning
 
@@ -277,7 +278,8 @@ let through. Runs the rules allow are not approved runs.
 **Notice**:
 What the daemon tells an approval session of its own accord, not
 as the outcome of what the human typed: an approved run's start
-line or summary, a reread of the rules.
+line or summary, a reread of the rules, rules or daemon settings
+changed but not allowed.
 _Avoid_: message, event
 
 **Approval socket**:

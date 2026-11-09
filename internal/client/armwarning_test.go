@@ -3,9 +3,14 @@ package client_test
 import (
 	"errors"
 	"log/slog"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/kravlab/hostrunner/internal/allow"
 	"github.com/kravlab/hostrunner/internal/daemon"
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
@@ -86,7 +91,7 @@ func TestArmedChangeNotAllowedIsWarnedOf(t *testing.T) {
 // Once the store allows the change armed, hostrun warns of nothing.
 func TestNoWarningOnceTheArmedChangeIsAllowed(t *testing.T) {
 	h, a, digest := startArmedDaemon(t)
-	if _, err := a.store.Allow(a.workspace, h.rulesFile, digest, armedSettings); err != nil {
+	if _, err := a.store.Allow(a.workspace, allow.Target{RulesFile: h.rulesFile, Scope: allow.Scope{Digest: digest, Settings: armedSettings}}); err != nil {
 		t.Fatal(err)
 	}
 	noWarning(t, h)
@@ -142,7 +147,7 @@ func TestArmedChangeAndARefusedEditAreWarnedOfTogether(t *testing.T) {
 // warned of in the words of a check that failed, not of one that found it
 // not allowed: for an edit of the rules file as for other settings.
 func TestArmedChangeWhoseAllowCannotBeCheckedIsWarnedOfInItsOwnWords(t *testing.T) {
-	broken := daemon.WithAllowed(func(string, map[string]string) (bool, error) {
+	broken := daemon.WithAllowed(func(allow.Scope) (bool, error) {
 		return false, errors.New("the allow store is broken")
 	})
 	t.Run("rules file", func(t *testing.T) {
@@ -164,4 +169,216 @@ func TestArmedChangeWhoseAllowCannotBeCheckedIsWarnedOfInItsOwnWords(t *testing.
 			t.Fatalf("got %+v, want the warning of a change not checked", got)
 		}
 	})
+}
+
+// armOnContainerSocket sends a on the container's socket of h, as a
+// process in the container could, and checks that the daemon refuses it
+// as a protocol error.
+func (h harness) armOnContainerSocket(t *testing.T, a protocol.Arm) {
+	t.Helper()
+	conn, err := h.transport.Dial(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	a.Version = protocol.Version
+	if err := protocol.WriteJSON(conn, protocol.FrameArm, a); err != nil {
+		t.Fatal(err)
+	}
+	f, err := protocol.ReadFrame(conn)
+	var e protocol.Error
+	if err != nil || f.Type != protocol.FrameError || protocol.DecodeJSON(f, &e) != nil || e.Code != protocol.ExitHostrunError {
+		t.Fatalf("frame %v %+v, err %v; want an error %d", f.Type, e, err, protocol.ExitHostrunError)
+	}
+}
+
+// An arm on the container's socket is refused and changes nothing: it
+// neither forges the warning of a change not allowed nor ends the one an
+// arm of up reported.
+func TestAnArmOnTheContainersSocketChangesNoWarning(t *testing.T) {
+	a := newAllowStore(t)
+	h := a.startDaemon(t, slog.New(slog.DiscardHandler), echoRules)
+	digest := rules.ContentDigest([]byte(echoRules))
+	h.armOnContainerSocket(t, protocol.Arm{NotAllowed: &protocol.ArmNotAllowed{Digest: digest, Settings: armedSettings}})
+	noWarning(t, h)
+
+	h.armNotAllowed(t, digest, armedSettings)
+	h.armOnContainerSocket(t, protocol.Arm{ConfigDigest: digest})
+	want := result{stdout: "old\n", stderr: "hostrun: warning: " + changeNotAllowedText(digest) + "\n"}
+	if got := h.run(t, containerRoot, "", "echo", "old"); got != want {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+}
+
+// armNotAllowedLog is how the daemon logs a change an arm of up reported
+// not allowed, of the given digest, whose settings differ from the
+// daemon's or not.
+func armNotAllowedLog(digest string, settingsDiffer bool) string {
+	return "msg=\"hostrunner up reported a change not allowed: the daemon keeps the old rules and settings until `hostrunner allow`\" digest=" +
+		digest + " settings_differ=" + strconv.FormatBool(settingsDiffer)
+}
+
+// A change an arm of up reports not allowed is logged, with its digest
+// and whether its settings differ, and shown in the session serving the
+// daemon, in the words of hostrun's warning.
+func TestArmedChangeNotAllowedIsLoggedAndShownInTheSession(t *testing.T) {
+	digest := rules.ContentDigest([]byte(touchRules))
+	for _, tt := range []struct {
+		name     string
+		settings map[string]string
+		differ   bool
+		notice   string
+	}{
+		{"other settings", armedSettings, true, "\n" + changeNotAllowedText(digest) + "\n"},
+		{"the daemon's settings", allowSettings, false, notAllowedNotice(digest)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var log lockedBuffer
+			a := newAllowStore(t)
+			h := a.startDaemon(t, slog.New(slog.NewTextHandler(&log, nil)), echoRules)
+			s := h.startSession(t)
+			if !tt.differ {
+				// With the daemon's own settings, up reports the rules file
+				// as it found it: holding the edit.
+				writeRules(t, h.rulesFile, touchRules)
+			}
+			h.armNotAllowed(t, digest, tt.settings)
+			waitForLog(t, &log, armNotAllowedLog(digest, tt.differ))
+			s.waitFor(t, tt.notice)
+		})
+	}
+}
+
+// A change an arm reports not allowed whose allow cannot be checked is
+// shown in the session as not checked.
+func TestArmedChangeNotCheckedIsShownInTheSession(t *testing.T) {
+	h := startRereadingDaemon(t, slog.New(slog.DiscardHandler), echoRules, daemon.WithSettings(allowSettings),
+		daemon.WithAllowed(func(allow.Scope) (bool, error) { return false, errors.New("the allow store is broken") }))
+	s := h.startSession(t)
+	digest := rules.ContentDigest([]byte(touchRules))
+	h.armNotAllowed(t, digest, armedSettings)
+	s.waitFor(t, "\n"+changeNotCheckedText(digest)+"\n")
+}
+
+// An edit the daemon refused is shown in the session when it is first
+// refused; an arm of up that reports the same edit not allowed, with the
+// daemon's own settings, shows it no more, though a later edit is shown.
+func TestArmedEditTheDaemonRefusedIsShownInTheSessionOnce(t *testing.T) {
+	a := newAllowStore(t)
+	h := a.startDaemon(t, slog.New(slog.DiscardHandler), echoRules)
+	s := h.startSession(t)
+	writeRules(t, h.rulesFile, touchRules)
+	digest := rules.ContentDigest([]byte(touchRules))
+	s.waitFor(t, notAllowedNotice(digest))
+	h.armNotAllowed(t, digest, allowSettings)
+	// A later edit is told after the arm's notice, if there is one.
+	writeRules(t, h.rulesFile, handDate)
+	got := s.waitFor(t, notAllowedNotice(rules.ContentDigest([]byte(handDate))))
+	if strings.Contains(got, digest) {
+		t.Fatalf("the session shows the edit again after the arm: %q", got)
+	}
+}
+
+// An edit the daemon refused while no session served is shown in the
+// session that starts serving later, and an arm of up that reports the same
+// edit not allowed, with the daemon's own settings, shows it no more: the
+// session is shown it once.
+func TestArmedEditRefusedBeforeTheSessionStartedIsShownInTheSessionOnce(t *testing.T) {
+	h, _, _, digest := pendingEdit(t)
+	s := h.startSession(t)
+	s.waitFor(t, notAllowedNotice(digest))
+	h.armNotAllowed(t, digest, allowSettings)
+	// A later edit is told after the arm's notice, if there is one.
+	writeRules(t, h.rulesFile, handDate)
+	got := s.waitFor(t, notAllowedNotice(rules.ContentDigest([]byte(handDate))))
+	if strings.Contains(got, digest) {
+		t.Fatalf("the session shows the edit again after the arm: %q", got)
+	}
+}
+
+// replaceRules replaces the rules file at path, at once, with a symbolic
+// link to target, or with a file holding content when target is "", as an
+// editor that saves by rename does.
+func replaceRules(t *testing.T, path, target, content string) {
+	t.Helper()
+	tmp := path + ".new"
+	var err error
+	if target != "" {
+		err = os.Symlink(target, tmp)
+	} else {
+		err = os.WriteFile(tmp, []byte(content), 0o644)
+	}
+	if err == nil {
+		err = os.Rename(tmp, path)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// An arm of up that reports an edit not allowed, with the daemon's own
+// settings, before the daemon refused the edit itself is noticed once: the
+// daemon refusing the same edit at a later look notices nothing more. Until
+// the arm is made, the rules file is a link to itself, which the daemon
+// cannot read, so its look at the edit comes after the arm.
+func TestArmedEditTheDaemonRefusesLaterIsNoticedOnce(t *testing.T) {
+	var log lockedBuffer
+	a := newAllowStore(t)
+	h := a.startDaemon(t, slog.New(slog.NewTextHandler(&log, nil)), echoRules)
+	conn := helloThenServe(t, h, func() {}, readsNotAllowedOnly)
+	replaceRules(t, h.rulesFile, filepath.Base(h.rulesFile), "")
+	digest := rules.ContentDigest([]byte(touchRules))
+	h.armNotAllowed(t, digest, allowSettings)
+	replaceRules(t, h.rulesFile, "", touchRules)
+	waitForLog(t, &log, notAllowedLog+h.rulesFile+" digest="+digest)
+	// A later edit is noticed after any notice of the first one.
+	later := rules.ContentDigest([]byte(handDate))
+	writeRules(t, h.rulesFile, handDate)
+	checkNotices(t, noticesUntil(t, conn, later), protocol.RulesNotAllowed{Digest: digest}, protocol.RulesNotAllowed{Digest: later})
+}
+
+// A change an arm of up reports not allowed while no session serves is
+// noticed to a session that starts serving later, unless the allow store
+// allows it by then.
+func TestArmedChangeIsNoticedToASessionStartingLater(t *testing.T) {
+	t.Run("not allowed", func(t *testing.T) {
+		h, _, digest := startArmedDaemon(t)
+		conn := helloThenServe(t, h, func() {}, readsNotAllowedOnly)
+		checkNotices(t, noticesBeforeStandingList(t, conn), protocol.RulesNotAllowed{Digest: digest, Settings: true})
+	})
+	t.Run("allowed since", func(t *testing.T) {
+		h, a, digest := startArmedDaemon(t)
+		if _, err := a.store.Allow(a.workspace, allow.Target{RulesFile: h.rulesFile, Scope: allow.Scope{Digest: digest, Settings: armedSettings}}); err != nil {
+			t.Fatal(err)
+		}
+		conn := helloThenServe(t, h, func() {}, readsNotAllowedOnly)
+		checkNotices(t, noticesBeforeStandingList(t, conn))
+	})
+}
+
+// Arms of up that report the same change not allowed again notice it once.
+func TestTheSameArmedChangeIsNoticedOnce(t *testing.T) {
+	a := newAllowStore(t)
+	h := a.startDaemon(t, slog.New(slog.DiscardHandler), echoRules)
+	conn := helloThenServe(t, h, func() {}, readsNotAllowedOnly)
+	digest := rules.ContentDigest([]byte(echoRules))
+	for range 3 {
+		h.armNotAllowed(t, digest, armedSettings)
+	}
+	checkNotices(t, noticesBeforeStandingList(t, conn), protocol.RulesNotAllowed{Digest: digest, Settings: true})
+}
+
+// An edit not allowed that the daemon refused and an arm of up reported,
+// with the daemon's own settings, is noticed again when it is made again
+// after the rules file went back to the rules served.
+func TestArmedEditUndoneIsNoticedAgainWhenMadeAgain(t *testing.T) {
+	h, _, log, digest := pendingEdit(t)
+	conn := helloThenServe(t, h, func() {}, readsNotAllowedOnly)
+	checkNotices(t, noticesUntil(t, conn, digest), protocol.RulesNotAllowed{Digest: digest})
+	h.armNotAllowed(t, digest, allowSettings)
+	writeRules(t, h.rulesFile, echoRules)
+	waitForLog(t, log, `msg="rules change undone: the file holds the rules served" file=`+h.rulesFile)
+	writeRules(t, h.rulesFile, touchRules)
+	checkNotices(t, noticesUntil(t, conn, digest), protocol.RulesNotAllowed{Digest: digest})
 }
