@@ -204,7 +204,8 @@ container restart or rebuild) arms it (`internal/launch`, `Up`):
   installs the new `hostrun` and starts the new daemon;
 - should `protocol.Version` ever differ between the versions, the old
   daemon rejects the arm and `up` fails with `stop the process serving
-  <socket> and retry`.
+  <socket> and retry`; so does a daemon from before arms moved to the
+  approval socket, which refuses an arm there.
 
 The first `up` after the daemon has exited starts the new daemon and
 installs the new `hostrun`. Replacing a running daemon stays out of

@@ -38,6 +38,7 @@ type harness struct {
 	rulesFile      string // the rules file a session adds rules to
 	stop           func() // shuts the daemon down; safe to call more than once
 	served         *serveResult
+	srv            *daemon.Server // the daemon, for what serve tells it besides its sockets (e.g. MountChecked)
 }
 
 // allowAll is a policy that allows every command, for tests about
@@ -124,7 +125,7 @@ func startHarnessAt(t *testing.T, log *slog.Logger, base string, setup func(rule
 		}
 	})
 	t.Cleanup(stop)
-	return harness{transport: tr, hostRoot: hostRoot, runtimeDir: base, approvalSocket: approvalSocket, rulesFile: rulesFile, stop: stop, served: served}
+	return harness{transport: tr, hostRoot: hostRoot, runtimeDir: base, approvalSocket: approvalSocket, rulesFile: rulesFile, stop: stop, served: served, srv: srv}
 }
 
 // serveResult is what the harness's Serve returned, once done is closed.
@@ -145,6 +146,28 @@ func (h harness) waitServed(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the daemon did not stop")
 	}
+}
+
+// arm arms the daemon of h as `hostrunner up` does, on its approval
+// socket, with a, waits for its answer and returns it.
+func (h harness) arm(t *testing.T, a protocol.Arm) protocol.Armed {
+	t.Helper()
+	conn, err := transport.Unix{Path: h.approvalSocket}.Dial(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	a.Version = protocol.Version
+	if err := protocol.WriteJSON(conn, protocol.FrameArm, a); err != nil {
+		t.Fatal(err)
+	}
+	f, err := protocol.ReadFrame(conn)
+	var armed protocol.Armed
+	if err != nil || f.Type != protocol.FrameArmed || protocol.DecodeJSON(f, &armed) != nil {
+		t.Fatalf("frame %v, err %v; want armed", f.Type, err)
+	}
+	return armed
 }
 
 // result is what the user of hostrun observes.

@@ -57,7 +57,7 @@ func (f *Flags) RegisterUp(fs *flag.FlagSet) {
 // a command that uses no other setting; the other keys serve takes still
 // come from the variables and the files, as for serve.
 func (f *Flags) RegisterRulesFile(fs *flag.FlagSet) {
-	f.register(fs, []key{mustLookup(rulesFileKey)}, scopeDaemon)
+	f.register(fs, []key{mustLookup(RulesFileKey)}, scopeDaemon)
 }
 
 // RegisterStop adds to fs the flags of the settings stop and restart

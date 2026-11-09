@@ -12,12 +12,15 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
 
+	"github.com/kravlab/hostrunner/internal/allow"
 	"github.com/kravlab/hostrunner/internal/client"
 	"github.com/kravlab/hostrunner/internal/fakedaemon"
 	"github.com/kravlab/hostrunner/internal/instructions"
@@ -138,14 +141,16 @@ func TestParseVersionHelpIsTheFlagHelp(t *testing.T) {
 }
 
 func TestParseServeAcceptsAllFlags(t *testing.T) {
-	got, err := parseServe([]string{"--socket", "/run/h.sock", "--workspace", "/home/u/app", "--container-workspace", "/workspaces/app"}, noEnv, io.Discard)
+	got, err := parseServe([]string{"--socket", "/run/h.sock", "--workspace", "/home/u/app", "--container-workspace", "/workspaces/app"}, withDataHome(noEnv), io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := serveConfig{
-		socket:         "/run/h.sock",
-		workspaceFlags: workspaceFlags{workspace: "/home/u/app", containerWorkspace: "/workspaces/app"},
-		Settings:       tuned("/home/u/app/.devcontainer/hostrunner-rules.yaml", 30*time.Minute, 15*time.Second, true),
+		socket:            "/run/h.sock",
+		workspaceFlags:    workspaceFlags{workspace: "/home/u/app", containerWorkspace: "/workspaces/app"},
+		workspaceSettings: "/home/u/app/.devcontainer/hostrunner.yaml",
+		allows:            allow.Store{Dir: "/data/hostrunner/allow"},
+		Settings:          tuned("/home/u/app/.devcontainer/hostrunner-rules.yaml", 30*time.Minute, 15*time.Second, true),
 	}
 	if got != want {
 		t.Fatalf("got %+v, want %+v", got, want)
@@ -156,7 +161,7 @@ func TestParseServeAcceptsWatchSettings(t *testing.T) {
 	got, err := parseServe([]string{
 		"--socket", "/run/h.sock", "--workspace", "/w", "--container-workspace", "/c",
 		"--watch", "--startup-timeout", "5m", "--grace", "3s",
-	}, noEnv, io.Discard)
+	}, withDataHome(noEnv), io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,9 +192,26 @@ func TestParseServeRejectsPositionalArguments(t *testing.T) {
 	}
 }
 
+// The allow store serve checks a hand edit in is the one allow.Open
+// opens; with no place to keep an allow there is nothing to check
+// against, which is an error.
+func TestParseServeFindsTheAllowStore(t *testing.T) {
+	args := []string{"--socket", "/run/h.sock", "--workspace", "/w", "--container-workspace", "/c"}
+	got, err := parseServe(args, envOf(map[string]string{"HOME": "/home/u"}), io.Discard)
+	if want := "/home/u/.local/share/hostrunner/allow"; err != nil || got.allows.Dir != want {
+		t.Fatalf("got %q, %v; want %q", got.allows.Dir, err, want)
+	}
+	if _, err := parseServe(args, noEnv, io.Discard); err == nil || !strings.Contains(err.Error(), "XDG_DATA_HOME") {
+		t.Fatalf("got %v, want an error naming XDG_DATA_HOME", err)
+	}
+}
+
+// up tells the human, on its output, what it says besides an error (see
+// launch.Config.Stderr).
 func TestParseUpBuildsLaunchConfig(t *testing.T) {
 	exe := "/home/u/.local/bin/hostrunner"
-	got, err := parseUp([]string{"--dir", "/run/user/1000/hostrunner/abc", "--workspace", "/home/u/app", "--container-workspace", "/workspaces/app"}, exe, noEnv, io.Discard)
+	var output strings.Builder
+	got, err := parseUp([]string{"--dir", "/run/user/1000/hostrunner/abc", "--workspace", "/home/u/app", "--container-workspace", "/workspaces/app"}, exe, withDataHome(noEnv), &output)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,10 +221,26 @@ func TestParseUpBuildsLaunchConfig(t *testing.T) {
 		ContainerWorkspace: "/workspaces/app",
 		Daemon:             exe,
 		Client:             filepath.Join("/home/u/.local/bin", "hostrun"),
+		Allows:             allow.Store{Dir: "/data/hostrunner/allow"},
+		Stderr:             &output,
+		WorkspaceSettings:  "/home/u/app/.devcontainer/hostrunner.yaml",
 		Settings:           tuned("/home/u/app/.devcontainer/hostrunner-rules.yaml", 30*time.Minute, 15*time.Second, true),
 	}
 	if got.launch != want || got.restart || got.answer != stop.Ask {
 		t.Fatalf("got %+v, want %+v without --restart", got, want)
+	}
+}
+
+// The allow store up checks is the one allow.Open opens; with no place to
+// keep an allow there is nothing to check against, which is an error.
+func TestParseUpFindsTheAllowStore(t *testing.T) {
+	args := []string{"--dir", "/d", "--workspace", "/w", "--container-workspace", "/c"}
+	got, err := parseUp(args, "/bin/hostrunner", envOf(map[string]string{"HOME": "/home/u"}), io.Discard)
+	if want := "/home/u/.local/share/hostrunner/allow"; err != nil || got.launch.Allows.Dir != want {
+		t.Fatalf("got %q, %v; want %q", got.launch.Allows.Dir, err, want)
+	}
+	if _, err := parseUp(args, "/bin/hostrunner", noEnv, io.Discard); err == nil || !strings.Contains(err.Error(), "XDG_DATA_HOME") {
+		t.Fatalf("got %v, want an error naming XDG_DATA_HOME", err)
 	}
 }
 
@@ -215,11 +253,11 @@ func TestUpAndServeMakeTheWorkspaceAbsolute(t *testing.T) {
 		t.Fatal(err)
 	}
 	ws := filepath.Join(cwd, "app")
-	up, err := parseUp([]string{"--dir", "/d", "--workspace", "app", "--container-workspace", "/c"}, "/bin/hostrunner", noEnv, io.Discard)
+	up, err := parseUp([]string{"--dir", "/d", "--workspace", "app", "--container-workspace", "/c"}, "/bin/hostrunner", withDataHome(noEnv), io.Discard)
 	if err != nil || up.launch.Workspace != ws || up.launch.RulesFile != filepath.Join(ws, ".devcontainer", "hostrunner-rules.yaml") {
 		t.Fatalf("up: got %q and %q, %v; want %q", up.launch.Workspace, up.launch.RulesFile, err, ws)
 	}
-	serve, err := parseServe([]string{"--socket", "/run/h.sock", "--workspace", "app", "--container-workspace", "/c"}, noEnv, io.Discard)
+	serve, err := parseServe([]string{"--socket", "/run/h.sock", "--workspace", "app", "--container-workspace", "/c"}, withDataHome(noEnv), io.Discard)
 	if err != nil || serve.workspace != ws || serve.RulesFile != filepath.Join(ws, ".devcontainer", "hostrunner-rules.yaml") {
 		t.Fatalf("serve: got %q and %q, %v; want %q", serve.workspace, serve.RulesFile, err, ws)
 	}
@@ -243,11 +281,11 @@ func TestParseUpRequiresEveryFlag(t *testing.T) {
 // --no-reread keeps a daemon from rereading its rules file by itself: up
 // passes it on to the daemon it starts.
 func TestParseNoReread(t *testing.T) {
-	up, err := parseUp([]string{"--dir", "/d", "--workspace", "/w", "--container-workspace", "/c", "--no-reread"}, "/bin/hostrunner", noEnv, io.Discard)
+	up, err := parseUp([]string{"--dir", "/d", "--workspace", "/w", "--container-workspace", "/c", "--no-reread"}, "/bin/hostrunner", withDataHome(noEnv), io.Discard)
 	if err != nil || up.launch.Reread {
 		t.Fatalf("up: got %+v, %v; want no reread", up.launch, err)
 	}
-	sv, err := parseServe([]string{"--socket", "/run/h.sock", "--workspace", "/w", "--container-workspace", "/c", "--no-reread"}, noEnv, io.Discard)
+	sv, err := parseServe([]string{"--socket", "/run/h.sock", "--workspace", "/w", "--container-workspace", "/c", "--no-reread"}, withDataHome(noEnv), io.Discard)
 	if err != nil || sv.Reread {
 		t.Fatalf("serve: got %+v, %v; want no reread", sv, err)
 	}
@@ -265,12 +303,24 @@ func tuned(rulesFile string, startupTimeout, grace time.Duration, reread bool) s
 		AskTimeout:     10 * time.Minute,
 		RequestTimeout: 10 * time.Second,
 		ReadyTimeout:   10 * time.Second,
+		MountCheck:     true,
 	}
 }
 
 // noEnv is a getenv for an empty environment: no HOSTRUNNER_* variable,
 // and no HOME or XDG_CONFIG_HOME, so no default host settings file.
 func noEnv(string) string { return "" }
+
+// withDataHome returns getenv with XDG_DATA_HOME set to /data, so the
+// allow store of an up or a serve lies in /data/hostrunner/allow.
+func withDataHome(getenv func(string) string) func(string) string {
+	return func(name string) string {
+		if name == "XDG_DATA_HOME" {
+			return "/data"
+		}
+		return getenv(name)
+	}
+}
 
 // envOf is a getenv over vars; every other variable is empty.
 func envOf(vars map[string]string) func(string) string {
@@ -289,18 +339,20 @@ func settingsFile(t *testing.T, content string) string {
 }
 
 // resolveUp parses `hostrunner up` with flags after the required ones
-// and returns the settings it gives the daemon.
+// and returns the settings it gives the daemon; getenv, besides what the
+// test sets, has the data directory of the allow store.
 func resolveUp(flags []string, getenv func(string) string) (settings.Settings, error) {
 	args := append([]string{"--dir", "/d", "--workspace", "/w", "--container-workspace", "/c"}, flags...)
-	cfg, err := parseUp(args, "/bin/hostrunner", getenv, io.Discard)
+	cfg, err := parseUp(args, "/bin/hostrunner", withDataHome(getenv), io.Discard)
 	return cfg.launch.Settings, err
 }
 
 // resolveServe parses `hostrunner serve` with flags after the required
-// ones and returns the settings it runs with.
+// ones and returns the settings it runs with; getenv, besides what the
+// test sets, has the data directory of the allow store.
 func resolveServe(flags []string, getenv func(string) string) (settings.Settings, error) {
 	args := append([]string{"--socket", "/run/h.sock", "--workspace", "/w", "--container-workspace", "/c"}, flags...)
-	cfg, err := parseServe(args, getenv, io.Discard)
+	cfg, err := parseServe(args, withDataHome(getenv), io.Discard)
 	return cfg.Settings, err
 }
 
@@ -419,7 +471,7 @@ func TestServeGivenEverySettingReadsNoOtherSource(t *testing.T) {
 		t.Errorf("read %s", name)
 		return ""
 	}
-	flags := []string{"--settings", settingsFile(t, "grase: [\n"), "--workspace-settings", settingsFile(t, "grase: [\n"), "--rules-file", "/r.yaml", "--startup-timeout", "1h", "--grace", "1m", "--reread", "--poll-interval", "1s", "--ask-timeout", "1m", "--request-timeout", "1s"}
+	flags := []string{"--settings", settingsFile(t, "grase: [\n"), "--workspace-settings", settingsFile(t, "grase: [\n"), "--rules-file", "/r.yaml", "--startup-timeout", "1h", "--grace", "1m", "--reread", "--poll-interval", "1s", "--ask-timeout", "1m", "--request-timeout", "1s", "--mount-check"}
 	got, err := resolveServe(flags, getenv)
 	want := tuned("/r.yaml", time.Hour, time.Minute, true)
 	want.PollInterval, want.AskTimeout, want.RequestTimeout = time.Second, time.Minute, time.Second
@@ -486,6 +538,77 @@ func TestUpAndServeReadTheWorkspaceSettings(t *testing.T) {
 		}
 		if _, err := resolve([]string{"--workspace", without}, envOf(map[string]string{"HOSTRUNNER_WORKSPACE_SETTINGS": "missing.yaml"})); err == nil || !strings.Contains(err.Error(), missing) {
 			t.Errorf("%s, missing HOSTRUNNER_WORKSPACE_SETTINGS file: got %v, want an error naming %s", name, err, missing)
+		}
+	}
+}
+
+// up and serve name the same workspace settings file, the one they read,
+// absolute: up passes it to the daemon it starts (see launch.Config), and
+// serve protects it in its mount check, whether or not it exists.
+func TestUpAndServeNameTheWorkspaceSettingsFile(t *testing.T) {
+	ws, cwd := t.TempDir(), t.TempDir()
+	t.Chdir(cwd)
+	tests := []struct {
+		name  string
+		flags []string
+		vars  map[string]string
+		want  string
+	}{
+		{"default", nil, nil, filepath.Join(ws, ".devcontainer", "hostrunner.yaml")},
+		{"HOSTRUNNER_WORKSPACE_SETTINGS", nil, map[string]string{"HOSTRUNNER_WORKSPACE_SETTINGS": "var.yaml"}, filepath.Join(ws, "var.yaml")},
+		{"--workspace-settings", []string{"--workspace-settings", "flag.yaml"}, map[string]string{"HOSTRUNNER_WORKSPACE_SETTINGS": "var.yaml"}, filepath.Join(cwd, "flag.yaml")},
+	}
+	for _, named := range []string{filepath.Join(ws, "var.yaml"), filepath.Join(cwd, "flag.yaml")} {
+		if err := os.WriteFile(named, nil, 0o600); err != nil { // a named file must exist
+			t.Fatal(err)
+		}
+	}
+	for _, tt := range tests {
+		up, err := parseUp(append([]string{"--dir", "/d", "--workspace", ws, "--container-workspace", "/c"}, tt.flags...), "/bin/hostrunner", withDataHome(envOf(tt.vars)), io.Discard)
+		if err != nil || up.launch.WorkspaceSettings != tt.want {
+			t.Errorf("up, %s: got %q, %v; want %q", tt.name, up.launch.WorkspaceSettings, err, tt.want)
+		}
+		sv, err := parseServe(append([]string{"--socket", "/run/h.sock", "--workspace", ws, "--container-workspace", "/c"}, tt.flags...), withDataHome(envOf(tt.vars)), io.Discard)
+		if err != nil || sv.workspaceSettings != tt.want {
+			t.Errorf("serve, %s: got %q, %v; want %q", tt.name, sv.workspaceSettings, err, tt.want)
+		}
+	}
+}
+
+// restart names the workspace settings file for the old daemon's
+// workspace as up does for the same flag, variable or default, so the
+// daemon it starts protects the file its settings were read from.
+func TestRestartNamesTheSameWorkspaceSettingsFileAsUp(t *testing.T) {
+	ws, cwd := t.TempDir(), t.TempDir()
+	t.Chdir(cwd)
+	tests := []struct {
+		name  string
+		flags []string
+		vars  map[string]string
+		want  string
+	}{
+		{"default", nil, nil, filepath.Join(ws, ".devcontainer", "hostrunner.yaml")},
+		{"HOSTRUNNER_WORKSPACE_SETTINGS", nil, map[string]string{"HOSTRUNNER_WORKSPACE_SETTINGS": "var.yaml"}, filepath.Join(ws, "var.yaml")},
+		{"--workspace-settings", []string{"--workspace-settings", "flag.yaml"}, map[string]string{"HOSTRUNNER_WORKSPACE_SETTINGS": "var.yaml"}, filepath.Join(cwd, "flag.yaml")},
+	}
+	for _, named := range []string{filepath.Join(ws, "var.yaml"), filepath.Join(cwd, "flag.yaml")} {
+		if err := os.WriteFile(named, nil, 0o600); err != nil { // a named file must exist
+			t.Fatal(err)
+		}
+	}
+	for _, tt := range tests {
+		env := withDataHome(envOf(tt.vars))
+		up, err := parseUp(append([]string{"--dir", "/d", "--workspace", ws, "--container-workspace", "/c"}, tt.flags...), "/bin/hostrunner", env, io.Discard)
+		if err != nil || up.launch.WorkspaceSettings != tt.want {
+			t.Errorf("up, %s: got %q, %v; want %q", tt.name, up.launch.WorkspaceSettings, err, tt.want)
+		}
+		got, err := parseStop("restart", append([]string{"--dir", "/d"}, tt.flags...), "/bin/hostrunner", env, io.Discard)
+		if err != nil || got.Restart == nil || got.Restart.WorkspaceSettings == nil {
+			t.Errorf("restart, %s: got %+v, %v; want a restart naming the workspace settings file", tt.name, got.Restart, err)
+			continue
+		}
+		if path, err := got.Restart.WorkspaceSettings(ws); err != nil || path != tt.want {
+			t.Errorf("restart, %s: got %q, %v; want %q", tt.name, path, err, tt.want)
 		}
 	}
 }
@@ -629,6 +752,7 @@ func watchConfig(t *testing.T) serveConfig {
 			PollInterval:   5 * time.Millisecond,
 			AskTimeout:     10 * time.Minute,
 			RequestTimeout: 10 * time.Second,
+			MountCheck:     true,
 		},
 	}
 }
@@ -638,6 +762,12 @@ func watchConfig(t *testing.T) serveConfig {
 // still running when the test ends is stopped then.
 func startServe(t *testing.T, cfg serveConfig, runtimes ...*watchtest.Runtime) <-chan error {
 	t.Helper()
+	return startLoggingServe(t, cfg, slog.New(slog.DiscardHandler), runtimes...)
+}
+
+// startLoggingServe is startServe for a serve that logs to log.
+func startLoggingServe(t *testing.T, cfg serveConfig, log *slog.Logger, runtimes ...*watchtest.Runtime) <-chan error {
+	t.Helper()
 	rts := make([]watch.Runtime, len(runtimes))
 	for i, rt := range runtimes {
 		rts[i] = rt
@@ -646,7 +776,7 @@ func startServe(t *testing.T, cfg serveConfig, runtimes ...*watchtest.Runtime) <
 	done := make(chan error, 1)
 	exited := make(chan struct{})
 	go func() {
-		done <- serve(ctx, cfg, slog.New(slog.DiscardHandler), rts)
+		done <- serve(ctx, cfg, log, rts)
 		close(exited)
 	}()
 	t.Cleanup(func() {
@@ -733,7 +863,7 @@ func TestServeWatchWaitsAgainWhenArmed(t *testing.T) {
 
 func TestParseServeAcceptsConfigPath(t *testing.T) {
 	for _, name := range []string{"--rules-file", "--config"} {
-		got, err := parseServe([]string{"--socket", "/s", "--workspace", "/w", "--container-workspace", "/c", name, "/etc/rules.yaml"}, noEnv, io.Discard)
+		got, err := parseServe([]string{"--socket", "/s", "--workspace", "/w", "--container-workspace", "/c", name, "/etc/rules.yaml"}, withDataHome(noEnv), io.Discard)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -827,8 +957,8 @@ func rulesDigest(t *testing.T, cfg serveConfig) string {
 	return p.Digest()
 }
 
-// armServe arms the daemon as `hostrunner up` would and returns whether it
-// stepped aside.
+// armServe arms the daemon as `hostrunner up` would, on its approval
+// socket, and returns whether it stepped aside.
 func armServe(t *testing.T, cfg serveConfig, digest string) bool {
 	t.Helper()
 	return armServeWith(t, cfg, digest, nil)
@@ -838,7 +968,7 @@ func armServe(t *testing.T, cfg serveConfig, digest string) bool {
 // settings.
 func armServeWith(t *testing.T, cfg serveConfig, digest string, carried map[string]string) bool {
 	t.Helper()
-	c, err := transport.Unix{Path: cfg.socket}.Dial(context.Background())
+	c, err := transport.Unix{Path: launch.ApprovalSocket(filepath.Dir(cfg.socket))}.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -971,6 +1101,23 @@ func TestArmHandlerComparesRereadingAmongTheSettings(t *testing.T) {
 	}
 }
 
+// An arm whose mount check differs from the daemon's makes it step aside,
+// so turning the check off or on on the host applies on the next `up`.
+func TestArmHandlerStepsAsideWhenTheMountCheckDiffers(t *testing.T) {
+	var logged bytes.Buffer
+	own := map[string]string{"reread": "true", "mount_check": "true"}
+	onArm := armHandler("rules.yaml", true, own, nil, slog.New(slog.NewTextHandler(&logged, nil)))
+	if onArm(protocol.Arm{ConfigDigest: "digest", Settings: own}, "digest") {
+		t.Fatal("stepped aside for an arm with the daemon's mount check")
+	}
+	if !onArm(protocol.Arm{ConfigDigest: "digest", Settings: with(own, "mount_check", "false")}, "digest") {
+		t.Fatal("kept running for an arm with the mount check off")
+	}
+	if got := logged.String(); !strings.Contains(got, `mount_check="true → false"`) {
+		t.Fatalf("logged %q, want the change of mount_check", got)
+	}
+}
+
 func TestArmHandlerStepsAsideWhenRulesChanged(t *testing.T) {
 	onArm := armHandler("rules.yaml", true, noSettings, nil, slog.New(slog.DiscardHandler))
 	if !onArm(protocol.Arm{ConfigDigest: "other"}, "digest") {
@@ -1087,7 +1234,7 @@ func TestRunDispatchesUpdate(t *testing.T) {
 // TestUsageListsTheSubcommands checks that the top-level usage names
 // every subcommand.
 func TestUsageListsTheSubcommands(t *testing.T) {
-	if err := run(nil, io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "up|serve|test|approve|stop|restart|update|instructions|version") {
+	if err := run(nil, io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "up|serve|test|allow|deny|approve|stop|restart|update|instructions|version") {
 		t.Fatalf("got %v, want the usage listing every subcommand", err)
 	}
 }
@@ -1114,7 +1261,7 @@ func TestUpdateMessage(t *testing.T) {
 // serve listens for approval sessions beside its socket's directory, the
 // runtime directory, which the container mounts, so the container cannot
 // reach it; it removes the socket when it stops. Its hello reports the
-// build version it is given.
+// build version it is given and the daemon settings it runs with.
 func TestServeListensOnTheApprovalSocket(t *testing.T) {
 	cfg := watchConfig(t)
 	cfg.watch = false
@@ -1148,11 +1295,11 @@ func TestServeListensOnTheApprovalSocket(t *testing.T) {
 	if err != nil || f.Type != protocol.FrameDaemonInfo || protocol.DecodeJSON(f, &got) != nil {
 		t.Fatalf("hello: frame %v, err %v", f.Type, err)
 	}
-	want := protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: cfg.workspace, ContainerWorkspace: cfg.containerWorkspace, RulesFile: cfg.RulesFile, RulesDigest: "missing", Stops: true, Rereads: true, BuildVersion: "v1.2.0", Runs: true}
+	want := protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: cfg.workspace, ContainerWorkspace: cfg.containerWorkspace, RulesFile: cfg.RulesFile, RulesDigest: "missing", Stops: true, Rereads: true, BuildVersion: "v1.2.0", Runs: true, Settings: cfg.Settings.Daemon()}
 	if real, err := filepath.EvalSymlinks(cfg.workspace); err == nil {
 		want.Workspace = real
 	}
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("hello: got %+v, want %+v", got, want)
 	}
 	cancel()
@@ -1252,13 +1399,24 @@ func TestServeClosesTheApprovalSocketFirstWhenSteppingAside(t *testing.T) {
 
 // A session that adds a rule makes serve reread its rules file: the next
 // arm, carrying the new file's digest, does not make the daemon step aside.
+// The file was allowed before the session wrote it, so serve records an
+// allow of the content written, with its own settings, in its allow store.
 func TestServeRereadsItsRulesOnceARuleIsAdded(t *testing.T) {
 	cfg := watchConfig(t)
 	cfg.watch = false
 	cfg.RulesFile = filepath.Join(cfg.workspace, "hostrun.yaml")
-	if err := os.WriteFile(cfg.RulesFile, []byte("rules:\n  - command: echo\n    args: any\n"), 0o644); err != nil {
+	loaded := []byte("rules:\n  - command: echo\n    args: any\n")
+	if err := os.WriteFile(cfg.RulesFile, loaded, 0o644); err != nil {
 		t.Fatal(err)
 	}
+	store, err := allow.Open(envOf(map[string]string{"XDG_DATA_HOME": t.TempDir()}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Allow(cfg.workspace, allow.Target{RulesFile: cfg.RulesFile, Scope: allow.Scope{Digest: rules.ContentDigest(loaded), Settings: cfg.Settings.Daemon()}}); err != nil {
+		t.Fatal(err)
+	}
+	cfg.allows = store
 	approvalSocket := launch.ApprovalSocket(filepath.Dir(cfg.socket))
 	t.Cleanup(func() { os.Remove(approvalSocket) })
 	startServe(t, cfg)
@@ -1283,7 +1441,7 @@ func TestServeRereadsItsRulesOnceARuleIsAdded(t *testing.T) {
 	if err := os.WriteFile(cfg.RulesFile, added, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := protocol.WriteJSON(c, protocol.FrameReread, protocol.Reread{Rule: "date", Digest: rules.ContentDigest(added)}); err != nil {
+	if err := protocol.WriteJSON(c, protocol.FrameReread, protocol.Reread{Rule: "date", Digest: rules.ContentDigest(added), WrittenOver: rules.ContentDigest(loaded)}); err != nil {
 		t.Fatal(err)
 	}
 	f, err := protocol.ReadFrame(c)
@@ -1298,9 +1456,177 @@ func TestServeRereadsItsRulesOnceARuleIsAdded(t *testing.T) {
 	if res.Error != "" || res.Digest != p.Digest() {
 		t.Fatalf("reread: got %+v, want the new file's digest %s", res, p.Digest())
 	}
+	if ok, err := store.Allowed(cfg.workspace, allow.Scope{Digest: p.Digest(), Settings: cfg.Settings.Daemon()}); err != nil || !ok {
+		t.Fatalf("the store allows the file as written: %v, %v; want it allowed", ok, err)
+	}
 	if stepAside := armServe(t, cfg, p.Digest()); stepAside {
 		t.Fatal("stepped aside for the rules it reread")
 	}
+}
+
+// logBuffer collects a serve's log for a test to wait on.
+type logBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *logBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+// waitFor waits until the log holds text, for 5 s at most.
+func (b *logBuffer) waitFor(t *testing.T, text string) {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		b.mu.Lock()
+		got := b.buf.String()
+		b.mu.Unlock()
+		if strings.Contains(got, text) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the log lacks %q:\n%s", text, got)
+		}
+	}
+}
+
+// handEdit is the rules a hand-edit test of serve starts with, and the
+// edit, which adds a rule for `sh -c 'exit 3'`.
+const (
+	handEditLoaded = "rules:\n  - command: true\n    args: none\n"
+	handEdited     = handEditLoaded + "  - command: sh\n    args: any\n"
+)
+
+// runServed runs argv in the container workspace of cfg's serve and
+// returns its exit code.
+func runServed(cfg serveConfig, argv ...string) int {
+	return client.Run(context.Background(), transport.Unix{Path: cfg.socket}, argv, cfg.containerWorkspace, strings.NewReader(""), io.Discard, io.Discard)
+}
+
+// waitServed runs `sh -c 'exit 3'` on cfg's serve until the edit allowing
+// it is served, for 5 s at most.
+func waitServed(t *testing.T, cfg serveConfig) {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); runServed(cfg, "sh", "-c", "exit 3") != 3; time.Sleep(cfg.PollInterval) {
+		if time.Now().After(deadline) {
+			t.Fatal("the edit allowed is not served")
+		}
+	}
+}
+
+// serve rereads a hand edit of its rules file only once it is allowed in
+// its allow store, the one allow.Open opens.
+func TestServeRereadsAHandEditOnceAllowed(t *testing.T) {
+	cfg := watchConfig(t)
+	cfg.watch = false
+	cfg.RulesFile = filepath.Join(cfg.workspace, "hostrun.yaml")
+	if err := os.WriteFile(cfg.RulesFile, []byte(handEditLoaded), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store, err := allow.Open(envOf(map[string]string{"XDG_DATA_HOME": t.TempDir()}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.allows = store
+	var log logBuffer
+	startLoggingServe(t, cfg, slog.New(slog.NewTextHandler(&log, nil)))
+	if err := os.WriteFile(cfg.RulesFile, []byte(handEdited), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	log.waitFor(t, "rules changed but not allowed")
+	if code := runServed(cfg, "sh", "-c", "exit 3"); code != protocol.ExitRejected {
+		t.Fatalf("a command of the edit not allowed exited %d, want %d", code, protocol.ExitRejected)
+	}
+	if _, err := store.Allow(cfg.workspace, allow.Target{RulesFile: cfg.RulesFile, Scope: allow.Scope{Digest: rules.ContentDigest([]byte(handEdited)), Settings: cfg.Settings.Daemon()}}); err != nil {
+		t.Fatal(err)
+	}
+	waitServed(t, cfg)
+}
+
+// serve without reread leaves an allowed hand edit to the next up: it
+// goes on serving the rules it loaded, and the next arm makes it step
+// aside. With no watcher there is no log to wait on, so the test waits
+// many of its polls.
+func TestServeWithoutRereadLeavesAnAllowedHandEditToTheNextUp(t *testing.T) {
+	cfg := watchConfig(t)
+	cfg.watch = false
+	cfg.Reread = false
+	cfg.RulesFile = filepath.Join(cfg.workspace, "hostrun.yaml")
+	if err := os.WriteFile(cfg.RulesFile, []byte(handEditLoaded), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store, err := allow.Open(envOf(map[string]string{"XDG_DATA_HOME": t.TempDir()}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.allows = store
+	startServe(t, cfg)
+	if err := os.WriteFile(cfg.RulesFile, []byte(handEdited), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	digest := rules.ContentDigest([]byte(handEdited))
+	if _, err := store.Allow(cfg.workspace, allow.Target{RulesFile: cfg.RulesFile, Scope: allow.Scope{Digest: digest, Settings: cfg.Settings.Daemon()}}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * cfg.PollInterval)
+	if code := runServed(cfg, "sh", "-c", "exit 3"); code != protocol.ExitRejected {
+		t.Fatalf("a command of the edit exited %d, want %d", code, protocol.ExitRejected)
+	}
+	if stepAside := armServe(t, cfg, digest); !stepAside {
+		t.Fatal("kept running for an arm with the edit")
+	}
+}
+
+// A hand edit not allowed records an allow request of the daemon's own
+// rules file, digest and settings, so `hostrunner allow` allows what the
+// daemon checks, though serve was given a setting `up` without flags does
+// not resolve; the daemon then serves the edit.
+func TestServeRecordsTheAllowRequestOfAHandEdit(t *testing.T) {
+	base, err := os.MkdirTemp("", "hrs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(base) })
+	rulesFile := filepath.Join(base, ".devcontainer", "hostrunner-rules.yaml")
+	if err := os.MkdirAll(filepath.Dir(rulesFile), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(rulesFile, []byte(handEditLoaded), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	getenv := envOf(map[string]string{"XDG_DATA_HOME": t.TempDir()})
+	cfg, err := parseServe([]string{
+		"--socket", filepath.Join(base, "h.sock"), "--workspace", base, "--container-workspace", "/workspaces/app",
+		"--grace", "1m", "--poll-interval", "10ms",
+	}, getenv, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	startServe(t, cfg)
+	if err := os.WriteFile(rulesFile, []byte(handEdited), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ac, err := parseAllow([]string{base}, getenv, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(cfg.PollInterval) {
+		if _, ok, err := ac.store.Pending(base); err != nil || ok {
+			if err != nil {
+				t.Fatal(err)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no allow request recorded")
+		}
+	}
+	if err := runAllow(ac, io.Discard, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	waitServed(t, cfg)
 }
 
 // TestParseInstructions checks that --append takes an optional path,
@@ -1534,7 +1860,7 @@ func TestParseUpRestart(t *testing.T) {
 		{[]string{"--restart", "--kill"}, stop.Kill},
 		{[]string{"--restart", "--wait"}, stop.Wait},
 	} {
-		got, err := parseUp(append(base, tt.flags...), "/bin/hostrunner", noEnv, io.Discard)
+		got, err := parseUp(append(base, tt.flags...), "/bin/hostrunner", withDataHome(noEnv), io.Discard)
 		if err != nil {
 			t.Fatalf("%q: %v", tt.flags, err)
 		}
@@ -1647,7 +1973,7 @@ func TestStopRestartAndApproveResolveTheirSettings(t *testing.T) {
 	}
 	for _, tt := range tests {
 		for _, name := range []string{"stop", "restart"} {
-			got, err := parseStop(name, tt.stopFlags, "/bin/hostrunner", envOf(tt.vars), io.Discard)
+			got, err := parseStop(name, tt.stopFlags, "/bin/hostrunner", withDataHome(envOf(tt.vars)), io.Discard)
 			if err != nil || got.Root != tt.root || got.StopTimeout != tt.stopTimeout {
 				t.Errorf("%s, %s: got %q and %v, %v; want %q and %v", name, tt.name, got.Root, got.StopTimeout, err, tt.root, tt.stopTimeout)
 			}
@@ -1713,7 +2039,7 @@ func TestStopRestartAndApproveRefuseInvalidSettings(t *testing.T) {
 }
 
 func TestParseRestartStartsTheInstalledHostrunner(t *testing.T) {
-	got, err := parseStop("restart", []string{"--all"}, "/home/u/.local/bin/hostrunner", xdgEnv, io.Discard)
+	got, err := parseStop("restart", []string{"--all"}, "/home/u/.local/bin/hostrunner", withDataHome(xdgEnv), io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1722,6 +2048,23 @@ func TestParseRestartStartsTheInstalledHostrunner(t *testing.T) {
 	}
 	if stopped, _ := parseStop("stop", nil, "/bin/hostrunner", xdgEnv, io.Discard); stopped.Restart != nil {
 		t.Fatal("stop restarts")
+	}
+}
+
+// restart checks the new daemon's rules and settings in the allow store
+// up checks, the one allow.Open opens; with no place to keep an allow
+// there is nothing to check against, which is an error of restart, not of
+// stop.
+func TestParseRestartFindsTheAllowStore(t *testing.T) {
+	got, err := parseStop("restart", []string{"--all"}, "/bin/hostrunner", envOf(map[string]string{"XDG_RUNTIME_DIR": "/run/user/1000", "HOME": "/home/u"}), io.Discard)
+	if want := "/home/u/.local/share/hostrunner/allow"; err != nil || got.Restart == nil || got.Restart.Allows.Dir != want {
+		t.Fatalf("got %+v, %v; want the allow store %q", got.Restart, err, want)
+	}
+	if _, err := parseStop("restart", []string{"--all"}, "/bin/hostrunner", xdgEnv, io.Discard); err == nil || !strings.Contains(err.Error(), "XDG_DATA_HOME") {
+		t.Fatalf("got %v, want an error naming XDG_DATA_HOME", err)
+	}
+	if _, err := parseStop("stop", []string{"--all"}, "/bin/hostrunner", xdgEnv, io.Discard); err != nil {
+		t.Fatalf("stop: %v", err)
 	}
 }
 
@@ -1735,7 +2078,7 @@ func TestParseRestartResolvesTheNewDaemonsSettings(t *testing.T) {
 	host := settingsFile(t, "stop_timeout: 1m\ngrace: 2m\nworkspaces:\n  "+ws+":\n    poll_interval: 3s\n")
 	wsFile := settingsFile(t, "ask_timeout: 4m\n")
 	vars := map[string]string{"XDG_RUNTIME_DIR": "/run/user/1000", "HOSTRUNNER_SETTINGS": host, "HOSTRUNNER_READY_TIMEOUT": "5s"}
-	got, err := parseStop("restart", []string{"--workspace-settings", wsFile, "--rules-file", "/r/hostrun.yaml"}, "/bin/hostrunner", envOf(vars), io.Discard)
+	got, err := parseStop("restart", []string{"--workspace-settings", wsFile, "--rules-file", "/r/hostrun.yaml"}, "/bin/hostrunner", withDataHome(envOf(vars)), io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1772,7 +2115,7 @@ func TestParseRestartRefusesTheDaemonsPathFlagsWithAll(t *testing.T) {
 			t.Errorf("--%s: got %v, want %q with the usage", flagName, err, want)
 		}
 	}
-	if _, err := parseStop("restart", []string{"--choose", "--rules-file", "/r/file.yaml"}, "/bin/hostrunner", xdgEnv, io.Discard); err != nil {
+	if _, err := parseStop("restart", []string{"--choose", "--rules-file", "/r/file.yaml"}, "/bin/hostrunner", withDataHome(xdgEnv), io.Discard); err != nil {
 		t.Errorf("--choose, which restarts one daemon: %v", err)
 	}
 }
@@ -1798,7 +2141,7 @@ func TestParseRestartRefusesAnEmptyConfig(t *testing.T) {
 // source.
 func TestParseRestartFindsAnInvalidDaemonSettingForTheNewDaemon(t *testing.T) {
 	bad := settingsFile(t, "grace: soon\n")
-	got, err := parseStop("restart", nil, "/bin/hostrunner", envOf(map[string]string{"XDG_RUNTIME_DIR": "/run/user/1000", "HOSTRUNNER_SETTINGS": bad}), io.Discard)
+	got, err := parseStop("restart", nil, "/bin/hostrunner", withDataHome(envOf(map[string]string{"XDG_RUNTIME_DIR": "/run/user/1000", "HOSTRUNNER_SETTINGS": bad})), io.Discard)
 	if err != nil {
 		t.Fatalf("parse: %v; want the setting found only for the new daemon", err)
 	}

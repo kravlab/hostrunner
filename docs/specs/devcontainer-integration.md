@@ -44,8 +44,13 @@ Synchronous, fast, idempotent (it runs on every `devcontainer up`):
    `XDG_RUNTIME_DIR` if the directory cannot be created.
 2. Take an exclusive `flock` on `<dir>/up.lock` for the remaining steps, so
    concurrent `up`s share one daemon.
-3. Send `FrameArm` to `<dir>/hostrunner.sock`. `FrameArmed` → exit 0. Nothing
-   listening → continue. Anything else → fail (a foreign listener).
+3. Send `FrameArm` to the daemon's approval socket, `<dir>.approval.sock`
+   (since the config protection: the container's socket refuses an arm, so
+   only the host arms). `FrameArmed` → exit 0. Nothing listening on it
+   while something serves `<dir>/hostrunner.sock` → fail (a daemon that
+   does not take arms there). Nothing listening → continue. Anything else
+   → fail (a foreign listener), with `stop the process serving <socket>
+   and retry`.
 4. Install the client: copy the `hostrun` binary that sits next to the
    running `hostrunner` executable into `<dir>/hostrun` (mode 0755, written
    to a temp file and renamed). Fail if that binary is dynamically linked
@@ -53,7 +58,8 @@ Synchronous, fast, idempotent (it runs on every `devcontainer up`):
 5. Start `hostrunner serve --watch …` detached (`setsid`, cwd `<dir>`,
    stdin from `/dev/null`, stdout/stderr appended to `<dir>/daemon.log`,
    which must be a regular file: opened with `O_NOFOLLOW`).
-6. Wait up to 10 s until the daemon answers `FrameArm`; exit 0. If the
+6. Wait up to 10 s until the daemon answers `FrameArm` on its approval
+   socket; exit 0. If the
    daemon exits or the wait times out (the daemon is then killed), exit
    non-zero with the log's tail, which makes `devcontainer up` fail.
 
@@ -89,7 +95,8 @@ Without `--watch`, `serve` behaves as today (runs until signalled).
 ## Packages
 
 - `internal/protocol` — `FrameArm`/`FrameArmed` (JSON `Arm{version}`); an
-  arm connection carries only that exchange.
+  arm connection carries only that exchange, on the approval socket; the
+  container's socket answers `FrameArm` with a protocol error (125).
 - `internal/daemon` — `WithArmHandler` option; version checked for both
   opening frames.
 - `internal/watch` — `Watcher` (`Run`, `Arm`) over a `Runtime` interface

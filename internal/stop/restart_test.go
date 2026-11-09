@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kravlab/hostrunner/internal/allow"
 	"github.com/kravlab/hostrunner/internal/daemon"
 	"github.com/kravlab/hostrunner/internal/launch"
 	"github.com/kravlab/hostrunner/internal/protocol"
@@ -30,8 +31,9 @@ import (
 
 // newDaemonEnv makes the test binary, started by a restart as
 // `<it> serve …`, act as the new daemon: it records its arguments in
-// new.args and its pid in new.pid beside its socket, and answers every
-// arm request on the socket.
+// new.args and its pid in new.pid beside its socket, listens on the
+// socket, and answers every arm request on its approval socket, where
+// `up` arms it.
 const newDaemonEnv = "HOSTRUNNER_STOP_TEST_NEW_DAEMON"
 
 // runNewDaemon is the process a newDaemonEnv test binary runs.
@@ -49,8 +51,13 @@ func runNewDaemon() {
 	if err != nil {
 		os.Exit(3)
 	}
+	defer l.Close() // listening until the process exits; nothing on it is answered
+	al, err := transport.Unix{Path: launch.ApprovalSocket(dir)}.Listen()
+	if err != nil {
+		os.Exit(3)
+	}
 	for {
-		c, err := l.Accept()
+		c, err := al.Accept()
 		if err != nil {
 			os.Exit(0)
 		}
@@ -103,6 +110,22 @@ func resolving(t *testing.T, vars map[string]string, args ...string) func(worksp
 	}
 }
 
+// workspaceFile returns how a test's restart names the new daemon's
+// workspace settings file: from restart's flags args and the variables
+// vars alone, as the terminal running restart would give them.
+func workspaceFile(t *testing.T, vars map[string]string, args ...string) func(workspace string) (string, error) {
+	t.Helper()
+	var f settings.Flags
+	fs := flag.NewFlagSet("restart", flag.ContinueOnError)
+	f.RegisterRestart(fs)
+	if err := fs.Parse(args); err != nil {
+		t.Fatal(err)
+	}
+	return func(workspace string) (string, error) {
+		return f.WorkspaceFile(func(name string) string { return vars[name] }, workspace)
+	}
+}
+
 // besideRules are the variables of a restart whose new daemon takes the
 // rules file hostrun.yaml in its workspace, as a current daemon of the
 // tests does.
@@ -110,8 +133,9 @@ var besideRules = map[string]string{"HOSTRUNNER_RULES_FILE": "hostrun.yaml"}
 
 // restartConfig is how a test restarts: the test binary as the new
 // daemon, a static client, the settings resolved from besideRules,
-// runtimes asked for an older daemon's container. The new daemon is
-// killed when the test ends.
+// runtimes asked for an older daemon's container, and an allow store of
+// the test's own, which allows nothing (see allowRestart). The new daemon
+// is killed when the test ends.
 func restartConfig(t *testing.T, runtimes ...watch.Runtime) *stop.Restart {
 	t.Helper()
 	client, err := staticClient()
@@ -123,7 +147,25 @@ func restartConfig(t *testing.T, runtimes ...watch.Runtime) *stop.Restart {
 		t.Fatal(err)
 	}
 	t.Setenv(newDaemonEnv, "1")
-	return &stop.Restart{Daemon: exe, Client: client, Settings: resolving(t, besideRules), Runtimes: runtimes}
+	return &stop.Restart{Daemon: exe, Client: client, Settings: resolving(t, besideRules), WorkspaceSettings: workspaceFile(t, besideRules), Runtimes: runtimes, Allows: allow.Store{Dir: filepath.Join(t.TempDir(), "allow")}}
+}
+
+// allowRestart allows, as a human running `hostrunner allow` would, what
+// a restart with r starts for the host workspace workspace: its rules
+// file as it is now, with the daemon settings r resolves for it.
+func allowRestart(t *testing.T, r *stop.Restart, workspace string) {
+	t.Helper()
+	s, err := r.Settings(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := rules.Load(s.RulesFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Allows.Allow(workspace, allow.Target{RulesFile: s.RulesFile, Scope: allow.Scope{Digest: policy.Digest(), Settings: s.Settings.Daemon()}}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // newDaemonArgs returns the arguments the new daemon of dir started
@@ -247,7 +289,9 @@ var rereading = []daemon.Option{
 
 func TestRestartReplacesTheDaemon(t *testing.T) {
 	d := startCurrentDaemon(t, validRules, false, rereading...)
-	out, err := runStop(t, stop.Config{Dir: d.dir, Restart: restartConfig(t)}, "")
+	r := restartConfig(t)
+	allowRestart(t, r, d.workspace)
+	out, err := runStop(t, stop.Config{Dir: d.dir, Restart: r}, "")
 	if err != nil {
 		t.Fatalf("restart: %v; printed %q", err, out)
 	}
@@ -256,13 +300,54 @@ func TestRestartReplacesTheDaemon(t *testing.T) {
 	}
 	d.waitStopped(t)
 	args := newDaemonArgs(t, d.dir)
-	want := []string{"serve", "--socket", filepath.Join(d.dir, launch.SocketName), "--workspace", d.workspace, "--container-workspace", "/workspaces/app", "--rules-file", d.rulesFile, "--watch",
-		"--startup-timeout", "30m0s", "--grace", "15s", "--poll-interval", "2s", "--ask-timeout", "10m0s", "--request-timeout", "10s", "--reread"}
+	want := []string{"serve", "--socket", filepath.Join(d.dir, launch.SocketName), "--workspace", d.workspace, "--container-workspace", "/workspaces/app", "--workspace-settings", filepath.Join(d.workspace, ".devcontainer", "hostrunner.yaml"), "--rules-file", d.rulesFile, "--watch",
+		"--startup-timeout", "30m0s", "--grace", "15s", "--poll-interval", "2s", "--ask-timeout", "10m0s", "--request-timeout", "10s", "--reread", "--mount-check"}
 	if strings.Join(args, " ") != strings.Join(want, " ") {
 		t.Fatalf("the new daemon runs %q, want %q", args, want)
 	}
 	if _, err := os.Stat(filepath.Join(d.dir, launch.ClientName)); err != nil {
 		t.Fatalf("the client was not installed: %v", err)
+	}
+}
+
+// The new daemon is given the workspace settings file the restart
+// resolves for the old daemon's workspace, as up gives its daemon the
+// one it resolved, so that it protects, and reads, the named file and
+// not the default one.
+func TestRestartGivesTheNewDaemonTheWorkspaceSettingsFile(t *testing.T) {
+	d := startCurrentDaemon(t, validRules, false, rereading...)
+	named := filepath.Join(t.TempDir(), "named.yaml")
+	if err := os.WriteFile(named, []byte("ask_timeout: 4m\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r := restartConfig(t)
+	r.Settings = resolving(t, besideRules, "--workspace-settings", named)
+	r.WorkspaceSettings = workspaceFile(t, besideRules, "--workspace-settings", named)
+	allowRestart(t, r, d.workspace)
+	if out, err := runStop(t, stop.Config{Dir: d.dir, Restart: r}, ""); err != nil {
+		t.Fatalf("restart: %v; printed %q", err, out)
+	}
+	d.waitStopped(t)
+	args := newDaemonArgs(t, d.dir)
+	i := slices.Index(args, "--workspace-settings")
+	if i < 0 || i+1 >= len(args) || args[i+1] != named {
+		t.Fatalf("the new daemon runs %q, want --workspace-settings %s", args, named)
+	}
+}
+
+// A workspace settings file that cannot be named leaves the old daemon
+// running, the error naming the source.
+func TestRestartWithUnnamableWorkspaceSettingsLeavesTheDaemonRunning(t *testing.T) {
+	d := startCurrentDaemon(t, validRules, false)
+	r := restartConfig(t)
+	r.WorkspaceSettings = func(string) (string, error) { return "", errors.New("workspace settings source is broken") }
+	_, err := runStop(t, stop.Config{Dir: d.dir, Restart: r}, "")
+	if err == nil || !strings.Contains(err.Error(), "workspace settings source is broken") || !strings.Contains(err.Error(), "keeps running") {
+		t.Fatalf("got %v, want the source named and the daemon kept running", err)
+	}
+	d.stillServes(t)
+	if args := newDaemonArgs(t, d.dir); args != nil {
+		t.Fatalf("a new daemon started: %q", args)
 	}
 }
 
@@ -278,6 +363,29 @@ func TestRestartWithInvalidRulesLeavesTheDaemonRunning(t *testing.T) {
 	d.stillServes(t)
 	if args := newDaemonArgs(t, d.dir); args != nil {
 		t.Fatalf("a new daemon started: %q", args)
+	}
+}
+
+// Rules or settings not allowed fail the restart before the old daemon
+// stops, which keeps running; the restart records its request, as up
+// does, for `hostrunner allow` to allow.
+func TestRestartOfRulesNotAllowedLeavesTheDaemonRunning(t *testing.T) {
+	d := startCurrentDaemon(t, validRules, false, rereading...)
+	r := restartConfig(t)
+	out, err := runStop(t, stop.Config{Dir: d.dir, Restart: r}, "")
+	na, ok := errors.AsType[*launch.NotAllowedError](err)
+	if !ok || na.Workspace != d.workspace || na.RulesFile != d.rulesFile {
+		t.Fatalf("got %v, want a *launch.NotAllowedError for %s; printed %q", err, d.rulesFile, out)
+	}
+	if !strings.Contains(err.Error(), "keeps running") {
+		t.Errorf("error %q does not say the daemon keeps running", err)
+	}
+	d.stillServes(t)
+	if args := newDaemonArgs(t, d.dir); args != nil {
+		t.Fatalf("a new daemon started: %q", args)
+	}
+	if _, ok, err := r.Allows.Pending(d.workspace); err != nil || !ok {
+		t.Errorf("Pending = %v, %v, want the request recorded", ok, err)
 	}
 }
 
@@ -334,7 +442,9 @@ func TestRestartOfAnOlderDaemonAsksTheContainerRuntime(t *testing.T) {
 	for _, running := range []bool{true, false} {
 		t.Run(strconv.FormatBool(running), func(t *testing.T) {
 			d := startOlderDaemon(t, false, "")
-			out, err := runStop(t, stop.Config{Dir: d.dir, Restart: restartConfig(t, fakeRuntime{running}), Commands: stop.Commands{Answer: stop.Kill}}, "")
+			r := restartConfig(t, fakeRuntime{running})
+			allowRestart(t, r, "/home/u/app")
+			out, err := runStop(t, stop.Config{Dir: d.dir, Restart: r, Commands: stop.Commands{Answer: stop.Kill}}, "")
 			if err != nil {
 				t.Fatalf("restart: %v; printed %q", err, out)
 			}
@@ -368,6 +478,7 @@ func TestRestartSaysWhatTheSettingsChange(t *testing.T) {
 	}
 	r := restartConfig(t)
 	r.Settings = resolving(t, map[string]string{"HOSTRUNNER_RULES_FILE": "other.yaml", "HOSTRUNNER_REREAD": "false"})
+	allowRestart(t, r, d.workspace)
 	out, err := runStop(t, stop.Config{Dir: d.dir, Restart: r}, "")
 	if want := "hostrunner: restarted " + d.dir + "; rules_file " + d.rulesFile + " → " + other + ", reread true → false\n"; err != nil || out != want {
 		t.Fatalf("restart: %v; printed %q, want %q", err, out, want)
@@ -390,6 +501,7 @@ func TestRestartTakesRereadingFromTheSettings(t *testing.T) {
 		d := startCurrentDaemon(t, validRules, false, tt.opts...)
 		r := restartConfig(t)
 		r.Settings = resolving(t, tt.vars)
+		allowRestart(t, r, d.workspace)
 		if out, err := runStop(t, stop.Config{Dir: d.dir, Restart: r}, ""); err != nil {
 			t.Fatalf("%s: restart: %v; printed %q", tt.name, err, out)
 		}
@@ -419,6 +531,7 @@ func TestRestartPicksUpTheSettingsFilesAsTheyAreNow(t *testing.T) {
 	}
 	r := restartConfig(t)
 	r.Settings = resolving(t, map[string]string{"HOSTRUNNER_RULES_FILE": "hostrun.yaml", "HOSTRUNNER_SETTINGS": host})
+	allowRestart(t, r, d.workspace)
 	if out, err := runStop(t, stop.Config{Dir: d.dir, Restart: r}, ""); err != nil {
 		t.Fatalf("restart: %v; printed %q", err, out)
 	}
@@ -456,7 +569,9 @@ func TestRestartWithInvalidSettingsLeavesTheDaemonRunning(t *testing.T) {
 // as one that does when the settings say nothing, the default.
 func TestRestartOfAnOlderDaemonStartsOneThatRereads(t *testing.T) {
 	d := startOlderDaemon(t, false, "")
-	out, err := runStop(t, stop.Config{Dir: d.dir, Restart: restartConfig(t, fakeRuntime{true}), Commands: stop.Commands{Answer: stop.Kill}}, "")
+	r := restartConfig(t, fakeRuntime{true})
+	allowRestart(t, r, "/home/u/app")
+	out, err := runStop(t, stop.Config{Dir: d.dir, Restart: r, Commands: stop.Commands{Answer: stop.Kill}}, "")
 	if err != nil {
 		t.Fatalf("restart: %v; printed %q", err, out)
 	}
@@ -509,6 +624,7 @@ func TestRestartWarnsOfAnIgnoredRulesFile(t *testing.T) {
 		dir := d.devcontainerWith(t, older)
 		r := restartConfig(t)
 		r.Settings = resolving(t, nil)
+		allowRestart(t, r, d.workspace)
 		out, err := runStop(t, stop.Config{Dir: d.dir, Restart: r}, "")
 		if err != nil {
 			t.Fatalf("restart: %v; printed %q", err, out)
@@ -550,6 +666,7 @@ func TestRestartAllWarnsOnceForDaemonsOfOneWorkspace(t *testing.T) {
 	devcontainer := daemons[0].devcontainerWith(t, true)
 	r := restartConfig(t)
 	r.Settings = resolving(t, nil)
+	allowRestart(t, r, ws)
 	out, err := runStop(t, stop.Config{Root: root, All: true, Restart: r}, "")
 	if err != nil {
 		t.Fatalf("restart --all: %v; printed %q", err, out)
@@ -573,6 +690,7 @@ func TestRestartWithAGivenRulesFileDoesNotWarn(t *testing.T) {
 	dir := d.devcontainerWith(t, true)
 	r := restartConfig(t)
 	r.Settings = resolving(t, map[string]string{"HOSTRUNNER_RULES_FILE": filepath.Join(dir, "hostrunner-rules.yaml")})
+	allowRestart(t, r, d.workspace)
 	out, err := runStop(t, stop.Config{Dir: d.dir, Restart: r}, "")
 	if err != nil || strings.Contains(out, "warning") {
 		t.Fatalf("restart: %v; printed %q", err, out)

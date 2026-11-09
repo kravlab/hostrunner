@@ -121,11 +121,19 @@ const (
 // frames go (each write bounded by sessionWriteTimeout), and its pid,
 // which names it in the log.
 type sessionConn struct {
-	conn    net.Conn
-	out     *frameWriter
-	pid     int
-	notices atomic.Bool             // it reads FrameRulesReread (protocol.Serve.Notices)
-	runs    atomic.Pointer[runFeed] // where its run frames go, once it asked for them (protocol.Serve.Runs)
+	conn            net.Conn
+	out             *frameWriter
+	pid             int
+	notices         atomic.Bool             // it reads FrameRulesReread (protocol.Serve.Notices)
+	readsMountCheck atomic.Bool             // it reads FrameMountCheckFailed (protocol.Serve.MountCheck)
+	readsNotAllowed atomic.Bool             // it reads FrameRulesNotAllowed (protocol.Serve.RulesNotAllowed)
+	runs            atomic.Pointer[runFeed] // where its run frames go, once it asked for them (protocol.Serve.Runs)
+	// helloMountFailures is the count of failed mount checks
+	// (mountSnapshot.failures) as its DaemonInfo was sent: a failure that
+	// count names is the one DaemonInfo carried
+	// (protocol.DaemonInfo.MountCheckFailed), which serveSession does not
+	// send it again; only its handleSession uses it.
+	helloMountFailures uint64
 }
 
 // approvalRequest is a request waiting for its outcome, which arrives once
@@ -140,11 +148,24 @@ type approvalRequest struct {
 }
 
 // outcome is how an approval request ended: the human's answer, given in
-// the session by, or, when ended is set, why it got none.
+// the session by, or, when ended is set, why it got none, and, when the
+// reason does not say it (endedMountCheck), what its client is refused
+// with.
 type outcome struct {
-	answer protocol.Answer
-	by     *sessionConn
-	ended  endReason
+	answer  protocol.Answer
+	by      *sessionConn
+	ended   endReason
+	refused *refusal
+}
+
+// refusal is what the client of a request that ended unanswered with o is
+// told: the refusal o carries, else the one its reason implies, or nil
+// when the client went away.
+func (o outcome) refusal() *refusal {
+	if o.refused != nil {
+		return o.refused
+	}
+	return o.ended.refusal()
 }
 
 // endReason is why an approval request ended unanswered.
@@ -152,28 +173,29 @@ type endReason string
 
 // Reasons an approval request ends unanswered; the daemon log gives them.
 const (
-	endedWithdrawn             = endReason(protocol.WithdrawnByClient) // the client went away
-	endedExpired               = endReason(protocol.WithdrawnExpired)  // its limit ran out
-	endedSessionLeft endReason = "session left"                        // its session left
-	endedStopping    endReason = "daemon stopping"                     // the daemon stops or steps aside
-	endedDraining              = endReason(protocol.WithdrawnStopping) // the daemon drains
+	endedWithdrawn             = endReason(protocol.WithdrawnByClient)   // the client went away
+	endedExpired               = endReason(protocol.WithdrawnExpired)    // its limit ran out
+	endedSessionLeft endReason = "session left"                          // its session left
+	endedStopping    endReason = "daemon stopping"                       // the daemon stops or steps aside
+	endedDraining              = endReason(protocol.WithdrawnStopping)   // the daemon drains
+	endedMountCheck            = endReason(protocol.WithdrawnMountCheck) // the mount check failed (see MountChecked)
 )
 
 // withdrawn returns the reason the session is told of the end with
 // (FrameWithdrawn), and whether it is told: it still shows the request,
 // while a session that left or a stopping daemon takes it along. A
 // draining daemon keeps the session connected until it stops, so the
-// session is told.
+// session is told; so is the session of a request the mount check ended.
 func (r endReason) withdrawn() (protocol.EndReason, bool) {
 	switch r {
-	case endedWithdrawn, endedExpired, endedDraining:
+	case endedWithdrawn, endedExpired, endedDraining, endedMountCheck:
 		return protocol.EndReason(r), true
 	}
 	return "", false
 }
 
 // refusal is what the client of a request that ended for r is told, or nil
-// when it went away.
+// when it went away or the outcome carries it (endedMountCheck).
 func (r endReason) refusal() *refusal {
 	switch r {
 	case endedExpired:
@@ -233,31 +255,61 @@ func (a *approvals) enqueue(msg protocol.ApprovalRequest) (uint64, *approvalRequ
 // request learns the reason from answer, so the session reports the end
 // whichever frame reaches it first.
 func (a *approvals) end(id uint64, r *approvalRequest, reason endReason) outcome {
+	return a.endWith(id, r, outcome{ended: reason})
+}
+
+// endWith is end for o, an outcome that carries why the request ended
+// (o.ended) and, when that reason does not say it, its client's refusal.
+func (a *approvals) endWith(id uint64, r *approvalRequest, o outcome) outcome {
 	a.mu.Lock()
 	_, waiting := a.waiting[id]
 	if waiting {
 		delete(a.waiting, id)
-		r.done <- outcome{ended: reason}
+		r.done <- o
 	}
 	// A take-over may move the request to another session: the one told is
 	// the one it has under the lock.
 	session := r.session
-	told, tell := reason.withdrawn()
+	told, tell := o.ended.withdrawn()
 	tell = tell && waiting && a.serving == session
 	if tell {
 		a.telling[id] = told
 	}
 	a.mu.Unlock()
 	if tell {
-		if err := session.out.writeJSON(protocol.FrameWithdrawn, protocol.Withdrawn{ID: id, Reason: told}); err != nil {
-			// As in enqueue: a session that does not take it is gone.
-			session.conn.Close()
-		}
-		a.mu.Lock()
-		delete(a.telling, id)
-		a.mu.Unlock()
+		a.tellWithdrawn(session, told, []uint64{id}, nil)
 	}
 	return <-r.done
+}
+
+// tellWithdrawn tells session c that requests ids ended for told, which
+// the caller marked in a.telling under a.mu: first the frames before
+// sends, if any, then FrameWithdrawn for each of ids in their order, with
+// no other frame between them. It writes outside a.mu, then unmarks the
+// ids. As in enqueue, a session that does not take the frames is gone: its
+// connection is closed.
+func (a *approvals) tellWithdrawn(c *sessionConn, told protocol.EndReason, ids []uint64, before func(send func(protocol.FrameType, any) error) error) {
+	err := c.out.batch(func(send func(protocol.FrameType, any) error) error {
+		if before != nil {
+			if err := before(send); err != nil {
+				return err
+			}
+		}
+		for _, id := range ids {
+			if err := send(protocol.FrameWithdrawn, protocol.Withdrawn{ID: id, Reason: told}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		c.conn.Close()
+	}
+	a.mu.Lock()
+	for _, id := range ids {
+		delete(a.telling, id)
+	}
+	a.mu.Unlock()
 }
 
 // answer delivers ans from session c to its request and returns why it was
@@ -371,16 +423,33 @@ func (a *approvals) served() bool {
 }
 
 // notice tells the session serving the daemon, if it reads notices, that
-// the daemon reread its rules file by itself (n). A session that does not
-// take the frame is gone, as in enqueue.
+// the daemon reread its rules file by itself (n).
 func (a *approvals) notice(n protocol.RulesReread) {
+	a.tell(func(c *sessionConn) bool { return c.notices.Load() }, protocol.FrameRulesReread, n)
+}
+
+// noticeNotAllowed tells the session serving the daemon, if it reads the
+// frame (protocol.Serve.RulesNotAllowed), that the rules or the daemon
+// settings changed to ones not allowed, which the daemon keeps the old
+// ones against (n). A Server without approvals tells nobody.
+func (a *approvals) noticeNotAllowed(n protocol.RulesNotAllowed) {
+	if a == nil {
+		return
+	}
+	a.tell(func(c *sessionConn) bool { return c.readsNotAllowed.Load() }, protocol.FrameRulesNotAllowed, n)
+}
+
+// tell sends the session serving the daemon, if reads says it reads
+// frames of type t, a frame of that type carrying v. A session that does
+// not take the frame is gone, as in enqueue.
+func (a *approvals) tell(reads func(c *sessionConn) bool, t protocol.FrameType, v any) {
 	a.mu.Lock()
 	c := a.serving
 	a.mu.Unlock()
-	if c == nil || !c.notices.Load() {
+	if c == nil || !reads(c) {
 		return
 	}
-	if err := c.out.writeJSON(protocol.FrameRulesReread, n); err != nil {
+	if err := c.out.writeJSON(t, v); err != nil {
 		c.conn.Close()
 	}
 }
@@ -533,7 +602,11 @@ func (s *Server) serveApprovals(ctx context.Context, wg *sync.WaitGroup) {
 // process of the daemon's own uid may use it; it opens with FrameHello and
 // then takes FrameServe, FrameAnswer, FrameStanding, FrameRevoke and
 // FrameReread, and from `hostrunner stop` FrameRunning and FrameStop,
-// whatever the hello's version. Any other frame ends it.
+// whatever the hello's version. Any other frame ends it. A connection
+// that opens with FrameArm instead, from `hostrunner up`, carries that
+// one arm, checked for its protocol version (see checkVersion) and
+// handled as arm does: the container does not reach this socket, so
+// only the host arms the daemon.
 func (s *Server) handleSession(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
 	uid, pid, err := transport.PeerCred(conn)
@@ -560,6 +633,14 @@ func (s *Server) handleSession(ctx context.Context, conn net.Conn) {
 	_ = conn.SetReadDeadline(time.Now().Add(s.requestTimeout))
 	f, err := protocol.ReadFrame(conn)
 	_ = conn.SetReadDeadline(time.Time{})
+	if err == nil && f.Type == protocol.FrameArm {
+		if err := checkVersion(f); err != nil {
+			s.reject(out, protocol.ExitHostrunError, err.Error(), err)
+			return
+		}
+		s.arm(out, f)
+		return
+	}
 	var hello protocol.Hello
 	if err == nil && f.Type != protocol.FrameHello {
 		err = fmt.Errorf("expected a hello on the approval socket, got frame type %d", f.Type)
@@ -572,12 +653,14 @@ func (s *Server) handleSession(ctx context.Context, conn net.Conn) {
 		return
 	}
 	host, container := s.mapper.Roots()
+	mountFailed, mountFailures := s.mount.failure()
+	c.helloMountFailures = mountFailures
 	_ = out.writeJSON(protocol.FrameDaemonInfo, protocol.DaemonInfo{
 		Version: protocol.ApprovalVersion, Workspace: host, ContainerWorkspace: container,
 		RulesFile: s.approvals.rulesFile, RulesDigest: s.rulesDigest(), Served: s.approvals.served(),
 		Stops: true, ContainerStopped: s.containerStopped != nil && s.containerStopped(),
 		Rereads: s.rereadsByItself(), NoReread: !s.rereadsByItself(), BuildVersion: s.buildVersion,
-		Runs: true,
+		Runs: true, Settings: s.settings, MountCheckFailed: mountFailed,
 	})
 	defer func() {
 		// The daemon stopping closes the connection too: its requests end
@@ -613,6 +696,8 @@ func (s *Server) handleSession(ctx context.Context, conn net.Conn) {
 				}
 			}
 			c.notices.Store(sv.Notices)
+			c.readsMountCheck.Store(sv.MountCheck)
+			c.readsNotAllowed.Store(sv.RulesNotAllowed)
 			if sv.Runs && c.runs.Load() == nil {
 				feed := newRunFeed(out)
 				c.runs.Store(feed)
@@ -683,18 +768,30 @@ func (s *Server) closeStopping(c *sessionConn) {
 // reread rereads the rules file for session c, which wrote rr.Rule into
 // it, or, with no rule, found it changed by hand before proposing one,
 // and logs both; a failed reread keeps the old rules and is logged as a
-// warning.
+// warning. Content not allowed (see WithAllowed) is not reread: the old
+// rules stay, and the result says why (see refuseNotAllowed). A hand edit
+// is checked as it is; a rule is allowed when the file it was written over
+// was, and the allow is recorded as the file is reread (see allowAddedRule).
 func (s *Server) reread(c *sessionConn, rr protocol.Reread) protocol.RereadResult {
 	if why := s.approvals.heard(c); why != "" {
 		return protocol.RereadResult{Error: why}
 	}
+	var record func(digest string) error // the allow to record, for a rule added
 	if rr.Rule != "" {
+		var err error
+		if record, err = s.allowAddedRule(rr); err != nil {
+			return protocol.RereadResult{Error: err.Error()}
+		}
 		s.log.Info("rule added", "file", s.approvals.rulesFile, "rule", rr.Rule, "edited", rr.Edited, "pid", c.pid)
 	} else {
-		// A file changed by hand, reread before a rule is proposed.
+		// A file changed by hand, reread before a rule is proposed, unless
+		// its content is not allowed (see WithAllowed).
+		if err := s.refuseNotAllowed(rr.Digest); err != nil {
+			return protocol.RereadResult{Error: err.Error()}
+		}
 		s.log.Info("hand-edited rules reread", "file", s.approvals.rulesFile, "pid", c.pid)
 	}
-	digest, _, err := s.rereadRules(rr.Digest)
+	digest, _, err := s.rereadRules(rr.Digest, record)
 	s.logReread(digest, err)
 	if err != nil {
 		return protocol.RereadResult{Error: err.Error()}
@@ -731,21 +828,47 @@ func (a *approvals) waitingMsg(id uint64) (protocol.ApprovalRequest, bool) {
 // that the handover holds (see serve), and sends it the requests a
 // take-over passed to it, each with the rest of its limit, holding c's
 // writer from before c serves: no request, end of one or frame of a run
-// reaches c before them. It then tells the session it replaced, which it
-// drops. Take-overs run one at a time.
+// reaches c before them. Right after FrameServing, a c that reads it
+// (protocol.Serve.MountCheck) is told the mount check failed, unless its
+// DaemonInfo said so already, and a c that reads the notice of a change
+// not allowed (protocol.Serve.RulesNotAllowed) is told of each change not
+// allowed pending (see pendingChanges), its allow checked again, so not of
+// one allowed by now; what the session serving was told becomes those
+// changes (see noticeChanges). It then tells the session it replaced,
+// which it drops. Take-overs run one at a time.
 func (s *Server) serveSession(c *sessionConn, takeOver bool) string {
 	s.approvals.takeovers.Lock()
 	defer s.approvals.takeovers.Unlock()
+	// A failed mount check reaches c either here or from MountChecked once
+	// c serves: never both, never neither.
+	release := s.mount.holdReports()
+	defer release()
+	// A change not allowed pending reaches c either here or from
+	// noticeChanges once c serves: never both, never neither.
+	s.noticing.Lock()
 	var (
 		why string
 		h   handover
 	)
+	pending := s.pendingChanges()
 	err := c.out.batch(func(send func(protocol.FrameType, any) error) error {
 		if why, h = s.approvals.serve(c, takeOver); why != "" {
 			return nil
 		}
 		if err := send(protocol.FrameServing, nil); err != nil {
 			return err
+		}
+		if failed, failures := s.mount.failure(); failed != "" && failures != c.helloMountFailures && c.readsMountCheck.Load() {
+			if err := send(protocol.FrameMountCheckFailed, protocol.MountCheckFailed{Error: failed}); err != nil {
+				return err
+			}
+		}
+		if c.readsNotAllowed.Load() {
+			for _, n := range pending {
+				if err := send(protocol.FrameRulesNotAllowed, n); err != nil {
+					return err
+				}
+			}
 		}
 		for _, m := range h.earlier {
 			if err := send(protocol.FrameRunStarted, m); err != nil {
@@ -761,6 +884,10 @@ func (s *Server) serveSession(c *sessionConn, takeOver bool) string {
 		}
 		return nil
 	})
+	if why == "" {
+		s.noticed = pending
+	}
+	s.noticing.Unlock()
 	if why != "" {
 		return why
 	}
@@ -801,6 +928,7 @@ func (s *Server) sessionRefused(out *frameWriter, pid int, err error) {
 // runs out, its session leaves or the daemon stops; but for the first,
 // the client is told why. To tell it the daemon stops, ask closes the
 // connection on ctx's end itself, once nothing waits (handle does not).
+// The waiting frame carries the warning of the daemon (see pendingAllowWarning).
 func (s *Server) ask(ctx context.Context, x exchange, f protocol.Frame) {
 	// The connection closes when the daemon stops, as handle closes it for
 	// other requests, but while a request waits: ask then tells its client
@@ -826,6 +954,10 @@ func (s *Server) ask(ctx context.Context, x exchange, f protocol.Frame) {
 			s.reject(x.out, protocol.ExitHostrunError, err.Error(), err)
 			return
 		}
+	}
+	if r := s.mount.refusal(); r != nil {
+		s.reject(x.out, r.code, r.message, r.err)
+		return
 	}
 	need, r := s.assessApproval(req)
 	if r != nil {
@@ -875,29 +1007,33 @@ func (s *Server) ask(ctx context.Context, x exchange, f protocol.Frame) {
 		s.reject(x.out, protocol.ExitRejected, message, err)
 		return
 	}
+	// The mount check may have failed between the gate above and the
+	// enqueue, after the requests waiting then were ended for it.
+	o, rechecked := s.mount.recheck(id, request)
 	guarded := need.text.guarded()
 	s.log.Info("approval requested", "approval_id", id, "argv", req.Argv, "dir", need.hostDir, "reasons", need.text.agentReasons, "guarded", guarded, "timeout", timeout)
-	_ = x.out.writeJSON(protocol.FrameWaiting, protocol.Waiting{Reasons: need.text.agentReasons, Guarded: guarded})
+	_ = x.out.writeJSON(protocol.FrameWaiting, protocol.Waiting{Reasons: need.text.agentReasons, Guarded: guarded, Warning: s.pendingAllowWarning()})
 
 	frames := readFrames(ctx, x.conn)
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
-	var o outcome
-	select {
-	case o = <-request.done:
-	case <-frames:
-		// The client sends nothing before its command starts: it went away.
-		o = s.approvals.end(id, request, endedWithdrawn)
-	case <-timer.C:
-		o = s.approvals.end(id, request, endedExpired)
-	case <-ctx.Done():
-		o = s.approvals.end(id, request, endedStopping)
-	case <-s.draining:
-		o = s.approvals.end(id, request, endedDraining)
+	if !rechecked {
+		select {
+		case o = <-request.done:
+		case <-frames:
+			// The client sends nothing before its command starts: it went away.
+			o = s.approvals.end(id, request, endedWithdrawn)
+		case <-timer.C:
+			o = s.approvals.end(id, request, endedExpired)
+		case <-ctx.Done():
+			o = s.approvals.end(id, request, endedStopping)
+		case <-s.draining:
+			o = s.approvals.end(id, request, endedDraining)
+		}
 	}
 	if o.ended != "" {
 		s.log.Info("approval not answered", "approval_id", id, "reason", string(o.ended))
-		if r := o.ended.refusal(); r != nil {
+		if r := o.refusal(); r != nil {
 			s.reject(x.out, r.code, r.message, r.err)
 		}
 		return
@@ -938,6 +1074,16 @@ func (s *Server) ask(ctx context.Context, x exchange, f protocol.Frame) {
 		}
 		s.log.Info("approval not run", "approval_id", id, "reason", string(endedDraining))
 		s.rejectRun(x.out, run, *endedDraining.refusal(), drainingMessage)
+		return
+	}
+	if r := s.mount.refusal(); r != nil {
+		// The mount check failed after the answer: the command is refused
+		// as a new one would be, and nothing is granted.
+		if p != nil {
+			p.close()
+		}
+		s.log.Info("approval not run", "approval_id", id, "reason", string(endedMountCheck))
+		s.rejectRun(x.out, run, *r, r.message)
 		return
 	}
 	_ = x.out.writeJSON(protocol.FrameApproved, protocol.Approved{Scope: scope})

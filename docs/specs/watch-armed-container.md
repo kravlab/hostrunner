@@ -29,6 +29,13 @@ daemon now follows its armed container, recognised by start time.
   inspection with "no such container" on stderr while the others are still
   printed: it is absent. Any other failure is the runtime's.
 - Containers of all answering runtimes are merged.
+- For the mount check, the volumes the containers' mounts name are
+  inspected once, all together: `<rt> volume inspect --format '{{json
+  .}}' <names…>`, one JSON object per line whose `Name`, `Driver` and
+  `Options` docker and podman name alike. A volume it does not report
+  (one removed meanwhile, which makes the inspection fail with `no such
+  volume`), and a volume mount that names no volume, carries an error on
+  its mount instead; the mount check fails on it.
 
 ## Watcher
 

@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os/exec"
 	"slices"
 	"strings"
@@ -33,6 +34,45 @@ type Container struct {
 	ID        string
 	Running   bool
 	StartedAt time.Time // last start; zero if never started
+	Mounts    []Mount   // meaningful only if MountsErr is nil
+	MountsErr error     // why the mounts could not be read; nil when they were
+}
+
+// The Mount.Type of a volume mount, the Volume.Driver of the runtime's
+// own volumes, and the Volume.Options key that names the host path a
+// local volume binds.
+const (
+	MountTypeVolume    = "volume"
+	DriverLocal        = "local"
+	VolumeOptionDevice = "device"
+)
+
+// Mount is one of a container's mounts as its runtime reports it. A
+// volume's Source lies in the runtime's storage; where its content comes
+// from, a host directory a local volume binds, say, only the volume's
+// driver and options tell (Volume).
+type Mount struct {
+	Type        string // the runtime's mount type: "bind", "volume" (MountTypeVolume) or "tmpfs"; empty if it names none
+	Name        string // the volume's name, for a "volume" mount; empty otherwise or if the runtime names none
+	Source      string // on the host; empty for a mount without one, as tmpfs
+	Destination string // in the container
+	ReadOnly    bool
+	// Volume is, for a "volume" mount, the volume as the runtime's
+	// inspection of it reports it; nil for other mounts and when VolumeErr
+	// says why it could not be inspected. Copies of a Mount share it.
+	Volume *Volume
+	// VolumeErr is, for a "volume" mount, why the volume could not be
+	// inspected; nil when it was, and for other mounts.
+	VolumeErr error
+}
+
+// Volume is a volume as its runtime's inspection reports it: its driver
+// (DriverLocal for the runtime's own) and the options it was created with,
+// such as a local volume's type, o and device (VolumeOptionDevice); nil
+// Options for none.
+type Volume struct {
+	Driver  string
+	Options map[string]string
 }
 
 // Runtime lists a workspace's containers, stopped ones included: a stopped
@@ -49,6 +89,24 @@ type Config struct {
 	QueryTimeout   time.Duration // how long one runtime query may take
 	StartupTimeout time.Duration // how long to wait for the armed container (covers image builds)
 	Grace          time.Duration // how long the armed container must be seen absent
+
+	// Attached, when set, is called on each attach to an armed container,
+	// and again whenever a container that started after the arm joins an
+	// attached arm (e.g. one a Compose devcontainer recreated), so its
+	// mounts are seen too. It gets all armed containers, the new one
+	// included, as the runtimes reported them in the poll that changed the
+	// armed set, mounts included; Run calls it before it polls again.
+	// Polls that bring no new armed container do not call it. The
+	// containers are copies the callback may keep. armedAt is the time of
+	// the arm it attached for (see Armed): a call may come after a later
+	// arm, from a poll that was under way when it came.
+	Attached func(armedAt time.Time, armed []Container)
+
+	// Armed, when set, is called by each Arm that the watcher follows, with
+	// the arm's time, before Arm returns: so before the caller lets the
+	// container start. Concurrent arms may call it out of order. The arm
+	// New makes is not reported.
+	Armed func(armedAt time.Time)
 }
 
 // Watcher follows one workspace's armed container: the container the last
@@ -117,12 +175,26 @@ func New(runtimes []Runtime, cfg Config, log *slog.Logger) *Watcher {
 // cancelled, Arm refuses and returns why it ended: the watcher will not
 // follow the arm, and the daemon must step aside. Arm never waits for
 // runtime queries; the arm's time is taken here, before the caller lets the
-// container start.
+// container start, and reported to Config.Armed before Arm returns.
 func (w *Watcher) Arm() error {
+	armedAt, err := w.arm()
+	if err != nil {
+		return err
+	}
+	// Outside w.mu: the callback must not hold up Run or ContainerStopped.
+	if w.cfg.Armed != nil {
+		w.cfg.Armed(armedAt)
+	}
+	return nil
+}
+
+// arm records an arm now and signals Run, or refuses once the watch has
+// ended; it returns the arm's time.
+func (w *Watcher) arm() (time.Time, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.ended != nil {
-		return fmt.Errorf("the watch has ended: %w", w.ended)
+		return time.Time{}, fmt.Errorf("the watch has ended: %w", w.ended)
 	}
 	w.armedAt = time.Now()
 	w.stopped = false // waiting from the arm on
@@ -130,7 +202,7 @@ func (w *Watcher) Arm() error {
 	case w.armSignal <- struct{}{}:
 	default: // an arm is already pending; it reads the latest time
 	}
-	return nil
+	return w.armedAt, nil
 }
 
 // lastArm returns the time of the last arm.
@@ -199,8 +271,15 @@ func (w *Watcher) Run(ctx context.Context) error {
 		containers, answered := w.query(ctx)
 		if answered {
 			lastAnswer = now
-			if arm.observe(containers, now, w.cfg.Grace) {
-				w.log.Info("attached to the armed container", "workspace", w.cfg.Workspace)
+			if justAttached, changed := arm.observe(containers, now, w.cfg.Grace); changed {
+				if justAttached {
+					w.log.Info("attached to the armed container", "workspace", w.cfg.Workspace)
+				} else {
+					w.log.Info("a container joined the armed containers", "workspace", w.cfg.Workspace)
+				}
+				if w.cfg.Attached != nil {
+					w.cfg.Attached(arm.at, arm.armed(containers))
+				}
 			}
 			w.setStopped(arm.at, arm.attached() && !arm.absentSince.IsZero())
 		} else {
@@ -257,23 +336,26 @@ type arming struct {
 func (a *arming) attached() bool { return a.ids != nil }
 
 // observe takes the containers the runtimes answered with and reports
-// whether the watcher has just attached. Absence counts from the attach at
-// the earliest.
-func (a *arming) observe(containers []Container, now time.Time, grace time.Duration) (justAttached bool) {
+// whether the watcher has just attached, and whether the armed set changed:
+// that attach, or a container that joined it. Absence counts from the attach
+// at the earliest.
+func (a *arming) observe(containers []Container, now time.Time, grace time.Duration) (justAttached, changed bool) {
 	if !a.attached() {
 		a.ids = findArmed(containers, a.at, now, grace)
 		justAttached = a.attached()
 	}
 	if !a.attached() {
-		return false
+		return false, false
 	}
 	// A container started after the arm is the armed container too, e.g.
 	// one a Compose devcontainer recreated.
 	for _, c := range containers {
-		if c.StartedAt.After(a.at) {
+		if c.StartedAt.After(a.at) && !a.ids[c.ID] {
 			a.ids[c.ID] = true
+			changed = true
 		}
 	}
+	changed = changed || justAttached
 	running := slices.ContainsFunc(containers, func(c Container) bool { return c.Running && a.ids[c.ID] })
 	switch {
 	case running:
@@ -281,7 +363,27 @@ func (a *arming) observe(containers []Container, now time.Time, grace time.Durat
 	case a.absentSince.IsZero():
 		a.absentSince = now
 	}
-	return justAttached
+	return justAttached, changed
+}
+
+// armed returns copies of the armed containers among containers, in their
+// order, their mounts' volumes copied too.
+func (a *arming) armed(containers []Container) []Container {
+	var out []Container
+	for _, c := range containers {
+		if a.ids[c.ID] {
+			c.Mounts = slices.Clone(c.Mounts)
+			for i, m := range c.Mounts {
+				if m.Volume != nil {
+					v := *m.Volume
+					v.Options = maps.Clone(v.Options)
+					c.Mounts[i].Volume = &v
+				}
+			}
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // findArmed returns the IDs of the armed container among containers, or
@@ -343,7 +445,8 @@ type CLI struct {
 }
 
 // Containers lists the containers carrying the workspace's
-// devcontainer.local_folder label, in every state, then inspects them.
+// devcontainer.local_folder label, in every state, then inspects them and
+// the volumes their mounts name (see inspectVolumes).
 func (c CLI) Containers(ctx context.Context, workspace string) ([]Container, error) {
 	out, _, err := c.run(ctx, "ps", "-aq", "--filter", "label=devcontainer.local_folder="+workspace)
 	if err != nil {
@@ -355,7 +458,7 @@ func (c CLI) Containers(ctx context.Context, workspace string) ([]Container, err
 	}
 	// json renders docker's string and podman's time.Time alike, as RFC 3339.
 	args := append([]string{"inspect", "--type", "container", "--format",
-		"{{.Id}} {{.State.Running}} {{json .State.StartedAt}}"}, ids...)
+		"{{.Id}} {{.State.Running}} {{json .State.StartedAt}} {{json .Mounts}}"}, ids...)
 	out, stderr, err := c.run(ctx, args...)
 	// A container removed since the listing fails the inspection but not
 	// the others: it is absent. Any other failure is the runtime's.
@@ -364,17 +467,106 @@ func (c CLI) Containers(ctx context.Context, workspace string) ([]Container, err
 	}
 	var found []Container
 	for line := range strings.Lines(out) {
-		fields := strings.Fields(line)
-		if len(fields) != 3 {
+		// The mounts are JSON and may hold spaces, so they are the rest of the line.
+		fields := strings.SplitN(strings.TrimRight(line, "\r\n"), " ", 4)
+		if len(fields) < 3 {
 			return nil, fmt.Errorf("%s inspect: unexpected line %q", c.Binary, line)
 		}
 		started, perr := parseStartedAt(fields[2])
 		if perr != nil {
 			return nil, fmt.Errorf("%s inspect: %w", c.Binary, perr)
 		}
-		found = append(found, Container{ID: fields[0], Running: fields[1] == "true", StartedAt: started})
+		container := Container{ID: fields[0], Running: fields[1] == "true", StartedAt: started}
+		if len(fields) == 4 {
+			container.Mounts, container.MountsErr = parseMounts(fields[3])
+		} else {
+			container.MountsErr = errors.New("no mounts reported")
+		}
+		if container.MountsErr != nil {
+			container.MountsErr = fmt.Errorf("%s inspect: mounts of %s: %w", c.Binary, container.ID, container.MountsErr)
+		}
+		found = append(found, container)
 	}
+	c.inspectVolumes(ctx, found)
 	return found, nil
+}
+
+// inspectVolumes sets the Volume of every "volume" mount of containers
+// whose mounts were read, from one inspection of all the volumes they
+// name, each once; docker and podman both name a volume's keys Name,
+// Driver and Options. A volume the inspection does not report (one
+// removed meanwhile, which makes it fail), or a mount that names none,
+// gets a VolumeErr instead: the caller decides what an unknown volume
+// means.
+func (c CLI) inspectVolumes(ctx context.Context, containers []Container) {
+	volumes, inspectErr := c.inspectVolumeNames(ctx, volumeNames(containers))
+	c.setVolumes(containers, volumes, inspectErr)
+}
+
+// volumeNames returns the names of the volumes the "volume" mounts of
+// containers name, each once, in the order they are first named; a mount
+// that names none adds nothing.
+func volumeNames(containers []Container) []string {
+	var names []string
+	for _, ct := range containers {
+		for _, m := range ct.Mounts {
+			if m.Type == MountTypeVolume && m.Name != "" && !slices.Contains(names, m.Name) {
+				names = append(names, m.Name)
+			}
+		}
+	}
+	return names
+}
+
+// inspectVolumeNames runs one `volume inspect` of the volumes named and
+// returns those it reports, by name, and its failure, err. A line of its
+// output that is not a volume is skipped. A failed command still returns
+// the volumes it reported: one removed meanwhile makes it fail, and the
+// others are reported all the same. No names run nothing.
+func (c CLI) inspectVolumeNames(ctx context.Context, names []string) (volumes map[string]Volume, err error) {
+	volumes = make(map[string]Volume, len(names))
+	if len(names) == 0 {
+		return volumes, nil
+	}
+	out, _, err := c.run(ctx, append([]string{"volume", "inspect", "--format", "{{json .}}"}, names...)...)
+	for line := range strings.Lines(out) {
+		var v struct {
+			Name    string
+			Driver  string
+			Options map[string]string
+		}
+		if json.Unmarshal([]byte(line), &v) == nil && v.Name != "" {
+			volumes[v.Name] = Volume{Driver: v.Driver, Options: v.Options}
+		}
+	}
+	return volumes, err
+}
+
+// setVolumes sets the Volume of every "volume" mount of containers from
+// volumes, the volumes the inspection reported, or its VolumeErr: that
+// the mount names no volume, or, for a volume volumes lacks, inspectErr,
+// the failure of the inspection, when there was one, else that the
+// inspection did not report it.
+func (c CLI) setVolumes(containers []Container, volumes map[string]Volume, inspectErr error) {
+	for i := range containers {
+		for j := range containers[i].Mounts {
+			m := &containers[i].Mounts[j]
+			if m.Type != MountTypeVolume {
+				continue
+			}
+			v, ok := volumes[m.Name]
+			switch {
+			case m.Name == "":
+				m.VolumeErr = fmt.Errorf("%s inspect: a volume mount of %s at %s names no volume", c.Binary, containers[i].ID, m.Destination)
+			case ok:
+				m.Volume = &v
+			case inspectErr != nil:
+				m.VolumeErr = fmt.Errorf("volume %s: %w", m.Name, inspectErr)
+			default:
+				m.VolumeErr = fmt.Errorf("%s volume inspect: volume %s not reported", c.Binary, m.Name)
+			}
+		}
+	}
 }
 
 // run runs the runtime's CLI and returns its stdout and stderr.
@@ -397,6 +589,31 @@ func parseStartedAt(raw string) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("start time %s: %w", raw, err)
 	}
 	return t, nil
+}
+
+// parseMounts reads mounts as {{json .Mounts}} renders them: docker and
+// podman both name a mount's keys Type, Name (a volume's), Source,
+// Destination and RW. null is no mounts.
+func parseMounts(raw string) ([]Mount, error) {
+	var parsed []struct {
+		Type        string
+		Name        string
+		Source      string
+		Destination string
+		RW          bool
+	}
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+		return nil, err
+	}
+	var mounts []Mount
+	for _, m := range parsed {
+		mount := Mount{Type: m.Type, Source: m.Source, Destination: m.Destination, ReadOnly: !m.RW}
+		if m.Type == MountTypeVolume {
+			mount.Name = m.Name
+		}
+		mounts = append(mounts, mount)
+	}
+	return mounts, nil
 }
 
 // String names the runtime in logs.

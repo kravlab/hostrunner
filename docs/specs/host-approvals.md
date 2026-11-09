@@ -138,7 +138,9 @@ from `protocol.Version` of the container's socket.
   requests nor other sessions.
 - Session frames (answer, revoke a standing approval, reread the rules,
   take over) are accepted only there and refused on the container's
-  socket; the approval socket accepts no container frames.
+  socket; the approval socket accepts no container frames. So is
+  `FrameArm`, which `hostrunner up` sends in place of a hello: the
+  container's socket refuses it with a protocol error (125).
 - Hello: the daemon answers with its approval protocol version, the host
   and container workspaces, the rules file path, whether a session
   serves it, its build version (`build_version`, optional; see
@@ -290,7 +292,13 @@ from `protocol.Version` of the container's socket.
   next arm does not step aside and standing approvals stay; running
   commands are untouched; the approved request runs under the new rule. A
   failed reread keeps the old rules and runs the request once, and the
-  session says so. A manual edit takes effect at the next container start,
+  session says so. The session also sends the digest of the file it wrote
+  over: when the daemon checks allows (ADR 0009) and that file was
+  allowed, it records an allow of the content written as it rereads the
+  file, once the file parses and has that content's digest; when it was
+  not, or the allow cannot be recorded, the old rules stay, the change
+  waits for an allow and the request runs once. A manual edit takes
+  effect at the next container start,
   or before, when the human agrees to its reread to add a rule.
 - A flag given its value in its token (`--file=x`) is declared in a new
   rule's `flags.values`, allowing that value; given apart (`--file x`) it
