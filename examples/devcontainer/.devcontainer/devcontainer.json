@@ -1,6 +1,9 @@
 // Minimal devcontainer wired to hostrunner. Copy the initializeCommand,
 // mounts and remoteEnv entries into your own devcontainer.json; the image is
 // only an example. Requires `mise run install` on the host (hostrunner in PATH).
+// The daemon serves the rules and settings only once a human on the host
+// has run `hostrunner allow` for this workspace; until then `up` refuses to
+// start it.
 {
   "name": "hostrunner example",
   "image": "docker.io/library/alpine:3",
@@ -16,6 +19,9 @@
     "--container-workspace", "${containerWorkspaceFolder}"
   ],
 
+  // The last mount, which keeps .devcontainer read-only, is what the
+  // daemon's mount check requires: without it every command is refused,
+  // unless a human on the host turns the check off.
   "mounts": [
     // The daemon's socket and the hostrun client. Read-only: connecting to a
     // socket needs no write access, and the container must not be able to

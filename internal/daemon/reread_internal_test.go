@@ -25,10 +25,10 @@ func TestRereadOfTheRulesServedChangesNothing(t *testing.T) {
 		rereads++
 		return p, "new", nil
 	}))
-	if digest, changed, err := s.rereadRules("new"); err != nil || !changed || digest != "new" {
+	if digest, changed, err := s.rereadRules("new", nil); err != nil || !changed || digest != "new" {
 		t.Fatalf("the first reread: got %q, changed %v, %v; want new, changed", digest, changed, err)
 	}
-	if digest, changed, err := s.rereadRules("new"); err != nil || changed || digest != "new" {
+	if digest, changed, err := s.rereadRules("new", nil); err != nil || changed || digest != "new" {
 		t.Fatalf("the second reread: got %q, changed %v, %v; want new, unchanged", digest, changed, err)
 	}
 	if rereads != 1 {

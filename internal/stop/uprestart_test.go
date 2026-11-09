@@ -2,6 +2,7 @@ package stop_test
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -9,9 +10,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kravlab/hostrunner/internal/allow"
 	"github.com/kravlab/hostrunner/internal/client"
 	"github.com/kravlab/hostrunner/internal/launch"
 	"github.com/kravlab/hostrunner/internal/protocol"
+	"github.com/kravlab/hostrunner/internal/rules"
 	"github.com/kravlab/hostrunner/internal/settings"
 	"github.com/kravlab/hostrunner/internal/stop"
 	"github.com/kravlab/hostrunner/internal/transport"
@@ -21,15 +24,32 @@ import (
 const busyRules = validRules + "  - command: sleep\n    args: any\n"
 
 // upConfig is the `up` of a test for the runtime directory dir, serving
-// workspace with rulesFile; its new daemon is the test binary.
+// workspace with rulesFile; its new daemon is the test binary. Its allow
+// store is empty: nothing is allowed.
 func upConfig(t *testing.T, dir, workspace, rulesFile string) launch.Config {
 	t.Helper()
 	r := restartConfig(t)
 	return launch.Config{
 		Dir: dir, Workspace: workspace, ContainerWorkspace: "/workspaces/new",
 		Daemon: r.Daemon, Client: r.Client,
+		Allows:   allow.Store{Dir: filepath.Join(t.TempDir(), "allow")},
 		Settings: settings.Settings{RulesFile: rulesFile, Reread: true, ReadyTimeout: 5 * time.Second},
 	}
+}
+
+// allowedUpConfig is upConfig with the rules file as it is now, and the
+// daemon settings, allowed, as a human running `hostrunner allow` would.
+func allowedUpConfig(t *testing.T, dir, workspace, rulesFile string) launch.Config {
+	t.Helper()
+	cfg := upConfig(t, dir, workspace, rulesFile)
+	policy, err := rules.Load(rulesFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cfg.Allows.Allow(workspace, allow.Target{RulesFile: rulesFile, Scope: allow.Scope{Digest: policy.Digest(), Settings: cfg.Settings.Daemon()}}); err != nil {
+		t.Fatal(err)
+	}
+	return cfg
 }
 
 // runUpRestart runs `up --restart` for up, its commands treated as
@@ -90,7 +110,7 @@ func TestUpRestartWithoutADaemonStartsOne(t *testing.T) {
 		t.Fatal(err)
 	}
 	ws := t.TempDir()
-	if _, err := runUpRestart(t, upConfig(t, dir, ws, filepath.Join(ws, "missing.yaml")), stop.Commands{}); err != nil {
+	if _, err := runUpRestart(t, allowedUpConfig(t, dir, ws, filepath.Join(ws, "missing.yaml")), stop.Commands{}); err != nil {
 		t.Fatalf("up --restart: %v", err)
 	}
 	if args := newDaemonArgs(t, dir); args == nil {
@@ -106,7 +126,7 @@ func TestUpRestartReplacesAnIdleDaemon(t *testing.T) {
 	if err := os.WriteFile(rulesFile, []byte(validRules), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	out, err := runUpRestart(t, upConfig(t, d.dir, ws, rulesFile), stop.Commands{})
+	out, err := runUpRestart(t, allowedUpConfig(t, d.dir, ws, rulesFile), stop.Commands{})
 	if err != nil {
 		t.Fatalf("up --restart: %v; printed %q", err, out)
 	}
@@ -123,7 +143,7 @@ func TestUpRestartReplacesAnIdleDaemon(t *testing.T) {
 func TestUpRestartOfABusyDaemonWithoutKillFailsAndLeavesIt(t *testing.T) {
 	d := startCurrentDaemon(t, busyRules, false)
 	code := d.keepBusy(t)
-	_, err := runUpRestart(t, upConfig(t, d.dir, d.workspace, d.rulesFile), stop.Commands{})
+	_, err := runUpRestart(t, allowedUpConfig(t, d.dir, d.workspace, d.rulesFile), stop.Commands{})
 	if err == nil || !strings.Contains(err.Error(), "--kill or --wait") {
 		t.Fatalf("got %v, want an error naming --kill and --wait", err)
 	}
@@ -141,7 +161,7 @@ func TestUpRestartOfABusyDaemonWithoutKillFailsAndLeavesIt(t *testing.T) {
 func TestUpRestartWithKillReplacesABusyDaemon(t *testing.T) {
 	d := startCurrentDaemon(t, busyRules, false)
 	code := d.keepBusy(t)
-	if out, err := runUpRestart(t, upConfig(t, d.dir, d.workspace, d.rulesFile), stop.Commands{Answer: stop.Kill}); err != nil {
+	if out, err := runUpRestart(t, allowedUpConfig(t, d.dir, d.workspace, d.rulesFile), stop.Commands{Answer: stop.Kill}); err != nil {
 		t.Fatalf("up --restart --kill: %v; printed %q", err, out)
 	}
 	d.waitStopped(t)
@@ -164,4 +184,22 @@ func TestUpRestartWithInvalidRulesLeavesTheDaemon(t *testing.T) {
 		t.Fatalf("got %v, want the rules file refused", err)
 	}
 	d.stillServes(t)
+}
+
+// Rules or settings nobody allowed fail the restart before it stops
+// anything: the old daemon keeps serving and no new one starts.
+func TestUpRestartWithContentNotAllowedLeavesTheDaemon(t *testing.T) {
+	d := startCurrentDaemon(t, validRules, false)
+	out, err := runUpRestart(t, upConfig(t, d.dir, d.workspace, d.rulesFile), stop.Commands{})
+	var na *launch.NotAllowedError
+	if !errors.As(err, &na) || !strings.Contains(err.Error(), "hostrunner allow") {
+		t.Fatalf("got %v, want a launch.NotAllowedError naming hostrunner allow", err)
+	}
+	if out != "" {
+		t.Fatalf("printed %q, want nothing: no daemon was stopped", out)
+	}
+	d.stillServes(t)
+	if args := newDaemonArgs(t, d.dir); args != nil {
+		t.Fatalf("a new daemon started: %q", args)
+	}
 }

@@ -1298,17 +1298,7 @@ func TestADaemonSteppingAsideAnswersWaitingRequests(t *testing.T) {
 	s := h.startSession(t)
 	ch := h.ask(t, "touch", "marker")
 	s.waitFor(t, answerPromptText)
-	conn, err := h.transport.Dial(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-	if err := protocol.WriteJSON(conn, protocol.FrameArm, protocol.Arm{Version: protocol.Version}); err != nil {
-		t.Fatal(err)
-	}
-	if f, err := protocol.ReadFrame(conn); err != nil || f.Type != protocol.FrameArmed {
-		t.Fatalf("frame %v, err %v; want armed", f.Type, err)
-	}
+	h.arm(t, protocol.Arm{})
 	if got := awaitResult(t, ch); got != (result{code: protocol.ExitRejected, stderr: waitingNoRule + "hostrun: not approved: the hostrunner daemon is stopping\n"}) {
 		t.Fatalf("got %+v, want the daemon stopping", got)
 	}

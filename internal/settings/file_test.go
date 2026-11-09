@@ -89,6 +89,7 @@ poll_interval: 5s
 ask_timeout: 20m
 request_timeout: 30s
 ready_timeout: 1m
+mount_check: false
 `)
 	got, err := parseUp(t, "--settings", path).Resolve(env(nil), noWorkspace)
 	want := settings.Settings{

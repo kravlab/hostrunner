@@ -201,19 +201,8 @@ func TestRereadArmGetsTheNewDigest(t *testing.T) {
 		}))
 	writeRules(t, h.rulesFile, touchRules)
 	h.waitForCode(t, 0, "touch", "marker")
-	conn, err := h.transport.Dial(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 	want := rules.ContentDigest([]byte(touchRules))
-	if err := protocol.WriteJSON(conn, protocol.FrameArm, protocol.Arm{Version: protocol.Version, ConfigDigest: want}); err != nil {
-		t.Fatal(err)
-	}
-	if f, err := protocol.ReadFrame(conn); err != nil || f.Type != protocol.FrameArmed {
-		t.Fatalf("frame %v, err %v; want armed", f.Type, err)
-	}
+	h.arm(t, protocol.Arm{ConfigDigest: want})
 	select {
 	case got := <-digests:
 		if got != want {

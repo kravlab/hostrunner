@@ -24,6 +24,7 @@ var defaults = settings.Settings{
 	AskTimeout:     10 * time.Minute,
 	RequestTimeout: 10 * time.Second,
 	ReadyTimeout:   10 * time.Second,
+	MountCheck:     true,
 }
 
 // tuned is defaults with the keys most tests set given.
@@ -134,6 +135,7 @@ func TestResolveReadsEveryVariable(t *testing.T) {
 		"HOSTRUNNER_ASK_TIMEOUT":     "20m",
 		"HOSTRUNNER_REQUEST_TIMEOUT": "30s",
 		"HOSTRUNNER_READY_TIMEOUT":   "1m",
+		"HOSTRUNNER_MOUNT_CHECK":     "false",
 	}), noWorkspace)
 	want := settings.Settings{
 		RulesFile:      "/r/hostrun.yaml",
@@ -166,6 +168,7 @@ func TestResolveRejectsAnInvalidVariable(t *testing.T) {
 		{"zero duration", "HOSTRUNNER_GRACE", "0s", `HOSTRUNNER_GRACE: must be positive`},
 		{"negative duration", "HOSTRUNNER_STARTUP_TIMEOUT", "-5m", `HOSTRUNNER_STARTUP_TIMEOUT: must be positive`},
 		{"unparsable bool", "HOSTRUNNER_REREAD", "maybe", `HOSTRUNNER_REREAD: invalid bool "maybe"`},
+		{"unparsable mount check", "HOSTRUNNER_MOUNT_CHECK", "off", `HOSTRUNNER_MOUNT_CHECK: invalid bool "off"`},
 		{"zero poll interval", "HOSTRUNNER_POLL_INTERVAL", "0s", `HOSTRUNNER_POLL_INTERVAL: must be positive`},
 		{"unparsable ask timeout", "HOSTRUNNER_ASK_TIMEOUT", "soon", `HOSTRUNNER_ASK_TIMEOUT: invalid duration "soon"`},
 		{"request timeout without unit", "HOSTRUNNER_REQUEST_TIMEOUT", "10", `HOSTRUNNER_REQUEST_TIMEOUT: invalid duration "10"`},
@@ -189,7 +192,7 @@ const givenRules = "/given/hostrun.yaml"
 
 // daemonFlags gives every setting but the rules file and reread that
 // serve takes as a flag; givenTimings is what they give.
-var daemonFlags = []string{"--startup-timeout", "1h", "--grace", "1m", "--poll-interval", "5s", "--ask-timeout", "20m", "--request-timeout", "30s"}
+var daemonFlags = []string{"--startup-timeout", "1h", "--grace", "1m", "--poll-interval", "5s", "--ask-timeout", "20m", "--request-timeout", "30s", "--mount-check"}
 
 // givenTimings is defaults with what daemonFlags gives, the rules file
 // given and reread off.
@@ -329,8 +332,17 @@ func TestResolveRefusesATildeWithoutHome(t *testing.T) {
 }
 
 func TestUsageNamesEveryFlagServeTakes(t *testing.T) {
-	want := "[--settings <path>] [--workspace-settings <path>] [--rules-file <path>] [--startup-timeout <duration>] [--grace <duration>] [--reread | --no-reread] [--poll-interval <duration>] [--ask-timeout <duration>] [--request-timeout <duration>]"
+	want := "[--settings <path>] [--workspace-settings <path>] [--rules-file <path>] [--startup-timeout <duration>] [--grace <duration>] [--reread | --no-reread] [--poll-interval <duration>] [--ask-timeout <duration>] [--request-timeout <duration>] [--mount-check | --no-mount-check]"
 	if got := settings.Usage(); got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+// MountCheckOffHint names every way a human on the host turns the mount
+// check off, none of which the container can reach.
+func TestMountCheckOffHint(t *testing.T) {
+	want := "mount_check: false in the host settings file, HOSTRUNNER_MOUNT_CHECK=false or --no-mount-check"
+	if got := settings.MountCheckOffHint(); got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}
 }

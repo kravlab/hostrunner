@@ -34,12 +34,13 @@ func ignoredWarning(dir string) string {
 }
 
 // isolate keeps the machine's settings and variables from choosing the
-// rules file of a run.
+// rules file of a run, and gives the run an allow store of its own.
 func isolate(t *testing.T) {
 	t.Helper()
 	for _, name := range []string{"HOME", "XDG_CONFIG_HOME", "HOSTRUNNER_SETTINGS", "HOSTRUNNER_WORKSPACE_SETTINGS", "HOSTRUNNER_RULES_FILE"} {
 		t.Setenv(name, "")
 	}
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
 }
 
 // up and `up --restart` warn once when both rules files exist, and go on

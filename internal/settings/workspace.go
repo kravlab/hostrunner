@@ -9,12 +9,22 @@ import (
 )
 
 // readWorkspaceFile reads the workspace settings file workspaceFile
-// names, which holds the keys at its top level and no sections. A missing
+// names, which holds the keys at its top level and no sections, and none
+// only the host settings file may set (see key.hostOnly). A missing
 // default file sets nothing, a missing named one is an error.
 func readWorkspaceFile(in scopes, named, workspace string, getenv func(string) string) (sourced, error) {
 	path, required := workspaceFile(named, workspace, getenv)
-	l, _, err := readNamed(in, path, required, false)
+	l, _, err := readNamed(in, path, required, workspacePart)
 	return sourced{l, inFile(path, "")}, err
+}
+
+// WorkspaceFile returns the workspace settings file of the parsed command
+// line for the workspace at the host path workspace, the one Resolve
+// reads (see workspaceFile), made absolute against the current directory.
+// It names the file whether or not it exists.
+func (f *Flags) WorkspaceFile(getenv func(string) string, workspace string) (string, error) {
+	path, _ := workspaceFile(f.workspaceFile, workspace, getenv)
+	return filepath.Abs(path)
 }
 
 // workspaceFile is the workspace settings file of the workspace at the

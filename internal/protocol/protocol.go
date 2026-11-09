@@ -2,10 +2,9 @@
 // the hostrunner daemon.
 //
 // A connection carries a sequence of frames, each encoded as
-// [type:1][length:4, big-endian][payload:length]. A connection either arms
-// the daemon (FrameArm, answered by FrameArmed or FrameError), dry-runs one
-// command (FrameDryRun, answered by FrameAllowed or FrameError, the command
-// never starting), or runs one
+// [type:1][length:4, big-endian][payload:length]. A connection to the
+// container's socket either dry-runs one command (FrameDryRun, answered by
+// FrameAllowed or FrameError, the command never starting), or runs one
 // command: the client opens with one FrameRequest, then streams FrameStdin/FrameStdinClose; the daemon streams
 // FrameStdout/FrameStderr and, when it has a result to report, ends the
 // exchange with one FrameExit or FrameError. If the exchange is cancelled
@@ -16,6 +15,10 @@
 // more as the command consumes them). This keeps the daemon's reader of the
 // connection from ever blocking on a command that does not read stdin, so it
 // always notices a disconnect. Structured payloads are JSON.
+//
+// The first answer of an exchange may carry a Warning, which the client
+// prints on stderr once without changing the command's output or exit
+// code (see Credit).
 //
 // A dry run has a frame type of its own rather than a field in Request: a
 // daemon that predates it rejects the unknown frame type, where it would
@@ -36,15 +39,23 @@
 // FrameRevoke list and revoke the standing and session approvals;
 // FrameReread makes the daemon reread its rules file once the session has
 // added a rule, and FrameRulesReread tells the session the daemon reread
-// it by itself. A session that asks for them (Serve.Runs) learns how the
-// runs a human approved go: FrameRunStarted, FrameRunOutput, FrameRunEnded,
-// sent apart from the container's stream so that a session falling behind
-// loses output but neither slows the command nor is dropped for it. A
+// it by itself; FrameRulesNotAllowed tells it the rules or the daemon
+// settings changed to ones not allowed, which it keeps the old ones
+// against; FrameMountCheckFailed tells it the check of the armed
+// container's mounts failed. A session that asks for them (Serve.Runs)
+// learns how the runs a human approved go: FrameRunStarted,
+// FrameRunOutput, FrameRunEnded, sent apart from the container's stream
+// so that a session falling behind loses output but neither slows the
+// command nor is dropped for it. A
 // session that takes the daemon over from another (Serve.TakeOver) gets
 // its waiting requests, and the other FrameTakenOver. `hostrunner stop`,
 // `restart` and `up --restart` open with FrameHello too, without
 // serving: FrameRunning lists what the daemon runs, and FrameStop,
-// confirmed by FrameStopping, stops it.
+// confirmed by FrameStopping, stops it. `hostrunner up` arms the daemon on
+// the approval socket too: a connection that opens with FrameArm instead
+// of FrameHello carries that one arm, answered by FrameArmed or
+// FrameError. The container's socket refuses FrameArm, so only the host
+// arms the daemon.
 package protocol
 
 import (
@@ -85,7 +96,7 @@ const (
 	FrameExit                             // daemon → client, JSON Exit
 	FrameError                            // daemon → client, JSON Error
 	FrameStdinCredit                      // daemon → client, JSON Credit
-	FrameArm                              // `hostrunner up` → daemon, JSON Arm
+	FrameArm                              // `hostrunner up` → daemon, on the approval socket only, JSON Arm
 	FrameArmed                            // daemon → `hostrunner up`, JSON Armed
 	FrameDryRun                           // client → daemon, JSON Request
 	FrameAllowed                          // daemon → client, JSON Allowed
@@ -96,32 +107,34 @@ const (
 	// Frames of the approval socket, between the daemon and an approval
 	// session, or `hostrunner stop` (restart and `up --restart` send the
 	// same frames); the container's socket refuses them, and the approval
-	// socket refuses every other frame.
-	FrameHello           // session → daemon, JSON Hello
-	FrameDaemonInfo      // daemon → session, JSON DaemonInfo
-	FrameServe           // session → daemon, JSON Serve (or no payload): serve the daemon
-	FrameServing         // daemon → session, no payload: the session serves it
-	FrameApprovalRequest // daemon → session, JSON ApprovalRequest
-	FrameAnswer          // session → daemon, JSON Answer
-	FrameAnswered        // daemon → session, JSON Answered
-	FrameWithdrawn       // daemon → session, JSON Withdrawn
-	FrameStanding        // session → daemon, no payload: list the standing and session approvals
-	FrameStandingList    // daemon → session, JSON StandingList
-	FrameRevoke          // session → daemon, JSON Revoke
-	FrameRevoked         // daemon → session, JSON Revoked
-	FrameReread          // session → daemon, JSON Reread
-	FrameRereadResult    // daemon → session, JSON RereadResult
-	FrameTakenOver       // daemon → session, no payload: another session took over
-	FrameRunning         // `hostrunner stop` → daemon, no payload: list the running commands and count the approvals
-	FrameRunningList     // daemon → `hostrunner stop`, JSON RunningList
-	FrameStop            // `hostrunner stop` → daemon, JSON Stop
-	FrameStopping        // daemon → `hostrunner stop`, no payload: the daemon stops; the connection closes once it does, maybe before its sockets are closed and its commands are gone
-	FrameRulesReread     // daemon → session, JSON RulesReread: the daemon reread its rules file by itself, to a session that said it reads this (Serve.Notices)
-	FrameRunStarted      // daemon → session, JSON RunStarted: an approved run began, to a session that asked for runs (Serve.Runs)
-	FrameRunOutput       // daemon → session, JSON RunOutput: a chunk of an approved run's output, likewise
-	FrameRunEnded        // daemon → session, JSON RunEnded: an approved run ended, likewise
+	// socket refuses every other frame but FrameArm and FrameArmed.
+	FrameHello            // session → daemon, JSON Hello
+	FrameDaemonInfo       // daemon → session, JSON DaemonInfo
+	FrameServe            // session → daemon, JSON Serve (or no payload): serve the daemon
+	FrameServing          // daemon → session, no payload: the session serves it
+	FrameApprovalRequest  // daemon → session, JSON ApprovalRequest
+	FrameAnswer           // session → daemon, JSON Answer
+	FrameAnswered         // daemon → session, JSON Answered
+	FrameWithdrawn        // daemon → session, JSON Withdrawn
+	FrameStanding         // session → daemon, no payload: list the standing and session approvals
+	FrameStandingList     // daemon → session, JSON StandingList
+	FrameRevoke           // session → daemon, JSON Revoke
+	FrameRevoked          // daemon → session, JSON Revoked
+	FrameReread           // session → daemon, JSON Reread
+	FrameRereadResult     // daemon → session, JSON RereadResult
+	FrameTakenOver        // daemon → session, no payload: another session took over
+	FrameRunning          // `hostrunner stop` → daemon, no payload: list the running commands and count the approvals
+	FrameRunningList      // daemon → `hostrunner stop`, JSON RunningList
+	FrameStop             // `hostrunner stop` → daemon, JSON Stop
+	FrameStopping         // daemon → `hostrunner stop`, no payload: the daemon stops; the connection closes once it does, maybe before its sockets are closed and its commands are gone
+	FrameRulesReread      // daemon → session, JSON RulesReread: the daemon reread its rules file by itself, to a session that said it reads this (Serve.Notices)
+	FrameRunStarted       // daemon → session, JSON RunStarted: an approved run began, to a session that asked for runs (Serve.Runs)
+	FrameRunOutput        // daemon → session, JSON RunOutput: a chunk of an approved run's output, likewise
+	FrameRunEnded         // daemon → session, JSON RunEnded: an approved run ended, likewise
+	FrameMountCheckFailed // daemon → session, JSON MountCheckFailed: the check of the armed container's mounts failed, to a session that said it reads this (Serve.MountCheck)
+	FrameRulesNotAllowed  // daemon → session, JSON RulesNotAllowed: the rules or the daemon settings changed to ones not allowed, to a session that said it reads this (Serve.RulesNotAllowed)
 
-	lastFrameType = FrameRunEnded
+	lastFrameType = FrameRulesNotAllowed
 )
 
 // Exit codes for failures of hostrun itself rather than of the command,
@@ -164,11 +177,26 @@ type Request struct {
 // still reads NoReread, which Settings' reread then repeats, and a
 // current daemon reads only Settings; an arm without the field, from an
 // `up` that predates it, has the daemon compare its NoReread alone.
+// NotAllowed is set when `up` found the rules file and settings not
+// allowed (see ArmNotAllowed); a daemon that predates it ignores the
+// field.
 type Arm struct {
 	Version      int               `json:"version"`
 	ConfigDigest string            `json:"config_digest"`
 	NoReread     bool              `json:"no_reread,omitempty"`
 	Settings     map[string]string `json:"settings,omitempty"`
+	NotAllowed   *ArmNotAllowed    `json:"not_allowed,omitempty"`
+}
+
+// ArmNotAllowed tells a running daemon that `hostrunner up` found the rules
+// file of Digest, with the daemon settings Settings (key to value text, as
+// settings.Settings.Daemon writes them), not allowed. The daemon, which
+// serves allowed ones, is armed instead of replaced; it warns the client
+// (the Warning fields) while that change stays not allowed, until an arm
+// without the field or the allow store allows it.
+type ArmNotAllowed struct {
+	Digest   string            `json:"digest"`
+	Settings map[string]string `json:"settings,omitempty"`
 }
 
 // Armed answers Arm. Restart means the daemon steps aside: it will not
@@ -187,12 +215,13 @@ type Armed struct {
 // client that predates them ignores the field. Approval is ScopeStanding
 // or ScopeSession when a standing or session approval lets the command
 // through, which runs it as the rule that refused it would (Dir,
-// Secrets).
+// Secrets). Warning is described on Credit.
 type Allowed struct {
 	Rule     string   `json:"rule"`
 	Dir      string   `json:"dir,omitempty"`
 	Secrets  []string `json:"secrets,omitempty"`
 	Approval Scope    `json:"approval,omitempty"`
+	Warning  string   `json:"warning,omitempty"`
 }
 
 // String describes a, as the dry run and the Rules test report it.
@@ -224,10 +253,11 @@ type Ask struct {
 // Waiting tells the client that its command waits for a human's answer.
 // Reasons are every reason it was refused, the first naming the rule that
 // refused it, as a refusal does; Guarded is set when approving it needs a
-// second confirmation.
+// second confirmation. Warning is described on Credit.
 type Waiting struct {
 	Reasons []string `json:"reasons"`
 	Guarded bool     `json:"guarded,omitempty"`
+	Warning string   `json:"warning,omitempty"`
 }
 
 // String is the line the client prints while its command waits.
@@ -297,11 +327,15 @@ const ApprovalVersion = 1
 // a frame it does not know for an error, so a daemon sends it none. Runs
 // says, for the same reason, that it reads the frames of approved runs
 // (FrameRunStarted, FrameRunOutput, FrameRunEnded), which a daemon with
-// DaemonInfo.Runs then sends it.
+// DaemonInfo.Runs then sends it. MountCheck says, for the same reason,
+// that it reads FrameMountCheckFailed, and RulesNotAllowed that it reads
+// FrameRulesNotAllowed.
 type Serve struct {
-	TakeOver bool `json:"take_over,omitempty"`
-	Notices  bool `json:"notices,omitempty"`
-	Runs     bool `json:"runs,omitempty"`
+	TakeOver        bool `json:"take_over,omitempty"`
+	Notices         bool `json:"notices,omitempty"`
+	Runs            bool `json:"runs,omitempty"`
+	MountCheck      bool `json:"mount_check,omitempty"`
+	RulesNotAllowed bool `json:"rules_not_allowed,omitempty"`
 }
 
 // RunStarted tells the session serving the daemon that an approved run
@@ -374,6 +408,49 @@ type RulesReread struct {
 	Error  string `json:"error,omitempty"`
 }
 
+// RulesNotAllowed tells the session serving the daemon that the rules
+// file, or with Settings the rules or the daemon settings (a change
+// `hostrunner up` reported in its arm, see ArmNotAllowed, with settings
+// other than the daemon's), changed to content of Digest that is not
+// allowed, or with NotChecked whose allow cannot be checked, so the
+// daemon keeps the old ones. Text says so, as hostrun's warning does.
+type RulesNotAllowed struct {
+	Digest     string `json:"digest"`
+	Settings   bool   `json:"settings,omitempty"`
+	NotChecked bool   `json:"not_checked,omitempty"`
+}
+
+// AllowCommand is the command a human on the host runs to allow the
+// rules and the daemon settings of a workspace.
+const AllowCommand = "hostrunner allow"
+
+// Text says that the rules file, or the rules or the daemon settings,
+// changed to content of n.Digest, but the change is not allowed, or its
+// allow cannot be checked, so the daemon keeps the old ones, and what a
+// human on the host does about it: runs hostrunner allow, or looks at the
+// daemon log. It defines the texts of all four variants, which the
+// daemon's warning to hostrun (the Warning fields) and the approval
+// session both give.
+func (n RulesNotAllowed) Text() string {
+	subject, kept := "the rules file", "rules"
+	if n.Settings {
+		subject, kept = "the rules or the daemon settings", "ones"
+	}
+	cause, remedy := "the change is not allowed", "runs "+AllowCommand+" to allow it"
+	if n.NotChecked {
+		cause, remedy = "its allow cannot be checked", "looks at the daemon log"
+	}
+	return subject + " changed (digest " + n.Digest + "), but " + cause + ", so the daemon keeps the old " + kept + "; a human on the host " + remedy
+}
+
+// MountCheckFailed tells the session serving the daemon that the check of
+// the mounts of the container the daemon attached to failed, so the daemon
+// refuses every command until a later check passes: Error says why, in
+// host terms (it may name host paths).
+type MountCheckFailed struct {
+	Error string `json:"error"`
+}
+
 // ServedRefusal is the message of the error a daemon refuses Serve with
 // when another session serves it and Serve does not take it over.
 const ServedRefusal = "another approval session serves this daemon"
@@ -407,19 +484,30 @@ type Hello struct {
 // Runs says the daemon sends the frames of approved runs to a session
 // that asks for them (Serve.Runs); a daemon older than the field reports
 // it not, and a session then gets no run output.
+// MountCheckFailed is why the check of the armed container's mounts
+// failed, when it has, as the session says Hello: the daemon refuses
+// every command until a later check passes (see FrameMountCheckFailed); a
+// daemon older than the field, or one that does not check, reports none,
+// and an older session ignores it.
+// Settings are the daemon settings the daemon runs with, keyed by their
+// names as an arm carries them (settings.Settings.Daemon), so that
+// `hostrunner up` can tell whether what it serves is allowed; a daemon
+// older than the field reports none, and an older session ignores it.
 type DaemonInfo struct {
-	Version            int    `json:"version"`
-	Workspace          string `json:"workspace"`
-	ContainerWorkspace string `json:"container_workspace"`
-	RulesFile          string `json:"rules_file"`
-	RulesDigest        string `json:"rules_digest,omitempty"`
-	Served             bool   `json:"served,omitempty"`
-	Stops              bool   `json:"stops,omitempty"`
-	ContainerStopped   bool   `json:"container_stopped,omitempty"`
-	Rereads            bool   `json:"rereads,omitempty"`
-	NoReread           bool   `json:"no_reread,omitempty"`
-	BuildVersion       string `json:"build_version,omitempty"`
-	Runs               bool   `json:"runs,omitempty"`
+	Version            int               `json:"version"`
+	Workspace          string            `json:"workspace"`
+	ContainerWorkspace string            `json:"container_workspace"`
+	RulesFile          string            `json:"rules_file"`
+	RulesDigest        string            `json:"rules_digest,omitempty"`
+	Served             bool              `json:"served,omitempty"`
+	Stops              bool              `json:"stops,omitempty"`
+	ContainerStopped   bool              `json:"container_stopped,omitempty"`
+	Rereads            bool              `json:"rereads,omitempty"`
+	NoReread           bool              `json:"no_reread,omitempty"`
+	BuildVersion       string            `json:"build_version,omitempty"`
+	Runs               bool              `json:"runs,omitempty"`
+	Settings           map[string]string `json:"settings,omitempty"`
+	MountCheckFailed   string            `json:"mount_check_failed,omitempty"`
 }
 
 // RunningList answers FrameRunning: the commands the daemon runs, and
@@ -517,12 +605,15 @@ type Revoked struct {
 // hand, and the human agreed to have it reread before a rule is proposed;
 // Digest is that of the file the session read. The daemon keeps its rules
 // when the file it rereads has another digest: an edit nobody reviewed
-// waits for the next start.
+// waits for the next start. WrittenOver is the digest of the file Rule
+// was written over: the daemon allows the content of a Rule it checks the
+// allow of (see daemon.WithAllowed) if it allowed that file.
 type Reread struct {
-	Rule   string `json:"rule,omitempty"`
-	Edited bool   `json:"edited,omitempty"`
-	Digest string `json:"digest"`
-	ID     uint64 `json:"id,omitempty"`
+	Rule        string `json:"rule,omitempty"`
+	Edited      bool   `json:"edited,omitempty"`
+	Digest      string `json:"digest"`
+	WrittenOver string `json:"written_over,omitempty"`
+	ID          uint64 `json:"id,omitempty"`
 }
 
 // RereadResult answers Reread: Digest identifies the rules the daemon now
@@ -549,9 +640,10 @@ type EndReason string
 
 // Reasons a request ends unanswered that the session is told.
 const (
-	WithdrawnByClient EndReason = "withdrawn"                     // the client went away
-	WithdrawnExpired  EndReason = "expired"                       // its limit ran out
-	WithdrawnStopping EndReason = "ended: the daemon is stopping" // the daemon drains; a session that predates it shows the text as is
+	WithdrawnByClient   EndReason = "withdrawn"                     // the client went away
+	WithdrawnExpired    EndReason = "expired"                       // its limit ran out
+	WithdrawnStopping   EndReason = "ended: the daemon is stopping" // the daemon drains; a session that predates it shows the text as is
+	WithdrawnMountCheck EndReason = "ended: the mount check failed" // the check of the armed container's mounts failed; likewise
 )
 
 // Exit reports the exit code of a command that ran.
@@ -560,15 +652,25 @@ type Exit struct {
 }
 
 // Error reports that the command could not run. Code is the exit code the
-// client must terminate with; Message is shown to the user.
+// client must terminate with; Message is shown to the user. Warning is
+// described on Credit.
 type Error struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
+	Warning string `json:"warning,omitempty"`
 }
 
-// Credit allows the client to send Bytes more bytes of stdin.
+// Credit allows the client to send Bytes more bytes of stdin. Warning is a
+// warning the daemon gives the client while the rules file or the daemon
+// settings changed but a human on the host has not allowed the change
+// (`hostrunner allow`); the client prints it on stderr, at most once per
+// call, from the first answer carrying it, without changing the command's
+// output or exit code. A daemon puts it in the first answer of an exchange:
+// the initial Credit when the command starts, Waiting, Allowed or Error.
+// An older client ignores the field; an older daemon sends none.
 type Credit struct {
-	Bytes int `json:"bytes"`
+	Bytes   int    `json:"bytes"`
+	Warning string `json:"warning,omitempty"`
 }
 
 const headerSize = 5

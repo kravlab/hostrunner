@@ -1,7 +1,6 @@
 package client_test
 
 import (
-	"context"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -121,17 +120,7 @@ func TestStandingApprovalWorksWithoutASessionAndSurvivesAnArm(t *testing.T) {
 	h.grantStanding(t, s, false, "touch", "marker")
 	s.cancel()
 	<-s.ended
-	conn, err := h.transport.Dial(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-	if err := protocol.WriteJSON(conn, protocol.FrameArm, protocol.Arm{Version: protocol.Version}); err != nil {
-		t.Fatal(err)
-	}
-	if f, err := protocol.ReadFrame(conn); err != nil || f.Type != protocol.FrameArmed {
-		t.Fatalf("frame %v, err %v; want armed", f.Type, err)
-	}
+	h.arm(t, protocol.Arm{})
 	if err := os.Remove(filepath.Join(h.hostRoot, "marker")); err != nil {
 		t.Fatal(err)
 	}
@@ -298,18 +287,8 @@ func TestStandingApprovalIsGoneAfterTheDaemonStepsAside(t *testing.T) {
 	if err := os.Remove(filepath.Join(h.hostRoot, "marker")); err != nil {
 		t.Fatal(err)
 	}
-	conn, err := h.transport.Dial(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-	if err := protocol.WriteJSON(conn, protocol.FrameArm, protocol.Arm{Version: protocol.Version}); err != nil {
-		t.Fatal(err)
-	}
-	f, err := protocol.ReadFrame(conn)
-	var armed protocol.Armed
-	if err != nil || f.Type != protocol.FrameArmed || protocol.DecodeJSON(f, &armed) != nil || !armed.Restart {
-		t.Fatalf("frame %v %+v, err %v; want the daemon to step aside", f.Type, armed, err)
+	if armed := h.arm(t, protocol.Arm{}); !armed.Restart {
+		t.Fatalf("armed %+v; want the daemon to step aside", armed)
 	}
 	// Stepping aside, the daemon stops; stop waits for it.
 	h.stop()

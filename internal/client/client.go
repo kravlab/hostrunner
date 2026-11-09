@@ -67,6 +67,11 @@ func isAskFlag(arg string) bool { return arg == askFlag || strings.HasPrefix(arg
 // finishes while a terminal read may still block. Cancelling ctx drops the
 // connection, which makes the daemon kill the command, and Run returns
 // ExitInterrupted.
+//
+// When the first frame of the daemon that carries a Warning (the credit,
+// waiting, allowed and error frames may) is read, Run prints it once on
+// stderr as "hostrun: warning: <text>", before anything that frame prints;
+// it changes nothing else.
 func Run(ctx context.Context, d Dialer, args []string, cwd string, stdin io.Reader, stdout, stderr io.Writer) int {
 	argv, dryRun, ask := args, false, false
 	var limit time.Duration // how long an approval request waits; 0: the daemon's default
@@ -129,6 +134,16 @@ func Run(ctx context.Context, d Dialer, args []string, cwd string, stdin io.Read
 		startStdin()
 	}
 
+	// warn prints the warning w of a daemon frame, if any, but only the
+	// first one: the daemon repeats it in a later frame of the same call.
+	warned := false
+	warn := func(w string) {
+		if w != "" && !warned {
+			warned = true
+			fmt.Fprintf(stderr, "hostrun: warning: %s\n", w)
+		}
+	}
+
 	for {
 		f, err := protocol.ReadFrame(conn)
 		if err != nil {
@@ -150,6 +165,7 @@ func Run(ctx context.Context, d Dialer, args []string, cwd string, stdin io.Read
 			if err := protocol.DecodeJSON(f, &c); err != nil {
 				return fail(stderr, protocol.ExitHostrunError, "%v", err)
 			}
+			warn(c.Warning)
 			credit.grant(c.Bytes)
 		case protocol.FrameExit:
 			var exit protocol.Exit
@@ -162,6 +178,7 @@ func Run(ctx context.Context, d Dialer, args []string, cwd string, stdin io.Read
 			if err := protocol.DecodeJSON(f, &e); err != nil {
 				return fail(stderr, protocol.ExitHostrunError, "%v", err)
 			}
+			warn(e.Warning)
 			return fail(stderr, e.Code, "%s", e.Message)
 		case protocol.FrameAllowed: // only a dry run is answered with it
 			if !dryRun {
@@ -171,6 +188,7 @@ func Run(ctx context.Context, d Dialer, args []string, cwd string, stdin io.Read
 			if err := protocol.DecodeJSON(f, &a); err != nil {
 				return fail(stderr, protocol.ExitHostrunError, "%v", err)
 			}
+			warn(a.Warning)
 			fmt.Fprintf(stderr, "hostrun: dry run: %s\n", a)
 			return 0
 		case protocol.FrameWaiting: // only an approval request gets it
@@ -181,6 +199,7 @@ func Run(ctx context.Context, d Dialer, args []string, cwd string, stdin io.Read
 			if err := protocol.DecodeJSON(f, &w); err != nil {
 				return fail(stderr, protocol.ExitHostrunError, "%v", err)
 			}
+			warn(w.Warning)
 			fmt.Fprintf(stderr, "hostrun: %s\n", w)
 		case protocol.FrameApproved: // likewise; the run stream follows
 			if !ask {

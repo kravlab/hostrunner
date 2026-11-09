@@ -18,9 +18,10 @@ const wOK = 0x2
 // default rules file in it, is writable; that file is the one the daemon
 // uses, hostrunner-rules.yaml or, while that is absent, hostrun.yaml (see
 // rulesfile.Choose). A writable directory is enough, since the
-// file can then be replaced or, when missing, created; the daemon picks up
-// such a change on the next container start, or when a human adding a rule
-// agrees to have the file reread.
+// file can then be replaced or, when missing, created. The daemon serves
+// such a change only once a human on the host allows it (hostrunner
+// allow): within a poll when it rereads by itself, otherwise at the next
+// up or when a human adding a rule has the file reread.
 //
 // It is best effort: it checks the default location only (not a file
 // rules_file names), and finds nothing when cwd is outside the

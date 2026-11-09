@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -544,15 +547,43 @@ func TestFailingRuntimeIsLoggedOnce(t *testing.T) {
 	}
 }
 
+const (
+	// mountsOfA is a's mounts: a bind mount whose source has a space, a
+	// read-only one, a named volume whose source is under the runtime's
+	// storage, and a tmpfs without a source.
+	mountsOfA = `[{"Type":"bind","Source":"/home/u/my app","Destination":"/workspace","Mode":"","RW":true,"Propagation":"rprivate"},` +
+		`{"Type":"bind","Source":"/etc/ro","Destination":"/ro","Mode":"ro","RW":false,"Propagation":"rprivate"},` +
+		`{"Type":"volume","Name":"data","Source":"/var/lib/example/volumes/data/_data","Destination":"/data","Driver":"local","Mode":"z","RW":true,"Propagation":""},` +
+		`{"Type":"tmpfs","Source":"","Destination":"/tmp","Mode":"","RW":true,"Propagation":""}]`
+	noMounts = "null"
+	// dataVolume is how the runtime answers the inspection of the volume
+	// data that a mounts: a local volume that binds a host directory, as
+	// `volume inspect --format {{json .}}` prints it.
+	dataVolume = `echo '{"CreatedAt":"2026-10-09T10:00:00Z","Driver":"local","Labels":null,"Mountpoint":"/var/lib/example/volumes/data/_data","Name":"data","Options":{"device":"/home/u/data","o":"bind","type":"none"},"Scope":"local"}'`
+)
+
 // fakeCLI writes an executable that answers a container listing for
-// workspace with containers a (running) and b (stopped, its start time with
-// an offset as podman prints it), and their inspection in the format the
-// watch.CLI runtime asks for. With bErr set, inspecting b fails with that message
-// instead, as when it is gone by then.
+// workspace with containers a (running, with mountsOfA) and b (stopped, its
+// start time with an offset as podman prints it, without mounts), and their
+// inspection in the format the watch.CLI runtime asks for. With bErr set,
+// inspecting b fails with that message instead, as when it is gone by then.
 func fakeCLI(t *testing.T, workspace, bErr string) string {
 	t.Helper()
+	return fakeCLIMounts(t, workspace, bErr, mountsOfA, noMounts)
+}
+
+// fakeCLIMounts is fakeCLI with the mounts field of a and b given verbatim.
+func fakeCLIMounts(t *testing.T, workspace, bErr, mountsA, mountsB string) string {
+	t.Helper()
+	return fakeCLIVolumes(t, workspace, bErr, mountsA, mountsB, dataVolume)
+}
+
+// fakeCLIVolumes is fakeCLIMounts with volume, the shell commands that
+// answer the inspection of the volume data, given verbatim.
+func fakeCLIVolumes(t *testing.T, workspace, bErr, mountsA, mountsB, volume string) string {
+	t.Helper()
 	path := filepath.Join(t.TempDir(), "fakert")
-	inspectB := `echo 'b false "2026-10-09T12:00:05.5+02:00"'`
+	inspectB := `echo 'b false "2026-10-09T12:00:05.5+02:00" ` + mountsB + `'`
 	if bErr != "" {
 		inspectB = `echo '` + bErr + `' >&2; status=1`
 	}
@@ -562,9 +593,11 @@ case "$*" in
 "ps -aq --filter label=devcontainer.local_folder=` + workspace + `")
 	echo a; echo b ;;
 "ps -aq --filter label=devcontainer.local_folder="*) ;;
-"inspect --type container --format {{.Id}} {{.State.Running}} {{json .State.StartedAt}} a b")
-	echo 'a true "2026-10-09T10:00:00.123456789Z"'
+"inspect --type container --format {{.Id}} {{.State.Running}} {{json .State.StartedAt}} {{json .Mounts}} a b")
+	echo 'a true "2026-10-09T10:00:00.123456789Z" ` + mountsA + `'
 	` + inspectB + ` ;;
+"volume inspect --format {{json .}} data")
+	` + volume + ` ;;
 *) echo "unexpected: $*" >&2; exit 2 ;;
 esac
 exit $status
@@ -584,6 +617,62 @@ func TestCLIRuntimeListsWorkspaceContainersInEveryState(t *testing.T) {
 	}
 	if err != nil || !slices.EqualFunc(got, want, sameContainer) {
 		t.Fatalf("got %v, %v; want %v, nil", got, err, want)
+	}
+}
+
+func TestCLIRuntimeReportsMounts(t *testing.T) {
+	rt := watch.CLI{Binary: fakeCLI(t, "/home/u/app", "")}
+	got, err := rt.Containers(context.Background(), "/home/u/app")
+	if err != nil || len(got) != 2 {
+		t.Fatalf("got %v, %v; want two containers, nil", got, err)
+	}
+	want := []watch.Mount{
+		{Type: "bind", Source: "/home/u/my app", Destination: "/workspace"},
+		{Type: "bind", Source: "/etc/ro", Destination: "/ro", ReadOnly: true},
+		{Type: "volume", Name: "data", Source: "/var/lib/example/volumes/data/_data", Destination: "/data",
+			Volume: &watch.Volume{Driver: "local", Options: map[string]string{"device": "/home/u/data", "o": "bind", "type": "none"}}},
+		{Type: "tmpfs", Destination: "/tmp"},
+	}
+	if !slices.EqualFunc(got[0].Mounts, want, sameMount) || got[0].MountsErr != nil {
+		t.Fatalf("a: got %v, %v; want %v, nil", got[0].Mounts, got[0].MountsErr, want)
+	}
+	if len(got[1].Mounts) != 0 || got[1].MountsErr != nil {
+		t.Fatalf("b (null mounts): got %v, %v; want none, nil", got[1].Mounts, got[1].MountsErr)
+	}
+}
+
+func TestCLIRuntimeReportsUnparsableMountsPerContainer(t *testing.T) {
+	rt := watch.CLI{Binary: fakeCLIMounts(t, "/home/u/app", "", mountsOfA, "{not json")}
+	got, err := rt.Containers(context.Background(), "/home/u/app")
+	if err != nil || len(got) != 2 {
+		t.Fatalf("got %v, %v; want two containers, nil", got, err)
+	}
+	if got[0].MountsErr != nil || len(got[0].Mounts) != 4 {
+		t.Fatalf("a: got %v, %v; want its four mounts, nil", got[0].Mounts, got[0].MountsErr)
+	}
+	b := got[1]
+	if b.ID != "b" || b.Running || b.StartedAt.IsZero() {
+		t.Fatalf("b: got %+v; want its id, state and start time intact", b)
+	}
+	if b.MountsErr == nil || !strings.Contains(b.MountsErr.Error(), "b") || len(b.Mounts) != 0 {
+		t.Fatalf("b: got %v, %v; want an error naming b, no mounts", b.Mounts, b.MountsErr)
+	}
+}
+
+func TestCLIRuntimeReportsMissingMountsField(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fakert")
+	script := `#!/bin/sh
+case "$1" in
+ps) echo a ;;
+inspect) echo 'a true "2026-10-09T10:00:00Z"' ;;
+esac
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	got, err := (watch.CLI{Binary: path}).Containers(context.Background(), "/home/u/app")
+	if err != nil || len(got) != 1 || got[0].MountsErr == nil || !got[0].Running {
+		t.Fatalf("got %+v, %v; want container a with a MountsErr, nil", got, err)
 	}
 }
 
@@ -609,6 +698,56 @@ func TestCLIRuntimeReportsOtherInspectionFailure(t *testing.T) {
 	if got, err := rt.Containers(context.Background(), "/home/u/app"); err == nil {
 		t.Fatalf("got %v, nil; want the runtime's error", got)
 	}
+}
+
+// A volume the runtime cannot inspect, or whose inspection leaves it out,
+// is reported on its mount, naming it; the container's other mounts stay.
+func TestCLIRuntimeReportsAVolumeItCannotInspect(t *testing.T) {
+	for _, tt := range []struct{ name, volume string }{
+		{"an inspection that fails", `echo 'Error: no such volume data' >&2; exit 1`},
+		{"an inspection that leaves it out", `:`},
+		{"an inspection it cannot parse", `echo '{not json'`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			rt := watch.CLI{Binary: fakeCLIVolumes(t, "/home/u/app", "", mountsOfA, noMounts, tt.volume)}
+			got, err := rt.Containers(context.Background(), "/home/u/app")
+			if err != nil || len(got) != 2 || got[0].MountsErr != nil || len(got[0].Mounts) != 4 {
+				t.Fatalf("got %+v, %v; want a with its four mounts, nil", got, err)
+			}
+			m := got[0].Mounts[2]
+			if m.Name != "data" || m.Volume != nil || m.VolumeErr == nil || !strings.Contains(m.VolumeErr.Error(), "data") {
+				t.Fatalf("the volume mount: got %+v; want no volume and an error naming data", m)
+			}
+			if got[0].Mounts[0].VolumeErr != nil {
+				t.Fatalf("the bind mount: got %+v; want no volume error", got[0].Mounts[0])
+			}
+		})
+	}
+}
+
+// A volume mount that names no volume cannot be inspected: it is reported
+// as such, and nothing is asked of the runtime for it.
+func TestCLIRuntimeReportsAVolumeMountWithoutAName(t *testing.T) {
+	mounts := `[{"Type":"volume","Source":"/var/lib/example/volumes/x/_data","Destination":"/x","RW":true}]`
+	rt := watch.CLI{Binary: fakeCLIVolumes(t, "/home/u/app", "", mounts, noMounts, `echo unexpected >&2; exit 2`)}
+	got, err := rt.Containers(context.Background(), "/home/u/app")
+	if err != nil || len(got) != 2 || len(got[0].Mounts) != 1 {
+		t.Fatalf("got %+v, %v; want a with its mount, nil", got, err)
+	}
+	if m := got[0].Mounts[0]; m.Volume != nil || m.VolumeErr == nil {
+		t.Fatalf("got %+v; want no volume and an error", m)
+	}
+}
+
+// sameMount reports whether a and b are the same mount, their volumes
+// compared by value.
+func sameMount(a, b watch.Mount) bool {
+	va, vb := a.Volume, b.Volume
+	a.Volume, b.Volume = nil, nil
+	if a != b || (va == nil) != (vb == nil) {
+		return false
+	}
+	return va == nil || va.Driver == vb.Driver && maps.Equal(va.Options, vb.Options)
 }
 
 func sameContainer(a, b watch.Container) bool {
@@ -684,5 +823,273 @@ func TestContainerStoppedFollowsTheArmedContainer(t *testing.T) {
 		t.Fatalf("the watcher ended (%v) before its grace", err)
 	default:
 	}
+	expectResult(t, done, nil)
+}
+
+// attachRecorder collects what Config.Attached is called with.
+type attachRecorder struct {
+	mu      sync.Mutex
+	calls   [][]watch.Container
+	armedAt []time.Time // the arm of each call
+}
+
+func (r *attachRecorder) attached(armedAt time.Time, armed []watch.Container) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, armed)
+	r.armedAt = append(r.armedAt, armedAt)
+}
+
+// arms returns the arm time of each call.
+func (r *attachRecorder) arms() []time.Time {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.armedAt)
+}
+
+func (r *attachRecorder) snapshot() [][]watch.Container {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.calls)
+}
+
+func (r *attachRecorder) count() int { return len(r.snapshot()) }
+
+// ids returns the IDs of one call's containers.
+func ids(armed []watch.Container) []string {
+	var out []string
+	for _, c := range armed {
+		out = append(out, c.ID)
+	}
+	return out
+}
+
+func TestAttachedGetsTheArmedContainerWithItsMounts(t *testing.T) {
+	rt := &watchtest.Runtime{}
+	rt.Start("other") // runs, but started before the arm: not the armed container
+	rt.SetMounts("other", watch.Mount{Source: "/home/u/other", Destination: "/other"})
+	rec := &attachRecorder{}
+	cfg := testConfig
+	cfg.Attached = rec.attached
+	_, done := startWatcherWith(context.Background(), cfg, nil, rt)
+	time.Sleep(testConfig.PollInterval)
+	want := []watch.Mount{{Source: "/home/u/app", Destination: "/workspace"}, {Destination: "/tmp", ReadOnly: true}}
+	rt.Start("c")
+	rt.SetMounts("c", want...)
+	eventually(t, func() bool { return rec.count() > 0 }, "Attached was not called")
+	got := rec.snapshot()[0]
+	if len(got) != 1 || got[0].ID != "c" || !got[0].Running || !slices.Equal(got[0].Mounts, want) {
+		t.Fatalf("got %+v; want only the armed container c with mounts %v", got, want)
+	}
+	rt.Stop("c")
+	expectResult(t, done, nil)
+}
+
+func TestAttachedGetsEveryArmedContainerInPollOrder(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		rt := &watchtest.Runtime{}
+		rec := &attachRecorder{}
+		cfg := testConfig
+		cfg.Attached = rec.attached
+		_, done := startWatcherWith(context.Background(), cfg, nil, rt)
+		time.Sleep(cfg.PollInterval / 2)
+		rt.Start("b")
+		rt.Start("a") // both start between two polls
+		time.Sleep(cfg.PollInterval)
+		calls := rec.snapshot()
+		if len(calls) != 1 || !slices.Equal(ids(calls[0]), []string{"b", "a"}) {
+			t.Fatalf("got %+v; want one call with b and a in the poll's order", calls)
+		}
+		rt.Stop("a")
+		rt.Stop("b")
+		expectResult(t, done, nil)
+	})
+}
+
+func TestAttachedIsCalledOncePerAttachNotPerPoll(t *testing.T) {
+	rt := &watchtest.Runtime{}
+	rec := &attachRecorder{}
+	cfg := testConfig
+	cfg.Attached = rec.attached
+	_, done := startWatcherWith(context.Background(), cfg, nil, rt)
+	rt.Start("c")
+	eventually(t, func() bool { return rec.count() > 0 }, "Attached was not called")
+	time.Sleep(10 * testConfig.PollInterval)
+	if n := rec.count(); n != 1 {
+		t.Fatalf("Attached called %d times over many polls; want once", n)
+	}
+	rt.Stop("c")
+	expectResult(t, done, nil)
+}
+
+func TestAttachedIsCalledAgainAfterRearmAndNewContainer(t *testing.T) {
+	rt := &watchtest.Runtime{}
+	rec := &attachRecorder{}
+	cfg := testConfig
+	cfg.Attached = rec.attached
+	w, done := startWatcherWith(context.Background(), cfg, nil, rt)
+	rt.Start("old")
+	rt.SetMounts("old", watch.Mount{Destination: "/old"})
+	eventually(t, func() bool { return rec.count() == 1 }, "Attached was not called for the first container")
+
+	// A rebuild: the old container stops, `up` arms, a new one starts.
+	rt.Stop("old")
+	w.Arm()
+	rt.Start("new")
+	rt.SetMounts("new", watch.Mount{Destination: "/new"})
+	eventually(t, func() bool { return rec.count() == 2 }, "Attached was not called again for the new container")
+	got := rec.snapshot()[1]
+	if len(got) != 1 || got[0].ID != "new" || !slices.Equal(got[0].Mounts, []watch.Mount{{Destination: "/new"}}) {
+		t.Fatalf("got %+v; want only the new container with its mounts", got)
+	}
+	time.Sleep(5 * testConfig.PollInterval)
+	if n := rec.count(); n != 2 {
+		t.Fatalf("Attached called %d times; want 2", n)
+	}
+	rt.Stop("new")
+	expectResult(t, done, nil)
+}
+
+// Armed reports each arm's time before Arm returns, and Attached carries the
+// time of the arm it attached for: New's, then that of each later arm, so a
+// callback can tell an attach of an earlier arm from one of the latest.
+func TestArmedAndAttachedCarryTheArmTime(t *testing.T) {
+	rt := &watchtest.Runtime{}
+	rec := &attachRecorder{}
+	var (
+		mu    sync.Mutex
+		armed []time.Time
+	)
+	cfg := testConfig
+	cfg.Attached = rec.attached
+	cfg.Armed = func(armedAt time.Time) {
+		mu.Lock()
+		defer mu.Unlock()
+		armed = append(armed, armedAt)
+	}
+	before := time.Now()
+	w, done := startWatcherWith(context.Background(), cfg, nil, rt)
+	rt.Start("old")
+	eventually(t, func() bool { return rec.count() == 1 }, "Attached was not called for the first container")
+	first := rec.arms()[0]
+	if first.Before(before) {
+		t.Fatalf("the first attach carries %v; want New's time, not before %v", first, before)
+	}
+	mu.Lock()
+	if len(armed) != 0 {
+		t.Fatalf("Armed called %d times before any Arm; want none: New does not report its arm", len(armed))
+	}
+	mu.Unlock()
+
+	rt.Stop("old")
+	if err := w.Arm(); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	reported := slices.Clone(armed)
+	mu.Unlock()
+	if len(reported) != 1 || !reported[0].After(first) {
+		t.Fatalf("Armed got %v by the time Arm returned; want one time after the first arm %v", reported, first)
+	}
+	rt.Start("new")
+	eventually(t, func() bool { return rec.count() == 2 }, "Attached was not called for the new container")
+	if second := rec.arms()[1]; !second.Equal(reported[0]) {
+		t.Fatalf("the second attach carries %v; want the time Armed reported, %v", second, reported[0])
+	}
+	rt.Stop("new")
+	expectResult(t, done, nil)
+}
+
+// A container that starts after the arm and joins an already attached arm,
+// e.g. one a Compose devcontainer recreated, is an armed container whose
+// mounts have not been seen: Attached gets every armed container again.
+func TestAttachedIsCalledAgainWhenANewContainerJoinsTheArm(t *testing.T) {
+	rt := &watchtest.Runtime{}
+	rec := &attachRecorder{}
+	cfg := testConfig
+	cfg.Attached = rec.attached
+	_, done := startWatcherWith(context.Background(), cfg, nil, rt)
+	rt.SetMounts("first", watch.Mount{Destination: "/first"})
+	rt.Start("first")
+	eventually(t, func() bool { return rec.count() == 1 }, "Attached was not called for the first container")
+
+	// No arm: the new container joins the one the arm is attached to.
+	rt.SetMounts("joined", watch.Mount{Source: "/home/u/app", Destination: "/workspace"})
+	rt.Start("joined")
+	eventually(t, func() bool { return rec.count() == 2 }, "Attached was not called again for the joined container")
+	got := rec.snapshot()[1]
+	if !slices.Equal(ids(got), []string{"first", "joined"}) ||
+		!slices.Equal(got[0].Mounts, []watch.Mount{{Destination: "/first"}}) ||
+		!slices.Equal(got[1].Mounts, []watch.Mount{{Source: "/home/u/app", Destination: "/workspace"}}) {
+		t.Fatalf("got %+v; want first and joined in poll order, with their mounts", got)
+	}
+	time.Sleep(5 * testConfig.PollInterval)
+	if n := rec.count(); n != 2 {
+		t.Fatalf("Attached called %d times; want 2: polls without a new armed container do not call it", n)
+	}
+	rt.Stop("first")
+	rt.Stop("joined")
+	expectResult(t, done, nil)
+}
+
+// sharedRuntime reports one container whose Mounts slice is the same on
+// every call, as a runtime that does not copy it would.
+type sharedRuntime struct {
+	mu sync.Mutex
+	c  watch.Container
+}
+
+func (r *sharedRuntime) Containers(context.Context, string) ([]watch.Container, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return []watch.Container{r.c}, nil
+}
+
+func (r *sharedRuntime) set(running bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.c.Running = running
+	if running {
+		r.c.StartedAt = time.Now()
+	}
+}
+
+func TestAttachedContainersAreCopiesTheCallbackMayChange(t *testing.T) {
+	want := []watch.Mount{{Source: "/home/u/app", Destination: "/workspace"}, {Destination: "/tmp"},
+		{Type: "volume", Name: "v", Destination: "/v", Volume: &watch.Volume{Driver: "local", Options: map[string]string{"device": "/home/u/v"}}}}
+	rt := &sharedRuntime{c: watch.Container{ID: "c", Mounts: slices.Clone(want)}}
+	var mu sync.Mutex
+	var seen [][]watch.Mount
+	cfg := testConfig
+	cfg.Attached = func(_ time.Time, armed []watch.Container) {
+		mu.Lock()
+		defer mu.Unlock()
+		mounts := slices.Clone(armed[0].Mounts)
+		v := *mounts[2].Volume
+		v.Options = maps.Clone(v.Options)
+		mounts[2].Volume = &v
+		seen = append(seen, mounts)
+		armed[0].Mounts[0].Destination = "/changed by the callback"
+		armed[0].Mounts[2].Volume.Options["device"] = "/changed by the callback"
+		armed[0].Mounts[2].Volume.Driver = "changed by the callback"
+		armed[0].Mounts = append(armed[0].Mounts, watch.Mount{Destination: "/added by the callback"})
+	}
+	count := func() int { mu.Lock(); defer mu.Unlock(); return len(seen) }
+	w, done := startWatcherWith(context.Background(), cfg, nil, rt)
+	rt.set(true)
+	eventually(t, func() bool { return count() == 1 }, "Attached was not called")
+
+	// The same container starts again after a re-arm: a second attach.
+	rt.set(false)
+	w.Arm()
+	rt.set(true)
+	eventually(t, func() bool { return count() == 2 }, "Attached was not called again")
+	mu.Lock()
+	got := seen[1]
+	mu.Unlock()
+	if !slices.EqualFunc(got, want, sameMount) {
+		t.Fatalf("second attach got mounts %v; want %v unchanged by the first callback", got, want)
+	}
+	rt.set(false)
 	expectResult(t, done, nil)
 }
