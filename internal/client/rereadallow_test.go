@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/kravlab/hostrunner/internal/allow"
+	"github.com/kravlab/hostrunner/internal/allow/allowtest"
 	"github.com/kravlab/hostrunner/internal/daemon"
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
@@ -56,9 +57,7 @@ func (a allowStore) check(sc allow.Scope) (bool, error) {
 // directory, as `hostrunner allow` does.
 func (a allowStore) allow(t *testing.T, rulesFile, content string) {
 	t.Helper()
-	if _, err := a.store.Allow(a.place(), allow.Target{RulesFile: rulesFile, Scope: allow.Scope{Digest: rules.ContentDigest([]byte(content)), Settings: allowSettings}}); err != nil {
-		t.Fatal(err)
-	}
+	allowtest.Allow(t, a.store, a.place(), allow.Target{RulesFile: rulesFile, Scope: allow.Scope{Digest: rules.ContentDigest([]byte(content)), Settings: allowSettings}})
 }
 
 // record is the allow a daemon of these tests records (see

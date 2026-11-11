@@ -27,6 +27,7 @@ import (
 	"maps"
 	"path/filepath"
 	"slices"
+	"strings"
 
 	"github.com/kravlab/hostrunner/internal/settings"
 )
@@ -61,7 +62,12 @@ func dir(getenv func(string) string) (string, error) {
 // method of a Store whose Dir is empty or relative fails, so a zero Store
 // never reads or writes the current directory. The directory is created
 // by the first allow or request; until then the store is empty.
-type Store struct{ Dir string }
+type Store struct {
+	Dir string
+	// ops are the file operations of the store (see fileOps), nil for
+	// those of package os; a pointer, so that a Store stays comparable.
+	ops *fileOps
+}
 
 // check returns an error unless the store's Dir is an absolute path.
 func (s Store) check() error {
@@ -167,7 +173,7 @@ func canonical(path string) (string, error) {
 
 // CanonicalSettings returns a clone of the daemon settings whose
 // rules_file, when present, is canonical, as the store holds and compares
-// it (see Store.Allow); the caller's map is not changed. A nil map stays
+// it (see Store.AllowAll); the caller's map is not changed. A nil map stays
 // nil. Settings that did not come from the store, such as
 // settings.DaemonDefaults, are compared with those of an allow through it.
 func CanonicalSettings(in map[string]string) (map[string]string, error) {
@@ -196,10 +202,10 @@ func canonicalTarget(t Target) (Target, error) {
 	return Target{RulesFile: rf, Scope: Scope{Digest: t.Digest, Settings: st}}, nil
 }
 
-// keyed checks the store and returns p by its keys (see key). An empty
-// runtime directory names none and is an error, so that nothing is ever
-// recorded for the current directory.
-func (s Store) keyed(p Place) (Place, error) {
+// canonicalPlace checks the store and returns p by its keys (see key). An
+// empty runtime directory names none and is an error, so that nothing is
+// ever recorded for the current directory.
+func (s Store) canonicalPlace(p Place) (Place, error) {
 	if err := s.check(); err != nil {
 		return Place{}, err
 	}
@@ -243,21 +249,6 @@ func covers(e Entry, sc Scope) bool {
 	return e.Digest == sc.Digest && maps.Equal(e.Settings, sc.Settings)
 }
 
-// Allow records that the content of the rules file, with the digest and
-// the daemon settings of t, is trusted for the Place p, and returns the
-// Entry it recorded. It is AllowAll of one request: it replaces any
-// earlier allow of p, leaving those of the workspace's other runtime
-// directories, and then removes the pending request of p if it is that of
-// t. With the allow recorded but the request not removed, it returns the
-// Entry together with the error.
-func (s Store) Allow(p Place, t Target) (Entry, error) {
-	allowed, err := s.AllowAll(p.Workspace, []Entry{{Place: p, Target: t}})
-	if len(allowed) == 0 {
-		return Entry{}, err
-	}
-	return allowed[0], err
-}
-
 // AllowAll allows each of requests, pending requests of runtime
 // directories of workspace as PendingAll returns them, for its Place, and
 // returns the Entries it recorded, in the order of requests. It allows all
@@ -281,7 +272,7 @@ func (s Store) AllowAll(workspace string, requests []Entry) ([]Entry, error) {
 	}
 	allowed := make([]Entry, 0, len(requests))
 	for _, r := range requests {
-		p, err := s.keyed(r.Place)
+		p, err := s.canonicalPlace(r.Place)
 		if err != nil {
 			return nil, err
 		}
@@ -297,10 +288,18 @@ func (s Store) AllowAll(workspace string, requests []Entry) ([]Entry, error) {
 	if len(allowed) == 0 {
 		return nil, nil
 	}
-	if err := s.writeAll(allowed, allowSuffix); err != nil {
+	return s.recordAllows(allowed)
+}
+
+// recordAllows records allows, all or none (see writeAll), and once they
+// are recorded removes the pending requests they answer (see
+// removeAnswered). It returns allows with the error of removeAnswered, or
+// none with the error of a write that recorded none.
+func (s Store) recordAllows(allows []Entry) ([]Entry, error) {
+	if err := s.writeAll(allows, allowSuffix); err != nil {
 		return nil, err
 	}
-	return allowed, s.removeAnswered(allowed)
+	return allows, s.removeAnswered(allows)
 }
 
 // RequestsNotRemovedError is the error of an allow recorded whose pending
@@ -314,6 +313,58 @@ func (e *RequestsNotRemovedError) Error() string { return e.Err.Error() }
 
 // Unwrap returns the error of the requests not removed.
 func (e *RequestsNotRemovedError) Unwrap() error { return e.Err }
+
+// DamagedFile is an allow file of the store that cannot be read or is not
+// valid: it allows nothing.
+type DamagedFile struct {
+	// Path is the path of the file.
+	Path string
+	// Err says why the file cannot be read or is not valid.
+	Err error
+}
+
+// DamagedFilesError is a warning, not a failure: the operation that
+// returns it was done, and Files are the damaged allow files of the
+// workspace it skipped or removed (see Deny, AllowAddedRule).
+type DamagedFilesError struct{ Files []DamagedFile }
+
+// Error returns the damaged files, each with why it is damaged.
+func (e *DamagedFilesError) Error() string {
+	parts := make([]string, len(e.Files))
+	for i, f := range e.Files {
+		parts[i] = fmt.Sprintf("%s: %v", f.Path, f.Err)
+	}
+	return "allow store: damaged allow files: " + strings.Join(parts, "; ")
+}
+
+// damagedFilesError returns files as a *DamagedFilesError, or nil when
+// there is none.
+func damagedFilesError(files []DamagedFile) error {
+	if len(files) == 0 {
+		return nil
+	}
+	return &DamagedFilesError{Files: files}
+}
+
+// OnlyWarns reports whether err is only a warning of an operation that was
+// done: nil, a *RequestsNotRemovedError, a *DamagedFilesError, or errors
+// joined (errors.Join) of which each only warns. It does not look into the
+// errors a *RequestsNotRemovedError wraps, which say why the requests were
+// not removed.
+func OnlyWarns(err error) bool {
+	switch e := err.(type) {
+	case nil, *RequestsNotRemovedError, *DamagedFilesError:
+		return true
+	case interface{ Unwrap() []error }:
+		for _, inner := range e.Unwrap() {
+			if !OnlyWarns(inner) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
 
 // removeAnswered removes the pending request of the Place of each allow
 // of allowed when it is still the request the allow answers (see
@@ -331,7 +382,7 @@ func (s Store) removeAnswered(allowed []Entry) error {
 		if !ok || !sameTarget(req.Target, e.Target) {
 			continue
 		}
-		if err := remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		if err := s.remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			errs = append(errs, fmt.Errorf("allow store: the request answered is not removed: %w", err))
 		}
 	}
@@ -351,7 +402,7 @@ func (s Store) removeAnswered(allowed []Entry) error {
 // canonical form included, next to it, and is no allow: Allowed does not
 // read it.
 func (s Store) Request(p Place, t Target) error {
-	k, err := s.keyed(p)
+	k, err := s.canonicalPlace(p)
 	if err != nil {
 		return err
 	}
@@ -364,12 +415,13 @@ func (s Store) Request(p Place, t Target) error {
 
 // Deny removes the allows of every runtime directory of workspace and
 // returns them, sorted by runtime directory; none, with a nil error, when
-// the workspace had none, so denying twice is not a failure. It reads
-// every allow first, and an allow file that cannot be read or is not
-// valid is an error naming the file, with no allow removed. An allow that
-// cannot be removed is an error returned together with the allows removed
-// before it. The pending requests of the workspace stay: a later `allow`
-// may still answer them.
+// the workspace had none, so denying twice is not a failure. It removes
+// the allow files that cannot be read or are not valid too, which allow
+// nothing: those it removed are a *DamagedFilesError, joined into the
+// error, which only warns (see OnlyWarns). A file that cannot be removed
+// is an error returned together with the allows removed before it. The
+// pending requests of the workspace stay: a later `allow` may still
+// answer them.
 func (s Store) Deny(workspace string) (removed []Entry, err error) {
 	if err := s.check(); err != nil {
 		return nil, err
@@ -378,17 +430,24 @@ func (s Store) Deny(workspace string) (removed []Entry, err error) {
 	if err != nil {
 		return nil, err
 	}
-	allows, err := s.list(wsKey, allowSuffix)
+	allows, damaged, err := s.scan(wsKey, allowSuffix)
 	if err != nil {
 		return nil, err
 	}
 	for _, e := range allows {
-		if err := remove(s.file(e.Place, allowSuffix)); err != nil {
+		if err := s.remove(s.file(e.Place, allowSuffix)); err != nil {
 			return removed, fmt.Errorf("allow store: %w", err)
 		}
 		removed = append(removed, e)
 	}
-	return removed, nil
+	var gone []DamagedFile
+	for _, f := range damaged {
+		if err := s.remove(f.Path); err != nil {
+			return removed, errors.Join(damagedFilesError(gone), fmt.Errorf("allow store: %w", err))
+		}
+		gone = append(gone, f)
+	}
+	return removed, damagedFilesError(gone)
 }
 
 // AllowAddedRule records the allow of a rule added from the approval
@@ -403,13 +462,17 @@ func (s Store) Deny(workspace string) (removed []Entry, err error) {
 // the human approved, with its own settings; the other allows stay. It
 // returns the Entries it recorded, sorted by runtime directory. It moves
 // all or none (see writeAll): an allow of p not covering writtenOver, an
-// allow file that cannot be read or is not valid, or a failed write
-// records none and is an error, the allows staying as they were. Once all
-// are recorded it removes the pending requests they answer (see
+// allow file of p that cannot be read or is not valid, or a failed write
+// records none and is an error, the allows staying as they were. Such a
+// damaged allow file of another runtime directory, which allows nothing,
+// is skipped: it is left as it is, and the files skipped are a
+// *DamagedFilesError returned together with the Entries recorded. Once
+// all are recorded it removes the pending requests they answer (see
 // removeAnswered): a request that cannot be read or removed then is a
-// *RequestsNotRemovedError returned together with the Entries recorded.
+// *RequestsNotRemovedError, joined to the *DamagedFilesError. Both only
+// warn (see OnlyWarns).
 func (s Store) AllowAddedRule(p Place, writtenOver Scope, digest string) ([]Entry, error) {
-	own, err := s.keyed(p)
+	own, err := s.canonicalPlace(p)
 	if err != nil {
 		return nil, err
 	}
@@ -417,9 +480,13 @@ func (s Store) AllowAddedRule(p Place, writtenOver Scope, digest string) ([]Entr
 	if err != nil {
 		return nil, err
 	}
-	allows, err := s.list(own.Workspace, allowSuffix)
+	allows, damaged, err := s.scan(own.Workspace, allowSuffix)
 	if err != nil {
 		return nil, err
+	}
+	ownFile := s.file(own, allowSuffix)
+	if j := slices.IndexFunc(damaged, func(f DamagedFile) bool { return f.Path == ownFile }); j >= 0 {
+		return nil, damagedErr(damaged[j])
 	}
 	i := slices.IndexFunc(allows, func(e Entry) bool { return e.RuntimeDir == own.RuntimeDir })
 	if i < 0 || !covers(allows[i], Scope{Digest: writtenOver.Digest, Settings: st}) {
@@ -433,10 +500,11 @@ func (s Store) AllowAddedRule(p Place, writtenOver Scope, digest string) ([]Entr
 			moved = append(moved, e)
 		}
 	}
-	if err := s.writeAll(moved, allowSuffix); err != nil {
+	recorded, err := s.recordAllows(moved)
+	if recorded == nil {
 		return nil, err
 	}
-	return moved, s.removeAnswered(moved)
+	return recorded, errors.Join(damagedFilesError(damaged), err)
 }
 
 // Allowed reports whether the Place p has an allow that covers exactly
@@ -449,7 +517,7 @@ func (s Store) AllowAddedRule(p Place, writtenOver Scope, digest string) ([]Entr
 // error naming the file, not a silent denial, so that damage to the store
 // is noticed.
 func (s Store) Allowed(p Place, sc Scope) (bool, error) {
-	k, err := s.keyed(p)
+	k, err := s.canonicalPlace(p)
 	if err != nil {
 		return false, err
 	}

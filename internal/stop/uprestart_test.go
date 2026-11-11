@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/kravlab/hostrunner/internal/allow"
+	"github.com/kravlab/hostrunner/internal/allow/allowtest"
 	"github.com/kravlab/hostrunner/internal/client"
 	"github.com/kravlab/hostrunner/internal/launch"
 	"github.com/kravlab/hostrunner/internal/protocol"
@@ -46,9 +47,7 @@ func allowedUpConfig(t *testing.T, dir, workspace, rulesFile string) launch.Conf
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := cfg.Allows.Allow(allow.Place{Workspace: workspace, RuntimeDir: dir}, allow.Target{RulesFile: rulesFile, Scope: allow.Scope{Digest: policy.Digest(), Settings: cfg.Settings.Daemon()}}); err != nil {
-		t.Fatal(err)
-	}
+	allowtest.Allow(t, cfg.Allows, allow.Place{Workspace: workspace, RuntimeDir: dir}, allow.Target{RulesFile: rulesFile, Scope: allow.Scope{Digest: policy.Digest(), Settings: cfg.Settings.Daemon()}})
 	return cfg
 }
 

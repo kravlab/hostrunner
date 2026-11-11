@@ -63,10 +63,12 @@ together with the daemon settings resolved for it in
 - A rule added from the approval session is allowed with the content the
   session wrote, provided the file was allowed before the write, for
   every runtime directory of the workspace whose allow covered that file
-  and the content before the write.
+  and the content before the write. A damaged allow file of another
+  runtime directory, which allows nothing, does not stop it.
 - `hostrunner allow` allows every pending request of the workspace, or
   none when one of them is out of date, and fails when there is none;
-  `hostrunner deny` removes the allows of all its runtime directories. The
-  allow of a devcontainer config that is gone stays until a `deny`.
+  `hostrunner deny` removes the allows of all its runtime directories,
+  damaged allow files included, with a warning. The allow of a
+  devcontainer config that is gone stays until a `deny`.
 - ADR 0008's "hostrunner does not protect the workspace settings file or
   the rules file" no longer holds for their content.

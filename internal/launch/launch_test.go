@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/kravlab/hostrunner/internal/allow"
+	"github.com/kravlab/hostrunner/internal/allow/allowtest"
 	"github.com/kravlab/hostrunner/internal/daemonlist"
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
@@ -50,7 +51,7 @@ func TestMain(m *testing.M) {
 			Settings: settings.Settings{RulesFile: filepath.Join(dir, "missing-rules.yaml"), Reread: true, ReadyTimeout: 5 * time.Second},
 		}
 		// The rules file is missing, which has the digest "missing".
-		if _, err := cfg.Allows.Allow(cfg.place(), allow.Target{RulesFile: cfg.RulesFile, Scope: allow.Scope{Digest: "missing", Settings: cfg.Settings.Daemon()}}); err != nil {
+		if _, err := cfg.Allows.AllowAll(cfg.Workspace, []allow.Entry{{Place: cfg.place(), Target: allow.Target{RulesFile: cfg.RulesFile, Scope: allow.Scope{Digest: "missing", Settings: cfg.Settings.Daemon()}}}}); err != nil {
 			os.Exit(1)
 		}
 		if err := Up(context.Background(), cfg); err != nil {
@@ -341,9 +342,7 @@ func allowCurrent(t *testing.T, cfg Config) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := cfg.Allows.Allow(cfg.place(), allow.Target{RulesFile: cfg.RulesFile, Scope: allow.Scope{Digest: policy.Digest(), Settings: cfg.Settings.Daemon()}}); err != nil {
-		t.Fatal(err)
-	}
+	allowtest.Allow(t, cfg.Allows, cfg.place(), allow.Target{RulesFile: cfg.RulesFile, Scope: allow.Scope{Digest: policy.Digest(), Settings: cfg.Settings.Daemon()}})
 }
 
 // pendingOf returns the pending request of the runtime directory of cfg,
@@ -1275,17 +1274,13 @@ func TestUpOfChangedRulesNotAllowedLeavesADaemonNotServingAllowedRules(t *testin
 			}
 		}},
 		{"other rules allowed", "serve", func(t *testing.T, cfg *Config) {
-			if _, err := cfg.Allows.Allow(cfg.place(), allow.Target{RulesFile: cfg.RulesFile, Scope: allow.Scope{Digest: "other", Settings: cfg.Settings.Daemon()}}); err != nil {
-				t.Fatal(err)
-			}
+			allowtest.Allow(t, cfg.Allows, cfg.place(), allow.Target{RulesFile: cfg.RulesFile, Scope: allow.Scope{Digest: "other", Settings: cfg.Settings.Daemon()}})
 		}},
 		{"a daemon of another workspace", "serve", func(t *testing.T, cfg *Config) {
 			// The other workspace allows what the daemon serves, for the
 			// workspace it was started for.
 			cfg.Workspace = "/home/u/other"
-			if _, err := cfg.Allows.Allow(cfg.place(), allow.Target{RulesFile: cfg.RulesFile, Scope: allow.Scope{Digest: "missing", Settings: cfg.Settings.Daemon()}}); err != nil {
-				t.Fatal(err)
-			}
+			allowtest.Allow(t, cfg.Allows, cfg.place(), allow.Target{RulesFile: cfg.RulesFile, Scope: allow.Scope{Digest: "missing", Settings: cfg.Settings.Daemon()}})
 		}},
 		{"an older daemon", "older", func(*testing.T, *Config) {}},
 	} {

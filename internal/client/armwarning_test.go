@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/kravlab/hostrunner/internal/allow"
+	"github.com/kravlab/hostrunner/internal/allow/allowtest"
 	"github.com/kravlab/hostrunner/internal/daemon"
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
@@ -91,9 +92,7 @@ func TestArmedChangeNotAllowedIsWarnedOf(t *testing.T) {
 // Once the store allows the change armed, hostrun warns of nothing.
 func TestNoWarningOnceTheArmedChangeIsAllowed(t *testing.T) {
 	h, a, digest := startArmedDaemon(t)
-	if _, err := a.store.Allow(a.place(), allow.Target{RulesFile: h.rulesFile, Scope: allow.Scope{Digest: digest, Settings: armedSettings}}); err != nil {
-		t.Fatal(err)
-	}
+	allowtest.Allow(t, a.store, a.place(), allow.Target{RulesFile: h.rulesFile, Scope: allow.Scope{Digest: digest, Settings: armedSettings}})
 	noWarning(t, h)
 }
 
@@ -352,9 +351,7 @@ func TestArmedChangeIsNoticedToASessionStartingLater(t *testing.T) {
 	})
 	t.Run("allowed since", func(t *testing.T) {
 		h, a, digest := startArmedDaemon(t)
-		if _, err := a.store.Allow(a.place(), allow.Target{RulesFile: h.rulesFile, Scope: allow.Scope{Digest: digest, Settings: armedSettings}}); err != nil {
-			t.Fatal(err)
-		}
+		allowtest.Allow(t, a.store, a.place(), allow.Target{RulesFile: h.rulesFile, Scope: allow.Scope{Digest: digest, Settings: armedSettings}})
 		conn := helloThenServe(t, h, func() {}, readsNotAllowedOnly)
 		checkNotices(t, noticesBeforeStandingList(t, conn))
 	})

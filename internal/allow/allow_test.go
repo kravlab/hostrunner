@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"maps"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/kravlab/hostrunner/internal/allow"
+	"github.com/kravlab/hostrunner/internal/allow/allowtest"
 )
 
 // The runtime directories of two devcontainer configs of a workspace. They
@@ -71,11 +73,7 @@ func mustAllowed(t *testing.T, s allow.Store, ws, rd, digest string, settings ma
 // an error.
 func mustAllow(t *testing.T, s allow.Store, ws, rd string, tg allow.Target) allow.Entry {
 	t.Helper()
-	e, err := s.Allow(allow.Place{Workspace: ws, RuntimeDir: rd}, tg)
-	if err != nil {
-		t.Fatalf("Allow(%q, %q): %v", ws, rd, err)
-	}
-	return e
+	return allowtest.Allow(t, s, allow.Place{Workspace: ws, RuntimeDir: rd}, tg)
 }
 
 // mustRequest records the request of tg for runtime directory rd of ws,
@@ -281,21 +279,33 @@ func TestDenyWithoutStoreDirRemovesNothing(t *testing.T) {
 	}
 }
 
-// A corrupt allow file fails Deny, naming it, and Deny removes no allow.
-func TestDenyWithACorruptAllowFileRemovesNothing(t *testing.T) {
+// Deny removes a damaged allow file together with the valid allows, which
+// it returns, and reports the damaged one in a *allow.DamagedFilesError
+// that only warns; the pending request stays.
+func TestDenyRemovesADamagedAllowFileAndReportsIt(t *testing.T) {
 	s := newStore(t)
 	ws := t.TempDir()
 	mustAllow(t, s, ws, runA, target("rules.yaml", "abc123", daemonSettings()))
-	mustAllow(t, s, ws, runB, target("rules.yaml", "abc123", daemonSettings()))
 	files, _ := storeFiles(t, s)
+	b := mustAllow(t, s, ws, runB, target("rules.yaml", "abc123", daemonSettings()))
+	mustRequest(t, s, ws, runA, target("rules.yaml", "def456", daemonSettings()))
 	if err := os.WriteFile(files[0], []byte("not json"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Deny(ws); err == nil || !strings.Contains(err.Error(), files[0]) {
-		t.Fatalf("Deny error = %v, want one naming %q", err, files[0])
+	removed, err := s.Deny(ws)
+	if !reflect.DeepEqual(removed, []allow.Entry{b}) {
+		t.Errorf("Deny removed %+v, want [%+v]", removed, b)
 	}
-	if after, _ := storeFiles(t, s); !reflect.DeepEqual(after, files) {
-		t.Errorf("store files after Deny = %v, want %v", after, files)
+	damaged, ok := errors.AsType[*allow.DamagedFilesError](err)
+	if !ok || len(damaged.Files) != 1 || damaged.Files[0].Path != files[0] || damaged.Files[0].Err == nil {
+		t.Fatalf("Deny error = %v, want a *allow.DamagedFilesError of %s", err, files[0])
+	}
+	if !allow.OnlyWarns(err) {
+		t.Errorf("Deny error %v does not only warn", err)
+	}
+	after, _ := storeFiles(t, s)
+	if len(after) != 1 || !strings.HasSuffix(after[0], ".request.json") {
+		t.Errorf("store files after Deny = %v, want the request only", after)
 	}
 }
 
@@ -850,23 +860,95 @@ func TestAllowAddedRuleWithoutTheAllowOfItsOwnRuntimeDirMovesNone(t *testing.T) 
 	}
 }
 
-// AllowAddedRule moves none, and fails naming the file, when an allow file
-// of the workspace is not valid.
-func TestAllowAddedRuleWithACorruptAllowFileMovesNone(t *testing.T) {
+// AllowAddedRule skips a damaged allow file of another runtime directory:
+// it moves the valid allows, returns them, leaves the damaged file as it
+// is and reports it in a *allow.DamagedFilesError that only warns.
+func TestAllowAddedRuleSkipsADamagedAllowFileOfAnotherRuntimeDir(t *testing.T) {
 	s := newStore(t)
 	ws := t.TempDir()
 	mustAllow(t, s, ws, runB, target("rules.yaml", "before", daemonSettings()))
 	files, _ := storeFiles(t, s)
 	mustAllow(t, s, ws, runA, target("rules.yaml", "before", daemonSettings()))
+	mustAllow(t, s, ws, runStale, target("rules.yaml", "before", daemonSettings()))
 	if err := os.WriteFile(files[0], []byte("not json"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, err := s.AllowAddedRule(allow.Place{Workspace: ws, RuntimeDir: runA}, writtenOver(), "after")
-	if err == nil || !strings.Contains(err.Error(), files[0]) {
-		t.Fatalf("AllowAddedRule error = %v, want one naming %s", err, files[0])
+	got, err := s.AllowAddedRule(allow.Place{Workspace: ws, RuntimeDir: runA}, writtenOver(), "after")
+	damaged, ok := errors.AsType[*allow.DamagedFilesError](err)
+	if !ok || len(damaged.Files) != 1 || damaged.Files[0].Path != files[0] {
+		t.Fatalf("AllowAddedRule error = %v, want a *allow.DamagedFilesError of %s", err, files[0])
 	}
-	if !mustAllowed(t, s, ws, runA, "before", daemonSettings()) {
-		t.Error("the allow of the adding runtime directory was moved")
+	if !allow.OnlyWarns(err) {
+		t.Errorf("AllowAddedRule error %v does not only warn", err)
+	}
+	if len(got) != 2 || got[0].RuntimeDir != runA || got[1].RuntimeDir != runStale {
+		t.Errorf("AllowAddedRule = %+v, want the allows of %s and %s", got, runA, runStale)
+	}
+	if !mustAllowed(t, s, ws, runA, "after", daemonSettings()) || !mustAllowed(t, s, ws, runStale, "after", daemonSettings()) {
+		t.Error("a valid allow was not moved")
+	}
+	if data, err := os.ReadFile(files[0]); err != nil || string(data) != "not json" {
+		t.Errorf("the damaged file holds %q, %v; want it left as it is", data, err)
+	}
+}
+
+// AllowAddedRule moves none, and fails naming the file, when the allow
+// file of the adding runtime directory itself is damaged.
+func TestAllowAddedRuleWithItsOwnDamagedAllowFileMovesNone(t *testing.T) {
+	s := newStore(t)
+	ws := t.TempDir()
+	mustAllow(t, s, ws, runA, target("rules.yaml", "before", daemonSettings()))
+	files, _ := storeFiles(t, s)
+	mustAllow(t, s, ws, runB, target("rules.yaml", "before", daemonSettings()))
+	if err := os.WriteFile(files[0], []byte("not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.AllowAddedRule(allow.Place{Workspace: ws, RuntimeDir: runA}, writtenOver(), "after")
+	if err == nil || allow.OnlyWarns(err) || !strings.Contains(err.Error(), files[0]) {
+		t.Fatalf("AllowAddedRule = %+v, %v; want a failure naming %s", got, err, files[0])
+	}
+	if len(got) != 0 {
+		t.Errorf("AllowAddedRule = %+v, want none recorded", got)
+	}
+	if !mustAllowed(t, s, ws, runB, "before", daemonSettings()) {
+		t.Error("the allow of another runtime directory was moved")
+	}
+}
+
+// OnlyWarns is true for nil, the warnings of the store and errors joined
+// of only warnings, and false for any other error, also one a
+// *allow.RequestsNotRemovedError wraps or one joined with a warning.
+func TestOnlyWarns(t *testing.T) {
+	other := errors.New("disk on fire")
+	notRemoved := &allow.RequestsNotRemovedError{Err: other}
+	damaged := &allow.DamagedFilesError{Files: []allow.DamagedFile{{Path: "/s/x.json", Err: other}}}
+	for _, tt := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, true},
+		{"requests not removed", notRemoved, true},
+		{"damaged files", damaged, true},
+		{"both joined", errors.Join(notRemoved, damaged), true},
+		{"other", other, false},
+		{"other joined with a warning", errors.Join(damaged, other), false},
+		{"wrapped warning", fmt.Errorf("x: %w", damaged), false},
+	} {
+		if got := allow.OnlyWarns(tt.err); got != tt.want {
+			t.Errorf("%s: OnlyWarns(%v) = %v, want %v", tt.name, tt.err, got, tt.want)
+		}
+	}
+}
+
+// DamagedFilesError names every file with why it is damaged.
+func TestDamagedFilesErrorNamesEveryFile(t *testing.T) {
+	err := &allow.DamagedFilesError{Files: []allow.DamagedFile{
+		{Path: "/s/a.json", Err: errors.New("not json")},
+		{Path: "/s/b.json", Err: errors.New("is a directory")},
+	}}
+	if got, want := err.Error(), "allow store: damaged allow files: /s/a.json: not json; /s/b.json: is a directory"; got != want {
+		t.Errorf("Error() = %q, want %q", got, want)
 	}
 }
 
@@ -954,9 +1036,6 @@ func TestStoreWithoutAnAbsoluteDirFails(t *testing.T) {
 	t.Chdir(cwd)
 	ws := t.TempDir()
 	for _, s := range []allow.Store{{}, {Dir: "allow"}} {
-		if _, err := s.Allow(allow.Place{Workspace: ws, RuntimeDir: runA}, target("rules.yaml", "abc123", daemonSettings())); err == nil {
-			t.Errorf("Store%+v.Allow: got no error", s)
-		}
 		if _, err := s.AllowAll(ws, []allow.Entry{{Place: allow.Place{Workspace: ws, RuntimeDir: runA}}}); err == nil {
 			t.Errorf("Store%+v.AllowAll: got no error", s)
 		}

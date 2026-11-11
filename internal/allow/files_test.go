@@ -9,32 +9,46 @@ import (
 	"testing"
 )
 
-// failingRename replaces rename with one whose n-th call fails, until the
-// test ends.
-func failingRename(t *testing.T, n int) {
+// mustAllow allows tg for the Place p in s, as AllowAll of that single
+// request, and returns the Entry recorded, failing the test on an error.
+func mustAllow(t *testing.T, s Store, p Place, tg Target) Entry {
 	t.Helper()
+	allowed, err := s.AllowAll(p.Workspace, []Entry{{Place: p, Target: tg}})
+	if err != nil {
+		t.Fatalf("allow %s: %v", p.RuntimeDir, err)
+	}
+	return allowed[0]
+}
+
+// opsOf returns the file operations of s, setting them first when s has
+// none.
+func opsOf(s *Store) *fileOps {
+	if s.ops == nil {
+		s.ops = &fileOps{}
+	}
+	return s.ops
+}
+
+// failingRename makes the rename of s one whose n-th call fails.
+func failingRename(s *Store, n int) {
 	calls := 0
-	rename = func(oldpath, newpath string) error {
+	opsOf(s).rename = func(oldpath, newpath string) error {
 		if calls++; calls == n {
 			return errors.New("injected rename failure")
 		}
 		return os.Rename(oldpath, newpath)
 	}
-	t.Cleanup(func() { rename = os.Rename })
 }
 
-// failingRemove replaces remove with one whose n-th call fails, until the
-// test ends.
-func failingRemove(t *testing.T, n int) {
-	t.Helper()
+// failingRemove makes the remove of s one whose n-th call fails.
+func failingRemove(s *Store, n int) {
 	calls := 0
-	remove = func(path string) error {
+	opsOf(s).remove = func(path string) error {
 		if calls++; calls == n {
 			return errors.New("injected remove failure")
 		}
 		return os.Remove(path)
 	}
-	t.Cleanup(func() { remove = os.Remove })
 }
 
 // tempFiles returns the temporary files left under dir.
@@ -62,11 +76,9 @@ func TestAllowAddedRuleMovesNoneWhenARenameFails(t *testing.T) {
 	settings := map[string]string{"reread": "true"}
 	dirs := []string{"/run/hostrunner/a", "/run/hostrunner/b"}
 	for _, rd := range dirs {
-		if _, err := s.Allow(Place{Workspace: ws, RuntimeDir: rd}, NewTarget("rules.yaml", "before", settings)); err != nil {
-			t.Fatal(err)
-		}
+		mustAllow(t, s, Place{Workspace: ws, RuntimeDir: rd}, NewTarget("rules.yaml", "before", settings))
 	}
-	failingRename(t, 2)
+	failingRename(&s, 2)
 	if _, err := s.AllowAddedRule(Place{Workspace: ws, RuntimeDir: dirs[0]}, Scope{Digest: "before", Settings: settings}, "after"); err == nil {
 		t.Fatal("AllowAddedRule returned no error")
 	}
@@ -96,10 +108,8 @@ func TestAllowAllPutsBackTheEarlierAllowsWhenARenameFails(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			s := Store{Dir: filepath.Join(t.TempDir(), "allow")}
-			if _, err := s.Allow(withEarlier, earlier); err != nil {
-				t.Fatal(err)
-			}
-			failingRename(t, 2)
+			mustAllow(t, s, withEarlier, earlier)
+			failingRename(&s, 2)
 			if _, err := s.AllowAll(ws, []Entry{{Place: order[0], Target: later}, {Place: order[1], Target: later}}); err == nil {
 				t.Fatal("AllowAll returned no error")
 			}
@@ -128,14 +138,9 @@ func TestAllowAllPutsBackTheEarlierAllowsWhenARenameFails(t *testing.T) {
 func TestDenyReturnsTheAllowsRemovedBeforeAFailure(t *testing.T) {
 	ws := t.TempDir()
 	s := Store{Dir: filepath.Join(t.TempDir(), "allow")}
-	a, err := s.Allow(Place{Workspace: ws, RuntimeDir: "/run/hostrunner/a"}, NewTarget("rules.yaml", "d", nil))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.Allow(Place{Workspace: ws, RuntimeDir: "/run/hostrunner/b"}, NewTarget("rules.yaml", "d", nil)); err != nil {
-		t.Fatal(err)
-	}
-	failingRemove(t, 2)
+	a := mustAllow(t, s, Place{Workspace: ws, RuntimeDir: "/run/hostrunner/a"}, NewTarget("rules.yaml", "d", nil))
+	mustAllow(t, s, Place{Workspace: ws, RuntimeDir: "/run/hostrunner/b"}, NewTarget("rules.yaml", "d", nil))
+	failingRemove(&s, 2)
 	removed, err := s.Deny(ws)
 	if err == nil {
 		t.Fatal("Deny returned no error")

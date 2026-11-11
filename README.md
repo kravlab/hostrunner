@@ -324,8 +324,11 @@ tune `up`, `stop`, `restart` or `approve` (`ready_timeout`,
 allow. `deny` removes the allows of every runtime directory of the
 workspace, printing each (`hostrunner: denied <workspace> for <runtime
 directory>`), and leaves the pending requests; without an allow it says
-so and succeeds. The allow of a devcontainer config that is gone stays
-until a `deny`.
+so and succeeds. An allow file that cannot be read or is not valid
+allows nothing: `deny` removes it too and succeeds, with a warning on
+stderr (`hostrunner: warning: removed the allow file <path>, which
+cannot be read: <why>`). The allow of a devcontainer config that is
+gone stays until a `deny`.
 
 A daemon that rereads its rules file by itself serves an edit only once
 it is allowed for its runtime directory, and records the request there
@@ -347,7 +350,10 @@ write, its own included, each with its own settings, and removes the
 pending requests these allows answer. It serves the rule at once, with
 or without `reread`, so the next `up` of each of these devcontainer
 configs finds it allowed. A runtime directory whose allow did not cover
-that content (an earlier edit, another rules file) keeps its allow.
+that content (an earlier edit, another rules file) keeps its allow. An
+allow file of another runtime directory that cannot be read or is not
+valid is left as it is and logged (`damaged allow file skipped`); that
+of the daemon's own runtime directory records no allow.
 Added to rules not allowed (after `hostrunner deny`, say), it is not:
 the daemon keeps the rules it serves, the change waits for
 `hostrunner allow` as above, the session says the daemon kept its old

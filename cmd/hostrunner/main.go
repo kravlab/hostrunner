@@ -34,8 +34,10 @@
 // and the daemon settings) in $XDG_DATA_HOME/hostrunner/allow; `allow`
 // allows exactly that request once the rules file still has that digest
 // and prints what it allowed; without a request it allows nothing and
-// fails, telling to start the container first. `deny` removes the allow.
-// Only the latest allow of a workspace is kept; the workspace is the
+// fails, telling to start the container first.
+// Each runtime directory of a workspace keeps only its latest allow, and
+// `deny` removes those of every runtime directory, damaged allow files
+// included, with a warning naming each of these; the workspace is the
 // current directory unless one is named (see internal/allow).
 // `update` switches the versioned install
 // of hostrunner and hostrun to the latest release (see internal/update).
@@ -240,7 +242,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 		if err != nil {
 			return err
 		}
-		return runDeny(cfg, stdout)
+		return runDeny(cfg, stdout, stderr)
 	case "approve":
 		cfg, err := parseApprove(args[1:], os.Getenv, stderr)
 		if err != nil {
@@ -910,6 +912,13 @@ func protectedPaths(cfg serveConfig) []string {
 	return []string{filepath.Join(cfg.workspace, rulesfile.Dir), cfg.RulesFile, cfg.workspaceSettings}
 }
 
+// servePlace returns the Place of the daemon serve runs for cfg: its
+// workspace and its runtime directory, the one its socket lies in, the
+// cfg.Dir of the `up` that started it.
+func servePlace(cfg serveConfig) allow.Place {
+	return allow.Place{Workspace: cfg.workspace, RuntimeDir: filepath.Dir(cfg.socket)}
+}
+
 // allowOptions returns the options that have the daemon of cfg reread
 // only rules file content allowed in cfg's allow store for its workspace,
 // its runtime directory and its daemon settings, as `up` checks them (with
@@ -923,7 +932,7 @@ func protectedPaths(cfg serveConfig) []string {
 // lies in, beside which its approval socket lies, the cfg.Dir of the `up`
 // that started it.
 func allowOptions(cfg serveConfig) []daemon.Option {
-	place := allow.Place{Workspace: cfg.workspace, RuntimeDir: filepath.Dir(cfg.socket)}
+	place := servePlace(cfg)
 	// target is what the daemon's own rules file and settings, with the
 	// given digest of its content, are allowed as.
 	target := func(digest string) allow.Target {

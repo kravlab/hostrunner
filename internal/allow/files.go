@@ -22,16 +22,38 @@ import (
 // the store directory itself, lie outside every workspace directory and so
 // are never read.
 const (
-	allowSuffix   = ".json"
-	requestSuffix = ".request.json"
+	allowSuffix   fileKind = ".json"
+	requestSuffix fileKind = ".request.json"
 )
 
-// rename and remove are os.Rename and os.Remove, which a test of the
-// package replaces to make a step fail.
-var (
-	rename = os.Rename
-	remove = os.Remove
-)
+// fileKind is the kind of a file of the store, an allow or a pending
+// request, given as the suffix its name ends with (see allowSuffix).
+type fileKind string
+
+// fileOps are the file operations of a Store that a test of the package
+// replaces to make a step fail; a nil one is that of package os.
+type fileOps struct {
+	rename func(oldpath, newpath string) error
+	remove func(path string) error
+}
+
+// rename renames oldpath to newpath with the rename of s.ops, os.Rename
+// when there is none.
+func (s Store) rename(oldpath, newpath string) error {
+	if s.ops != nil && s.ops.rename != nil {
+		return s.ops.rename(oldpath, newpath)
+	}
+	return os.Rename(oldpath, newpath)
+}
+
+// remove removes the file at path with the remove of s.ops, os.Remove
+// when there is none.
+func (s Store) remove(path string) error {
+	if s.ops != nil && s.ops.remove != nil {
+		return s.ops.remove(path)
+	}
+	return os.Remove(path)
+}
 
 // workspaceDir returns the directory of the store that holds the files of
 // the runtime directories of the workspace key wsKey.
@@ -39,10 +61,10 @@ func (s Store) workspaceDir(wsKey string) string {
 	return filepath.Join(s.Dir, name(wsKey))
 }
 
-// file returns the path of the file with suffix of the keyed Place p: its
+// file returns the path of the file of kind of the keyed Place p: its
 // allow with allowSuffix, its pending request with requestSuffix.
-func (s Store) file(p Place, suffix string) string {
-	return filepath.Join(s.workspaceDir(p.Workspace), name(p.RuntimeDir)+suffix)
+func (s Store) file(p Place, kind fileKind) string {
+	return filepath.Join(s.workspaceDir(p.Workspace), name(p.RuntimeDir)+string(kind))
 }
 
 // name returns the hex SHA-256 of a key.
@@ -51,15 +73,15 @@ func name(k string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// suffixOf returns the suffix of the file named n, requestSuffix or
+// suffixOf returns the kind of the file named n, requestSuffix or
 // allowSuffix, or "" for a file that is neither, such as a temporary one.
-func suffixOf(n string) string {
+func suffixOf(n string) fileKind {
 	switch {
 	case strings.HasPrefix(n, "."):
 		return ""
-	case strings.HasSuffix(n, requestSuffix):
+	case strings.HasSuffix(n, string(requestSuffix)):
 		return requestSuffix
-	case strings.HasSuffix(n, allowSuffix):
+	case strings.HasSuffix(n, string(allowSuffix)):
 		return allowSuffix
 	}
 	return ""
@@ -82,14 +104,14 @@ func (s Store) stage(e Entry) (tmp string, err error) {
 	return writeTemp(dir, append(data, '\n'))
 }
 
-// write records e as the file with suffix of its Place, replacing the
+// write records e as the file of kind of its Place, replacing the
 // earlier one: it stages the file (see stage) and renames it into place.
-func (s Store) write(e Entry, suffix string) error {
+func (s Store) write(e Entry, kind fileKind) error {
 	tmp, err := s.stage(e)
 	if err != nil {
 		return err
 	}
-	if err := rename(tmp, s.file(e.Place, suffix)); err != nil {
+	if err := s.rename(tmp, s.file(e.Place, kind)); err != nil {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("allow store: %w", err)
 	}
@@ -103,7 +125,7 @@ type earlierFile struct {
 	ok   bool
 }
 
-// writeAll records each of entries as the file with suffix of its Place,
+// writeAll records each of entries as the file of kind of its Place,
 // all or none: it stages every file (see stage) and keeps the earlier
 // content of each before it renames any into place. A failure to stage or
 // to read an earlier file records none; a rename that fails puts back the
@@ -111,7 +133,7 @@ type earlierFile struct {
 // none, so that none is recorded either. The temporary files left are
 // removed. Only a failure to put an earlier file back leaves the new one,
 // joined to the error.
-func (s Store) writeAll(entries []Entry, suffix string) error {
+func (s Store) writeAll(entries []Entry, kind fileKind) error {
 	temps := make([]string, 0, len(entries))
 	defer func() {
 		for _, tmp := range temps {
@@ -129,7 +151,7 @@ func (s Store) writeAll(entries []Entry, suffix string) error {
 	}
 	earlier := make([]earlierFile, len(entries))
 	for i, e := range entries {
-		data, err := os.ReadFile(s.file(e.Place, suffix))
+		data, err := os.ReadFile(s.file(e.Place, kind))
 		switch {
 		case err == nil:
 			earlier[i] = earlierFile{data: data, ok: true}
@@ -138,30 +160,30 @@ func (s Store) writeAll(entries []Entry, suffix string) error {
 		}
 	}
 	for i, e := range entries {
-		if err := rename(temps[i], s.file(e.Place, suffix)); err != nil {
-			return errors.Join(fmt.Errorf("allow store: %w", err), s.restore(entries[:i], earlier[:i], suffix))
+		if err := s.rename(temps[i], s.file(e.Place, kind)); err != nil {
+			return errors.Join(fmt.Errorf("allow store: %w", err), s.restore(entries[:i], earlier[:i], kind))
 		}
 		temps[i] = ""
 	}
 	return nil
 }
 
-// restore puts back earlier[i] as the file with suffix of entries[i], in
+// restore puts back earlier[i] as the file of kind of entries[i], in
 // reverse order, removing the file where there was none, and joins the
 // errors of those it cannot put back.
-func (s Store) restore(entries []Entry, earlier []earlierFile, suffix string) error {
+func (s Store) restore(entries []Entry, earlier []earlierFile, kind fileKind) error {
 	var errs []error
 	for i := len(entries) - 1; i >= 0; i-- {
-		path := s.file(entries[i].Place, suffix)
+		path := s.file(entries[i].Place, kind)
 		if !earlier[i].ok {
-			if err := remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			if err := s.remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 				errs = append(errs, fmt.Errorf("allow store: %w", err))
 			}
 			continue
 		}
 		tmp, err := writeTemp(filepath.Dir(path), earlier[i].data)
 		if err == nil {
-			if err = rename(tmp, path); err != nil {
+			if err = s.rename(tmp, path); err != nil {
 				_ = os.Remove(tmp)
 				err = fmt.Errorf("allow store: %w", err)
 			}
@@ -199,52 +221,92 @@ func writeTemp(dir string, data []byte) (path string, err error) {
 	return tmp.Name(), nil
 }
 
-// list returns the entries of the files with suffix, the allows or the
+// scan returns the entries of the files of kind, the allows or the
 // pending requests, of the runtime directories of the workspace key
-// wsKey, sorted by runtime directory; none when the workspace has no
-// directory in the store.
-func (s Store) list(wsKey, suffix string) ([]Entry, error) {
+// wsKey, sorted by runtime directory, and apart the files of kind that
+// cannot be read or are not valid (see decode), sorted by path; none when
+// the workspace has no directory in the store. A file removed while scan
+// reads the directory is skipped. Only a directory that cannot be read is
+// an error.
+func (s Store) scan(wsKey string, kind fileKind) (entries []Entry, damaged []DamagedFile, err error) {
 	dir := s.workspaceDir(wsKey)
 	ents, err := os.ReadDir(dir)
 	if errors.Is(err, fs.ErrNotExist) {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("allow store: %w", err)
+		return nil, nil, fmt.Errorf("allow store: %w", err)
 	}
-	var out []Entry
 	for _, d := range ents {
-		if suffixOf(d.Name()) != suffix {
+		if suffixOf(d.Name()) != kind {
 			continue
 		}
-		e, _, err := read(filepath.Join(dir, d.Name()), wsKey, suffix)
+		path := filepath.Join(dir, d.Name())
+		e, ok, err := decode(path, wsKey, kind)
 		if err != nil {
-			return nil, err
+			damaged = append(damaged, DamagedFile{Path: path, Err: err})
+			continue
 		}
-		out = append(out, e)
+		if ok {
+			entries = append(entries, e)
+		}
 	}
-	slices.SortFunc(out, func(a, b Entry) int { return strings.Compare(a.RuntimeDir, b.RuntimeDir) })
-	return out, nil
+	slices.SortFunc(entries, func(a, b Entry) int { return strings.Compare(a.RuntimeDir, b.RuntimeDir) })
+	return entries, damaged, nil
 }
 
-// read returns the Entry in the file at path, the file with suffix of a
+// list returns the entries of the files of kind of the runtime
+// directories of the workspace key wsKey as scan does; a file that cannot
+// be read or is not valid is an error naming it (see read).
+func (s Store) list(wsKey string, kind fileKind) ([]Entry, error) {
+	entries, damaged, err := s.scan(wsKey, kind)
+	if err != nil {
+		return nil, err
+	}
+	if len(damaged) > 0 {
+		return nil, damagedErr(damaged[0])
+	}
+	return entries, nil
+}
+
+// read returns the Entry in the file at path, the file of kind of a
+// runtime directory of the workspace key wsKey, as decode does, with an
+// error that names the file.
+func read(path, wsKey string, kind fileKind) (e Entry, ok bool, err error) {
+	e, ok, err = decode(path, wsKey, kind)
+	if err != nil {
+		return Entry{}, false, damagedErr(DamagedFile{Path: path, Err: err})
+	}
+	return e, ok, nil
+}
+
+// damagedErr returns the error of the damaged file f, naming it.
+func damagedErr(f DamagedFile) error {
+	return fmt.Errorf("allow store: %s: %w", f.Path, f.Err)
+}
+
+// decode returns the Entry in the file at path, the file of kind of a
 // runtime directory of the workspace key wsKey; ok is false, with a nil
 // error, when the file does not exist. A file that cannot be read, is not
 // valid, or holds another workspace or a runtime directory other than the
-// one it is the file of, or none, is an error naming it.
-func read(path, wsKey, suffix string) (e Entry, ok bool, err error) {
+// one it is the file of, or none, is an error saying why, without naming
+// the file.
+func decode(path, wsKey string, kind fileKind) (e Entry, ok bool, err error) {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return Entry{}, false, nil
 	}
 	if err != nil {
-		return Entry{}, false, fmt.Errorf("allow store: %w", err)
+		if pe, ok := errors.AsType[*fs.PathError](err); ok {
+			err = pe.Err
+		}
+		return Entry{}, false, err
 	}
 	if err := json.Unmarshal(data, &e); err != nil {
-		return Entry{}, false, fmt.Errorf("allow store: %s: %w", path, err)
+		return Entry{}, false, err
 	}
-	if e.Workspace != wsKey || e.RuntimeDir == "" || filepath.Base(path) != name(e.RuntimeDir)+suffix {
-		return Entry{}, false, fmt.Errorf("allow store: %s: holds the workspace %q and the runtime directory %q, not those of its name", path, e.Workspace, e.RuntimeDir)
+	if e.Workspace != wsKey || e.RuntimeDir == "" || filepath.Base(path) != name(e.RuntimeDir)+string(kind) {
+		return Entry{}, false, fmt.Errorf("holds the workspace %q and the runtime directory %q, not those of its name", e.Workspace, e.RuntimeDir)
 	}
 	return e, true, nil
 }

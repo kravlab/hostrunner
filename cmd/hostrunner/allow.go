@@ -154,11 +154,11 @@ func staleRequest(req allow.Entry) (string, error) {
 // workspace, the runtime directory, the rules file with its digest and the
 // settings sorted by key, one per line, so the human sees what was
 // trusted. A setting that differs from its default
-// (settings.DaemonDefaults) carries the default,
-// as `mount_check: false (default true)`: the settings flags of a refused
-// up come from initializeCommand, not from the human, who sees here which
-// of them the allow takes. The defaults are compared as the store holds
-// the settings of e, with links followed (allow.CanonicalSettings), so a
+// (settings.DaemonDefaults) carries the default, as
+// `mount_check: false (default true)`: the settings flags of a refused up
+// come from initializeCommand, not from the human, who sees here which of
+// them the allow takes. The defaults are compared as the store holds the
+// settings of e, with links followed (allow.CanonicalSettings), so a
 // workspace reached through a link has the default rules file. When they
 // cannot be put that way, no setting is marked, and a last line says that
 // the defaults are not shown and why, so that a setting without a mark is
@@ -213,19 +213,30 @@ func parseDeny(args []string, getenv func(string) string, output io.Writer) (den
 
 // runDeny removes the allows of every runtime directory of cfg's
 // workspace and says to stdout which it removed, one line each, or that
-// there was none; a workspace without an allow is no failure. When an
-// allow cannot be removed it still prints those removed before it, then
-// returns the error.
-func runDeny(cfg denyConfig, stdout io.Writer) error {
+// there was none; a workspace without an allow is no failure. An allow
+// file that cannot be read or is not valid is removed too, with a warning
+// on stderr naming it and why, and is no failure either (see
+// allow.Store.Deny). When a file cannot be removed it still prints those
+// removed before it, then returns the error.
+func runDeny(cfg denyConfig, stdout, stderr io.Writer) error {
 	removed, denyErr := cfg.store.Deny(cfg.workspace)
 	ws := hostterm.Display(cfg.workspace)
-	var b strings.Builder
+	var b, warn strings.Builder
 	for _, e := range removed {
 		fmt.Fprintf(&b, "hostrunner: denied %s for %s\n", ws, hostterm.Display(e.RuntimeDir))
+	}
+	if damaged, ok := errors.AsType[*allow.DamagedFilesError](denyErr); ok {
+		for _, f := range damaged.Files {
+			fmt.Fprintf(&warn, "hostrunner: warning: removed the allow file %s, which cannot be read: %s\n", hostterm.Display(f.Path), hostterm.Display(f.Err.Error()))
+		}
 	}
 	if len(removed) == 0 && denyErr == nil {
 		fmt.Fprintf(&b, "hostrunner: %s has no allow\n", ws)
 	}
+	if allow.OnlyWarns(denyErr) {
+		denyErr = nil
+	}
 	_, err := io.WriteString(stdout, b.String())
-	return errors.Join(denyErr, err)
+	_, warnErr := io.WriteString(stderr, warn.String())
+	return errors.Join(denyErr, err, warnErr)
 }

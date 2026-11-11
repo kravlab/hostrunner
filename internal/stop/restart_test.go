@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/kravlab/hostrunner/internal/allow"
+	"github.com/kravlab/hostrunner/internal/allow/allowtest"
 	"github.com/kravlab/hostrunner/internal/daemon"
 	"github.com/kravlab/hostrunner/internal/launch"
 	"github.com/kravlab/hostrunner/internal/protocol"
@@ -165,9 +166,7 @@ func allowRestart(t *testing.T, r *stop.Restart, workspace string, dirs ...strin
 		t.Fatal(err)
 	}
 	for _, dir := range dirs {
-		if _, err := r.Allows.Allow(allow.Place{Workspace: workspace, RuntimeDir: dir}, allow.Target{RulesFile: s.RulesFile, Scope: allow.Scope{Digest: policy.Digest(), Settings: s.Settings.Daemon()}}); err != nil {
-			t.Fatal(err)
-		}
+		allowtest.Allow(t, r.Allows, allow.Place{Workspace: workspace, RuntimeDir: dir}, allow.Target{RulesFile: s.RulesFile, Scope: allow.Scope{Digest: policy.Digest(), Settings: s.Settings.Daemon()}})
 	}
 }
 

@@ -57,9 +57,10 @@ func WithAllowRequest(request func(digest string) error) Option {
 // writes. writtenOver is the Scope the Server found allowed for the content
 // the session wrote over, its digest with the daemon settings, so that
 // record can allow the content written wherever that content was allowed.
-// A record that returns an *allow.RequestsNotRemovedError recorded the
-// allow: the Server serves the content and logs the error as a warning. It
-// is not WithAllowRequest, which records what a human is asked to allow.
+// A record whose error only warns (see allow.OnlyWarns), an
+// *allow.RequestsNotRemovedError or an *allow.DamagedFilesError, recorded
+// the allow: the Server serves the content and logs each warning. It is
+// not WithAllowRequest, which records what a human is asked to allow.
 func WithAllowRecorder(record func(writtenOver allow.Scope, digest string) error) Option {
 	return func(s *Server) { s.allowRecorder = record }
 }
@@ -307,12 +308,19 @@ func (s *Server) allowAddedRule(rr protocol.Reread) (record func(digest string) 
 // with the Scope writtenOver and the reread loaded. A failure is logged as
 // a warning, and the content is marked pending as a change not allowed, so
 // it is reported as any other (see refuseNotAllowed). An allow recorded
-// whose answered requests could not all be removed is no failure: the
-// error is logged as a warning and the content is served.
+// with an error that only warns (see allow.OnlyWarns) is no failure: its
+// answered requests that could not all be removed, and the damaged allow
+// files of other runtime directories it skipped, are each logged as a
+// warning, and the content is served.
 func (s *Server) recordAllow(writtenOver allow.Scope, digest string) error {
 	err := s.allowRecorder(writtenOver, digest)
-	if _, ok := errors.AsType[*allow.RequestsNotRemovedError](err); ok {
-		s.log.Warn("allow request not removed", "file", s.approvals.rulesFile, "digest", digest, "error", err)
+	if allow.OnlyWarns(err) {
+		if notRemoved, ok := errors.AsType[*allow.RequestsNotRemovedError](err); ok {
+			s.log.Warn("allow request not removed", "file", s.approvals.rulesFile, "digest", digest, "error", notRemoved)
+		}
+		if damaged, ok := errors.AsType[*allow.DamagedFilesError](err); ok {
+			s.log.Warn("damaged allow file skipped", "file", s.approvals.rulesFile, "digest", digest, "error", damaged)
+		}
 		err = nil
 	}
 	if err != nil {

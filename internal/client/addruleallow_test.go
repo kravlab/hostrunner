@@ -165,6 +165,34 @@ func TestAddRuleIsRereadWhenAnAnsweredRequestIsNotRemoved(t *testing.T) {
 	}
 }
 
+// A rule added to a rules file that is allowed, whose allow is recorded
+// while a damaged allow file of another runtime directory is skipped, is
+// reread as any rule allowed: the request runs under it, a later run needs
+// no approval, and the skipped file is logged as a warning.
+func TestAddRuleIsRereadWhenADamagedAllowFileIsSkipped(t *testing.T) {
+	var log lockedBuffer
+	a := newAllowStore(t)
+	h := startAddRuleDaemon(t, a, slog.New(slog.NewTextHandler(&log, nil)),
+		func(writtenOver allow.Scope, digest string) error {
+			if err := a.record(writtenOver, digest); err != nil {
+				return err
+			}
+			return &allow.DamagedFilesError{Files: []allow.DamagedFile{{Path: "/store/b.json", Err: errors.New("not json")}}}
+		})
+	a.allow(t, h.rulesFile, addRuleRules)
+	s := h.startSession(t)
+	ch := h.ask(t, "touch", "-a", "marker")
+	s.addRule(t)
+	s.waitFor(t, ruleAddedText+" · request 1 runs under it\n")
+	if got := awaitResult(t, ch); got.code != 0 {
+		t.Fatalf("got %+v, want the request to run", got)
+	}
+	waitForLog(t, &log, `level=WARN msg="damaged allow file skipped" file=`+h.rulesFile)
+	if got := h.run(t, containerRoot, "", "touch", "-a", "marker"); got != (result{}) {
+		t.Fatalf("a later run: got %+v, want it to run without asking", got)
+	}
+}
+
 // sendReread sends rr on conn, the serving approval session's, as a session
 // that wrote a rule into the rules file does, and returns the daemon's
 // answer.

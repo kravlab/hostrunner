@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"io"
@@ -636,6 +638,71 @@ func TestDenyRemovesTheAllow(t *testing.T) {
 	if want := "hostrunner: " + ws + " has no allow\n"; stdout != want {
 		t.Errorf("second deny: stdout %q, want %q", stdout, want)
 	}
+}
+
+// deny removes a damaged allow file with the valid allows: it prints the
+// valid ones to stdout, warns of the damaged one on stderr and succeeds.
+// With only a damaged file it warns and does not say there is no allow.
+func TestDenyRemovesADamagedAllowFileWithAWarning(t *testing.T) {
+	isolate(t)
+	ws, _ := devcontainerWith(t, allowRules, "hostrunner-rules.yaml")
+	a, b := runtimeDir(t, "a"), runtimeDir(t, "b")
+	refuseUpIn(t, a, ws)
+	refuseUpIn(t, b, ws)
+	if _, _, err := runAllowCmd(t, "allow", ws); err != nil {
+		t.Fatal(err)
+	}
+	damaged := allowFileOf(t, ws, b)
+	if err := os.WriteFile(damaged, []byte("not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stdout, stderr, err := runAllowCmd(t, "deny", ws)
+	if err != nil {
+		t.Fatalf("deny: %v", err)
+	}
+	if want := "hostrunner: denied " + ws + " for " + a + "\n"; stdout != want {
+		t.Errorf("stdout %q, want %q", stdout, want)
+	}
+	if want := "hostrunner: warning: removed the allow file " + damaged + ", which cannot be read: "; !strings.HasPrefix(stderr, want) || strings.Count(stderr, "\n") != 1 {
+		t.Errorf("stderr %q, want one line starting %q", stderr, want)
+	}
+	if _, err := os.Stat(damaged); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the damaged allow file is still there: %v", err)
+	}
+
+	refuseUpIn(t, a, ws)
+	if _, _, err := runAllowCmd(t, "allow", ws); err != nil {
+		t.Fatal(err)
+	}
+	damaged = allowFileOf(t, ws, a)
+	if err := os.WriteFile(damaged, []byte("not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stdout, stderr, err = runAllowCmd(t, "deny", ws)
+	if err != nil || stdout != "" || !strings.Contains(stderr, damaged) {
+		t.Errorf("deny of a damaged file only: got %q, %q and %v; want only the warning", stdout, stderr, err)
+	}
+}
+
+// allowFileOf returns the path of the allow file of the runtime directory
+// rd of ws in the store of an isolated test, as the store names it: the
+// hex SHA-256 of each key, rd's followed by .json. It fails the test
+// unless the file exists.
+func allowFileOf(t *testing.T, ws, rd string) string {
+	t.Helper()
+	wsKey, err := filepath.EvalSymlinks(ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hexOf := func(k string) string {
+		sum := sha256.Sum256([]byte(k))
+		return hex.EncodeToString(sum[:])
+	}
+	path := filepath.Join(allowStore(t).Dir, hexOf(wsKey), hexOf(rd)+".json")
+	if _, err := os.Stat(path); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 // deny defaults to the current directory and needs no existing workspace:
