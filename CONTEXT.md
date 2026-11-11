@@ -205,13 +205,21 @@ It cannot turn the mount check off.
 ### Config protection
 
 **Allow**:
-A human on the host trusting one content of a workspace's rules file
-together with the daemon settings resolved for it.
+A human on the host trusting, for one runtime directory of a workspace,
+one content of its rules file together with the daemon settings resolved
+for it.
 _Avoid_: trust, approve (an approval lets one command through)
 
 **Allowed**:
 Said of rules and daemon settings an allow covers; a daemon serves no
 others.
+
+**Pending request**:
+What a refused `up` or `restart`, or a daemon finding content not
+allowed, recorded for one runtime directory of a workspace: the rules
+file, its digest and the daemon settings, for `hostrunner allow` to
+allow.
+_Avoid_: approval request (one command waiting for a human's answer)
 
 **Mount check**:
 The daemon's check that its armed container cannot write the files that

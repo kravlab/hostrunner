@@ -233,14 +233,58 @@ func (e env) vars() []string {
 	return append(out, e.extra...)
 }
 
+// allowPoll and allowWait bound the retry of `hostrunner allow` while a
+// daemon that rereads by itself (every 2 s) has not yet recorded its
+// request.
+const (
+	allowPoll = 500 * time.Millisecond
+	allowWait = 10 * time.Second
+)
+
 // allow runs `hostrunner allow` for the workspace, as the human on the
-// host does before the first up and after each edit of the rules or the
-// settings: up starts a daemon only for allowed ones.
+// host does after a refused up or a hand edit of the rules: it allows the
+// pending request of the workspace. A daemon that rereads by itself records
+// its request only at its next look (every 2 s), so allow is retried every
+// allowPoll for up to allowWait while it fails.
 func (e env) allow(t *testing.T) {
 	t.Helper()
-	if _, err := run(t, e.vars(), filepath.Join(e.bin, "hostrunner"), "allow", e.ws); err != nil {
-		t.Fatalf("hostrunner allow: %v", err)
+	deadline := time.Now().Add(allowWait)
+	for {
+		_, err := run(t, e.vars(), filepath.Join(e.bin, "hostrunner"), "allow", e.ws)
+		if err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("hostrunner allow: %v", err)
+		}
+		time.Sleep(allowPoll)
 	}
+}
+
+// expectUpRefused runs `devcontainer up` while the rules and settings are not
+// allowed, as a human's first start does: the `hostrunner up` of
+// initializeCommand refuses and records its request, so `devcontainer up`
+// fails and starts no container; the test fails unless it does, and unless
+// its output names `hostrunner allow`.
+func (e env) expectUpRefused(t *testing.T) {
+	t.Helper()
+	args := []string{"up", "--workspace-folder", e.ws, "--docker-path", e.runtime}
+	out, err := run(t, e.vars(), "devcontainer", args...)
+	if err == nil {
+		t.Fatalf("devcontainer up succeeded with the rules not allowed: %q", out)
+	}
+	if text := out + err.Error(); !strings.Contains(text, "hostrunner allow") {
+		t.Fatalf("devcontainer up refused without naming `hostrunner allow`: %q", text)
+	}
+}
+
+// allowAfterRefusedUp brings the workspace to its first allow, as a human
+// does before the first start: a refused `devcontainer up` records the
+// request (expectUpRefused), and `hostrunner allow` allows it.
+func (e env) allowAfterRefusedUp(t *testing.T) {
+	t.Helper()
+	e.expectUpRefused(t)
+	e.allow(t)
 }
 
 // up runs `devcontainer up` with extra flags and returns the container ID.
@@ -443,9 +487,9 @@ func volumeName(ws string) string {
 
 // TestDevcontainerWritableMountWithTheCheckOff brings up the same variant
 // with the mount check turned off on the host (HOSTRUNNER_MOUNT_CHECK=false
-// for `hostrunner allow` and for the `hostrunner up` the devcontainer CLI
-// runs, so the allow covers it): the daemon runs the commands its rules
-// allow.
+// for the `hostrunner up` the devcontainer CLI runs, which records the
+// setting in its request, and `hostrunner allow` allows that request): the
+// daemon runs the commands its rules allow.
 func TestDevcontainerWritableMountWithTheCheckOff(t *testing.T) {
 	eachRuntime(t, func(t *testing.T) string { return newWorkspace(t, true) }, func(t *testing.T, e env) {
 		e.extra = []string{"HOSTRUNNER_MOUNT_CHECK=false"}
@@ -486,7 +530,7 @@ func (e env) cleanUp(t *testing.T) {
 
 func testLifecycle(t *testing.T, e env) {
 	t.Cleanup(func() { e.cleanUp(t) })
-	e.allow(t)
+	e.allowAfterRefusedUp(t)
 	container := e.up(t)
 	runtimeDir := e.runtimeDirOf(t, container)
 	socket := filepath.Join(runtimeDir, "hostrunner.sock")
@@ -651,6 +695,11 @@ func testLifecycle(t *testing.T, e env) {
 				t.Fatal(err)
 			}
 		}
+		// The daemon does not watch this file: a restart of settings not
+		// allowed fails before the old daemon stops, and records the request.
+		if _, err := run(t, e.vars(), filepath.Join(e.bin, "hostrunner"), "restart", "--dir", runtimeDir); err == nil {
+			t.Fatal("hostrunner restart succeeded with the settings not allowed")
+		}
 		e.allow(t)
 		before := daemonStarts(t, runtimeDir)
 		if _, err := run(t, e.vars(), filepath.Join(e.bin, "hostrunner"), "restart", "--dir", runtimeDir); err != nil {
@@ -696,7 +745,7 @@ func testLifecycle(t *testing.T, e env) {
 
 func testWritableMount(t *testing.T, e env) {
 	t.Cleanup(func() { e.cleanUp(t) })
-	e.allow(t)
+	e.allowAfterRefusedUp(t)
 	e.up(t)
 
 	// devcontainer's default workspace mount puts the workspace at
@@ -726,7 +775,7 @@ func testWritableMount(t *testing.T, e env) {
 
 func testWritableMountWithTheCheckOff(t *testing.T, e env) {
 	t.Cleanup(func() { e.cleanUp(t) })
-	e.allow(t)
+	e.allowAfterRefusedUp(t)
 	e.up(t)
 	e.expectHostrunWorks(t)
 }

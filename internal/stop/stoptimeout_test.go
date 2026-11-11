@@ -66,7 +66,7 @@ func startStuckDaemon(t *testing.T) string {
 func TestStopWaitsTheStopTimeoutForTheDaemonToClose(t *testing.T) {
 	dir := startStuckDaemon(t)
 	start := time.Now()
-	_, err := runStop(t, stop.Config{Dir: dir, Commands: stop.Commands{StopTimeout: 200 * time.Millisecond}}, "")
+	_, err := runStop(t, stop.Config{Dir: dir, Commands: stop.Commands{StopTimeout: 200 * time.Millisecond}})
 	if err == nil || !strings.Contains(err.Error(), "the daemon did not stop within 200ms") {
 		t.Fatalf("got %v, want the stop timeout's error", err)
 	}

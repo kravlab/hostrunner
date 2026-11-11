@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/kravlab/hostrunner/internal/allow"
+	"github.com/kravlab/hostrunner/internal/allow/allowtest"
 	"github.com/kravlab/hostrunner/internal/daemon"
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
@@ -22,44 +23,49 @@ import (
 // name.
 var allowSettings = map[string]string{"reread": "true"}
 
-// allowStore is an allow store, and the workspace whose allow the
-// daemons of these tests check in it. rulesFile is the rules file that the
-// allows made by record name.
+// allowStore is an allow store, and the workspace and the runtime
+// directory whose allow the daemons of these tests check in it. rulesFile
+// is a rules file of the workspace a test may name in an allow.
 type allowStore struct {
-	store     allow.Store
-	workspace string
-	rulesFile string
+	store      allow.Store
+	workspace  string
+	runtimeDir string
+	rulesFile  string
 }
 
 // newAllowStore returns an empty allow store in a temporary directory.
 func newAllowStore(t *testing.T) allowStore {
 	t.Helper()
 	workspace := t.TempDir()
-	return allowStore{store: allow.Store{Dir: t.TempDir()}, workspace: workspace, rulesFile: filepath.Join(workspace, "hostrun.yaml")}
+	return allowStore{store: allow.Store{Dir: t.TempDir()}, workspace: workspace, runtimeDir: t.TempDir(), rulesFile: filepath.Join(workspace, "hostrun.yaml")}
+}
+
+// place is where the daemons of these tests keep their allow in the
+// store: the workspace and the runtime directory.
+func (a allowStore) place() allow.Place {
+	return allow.Place{Workspace: a.workspace, RuntimeDir: a.runtimeDir}
 }
 
 // check is the allow check a daemon of these tests runs (see
 // daemon.WithAllowed): whether the store allows the Scope for the
-// workspace.
+// workspace and the runtime directory.
 func (a allowStore) check(sc allow.Scope) (bool, error) {
-	return a.store.Allowed(a.workspace, sc)
+	return a.store.Allowed(a.place(), sc)
 }
 
-// allow records an allow of content for the workspace, as `hostrunner
-// allow` does.
+// allow records an allow of content for the workspace and the runtime
+// directory, as `hostrunner allow` does.
 func (a allowStore) allow(t *testing.T, rulesFile, content string) {
 	t.Helper()
-	if _, err := a.store.Allow(a.workspace, allow.Target{RulesFile: rulesFile, Scope: allow.Scope{Digest: rules.ContentDigest([]byte(content)), Settings: allowSettings}}); err != nil {
-		t.Fatal(err)
-	}
+	allowtest.Allow(t, a.store, a.place(), allow.Target{RulesFile: rulesFile, Scope: allow.Scope{Digest: rules.ContentDigest([]byte(content)), Settings: allowSettings}})
 }
 
 // record is the allow a daemon of these tests records (see
-// daemon.WithAllowRecorder) for a rule added from the approval session: an allow
-// of content of the given digest for the workspace, as `hostrunner allow`
-// does.
-func (a allowStore) record(digest string) error {
-	_, err := a.store.Allow(a.workspace, allow.Target{RulesFile: a.rulesFile, Scope: allow.Scope{Digest: digest, Settings: allowSettings}})
+// daemon.WithAllowRecorder) for a rule added from the approval session:
+// the allows of the workspace that covered the content written over moved
+// to the content of the given digest, as `hostrunner serve` records them.
+func (a allowStore) record(writtenOver allow.Scope, digest string) error {
+	_, err := a.store.AllowAddedRule(a.place(), writtenOver, digest)
 	return err
 }
 

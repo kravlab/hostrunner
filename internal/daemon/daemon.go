@@ -69,7 +69,7 @@ type Server struct {
 	rereadEvery      time.Duration                                        // 0: the rules file is not watched; see WithRereadEvery
 	allowed          func(allow.Scope) (bool, error)                      // nil: every content of the rules file is allowed; see WithAllowed
 	allowRequest     func(digest string) error                            // nil: no allow request is recorded; see WithAllowRequest
-	allowRecorder    func(digest string) error                            // nil: no allow is recorded; see WithAllowRecorder
+	allowRecorder    func(writtenOver allow.Scope, digest string) error   // nil: no allow is recorded; see WithAllowRecorder
 	buildVersion     string                                               // "": unknown; see WithBuildVersion
 	settings         map[string]string                                    // nil: none reported; see WithSettings
 	mount            mountChecker                                         // the mount check: noMountCheck unless WithMountCheck; see MountChecked
