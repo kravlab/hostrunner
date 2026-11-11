@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -74,56 +75,86 @@ func parseWorkspaceArg(fs *flag.FlagSet, args []string, usage string) (string, e
 	return abs, nil
 }
 
-// runAllow allows what a refused `up` or a daemon asked for in cfg's
-// workspace and prints to stdout what it allowed: the request in the
-// store, settings flags included, once the rules file still has the
-// digest the request saw. A rules file changed since then is an error
-// naming it and both digests, and records nothing, so a human never
-// allows content other than what was shown to `up`. Without a request it
+// runAllow allows what the refused `up`s or the daemons of cfg's
+// workspace asked for and prints to stdout what it allowed: every pending
+// request in the store, one per runtime directory, settings flags
+// included, once the rules file of each still has the digest the request
+// saw. It allows all of them or none: a rules file changed since a request
+// is an error naming each such request, its runtime directory, its rules
+// file and both digests, and records nothing, so a human never allows
+// content other than what was shown to `up`. Without a pending request it
 // allows nothing and fails, telling to start the container, since
 // `hostrunner up` asks for the allow (ADR 0009). It asks nothing and reads
-// no stdin: the human who runs it is the one who allows. Invalid rules
-// are an error, as in `hostrunner up`, and record nothing; a missing rules
+// no stdin: the human who runs it is the one who allows. Invalid rules are
+// an error, as in `hostrunner up`, and record nothing; a missing rules
 // file is allowed, as the daemon would serve it, denying every command.
+// When the allows are recorded but a request answered cannot be removed,
+// it prints what it allowed and then returns the error.
 func runAllow(cfg allowConfig, stdout io.Writer) error {
-	target, err := allowTarget(cfg)
+	requests, err := allowRequests(cfg)
 	if err != nil {
 		return err
 	}
-	e, err := cfg.store.Allow(cfg.workspace, target)
-	if err != nil {
-		return err
+	allowed, allowErr := cfg.store.AllowAll(cfg.workspace, requests)
+	var b strings.Builder
+	for _, e := range allowed {
+		b.WriteString(allowMessage(cfg.workspace, e))
 	}
-	_, err = io.WriteString(stdout, allowMessage(cfg.workspace, e))
-	return err
+	_, err = io.WriteString(stdout, b.String())
+	return errors.Join(allowErr, err)
 }
 
-// allowTarget returns what runAllow allows for cfg's workspace: the
-// request in the store, checked against the rules file as it is now. No
-// request is an error naming `hostrunner up`, which asks for the allow.
-func allowTarget(cfg allowConfig) (allow.Target, error) {
-	req, ok, err := cfg.store.Pending(cfg.workspace)
+// allowRequests returns what runAllow allows for cfg's workspace: the
+// pending requests in the store, each checked against its rules file as it
+// is now (see staleRequest). No pending request is an error naming
+// `hostrunner up`, which asks for the allow; so is any request whose rules
+// file changed since, every such one named.
+func allowRequests(cfg allowConfig) ([]allow.Entry, error) {
+	requests, err := cfg.store.PendingAll(cfg.workspace)
 	if err != nil {
-		return allow.Target{}, err
+		return nil, err
 	}
-	if !ok {
-		return allow.Target{}, fmt.Errorf("nothing asked to allow %s: start the container first, hostrunner up asks for the allow", hostterm.Display(cfg.workspace))
+	if len(requests) == 0 {
+		return nil, fmt.Errorf("nothing asked to allow %s: start the container first, hostrunner up asks for the allow", hostterm.Display(cfg.workspace))
 	}
+	var changed []string
+	for _, req := range requests {
+		stale, err := staleRequest(req)
+		if err != nil {
+			return nil, err
+		}
+		if stale != "" {
+			changed = append(changed, stale)
+		}
+	}
+	if len(changed) > 0 {
+		return nil, fmt.Errorf("%s: nothing allowed, run hostrunner up again", strings.Join(changed, "; "))
+	}
+	return requests, nil
+}
+
+// staleRequest checks the pending request req against its rules file as
+// it is now, and returns what changed since `hostrunner up` asked for it,
+// naming its runtime directory, its rules file and both digests, or ""
+// when the file still has the digest of req. Rules that do not load are
+// an error naming the runtime directory of req.
+func staleRequest(req allow.Entry) (string, error) {
 	policy, err := rules.Load(req.RulesFile)
 	if err != nil {
-		return allow.Target{}, fmt.Errorf("rules file: %w", err)
+		return "", fmt.Errorf("rules file of the runtime directory %s: %w", hostterm.Display(req.RuntimeDir), err)
 	}
-	if policy.Digest() != req.Digest {
-		return allow.Target{}, fmt.Errorf("the rules file %s changed since hostrunner up asked to allow it (digest %s, now %s): run hostrunner up again",
-			hostterm.Display(req.RulesFile), req.Digest, policy.Digest())
+	if policy.Digest() == req.Digest {
+		return "", nil
 	}
-	return req.Target, nil
+	return fmt.Sprintf("the rules file %s changed since hostrunner up asked to allow it for the runtime directory %s (digest %s, now %s)",
+		hostterm.Display(req.RulesFile), hostterm.Display(req.RuntimeDir), req.Digest, policy.Digest()), nil
 }
 
 // allowMessage is what `allow` prints for the allow e of workspace: the
-// workspace, the rules file with its digest and the settings sorted by
-// key, one per line, so the human sees what was trusted. A setting that
-// differs from its default (settings.DaemonDefaults) carries the default,
+// workspace, the runtime directory, the rules file with its digest and the
+// settings sorted by key, one per line, so the human sees what was
+// trusted. A setting that differs from its default
+// (settings.DaemonDefaults) carries the default,
 // as `mount_check: false (default true)`: the settings flags of a refused
 // up come from initializeCommand, not from the human, who sees here which
 // of them the allow takes. The defaults are compared as the store holds
@@ -136,6 +167,7 @@ func allowMessage(workspace string, e allow.Entry) string {
 	defaults, defaultsErr := allow.CanonicalSettings(settings.DaemonDefaults(workspace))
 	var b strings.Builder
 	fmt.Fprintf(&b, "hostrunner: allowed %s\n", hostterm.Display(workspace))
+	fmt.Fprintf(&b, "  runtime directory: %s\n", hostterm.Display(e.RuntimeDir))
 	fmt.Fprintf(&b, "  rules file: %s\n", hostterm.Display(e.RulesFile))
 	fmt.Fprintf(&b, "  digest: %s\n", e.Digest)
 	b.WriteString("  settings:\n")
@@ -179,18 +211,21 @@ func parseDeny(args []string, getenv func(string) string, output io.Writer) (den
 	return cfg, nil
 }
 
-// runDeny removes the allow of cfg's workspace and says to stdout whether
-// there was one; a workspace without an allow is no failure.
+// runDeny removes the allows of every runtime directory of cfg's
+// workspace and says to stdout which it removed, one line each, or that
+// there was none; a workspace without an allow is no failure. When an
+// allow cannot be removed it still prints those removed before it, then
+// returns the error.
 func runDeny(cfg denyConfig, stdout io.Writer) error {
-	removed, err := cfg.store.Deny(cfg.workspace)
-	if err != nil {
-		return err
-	}
+	removed, denyErr := cfg.store.Deny(cfg.workspace)
 	ws := hostterm.Display(cfg.workspace)
-	if removed {
-		_, err = fmt.Fprintf(stdout, "hostrunner: denied %s\n", ws)
-	} else {
-		_, err = fmt.Fprintf(stdout, "hostrunner: %s has no allow\n", ws)
+	var b strings.Builder
+	for _, e := range removed {
+		fmt.Fprintf(&b, "hostrunner: denied %s for %s\n", ws, hostterm.Display(e.RuntimeDir))
 	}
-	return err
+	if len(removed) == 0 && denyErr == nil {
+		fmt.Fprintf(&b, "hostrunner: %s has no allow\n", ws)
+	}
+	_, err := io.WriteString(stdout, b.String())
+	return errors.Join(denyErr, err)
 }

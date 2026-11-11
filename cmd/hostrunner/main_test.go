@@ -1413,7 +1413,7 @@ func TestServeRereadsItsRulesOnceARuleIsAdded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Allow(cfg.workspace, allow.Target{RulesFile: cfg.RulesFile, Scope: allow.Scope{Digest: rules.ContentDigest(loaded), Settings: cfg.Settings.Daemon()}}); err != nil {
+	if _, err := store.Allow(servePlace(cfg), allow.Target{RulesFile: cfg.RulesFile, Scope: allow.Scope{Digest: rules.ContentDigest(loaded), Settings: cfg.Settings.Daemon()}}); err != nil {
 		t.Fatal(err)
 	}
 	cfg.allows = store
@@ -1456,12 +1456,18 @@ func TestServeRereadsItsRulesOnceARuleIsAdded(t *testing.T) {
 	if res.Error != "" || res.Digest != p.Digest() {
 		t.Fatalf("reread: got %+v, want the new file's digest %s", res, p.Digest())
 	}
-	if ok, err := store.Allowed(cfg.workspace, allow.Scope{Digest: p.Digest(), Settings: cfg.Settings.Daemon()}); err != nil || !ok {
+	if ok, err := store.Allowed(servePlace(cfg), allow.Scope{Digest: p.Digest(), Settings: cfg.Settings.Daemon()}); err != nil || !ok {
 		t.Fatalf("the store allows the file as written: %v, %v; want it allowed", ok, err)
 	}
 	if stepAside := armServe(t, cfg, p.Digest()); stepAside {
 		t.Fatal("stepped aside for the rules it reread")
 	}
+}
+
+// servePlace is where the allow store keeps the allow of cfg's serve: its
+// workspace and its runtime directory, the directory of its socket.
+func servePlace(cfg serveConfig) allow.Place {
+	return allow.Place{Workspace: cfg.workspace, RuntimeDir: filepath.Dir(cfg.socket)}
 }
 
 // logBuffer collects a serve's log for a test to wait on.
@@ -1539,7 +1545,62 @@ func TestServeRereadsAHandEditOnceAllowed(t *testing.T) {
 	if code := runServed(cfg, "sh", "-c", "exit 3"); code != protocol.ExitRejected {
 		t.Fatalf("a command of the edit not allowed exited %d, want %d", code, protocol.ExitRejected)
 	}
-	if _, err := store.Allow(cfg.workspace, allow.Target{RulesFile: cfg.RulesFile, Scope: allow.Scope{Digest: rules.ContentDigest([]byte(handEdited)), Settings: cfg.Settings.Daemon()}}); err != nil {
+	if _, err := store.Allow(servePlace(cfg), allow.Target{RulesFile: cfg.RulesFile, Scope: allow.Scope{Digest: rules.ContentDigest([]byte(handEdited)), Settings: cfg.Settings.Daemon()}}); err != nil {
+		t.Fatal(err)
+	}
+	waitServed(t, cfg)
+}
+
+// serve checks and records the allow of its own runtime directory, the
+// one its socket lies in: an allow of the hand edit for another runtime
+// directory of the workspace does not let it serve the edit, the request
+// it records is that of its own runtime directory, leaving the other's,
+// and the allow of its own lets it serve the edit.
+func TestServeChecksAndRecordsTheAllowOfItsOwnRuntimeDir(t *testing.T) {
+	cfg := watchConfig(t)
+	cfg.watch = false
+	cfg.RulesFile = filepath.Join(cfg.workspace, "hostrun.yaml")
+	if err := os.WriteFile(cfg.RulesFile, []byte(handEditLoaded), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store, err := allow.Open(envOf(map[string]string{"XDG_DATA_HOME": t.TempDir()}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.allows = store
+	// The runtime directory, apart from the workspace, as `up` gives it.
+	own, err := os.MkdirTemp("", "hrr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(own) })
+	cfg.socket = filepath.Join(own, "h.sock")
+	t.Cleanup(func() { os.Remove(launch.ApprovalSocket(own)) })
+	other := filepath.Join(t.TempDir(), "other")
+	edited := allow.Target{RulesFile: cfg.RulesFile, Scope: allow.Scope{Digest: rules.ContentDigest([]byte(handEdited)), Settings: cfg.Settings.Daemon()}}
+	if _, err := store.Allow(allow.Place{Workspace: cfg.workspace, RuntimeDir: other}, edited); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Request(allow.Place{Workspace: cfg.workspace, RuntimeDir: other}, allow.NewTarget(cfg.RulesFile, "other request", nil)); err != nil {
+		t.Fatal(err)
+	}
+	var log logBuffer
+	startLoggingServe(t, cfg, slog.New(slog.NewTextHandler(&log, nil)))
+	if err := os.WriteFile(cfg.RulesFile, []byte(handEdited), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	log.waitFor(t, "rules changed but not allowed")
+	if code := runServed(cfg, "sh", "-c", "exit 3"); code != protocol.ExitRejected {
+		t.Fatalf("a command of an edit allowed for another runtime directory exited %d, want %d", code, protocol.ExitRejected)
+	}
+	got, ok, err := pendingOf(store, cfg.workspace, own)
+	if err != nil || !ok || got.Digest != edited.Digest {
+		t.Fatalf("Pending of its own runtime directory = %+v, %v, %v; want the request of the edit", got, ok, err)
+	}
+	if got, ok, err := pendingOf(store, cfg.workspace, other); err != nil || !ok || got.Digest != "other request" {
+		t.Fatalf("Pending of the other runtime directory = %+v, %v, %v; want its own request", got, ok, err)
+	}
+	if _, err := store.Allow(servePlace(cfg), edited); err != nil {
 		t.Fatal(err)
 	}
 	waitServed(t, cfg)
@@ -1567,7 +1628,7 @@ func TestServeWithoutRereadLeavesAnAllowedHandEditToTheNextUp(t *testing.T) {
 		t.Fatal(err)
 	}
 	digest := rules.ContentDigest([]byte(handEdited))
-	if _, err := store.Allow(cfg.workspace, allow.Target{RulesFile: cfg.RulesFile, Scope: allow.Scope{Digest: digest, Settings: cfg.Settings.Daemon()}}); err != nil {
+	if _, err := store.Allow(servePlace(cfg), allow.Target{RulesFile: cfg.RulesFile, Scope: allow.Scope{Digest: digest, Settings: cfg.Settings.Daemon()}}); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(20 * cfg.PollInterval)
@@ -1613,7 +1674,7 @@ func TestServeRecordsTheAllowRequestOfAHandEdit(t *testing.T) {
 		t.Fatal(err)
 	}
 	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(cfg.PollInterval) {
-		if _, ok, err := ac.store.Pending(base); err != nil || ok {
+		if _, ok, err := pendingOf(ac.store, base, base); err != nil || ok {
 			if err != nil {
 				t.Fatal(err)
 			}

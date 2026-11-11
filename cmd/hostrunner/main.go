@@ -911,14 +911,18 @@ func protectedPaths(cfg serveConfig) []string {
 }
 
 // allowOptions returns the options that have the daemon of cfg reread
-// only rules file content allowed in cfg's allow store for its workspace
-// and its daemon settings, as `up` checks them (with the settings the
-// daemon gives, its own or those of a change an arm reports not allowed),
-// and record an allow request of its own rules file and settings for
-// content not allowed, so that `hostrunner allow` allows what the daemon
-// checks. They also have it allow, as `hostrunner allow` does, a rule added
-// from the approval session to a rules file that was allowed.
+// only rules file content allowed in cfg's allow store for its workspace,
+// its runtime directory and its daemon settings, as `up` checks them (with
+// the settings the daemon gives, its own or those of a change an arm
+// reports not allowed), and record a pending request of its own rules file
+// and settings for content not allowed under its runtime directory, so
+// that `hostrunner allow` allows what the daemon checks. They also have it
+// allow, as `hostrunner allow` does, a rule added from the approval
+// session to a rules file that was allowed, for its runtime directory. The
+// runtime directory is the one its socket lies in, beside which its
+// approval socket lies, the cfg.Dir of the `up` that started it.
 func allowOptions(cfg serveConfig) []daemon.Option {
+	place := allow.Place{Workspace: cfg.workspace, RuntimeDir: filepath.Dir(cfg.socket)}
 	// target is what the daemon's own rules file and settings, with the
 	// given digest of its content, are allowed as.
 	target := func(digest string) allow.Target {
@@ -926,13 +930,13 @@ func allowOptions(cfg serveConfig) []daemon.Option {
 	}
 	return []daemon.Option{
 		daemon.WithAllowed(func(sc allow.Scope) (bool, error) {
-			return cfg.allows.Allowed(cfg.workspace, sc)
+			return cfg.allows.Allowed(place, sc)
 		}),
 		daemon.WithAllowRequest(func(digest string) error {
-			return cfg.allows.Request(cfg.workspace, target(digest))
+			return cfg.allows.Request(place, target(digest))
 		}),
 		daemon.WithAllowRecorder(func(digest string) error {
-			_, err := cfg.allows.Allow(cfg.workspace, target(digest))
+			_, err := cfg.allows.Allow(place, target(digest))
 			return err
 		}),
 	}

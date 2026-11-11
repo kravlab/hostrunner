@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/kravlab/hostrunner/internal/allow"
+	"github.com/kravlab/hostrunner/internal/daemonlist"
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
 	"github.com/kravlab/hostrunner/internal/settings"
@@ -49,7 +50,7 @@ func TestMain(m *testing.M) {
 			Settings: settings.Settings{RulesFile: filepath.Join(dir, "missing-rules.yaml"), Reread: true, ReadyTimeout: 5 * time.Second},
 		}
 		// The rules file is missing, which has the digest "missing".
-		if _, err := cfg.Allows.Allow(cfg.Workspace, allow.Target{RulesFile: cfg.RulesFile, Scope: allow.Scope{Digest: "missing", Settings: cfg.Settings.Daemon()}}); err != nil {
+		if _, err := cfg.Allows.Allow(cfg.place(), allow.Target{RulesFile: cfg.RulesFile, Scope: allow.Scope{Digest: "missing", Settings: cfg.Settings.Daemon()}}); err != nil {
 			os.Exit(1)
 		}
 		if err := Up(context.Background(), cfg); err != nil {
@@ -61,8 +62,10 @@ func TestMain(m *testing.M) {
 		return
 	}
 	code := m.Run()
-	if staticDir != "" {
-		os.RemoveAll(staticDir)
+	for _, dir := range []string{staticDir, hostrunnerDir} {
+		if dir != "" {
+			os.RemoveAll(dir)
+		}
 	}
 	os.Exit(code)
 }
@@ -253,6 +256,34 @@ var staticBinary = sync.OnceValues(func() (string, error) {
 	return bin, nil
 })
 
+// hostrunnerDir holds the hostrunner binary; TestMain removes it.
+var hostrunnerDir string
+
+// hostrunnerBinary builds the hostrunner command once per test run, for
+// the tests that start the real daemon.
+var hostrunnerBinary = sync.OnceValues(func() (string, error) {
+	dir, err := os.MkdirTemp("", "hr-daemon")
+	if err != nil {
+		return "", err
+	}
+	hostrunnerDir = dir
+	bin := filepath.Join(dir, "hostrunner")
+	if out, err := exec.Command("go", "build", "-o", bin, "github.com/kravlab/hostrunner/cmd/hostrunner").CombinedOutput(); err != nil {
+		return "", &exec.ExitError{Stderr: out}
+	}
+	return bin, nil
+})
+
+// mustHostrunner returns the hostrunner binary (see hostrunnerBinary).
+func mustHostrunner(t *testing.T) string {
+	t.Helper()
+	bin, err := hostrunnerBinary()
+	if err != nil {
+		t.Fatalf("build hostrunner: %v", err)
+	}
+	return bin
+}
+
 func mustStatic(t *testing.T) string {
 	t.Helper()
 	bin, err := staticBinary()
@@ -302,16 +333,33 @@ func fakeConfig(t *testing.T, mode string) Config {
 }
 
 // allowCurrent allows what a human running `hostrunner allow` would:
-// the rules file of cfg as it is now, with the daemon settings of cfg.
+// the rules file of cfg as it is now, with the daemon settings of cfg,
+// for its runtime directory.
 func allowCurrent(t *testing.T, cfg Config) {
 	t.Helper()
 	policy, err := rules.Load(cfg.RulesFile)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := cfg.Allows.Allow(cfg.Workspace, allow.Target{RulesFile: cfg.RulesFile, Scope: allow.Scope{Digest: policy.Digest(), Settings: cfg.Settings.Daemon()}}); err != nil {
+	if _, err := cfg.Allows.Allow(cfg.place(), allow.Target{RulesFile: cfg.RulesFile, Scope: allow.Scope{Digest: policy.Digest(), Settings: cfg.Settings.Daemon()}}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// pendingOf returns the pending request of the runtime directory of cfg,
+// as PendingAll returns it; ok is false when there is none.
+func pendingOf(t *testing.T, cfg Config) (e allow.Entry, ok bool, err error) {
+	t.Helper()
+	requests, err := cfg.Allows.PendingAll(cfg.Workspace)
+	if err != nil {
+		return allow.Entry{}, false, err
+	}
+	for _, e := range requests {
+		if same, err := allow.SameWorkspace(e.RuntimeDir, cfg.Dir); err != nil || same {
+			return e, err == nil, err
+		}
+	}
+	return allow.Entry{}, false, nil
 }
 
 // alivePid reports whether process pid exists.
@@ -1148,7 +1196,7 @@ func TestUpOfChangedRulesNotAllowedArmsTheDaemonServingAllowedRules(t *testing.T
 	if got := stderr.String(); got != want {
 		t.Errorf("stderr %q, want %q", got, want)
 	}
-	if _, ok, err := cfg.Allows.Pending(cfg.Workspace); err != nil || !ok {
+	if _, ok, err := pendingOf(t, cfg); err != nil || !ok {
 		t.Errorf("Pending = %v, %v, want the request recorded", ok, err)
 	}
 }
@@ -1227,7 +1275,7 @@ func TestUpOfChangedRulesNotAllowedLeavesADaemonNotServingAllowedRules(t *testin
 			}
 		}},
 		{"other rules allowed", "serve", func(t *testing.T, cfg *Config) {
-			if _, err := cfg.Allows.Allow(cfg.Workspace, allow.Target{RulesFile: cfg.RulesFile, Scope: allow.Scope{Digest: "other", Settings: cfg.Settings.Daemon()}}); err != nil {
+			if _, err := cfg.Allows.Allow(cfg.place(), allow.Target{RulesFile: cfg.RulesFile, Scope: allow.Scope{Digest: "other", Settings: cfg.Settings.Daemon()}}); err != nil {
 				t.Fatal(err)
 			}
 		}},
@@ -1235,7 +1283,7 @@ func TestUpOfChangedRulesNotAllowedLeavesADaemonNotServingAllowedRules(t *testin
 			// The other workspace allows what the daemon serves, for the
 			// workspace it was started for.
 			cfg.Workspace = "/home/u/other"
-			if _, err := cfg.Allows.Allow(cfg.Workspace, allow.Target{RulesFile: cfg.RulesFile, Scope: allow.Scope{Digest: "missing", Settings: cfg.Settings.Daemon()}}); err != nil {
+			if _, err := cfg.Allows.Allow(cfg.place(), allow.Target{RulesFile: cfg.RulesFile, Scope: allow.Scope{Digest: "missing", Settings: cfg.Settings.Daemon()}}); err != nil {
 				t.Fatal(err)
 			}
 		}},
@@ -1279,16 +1327,150 @@ func TestUpRefusedRecordsItsRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 	notAllowed(t, Up(context.Background(), cfg), cfg, gitStatusDigest)
-	e, ok, err := cfg.Allows.Pending(cfg.Workspace)
+	e, ok, err := pendingOf(t, cfg)
 	if err != nil || !ok {
 		t.Fatalf("Pending = %v, %v, want a request", ok, err)
 	}
-	if e.Workspace != cfg.Workspace || e.RulesFile != cfg.RulesFile || e.Digest != gitStatusDigest || !maps.Equal(e.Settings, cfg.Settings.Daemon()) {
-		t.Fatalf("request %+v, want workspace %q, rules file %q, digest %q and settings %v", e, cfg.Workspace, cfg.RulesFile, gitStatusDigest, cfg.Settings.Daemon())
+	if e.Workspace != cfg.Workspace || e.RuntimeDir != cfg.Dir || e.RulesFile != cfg.RulesFile || e.Digest != gitStatusDigest || !maps.Equal(e.Settings, cfg.Settings.Daemon()) {
+		t.Fatalf("request %+v, want workspace %q, runtime directory %q, rules file %q, digest %q and settings %v", e, cfg.Workspace, cfg.Dir, cfg.RulesFile, gitStatusDigest, cfg.Settings.Daemon())
 	}
 	if e.Settings["grace"] != "1m0s" {
 		t.Errorf("request grace %q, want 1m0s", e.Settings["grace"])
 	}
+}
+
+// fakeContainerRuntime puts a docker in PATH, until the test ends, that
+// answers every command with no output: the real daemon's watch, which
+// needs one, finds no container and waits for it.
+func fakeContainerRuntime(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "docker"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// The regression of issue #144 with the real daemon: two devcontainer
+// configs of one workspace, each with its runtime directory, whose ups
+// get different settings flags. Both ups are refused first, each
+// recording its own request; once `hostrunner allow` allows both, each up
+// starts its own daemon with its settings; and a new allow of one, for
+// other settings, does not make the up of the other fail.
+func TestUpOfTwoRuntimeDirsStartsTheRealDaemonOfEachOnceAllowed(t *testing.T) {
+	ctx := context.Background()
+	daemon := mustHostrunner(t)
+	fakeContainerRuntime(t)
+	t.Setenv("XDG_DATA_HOME", t.TempDir()) // the store the daemons open too
+	store, err := allow.Open(os.Getenv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := shortDir(t)
+	ws := filepath.Join(base, "ws")
+	if err := os.Mkdir(ws, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rulesFile := filepath.Join(ws, "hostrun.yaml")
+	if err := os.WriteFile(rulesFile, []byte(gitStatusRules), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	config := func(name string, grace time.Duration) Config {
+		return Config{
+			Dir: filepath.Join(base, name), Workspace: ws, ContainerWorkspace: "/workspaces/app",
+			Daemon: daemon, Client: mustStatic(t), Allows: store,
+			Settings: settings.Settings{
+				RulesFile: rulesFile, StartupTimeout: 10 * time.Minute, Grace: grace,
+				PollInterval: time.Second, AskTimeout: 10 * time.Minute, RequestTimeout: 10 * time.Second,
+				Reread: true, MountCheck: true, ReadyTimeout: 10 * time.Second,
+			},
+		}
+	}
+	a, b := config("a", 15*time.Second), config("b", time.Minute)
+	for _, cfg := range []Config{a, b} {
+		t.Cleanup(func() {
+			stopCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			if out, err := exec.CommandContext(stopCtx, daemon, "stop", "--dir", cfg.Dir, "--kill").CombinedOutput(); err != nil {
+				t.Logf("stop %s: %v: %s", cfg.Dir, err, out)
+			}
+		})
+	}
+	// served returns the grace the daemon of cfg says it serves with.
+	served := func(cfg Config) string {
+		t.Helper()
+		info, err := daemonlist.Probe(ctx, ApprovalSocket(cfg.Dir))
+		if err != nil {
+			t.Fatalf("probe the daemon of %s: %v", cfg.Dir, err)
+		}
+		return info.Settings["grace"]
+	}
+	// allowPending allows every pending request, as `hostrunner allow`.
+	allowPending := func(want int) {
+		t.Helper()
+		requests, err := store.PendingAll(ws)
+		if err != nil || len(requests) != want {
+			t.Fatalf("PendingAll = %+v, %v; want %d requests", requests, err, want)
+		}
+		if _, err := store.AllowAll(ws, requests); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	notAllowed(t, Up(ctx, a), a, gitStatusDigest)
+	notAllowed(t, Up(ctx, b), b, gitStatusDigest)
+	allowPending(2)
+	for _, cfg := range []Config{a, b} {
+		if err := Up(ctx, cfg); err != nil {
+			t.Fatalf("Up of %s once allowed: %v", cfg.Dir, err)
+		}
+		if got, want := served(cfg), cfg.Grace.String(); got != want {
+			t.Errorf("the daemon of %s serves grace %s, want %s", cfg.Dir, got, want)
+		}
+	}
+
+	// Not allowed yet, the up of A keeps its daemon and asks for the allow.
+	a.Grace = 2 * time.Minute
+	if err := Up(ctx, a); err != nil {
+		t.Fatalf("Up of A with new settings not allowed: %v", err)
+	}
+	if got := served(a); got != "15s" {
+		t.Errorf("the daemon of A kept serves grace %s, want 15s", got)
+	}
+	allowPending(1)
+	if err := Up(ctx, a); err != nil {
+		t.Fatalf("Up of A with its new settings once allowed: %v", err)
+	}
+	if err := Up(ctx, b); err != nil {
+		t.Fatalf("Up of B after the new allow of A: %v", err)
+	}
+	if got := served(a); got != "2m0s" {
+		t.Errorf("the daemon of A serves grace %s, want 2m0s", got)
+	}
+	if got := served(b); got != "1m0s" {
+		t.Errorf("the daemon of B serves grace %s, want 1m0s", got)
+	}
+}
+
+// A refused up records its request under its own runtime directory: the
+// refusal of one runtime directory does not replace the request of another.
+func TestUpRefusedRecordsTheRequestOfItsOwnRuntimeDir(t *testing.T) {
+	ctx := context.Background()
+	a := fakeConfig(t, "serve")
+	a.Allows = allow.Store{Dir: filepath.Join(t.TempDir(), "allow")}
+	b := a
+	b.Dir = filepath.Join(filepath.Dir(a.Dir), "other")
+	b.Grace = time.Minute
+	notAllowed(t, Up(ctx, a), a, "missing")
+	notAllowed(t, Up(ctx, b), b, "missing")
+	for _, cfg := range []Config{a, b} {
+		e, ok, err := pendingOf(t, cfg)
+		if err != nil || !ok || !maps.Equal(e.Settings, cfg.Settings.Daemon()) {
+			t.Errorf("Pending(%s) = %+v, %v, %v; want its request", cfg.Dir, e, ok, err)
+		}
+	}
+	nothingStarted(t, a.Dir)
+	nothingStarted(t, b.Dir)
 }
 
 func TestUpAllowedRecordsNoRequest(t *testing.T) {
@@ -1296,7 +1478,7 @@ func TestUpAllowedRecordsNoRequest(t *testing.T) {
 	if err := Up(context.Background(), cfg); err != nil {
 		t.Fatalf("Up: %v", err)
 	}
-	if _, ok, err := cfg.Allows.Pending(cfg.Workspace); err != nil || ok {
+	if _, ok, err := pendingOf(t, cfg); err != nil || ok {
 		t.Fatalf("Pending = %v, %v, want no request", ok, err)
 	}
 }
@@ -1309,7 +1491,7 @@ func TestUpRefusedFailsWhenTheRequestCannotBeRecorded(t *testing.T) {
 		t.Fatal(err)
 	}
 	notAllowed(t, Up(context.Background(), cfg), cfg, gitStatusDigest)
-	requests, err := filepath.Glob(filepath.Join(cfg.Allows.Dir, "*.request.json"))
+	requests, err := filepath.Glob(filepath.Join(cfg.Allows.Dir, "*", "*.request.json"))
 	if err != nil || len(requests) != 1 {
 		t.Fatalf("request files %v, %v, want one", requests, err)
 	}

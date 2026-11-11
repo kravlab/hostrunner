@@ -91,7 +91,7 @@ func TestArmedChangeNotAllowedIsWarnedOf(t *testing.T) {
 // Once the store allows the change armed, hostrun warns of nothing.
 func TestNoWarningOnceTheArmedChangeIsAllowed(t *testing.T) {
 	h, a, digest := startArmedDaemon(t)
-	if _, err := a.store.Allow(a.workspace, allow.Target{RulesFile: h.rulesFile, Scope: allow.Scope{Digest: digest, Settings: armedSettings}}); err != nil {
+	if _, err := a.store.Allow(a.place(), allow.Target{RulesFile: h.rulesFile, Scope: allow.Scope{Digest: digest, Settings: armedSettings}}); err != nil {
 		t.Fatal(err)
 	}
 	noWarning(t, h)
@@ -349,7 +349,7 @@ func TestArmedChangeIsNoticedToASessionStartingLater(t *testing.T) {
 	})
 	t.Run("allowed since", func(t *testing.T) {
 		h, a, digest := startArmedDaemon(t)
-		if _, err := a.store.Allow(a.workspace, allow.Target{RulesFile: h.rulesFile, Scope: allow.Scope{Digest: digest, Settings: armedSettings}}); err != nil {
+		if _, err := a.store.Allow(a.place(), allow.Target{RulesFile: h.rulesFile, Scope: allow.Scope{Digest: digest, Settings: armedSettings}}); err != nil {
 			t.Fatal(err)
 		}
 		conn := helloThenServe(t, h, func() {}, readsNotAllowedOnly)

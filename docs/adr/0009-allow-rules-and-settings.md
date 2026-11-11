@@ -37,6 +37,13 @@ together with the daemon settings resolved for it in
   they did not type, which whoever can write `devcontainer.json` chose;
   `allow` prints every setting that differs from its default with the
   default (`mount_check: false (default true)`), so they see them.
+- **One allow per workspace**: two devcontainer configs of one workspace
+  whose `initializeCommand`s give `up` different settings flags would
+  replace each other's allow at every `hostrunner allow`. **One allow per
+  settings set of a workspace** would keep every set ever allowed, an
+  older `--grace` included, until `deny`, and still share one pending
+  request. Rejected: an allow and a pending request belong to one runtime
+  directory of a workspace, which is one per devcontainer config.
 
 ## Consequences
 
@@ -55,5 +62,9 @@ together with the daemon settings resolved for it in
   until it is stopped.
 - A rule added from the approval session is allowed with the content the
   session wrote, provided the file was allowed before the write.
+- `hostrunner allow` allows every pending request of the workspace, or
+  none when one of them is out of date, and fails when there is none;
+  `hostrunner deny` removes the allows of all its runtime directories. The
+  allow of a devcontainer config that is gone stays until a `deny`.
 - ADR 0008's "hostrunner does not protect the workspace settings file or
   the rules file" no longer holds for their content.
