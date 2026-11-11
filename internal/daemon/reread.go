@@ -51,11 +51,16 @@ func WithAllowRequest(request func(digest string) error) Option {
 }
 
 // WithAllowRecorder makes the Server record an allow of the rules file
-// content of the given digest through record (e.g. allow.Store.Allow with
-// its workspace, rules file and settings), as the human who approved a rule
-// added from the approval session allows what that session writes. It is
-// not WithAllowRequest, which records what a human is asked to allow.
-func WithAllowRecorder(record func(digest string) error) Option {
+// content of the given digest through record (e.g.
+// allow.Store.AllowAddedRule with its runtime directory), as the human who
+// approved a rule added from the approval session allows what that session
+// writes. writtenOver is the Scope the Server found allowed for the content
+// the session wrote over, its digest with the daemon settings, so that
+// record can allow the content written wherever that content was allowed.
+// A record that returns an *allow.RequestsNotRemovedError recorded the
+// allow: the Server serves the content and logs the error as a warning. It
+// is not WithAllowRequest, which records what a human is asked to allow.
+func WithAllowRecorder(record func(writtenOver allow.Scope, digest string) error) Option {
 	return func(s *Server) { s.allowRecorder = record }
 }
 
@@ -271,15 +276,16 @@ func (s *Server) recordRefusal(digest string) (refusal *notAllowedError, changed
 // content is allowed, and none is recorded. A rule added to a file the
 // Server allowed (rr.WrittenOver, the content the session wrote over, is
 // allowed with the daemon settings) is allowed too, as the human approving
-// it reviewed it: its allow is recorded through WithAllowRecorder, and only
-// once the reread has read the content of rr.Digest, so no allow of content
-// the Server never loaded is left. A failure to record it keeps the old
-// rules, is logged as a warning, and leaves the written content pending as
-// a change not allowed (see refuseNotAllowed). In any other case (the file
-// written over was not allowed or its allow cannot be checked, no
-// written-over digest was given, or no allow can be recorded) the written
-// content is treated as a hand edit: it is reread only if it is allowed by
-// itself (see refuseNotAllowed), and no allow is recorded.
+// it reviewed it: its allow is recorded through WithAllowRecorder, given
+// that Scope, and only once the reread has read the content of rr.Digest,
+// so no allow of content the Server never loaded is left. A failure to
+// record it keeps the old rules, is logged as a warning, and leaves the
+// written content pending as a change not allowed (see refuseNotAllowed).
+// In any other case (the file written over was not allowed or its allow
+// cannot be checked, no written-over digest was given, or no allow can be
+// recorded) the written content is treated as a hand edit: it is reread
+// only if it is allowed by itself (see refuseNotAllowed), and no allow is
+// recorded.
 func (s *Server) allowAddedRule(rr protocol.Reread) (record func(digest string) error, err error) {
 	if s.allowed == nil {
 		return nil, nil
@@ -288,20 +294,28 @@ func (s *Server) allowAddedRule(rr protocol.Reread) (record func(digest string) 
 		// A failed check of the file written over is one not allowed:
 		// refuseNotAllowed checks the written content too, and reports a
 		// check that fails.
-		if _, ok := s.recheckAllowed(allow.Scope{Digest: rr.WrittenOver, Settings: s.settings}, checkNotAllowed); ok {
-			return s.recordAllow, nil
+		writtenOver := allow.Scope{Digest: rr.WrittenOver, Settings: s.settings}
+		if _, ok := s.recheckAllowed(writtenOver, checkNotAllowed); ok {
+			return func(digest string) error { return s.recordAllow(writtenOver, digest) }, nil
 		}
 	}
 	return nil, s.refuseNotAllowed(rr.Digest)
 }
 
 // recordAllow records through WithAllowRecorder an allow of the rules file
-// content of the given digest, which a session wrote and the reread loaded.
-// A failure is logged as a warning, and the content is marked pending as a
-// change not allowed, so it is reported as any other (see
-// refuseNotAllowed).
-func (s *Server) recordAllow(digest string) error {
-	if err := s.allowRecorder(digest); err != nil {
+// content of the given digest, which a session wrote over content allowed
+// with the Scope writtenOver and the reread loaded. A failure is logged as
+// a warning, and the content is marked pending as a change not allowed, so
+// it is reported as any other (see refuseNotAllowed). An allow recorded
+// whose answered requests could not all be removed is no failure: the
+// error is logged as a warning and the content is served.
+func (s *Server) recordAllow(writtenOver allow.Scope, digest string) error {
+	err := s.allowRecorder(writtenOver, digest)
+	if _, ok := errors.AsType[*allow.RequestsNotRemovedError](err); ok {
+		s.log.Warn("allow request not removed", "file", s.approvals.rulesFile, "digest", digest, "error", err)
+		err = nil
+	}
+	if err != nil {
 		s.log.Warn("allow not recorded", "file", s.approvals.rulesFile, "digest", digest, "error", err)
 		_ = s.refuseNotAllowed(digest)
 		return err

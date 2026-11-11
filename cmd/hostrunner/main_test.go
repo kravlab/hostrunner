@@ -1400,8 +1400,13 @@ func TestServeClosesTheApprovalSocketFirstWhenSteppingAside(t *testing.T) {
 // A session that adds a rule makes serve reread its rules file: the next
 // arm, carrying the new file's digest, does not make the daemon step aside.
 // The file was allowed before the session wrote it, so serve records an
-// allow of the content written, with its own settings, in its allow store.
+// allow of the content written, with its own settings, in its allow store,
+// for every runtime directory of the workspace whose allow covered the file
+// written over: the next `up` of another such one, with its own settings,
+// is allowed, while that of one allowed other content is not, and one of
+// another rules file keeps its allow.
 func TestServeRereadsItsRulesOnceARuleIsAdded(t *testing.T) {
+	isolate(t)
 	cfg := watchConfig(t)
 	cfg.watch = false
 	cfg.RulesFile = filepath.Join(cfg.workspace, "hostrun.yaml")
@@ -1409,12 +1414,35 @@ func TestServeRereadsItsRulesOnceARuleIsAdded(t *testing.T) {
 	if err := os.WriteFile(cfg.RulesFile, loaded, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	store, err := allow.Open(envOf(map[string]string{"XDG_DATA_HOME": t.TempDir()}))
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := allowStore(t)
 	if _, err := store.Allow(servePlace(cfg), allow.Target{RulesFile: cfg.RulesFile, Scope: allow.Scope{Digest: rules.ContentDigest(loaded), Settings: cfg.Settings.Daemon()}}); err != nil {
 		t.Fatal(err)
+	}
+	elsewhereFile := filepath.Join(cfg.workspace, "other.yaml")
+	if err := os.WriteFile(elsewhereFile, loaded, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The other runtime directories of the workspace, by the flags their
+	// `up` gets, the content their allow covers and whether their next `up`
+	// is allowed once the rule is added.
+	others := []struct {
+		name, dir, rulesFile string
+		flags                []string
+		allowed              []byte
+		upAllowed            bool
+	}{
+		{"other settings", "o", cfg.RulesFile, []string{"--grace", "1m"}, loaded, true},
+		{"other content", "s", cfg.RulesFile, nil, []byte("rules: []\n"), false},
+		{"another rules file", "e", elsewhereFile, nil, loaded, true},
+	}
+	upFlags := func(rulesFile string, flags []string) []string {
+		return append([]string{"--rules-file", rulesFile}, flags...)
+	}
+	for _, o := range others {
+		tg := allow.NewTarget(o.rulesFile, rules.ContentDigest(o.allowed), upSettings(t, cfg.workspace, upFlags(o.rulesFile, o.flags)...))
+		if _, err := store.Allow(allow.Place{Workspace: cfg.workspace, RuntimeDir: runtimeDir(t, o.dir)}, tg); err != nil {
+			t.Fatal(err)
+		}
 	}
 	cfg.allows = store
 	approvalSocket := launch.ApprovalSocket(filepath.Dir(cfg.socket))
@@ -1458,6 +1486,12 @@ func TestServeRereadsItsRulesOnceARuleIsAdded(t *testing.T) {
 	}
 	if ok, err := store.Allowed(servePlace(cfg), allow.Scope{Digest: p.Digest(), Settings: cfg.Settings.Daemon()}); err != nil || !ok {
 		t.Fatalf("the store allows the file as written: %v, %v; want it allowed", ok, err)
+	}
+	for _, o := range others {
+		err := upAllowCheckIn(t, runtimeDir(t, o.dir), cfg.workspace, upFlags(o.rulesFile, o.flags)...)
+		if _, notAllowed := errors.AsType[*launch.NotAllowedError](err); (o.upAllowed && err != nil) || (!o.upAllowed && !notAllowed) {
+			t.Errorf("%s: the next up returned %v; want it allowed: %v", o.name, err, o.upAllowed)
+		}
 	}
 	if stepAside := armServe(t, cfg, p.Digest()); stepAside {
 		t.Fatal("stepped aside for the rules it reread")

@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io/fs"
 	"maps"
 	"os"
@@ -753,6 +754,168 @@ func TestDenyLeavesTheRequest(t *testing.T) {
 	}
 }
 
+// The runtime directories of the allows the TestAllowAddedRule tests keep
+// besides runA and runB: one allowed other content of the rules file, one
+// another rules file.
+const (
+	runStale     = "/run/hostrunner/stale"
+	runElsewhere = "/run/hostrunner/elsewhere"
+)
+
+// rulesSettings returns daemonSettings with extra and a rules_file setting
+// naming rulesFile, as the settings of a daemon serving it name it.
+func rulesSettings(rulesFile string, extra map[string]string) map[string]string {
+	s := daemonSettings()
+	maps.Copy(s, extra)
+	s["rules_file"] = rulesFile
+	return s
+}
+
+// writtenOver is the Scope a daemon with daemonSettings checked the
+// content "before" with, the content a rule was written over.
+func writtenOver() allow.Scope {
+	return allow.Scope{Digest: "before", Settings: daemonSettings()}
+}
+
+// AllowAddedRule moves to the content after the write every allow of the
+// workspace that covered the rules file of the adding runtime directory's
+// allow with the content before it, that runtime directory's and another's,
+// each with its own settings, and returns them; it leaves an allow of other
+// content, one of another rules file and one of another workspace.
+func TestAllowAddedRuleMovesEveryAllowThatCoveredTheContentBefore(t *testing.T) {
+	s := newStore(t)
+	ws, otherWS := t.TempDir(), t.TempDir()
+	own := rulesSettings("rules.yaml", nil)
+	grace := rulesSettings("rules.yaml", map[string]string{"grace": "1m0s"})
+	elsewhere := rulesSettings("other.yaml", nil)
+	mustAllow(t, s, ws, runA, target("rules.yaml", "before", own))
+	mustAllow(t, s, ws, runB, target("rules.yaml", "before", grace))
+	mustAllow(t, s, ws, runStale, target("rules.yaml", "earlier", own))
+	mustAllow(t, s, ws, runElsewhere, target("other.yaml", "before", elsewhere))
+	mustAllow(t, s, otherWS, runB, target("rules.yaml", "before", own))
+	got, err := s.AllowAddedRule(allow.Place{Workspace: ws, RuntimeDir: runA}, allow.Scope{Digest: "before", Settings: own}, "after")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rulesFile, err := filepath.Abs("rules.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []allow.Entry{
+		{Place: allow.Place{Workspace: evalDir(t, ws), RuntimeDir: runA}, Target: target(rulesFile, "after", rulesSettings(rulesFile, nil))},
+		{Place: allow.Place{Workspace: evalDir(t, ws), RuntimeDir: runB}, Target: target(rulesFile, "after", rulesSettings(rulesFile, map[string]string{"grace": "1m0s"}))},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("AllowAddedRule = %+v, want %+v", got, want)
+	}
+	if !mustAllowed(t, s, ws, runA, "after", own) || !mustAllowed(t, s, ws, runB, "after", grace) {
+		t.Error("a runtime directory whose allow covered the content before is not allowed the content after with its own settings")
+	}
+	for _, c := range []struct {
+		ws, rd, digest string
+		settings       map[string]string
+	}{
+		{ws, runStale, "earlier", own},
+		{ws, runElsewhere, "before", elsewhere},
+		{otherWS, runB, "before", own},
+	} {
+		if !mustAllowed(t, s, c.ws, c.rd, c.digest, c.settings) || mustAllowed(t, s, c.ws, c.rd, "after", c.settings) {
+			t.Errorf("the allow of %s of %s changed; want it to keep %s", c.rd, c.ws, c.digest)
+		}
+	}
+}
+
+// AllowAddedRule moves none, and fails, when the adding runtime directory
+// has no allow covering the Scope its daemon checked the content before
+// the write with: its allow is of other content or other settings, or it
+// has none.
+func TestAllowAddedRuleWithoutTheAllowOfItsOwnRuntimeDirMovesNone(t *testing.T) {
+	earlier := target("rules.yaml", "earlier", daemonSettings())
+	otherSettings := target("rules.yaml", "before", map[string]string{"grace": "1m0s"})
+	for name, own := range map[string]*allow.Target{"other content": &earlier, "other settings": &otherSettings, "no allow": nil} {
+		t.Run(name, func(t *testing.T) {
+			s := newStore(t)
+			ws := t.TempDir()
+			if own != nil {
+				mustAllow(t, s, ws, runA, *own)
+			}
+			mustAllow(t, s, ws, runB, target("rules.yaml", "before", daemonSettings()))
+			if got, err := s.AllowAddedRule(allow.Place{Workspace: ws, RuntimeDir: runA}, writtenOver(), "after"); err == nil {
+				t.Fatalf("AllowAddedRule = %+v, want an error", got)
+			}
+			if mustAllowed(t, s, ws, runA, "after", daemonSettings()) || !mustAllowed(t, s, ws, runB, "before", daemonSettings()) {
+				t.Error("an allow was moved")
+			}
+		})
+	}
+}
+
+// AllowAddedRule moves none, and fails naming the file, when an allow file
+// of the workspace is not valid.
+func TestAllowAddedRuleWithACorruptAllowFileMovesNone(t *testing.T) {
+	s := newStore(t)
+	ws := t.TempDir()
+	mustAllow(t, s, ws, runB, target("rules.yaml", "before", daemonSettings()))
+	files, _ := storeFiles(t, s)
+	mustAllow(t, s, ws, runA, target("rules.yaml", "before", daemonSettings()))
+	if err := os.WriteFile(files[0], []byte("not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := s.AllowAddedRule(allow.Place{Workspace: ws, RuntimeDir: runA}, writtenOver(), "after")
+	if err == nil || !strings.Contains(err.Error(), files[0]) {
+		t.Fatalf("AllowAddedRule error = %v, want one naming %s", err, files[0])
+	}
+	if !mustAllowed(t, s, ws, runA, "before", daemonSettings()) {
+		t.Error("the allow of the adding runtime directory was moved")
+	}
+}
+
+// AllowAddedRule removes the pending requests its allows answer, that of
+// another runtime directory included, and leaves a request of other
+// content.
+func TestAllowAddedRuleRemovesTheRequestsItAnswers(t *testing.T) {
+	s := newStore(t)
+	ws := t.TempDir()
+	mustAllow(t, s, ws, runA, target("rules.yaml", "before", daemonSettings()))
+	mustAllow(t, s, ws, runB, target("rules.yaml", "before", daemonSettings()))
+	mustRequest(t, s, ws, runA, target("rules.yaml", "hand edit", daemonSettings()))
+	mustRequest(t, s, ws, runB, target("rules.yaml", "after", daemonSettings()))
+	if _, err := s.AllowAddedRule(allow.Place{Workspace: ws, RuntimeDir: runA}, writtenOver(), "after"); err != nil {
+		t.Fatal(err)
+	}
+	if e, ok := mustPending(t, s, ws, runA); !ok || e.Digest != "hand edit" {
+		t.Errorf("pending request of A = %+v, %v; want the request of other content", e, ok)
+	}
+	if e, ok := mustPending(t, s, ws, runB); ok {
+		t.Errorf("pending request of B = %+v; want the request answered removed", e)
+	}
+}
+
+// When a request answered cannot be removed once the allows are moved,
+// AllowAddedRule returns the allows recorded with a
+// *allow.RequestsNotRemovedError, so that the caller knows they are.
+func TestAllowAddedRuleReportsARequestNotRemovedApart(t *testing.T) {
+	s := newStore(t)
+	ws := t.TempDir()
+	mustAllow(t, s, ws, runA, target("rules.yaml", "before", daemonSettings()))
+	mustRequest(t, s, ws, runA, target("rules.yaml", "after", daemonSettings()))
+	file := requestFile(t, s)
+	// A directory that is not empty can be neither read nor removed.
+	if err := os.Remove(file); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(file, "x"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.AllowAddedRule(allow.Place{Workspace: ws, RuntimeDir: runA}, writtenOver(), "after")
+	if _, ok := errors.AsType[*allow.RequestsNotRemovedError](err); !ok {
+		t.Fatalf("AllowAddedRule error = %v, want an *allow.RequestsNotRemovedError", err)
+	}
+	if len(got) != 1 || !mustAllowed(t, s, ws, runA, "after", daemonSettings()) {
+		t.Errorf("AllowAddedRule = %+v; want the allow moved and returned", got)
+	}
+}
+
 func TestCorruptRequestFileIsAnErrorNamingTheFile(t *testing.T) {
 	s := newStore(t)
 	ws := t.TempDir()
@@ -808,6 +971,9 @@ func TestStoreWithoutAnAbsoluteDirFails(t *testing.T) {
 		}
 		if _, err := s.PendingAll(ws); err == nil {
 			t.Errorf("Store%+v.PendingAll: got no error", s)
+		}
+		if _, err := s.AllowAddedRule(allow.Place{Workspace: ws, RuntimeDir: runA}, allow.Scope{Digest: "abc123", Settings: daemonSettings()}, "def456"); err == nil {
+			t.Errorf("Store%+v.AllowAddedRule: got no error", s)
 		}
 	}
 	if ents, err := os.ReadDir(cwd); err != nil || len(ents) != 0 {

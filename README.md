@@ -341,13 +341,20 @@ above and `daemon.log` still report it.
 
 A rule added from the approval session to rules that are allowed is
 allowed with the content the session wrote: the daemon records the allow
-for its runtime directory as `hostrunner allow` would and serves the rule at once, with or without
-`reread`, so the next `up` finds it allowed. Added to rules not allowed
-(after `hostrunner deny`, say), it is not: the daemon keeps the rules it
-serves, the change waits for `hostrunner allow` as above, the session
-says the daemon kept its old rules and the request runs once. The same
-happens if the allow cannot be recorded (`allow not recorded` in
-`daemon.log`).
+as `hostrunner allow` would, for every runtime directory of the workspace
+whose allow covered the same rules file with the content before the
+write, its own included, each with its own settings, and removes the
+pending requests these allows answer. It serves the rule at once, with
+or without `reread`, so the next `up` of each of these devcontainer
+configs finds it allowed. A runtime directory whose allow did not cover
+that content (an earlier edit, another rules file) keeps its allow.
+Added to rules not allowed (after `hostrunner deny`, say), it is not:
+the daemon keeps the rules it serves, the change waits for
+`hostrunner allow` as above, the session says the daemon kept its old
+rules and the request runs once. The same happens if the allow cannot
+be recorded (`allow not recorded` in `daemon.log`); a pending request
+answered that cannot be removed is only logged
+(`allow request not removed`).
 
 While rules or settings wait for an allow (the daemon found the rules
 file changed to content not allowed, or `up` armed it as above), every

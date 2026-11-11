@@ -53,6 +53,33 @@ func tempFiles(t *testing.T, dir string) []string {
 	return found
 }
 
+// A rename that fails while AllowAddedRule moves the allows records none:
+// each allow keeps the content before the write, and no temporary file
+// stays.
+func TestAllowAddedRuleMovesNoneWhenARenameFails(t *testing.T) {
+	s := Store{Dir: filepath.Join(t.TempDir(), "allow")}
+	ws := t.TempDir()
+	settings := map[string]string{"reread": "true"}
+	dirs := []string{"/run/hostrunner/a", "/run/hostrunner/b"}
+	for _, rd := range dirs {
+		if _, err := s.Allow(Place{Workspace: ws, RuntimeDir: rd}, NewTarget("rules.yaml", "before", settings)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	failingRename(t, 2)
+	if _, err := s.AllowAddedRule(Place{Workspace: ws, RuntimeDir: dirs[0]}, Scope{Digest: "before", Settings: settings}, "after"); err == nil {
+		t.Fatal("AllowAddedRule returned no error")
+	}
+	for _, rd := range dirs {
+		if ok, err := s.Allowed(Place{Workspace: ws, RuntimeDir: rd}, Scope{Digest: "before", Settings: settings}); err != nil || !ok {
+			t.Errorf("%s: Allowed(before) = %v, %v; want the allow kept", rd, ok, err)
+		}
+	}
+	if left := tempFiles(t, s.Dir); len(left) != 0 {
+		t.Errorf("temporary files left: %v", left)
+	}
+}
+
 // A rename that fails while AllowAll moves the allows into place records
 // none: the allows renamed before it are put back as they were, an
 // earlier allow rewritten and a runtime directory without one left

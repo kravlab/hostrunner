@@ -24,7 +24,7 @@ var allowSettings = map[string]string{"reread": "true"}
 
 // allowStore is an allow store, and the workspace and the runtime
 // directory whose allow the daemons of these tests check in it. rulesFile
-// is the rules file that the allows made by record name.
+// is a rules file of the workspace a test may name in an allow.
 type allowStore struct {
 	store      allow.Store
 	workspace  string
@@ -62,11 +62,11 @@ func (a allowStore) allow(t *testing.T, rulesFile, content string) {
 }
 
 // record is the allow a daemon of these tests records (see
-// daemon.WithAllowRecorder) for a rule added from the approval session: an allow
-// of content of the given digest for the workspace and the runtime
-// directory, as `hostrunner allow` does.
-func (a allowStore) record(digest string) error {
-	_, err := a.store.Allow(a.place(), allow.Target{RulesFile: a.rulesFile, Scope: allow.Scope{Digest: digest, Settings: allowSettings}})
+// daemon.WithAllowRecorder) for a rule added from the approval session:
+// the allows of the workspace that covered the content written over moved
+// to the content of the given digest, as `hostrunner serve` records them.
+func (a allowStore) record(writtenOver allow.Scope, digest string) error {
+	_, err := a.store.AllowAddedRule(a.place(), writtenOver, digest)
 	return err
 }
 

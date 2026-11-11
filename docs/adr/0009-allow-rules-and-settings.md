@@ -61,7 +61,9 @@ together with the daemon settings resolved for it in
   to pending. A daemon from before this refuses the arm, and `up` fails
   until it is stopped.
 - A rule added from the approval session is allowed with the content the
-  session wrote, provided the file was allowed before the write.
+  session wrote, provided the file was allowed before the write, for
+  every runtime directory of the workspace whose allow covered that file
+  and the content before the write.
 - `hostrunner allow` allows every pending request of the workspace, or
   none when one of them is out of date, and fails when there is none;
   `hostrunner deny` removes the allows of all its runtime directories. The

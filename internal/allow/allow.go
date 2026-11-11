@@ -15,6 +15,9 @@
 // exactly that, for every runtime directory of the workspace at once
 // (PendingAll, then AllowAll, which removes the requests), without
 // repeating the settings flags devcontainer.json gave `up`.
+//
+// A rule added from the approval session moves the allows that covered
+// the content it was written over (AllowAddedRule).
 package allow
 
 import (
@@ -23,6 +26,7 @@ import (
 	"io/fs"
 	"maps"
 	"path/filepath"
+	"slices"
 
 	"github.com/kravlab/hostrunner/internal/settings"
 )
@@ -233,6 +237,12 @@ func sameTarget(a, b Target) bool {
 	return a.RulesFile == b.RulesFile && a.Digest == b.Digest && maps.Equal(a.Settings, b.Settings)
 }
 
+// covers reports whether the allow e covers the Scope sc, whose settings
+// are in canonical form: the same digest and the same daemon settings.
+func covers(e Entry, sc Scope) bool {
+	return e.Digest == sc.Digest && maps.Equal(e.Settings, sc.Settings)
+}
+
 // Allow records that the content of the rules file, with the digest and
 // the daemon settings of t, is trusted for the Place p, and returns the
 // Entry it recorded. It is AllowAll of one request: it replaces any
@@ -257,7 +267,8 @@ func (s Store) Allow(p Place, t Target) (Entry, error) {
 // are recorded it removes the requests they answer: a request file that
 // holds another request by then, one recorded since PendingAll read it,
 // stays pending for the next allow. A request that cannot be read or
-// removed then is an error returned together with the Entries recorded.
+// removed then is a *RequestsNotRemovedError returned together with the
+// Entries recorded.
 // The rules file of a request, like the rules_file setting, is stored in
 // its canonical form (see canonical).
 func (s Store) AllowAll(workspace string, requests []Entry) ([]Entry, error) {
@@ -292,10 +303,22 @@ func (s Store) AllowAll(workspace string, requests []Entry) ([]Entry, error) {
 	return allowed, s.removeAnswered(allowed)
 }
 
+// RequestsNotRemovedError is the error of an allow recorded whose pending
+// requests answered could not all be read or removed: the allows are
+// recorded, so a caller goes on as allowed, and a request left pending
+// asks a human again for what is allowed already.
+type RequestsNotRemovedError struct{ Err error }
+
+// Error returns the error of the requests not removed.
+func (e *RequestsNotRemovedError) Error() string { return e.Err.Error() }
+
+// Unwrap returns the error of the requests not removed.
+func (e *RequestsNotRemovedError) Unwrap() error { return e.Err }
+
 // removeAnswered removes the pending request of the Place of each allow
 // of allowed when it is still the request the allow answers (see
 // sameTarget); a request recorded since stays. The errors of the requests
-// that cannot be read or removed are joined.
+// that cannot be read or removed are joined in a *RequestsNotRemovedError.
 func (s Store) removeAnswered(allowed []Entry) error {
 	var errs []error
 	for _, e := range allowed {
@@ -312,7 +335,10 @@ func (s Store) removeAnswered(allowed []Entry) error {
 			errs = append(errs, fmt.Errorf("allow store: the request answered is not removed: %w", err))
 		}
 	}
-	return errors.Join(errs...)
+	if len(errs) == 0 {
+		return nil
+	}
+	return &RequestsNotRemovedError{Err: errors.Join(errs...)}
 }
 
 // Request records the pending request of the Place p: what an `up`
@@ -365,6 +391,54 @@ func (s Store) Deny(workspace string) (removed []Entry, err error) {
 	return removed, nil
 }
 
+// AllowAddedRule records the allow of a rule added from the approval
+// session to the rules file served from the Place p: writtenOver is the
+// Scope the daemon of p checked the content the session wrote over with,
+// and digest is the digest of the content written. The allow of p must
+// cover writtenOver (see Allowed); its rules file is the one the rule was
+// added to, as the rules_file setting is among what it covers. Every allow
+// of p's workspace of that rules file with the digest of writtenOver, p's
+// included, is moved to digest, its daemon settings unchanged, so that
+// each runtime directory that trusted the content written over trusts what
+// the human approved, with its own settings; the other allows stay. It
+// returns the Entries it recorded, sorted by runtime directory. It moves
+// all or none (see writeAll): an allow of p not covering writtenOver, an
+// allow file that cannot be read or is not valid, or a failed write
+// records none and is an error, the allows staying as they were. Once all
+// are recorded it removes the pending requests they answer (see
+// removeAnswered): a request that cannot be read or removed then is a
+// *RequestsNotRemovedError returned together with the Entries recorded.
+func (s Store) AllowAddedRule(p Place, writtenOver Scope, digest string) ([]Entry, error) {
+	own, err := s.keyed(p)
+	if err != nil {
+		return nil, err
+	}
+	st, err := CanonicalSettings(writtenOver.Settings)
+	if err != nil {
+		return nil, err
+	}
+	allows, err := s.list(own.Workspace, allowSuffix)
+	if err != nil {
+		return nil, err
+	}
+	i := slices.IndexFunc(allows, func(e Entry) bool { return e.RuntimeDir == own.RuntimeDir })
+	if i < 0 || !covers(allows[i], Scope{Digest: writtenOver.Digest, Settings: st}) {
+		return nil, fmt.Errorf("allow store: the allow of %s does not cover the content %s written over with the daemon settings", own.RuntimeDir, writtenOver.Digest)
+	}
+	rulesFile := allows[i].RulesFile
+	var moved []Entry
+	for _, e := range allows {
+		if e.RulesFile == rulesFile && e.Digest == writtenOver.Digest {
+			e.Digest = digest
+			moved = append(moved, e)
+		}
+	}
+	if err := s.writeAll(moved, allowSuffix); err != nil {
+		return nil, err
+	}
+	return moved, s.removeAnswered(moved)
+}
+
 // Allowed reports whether the Place p has an allow that covers exactly
 // the given Scope: the same digest and the same daemon settings, the same
 // keys with the same values, none added or missing; the rules_file value
@@ -387,7 +461,7 @@ func (s Store) Allowed(p Place, sc Scope) (bool, error) {
 	if !ok || err != nil {
 		return false, err
 	}
-	return e.Digest == sc.Digest && maps.Equal(e.Settings, settings), nil
+	return covers(e, Scope{Digest: sc.Digest, Settings: settings}), nil
 }
 
 // PendingAll returns the pending requests of every runtime directory of

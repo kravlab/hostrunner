@@ -917,10 +917,11 @@ func protectedPaths(cfg serveConfig) []string {
 // reports not allowed), and record a pending request of its own rules file
 // and settings for content not allowed under its runtime directory, so
 // that `hostrunner allow` allows what the daemon checks. They also have it
-// allow, as `hostrunner allow` does, a rule added from the approval
-// session to a rules file that was allowed, for its runtime directory. The
-// runtime directory is the one its socket lies in, beside which its
-// approval socket lies, the cfg.Dir of the `up` that started it.
+// allow a rule added from the approval session to a rules file that was
+// allowed, for every runtime directory that covered it (see
+// allow.Store.AllowAddedRule). The runtime directory is the one its socket
+// lies in, beside which its approval socket lies, the cfg.Dir of the `up`
+// that started it.
 func allowOptions(cfg serveConfig) []daemon.Option {
 	place := allow.Place{Workspace: cfg.workspace, RuntimeDir: filepath.Dir(cfg.socket)}
 	// target is what the daemon's own rules file and settings, with the
@@ -935,8 +936,8 @@ func allowOptions(cfg serveConfig) []daemon.Option {
 		daemon.WithAllowRequest(func(digest string) error {
 			return cfg.allows.Request(place, target(digest))
 		}),
-		daemon.WithAllowRecorder(func(digest string) error {
-			_, err := cfg.allows.Allow(place, target(digest))
+		daemon.WithAllowRecorder(func(writtenOver allow.Scope, digest string) error {
+			_, err := cfg.allows.AllowAddedRule(place, writtenOver, digest)
 			return err
 		}),
 	}
