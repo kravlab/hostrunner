@@ -32,12 +32,11 @@
 // rules: `up` starts a daemon only for rules and settings so allowed, and
 // an `up` refused records what it asked for (the rules file, its digest
 // and the daemon settings) in $XDG_DATA_HOME/hostrunner/allow; `allow`
-// allows exactly that request once the rules file still has that digest,
-// or, without a request, the digest of the rules file together with the
-// daemon settings `up` without settings flags resolves for the workspace,
-// and prints what it allowed. `deny` removes the allow. Only the latest
-// allow of a workspace is kept; the workspace is the current directory
-// unless one is named (see internal/allow).
+// allows exactly that request once the rules file still has that digest
+// and prints what it allowed; without a request it allows nothing and
+// fails, telling to start the container first. `deny` removes the allow.
+// Only the latest allow of a workspace is kept; the workspace is the
+// current directory unless one is named (see internal/allow).
 // `update` switches the versioned install
 // of hostrunner and hostrun to the latest release (see internal/update).
 // `version` prints the module version Go stamped into the binary (see
@@ -235,7 +234,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 		if err != nil {
 			return err
 		}
-		return runAllow(cfg, stdout, stderr)
+		return runAllow(cfg, stdout)
 	case "deny":
 		cfg, err := parseDeny(args[1:], os.Getenv, stderr)
 		if err != nil {

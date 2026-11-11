@@ -43,12 +43,12 @@ the daemon rereads the file by itself once it changes, without stopping.
   ``rules changed but not allowed: the old rules stay until `hostrunner
   allow` `` with the file and the digest, and the session gets the
   notice of a change not allowed (see Approval session). The daemon also
-  records an allow request, as a refused
-  `up` does, with its own rules file, the digest and its daemon
-  settings, so `hostrunner allow` without flags allows exactly what the
-  daemon checks, settings flags `up` was given included; a request that
-  cannot be recorded is logged as `allow request not recorded` and
-  changes nothing else. An allow store that cannot be read allows nothing:
+  records an allow request, as a refused `up` does, with its own rules
+  file, the digest and its daemon settings, so `hostrunner allow`, which
+  allows only a pending request, allows exactly what the daemon checks,
+  settings flags `up` was given included; a request that cannot be
+  recorded is logged as `allow request not recorded` and changes nothing
+  else. An allow store that cannot be read allows nothing:
   logged as `rules change not checked: the old rules stay` with the
   error, the session getting the notice of a change whose allow cannot be
   checked, which points to the daemon log.

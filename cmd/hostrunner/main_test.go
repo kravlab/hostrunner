@@ -1623,7 +1623,7 @@ func TestServeRecordsTheAllowRequestOfAHandEdit(t *testing.T) {
 			t.Fatal("no allow request recorded")
 		}
 	}
-	if err := runAllow(ac, io.Discard, io.Discard); err != nil {
+	if err := runAllow(ac, io.Discard); err != nil {
 		t.Fatal(err)
 	}
 	waitServed(t, cfg)
