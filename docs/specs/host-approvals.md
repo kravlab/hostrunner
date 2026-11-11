@@ -294,12 +294,14 @@ from `protocol.Version` of the container's socket.
   failed reread keeps the old rules and runs the request once, and the
   session says so. The session also sends the digest of the file it wrote
   over: when the daemon checks allows (ADR 0009) and that file was
-  allowed, it records an allow of the content written as it rereads the
-  file, once the file parses and has that content's digest; when it was
-  not, or the allow cannot be recorded, the old rules stay, the change
-  waits for an allow and the request runs once. A manual edit takes
-  effect at the next container start,
-  or before, when the human agrees to its reread to add a rule.
+  allowed, it records an allow of the content written, for every runtime
+  directory of the workspace whose allow covered the same rules file with
+  the content written over (its own included), each with its own
+  settings, all or none, as it rereads the file, once the file parses and
+  has that content's digest; when it was not, or the allow cannot be
+  recorded, the old rules stay, the change waits for an allow and the
+  request runs once. A manual edit takes effect at the next container
+  start, or before, when the human agrees to its reread to add a rule.
 - A flag given its value in its token (`--file=x`) is declared in a new
   rule's `flags.values`, allowing that value; given apart (`--file x`) it
   is a flag and an argument, as the rules read it. An argument holding `*`

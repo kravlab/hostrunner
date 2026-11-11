@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/kravlab/hostrunner/internal/allow"
+	"github.com/kravlab/hostrunner/internal/allow/allowtest"
 	"github.com/kravlab/hostrunner/internal/daemon"
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
@@ -91,9 +92,7 @@ func TestArmedChangeNotAllowedIsWarnedOf(t *testing.T) {
 // Once the store allows the change armed, hostrun warns of nothing.
 func TestNoWarningOnceTheArmedChangeIsAllowed(t *testing.T) {
 	h, a, digest := startArmedDaemon(t)
-	if _, err := a.store.Allow(a.workspace, allow.Target{RulesFile: h.rulesFile, Scope: allow.Scope{Digest: digest, Settings: armedSettings}}); err != nil {
-		t.Fatal(err)
-	}
+	allowtest.Allow(t, a.store, a.place(), allow.Target{RulesFile: h.rulesFile, Scope: allow.Scope{Digest: digest, Settings: armedSettings}})
 	noWarning(t, h)
 }
 
@@ -299,7 +298,10 @@ func TestArmedEditRefusedBeforeTheSessionStartedIsShownInTheSessionOnce(t *testi
 
 // replaceRules replaces the rules file at path, at once, with a symbolic
 // link to target, or with a file holding content when target is "", as an
-// editor that saves by rename does.
+// editor that saves by rename does. The daemon never sees the file half
+// written, as it may see a file writeRules writes in place, empty between
+// its truncation and its write, so a test that counts the changes noticed
+// writes the file with replaceRules.
 func replaceRules(t *testing.T, path, target, content string) {
 	t.Helper()
 	tmp := path + ".new"
@@ -334,7 +336,7 @@ func TestArmedEditTheDaemonRefusesLaterIsNoticedOnce(t *testing.T) {
 	waitForLog(t, &log, notAllowedLog+h.rulesFile+" digest="+digest)
 	// A later edit is noticed after any notice of the first one.
 	later := rules.ContentDigest([]byte(handDate))
-	writeRules(t, h.rulesFile, handDate)
+	replaceRules(t, h.rulesFile, "", handDate)
 	checkNotices(t, noticesUntil(t, conn, later), protocol.RulesNotAllowed{Digest: digest}, protocol.RulesNotAllowed{Digest: later})
 }
 
@@ -349,9 +351,7 @@ func TestArmedChangeIsNoticedToASessionStartingLater(t *testing.T) {
 	})
 	t.Run("allowed since", func(t *testing.T) {
 		h, a, digest := startArmedDaemon(t)
-		if _, err := a.store.Allow(a.workspace, allow.Target{RulesFile: h.rulesFile, Scope: allow.Scope{Digest: digest, Settings: armedSettings}}); err != nil {
-			t.Fatal(err)
-		}
+		allowtest.Allow(t, a.store, a.place(), allow.Target{RulesFile: h.rulesFile, Scope: allow.Scope{Digest: digest, Settings: armedSettings}})
 		conn := helloThenServe(t, h, func() {}, readsNotAllowedOnly)
 		checkNotices(t, noticesBeforeStandingList(t, conn))
 	})
@@ -377,8 +377,8 @@ func TestArmedEditUndoneIsNoticedAgainWhenMadeAgain(t *testing.T) {
 	conn := helloThenServe(t, h, func() {}, readsNotAllowedOnly)
 	checkNotices(t, noticesUntil(t, conn, digest), protocol.RulesNotAllowed{Digest: digest})
 	h.armNotAllowed(t, digest, allowSettings)
-	writeRules(t, h.rulesFile, echoRules)
+	replaceRules(t, h.rulesFile, "", echoRules)
 	waitForLog(t, log, `msg="rules change undone: the file holds the rules served" file=`+h.rulesFile)
-	writeRules(t, h.rulesFile, touchRules)
+	replaceRules(t, h.rulesFile, "", touchRules)
 	checkNotices(t, noticesUntil(t, conn, digest), protocol.RulesNotAllowed{Digest: digest})
 }

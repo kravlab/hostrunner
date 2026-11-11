@@ -263,13 +263,17 @@ by what the human reads before allowing.
 the host has allowed: otherwise anything that can write the rules file
 or the workspace settings file (an agent in the container, or a command
 it runs on the host through `hostrun`, such as `git checkout`) could
-grant itself commands on the host. Allow a workspace on the host, in
-the workspace or naming it, after every change of its rules or settings:
+grant itself commands on the host. After every change of its rules or
+settings, once `hostrunner up` (or a running daemon) has asked for it,
+allow the workspace on the host, in the workspace or naming it. An allow
+belongs to one devcontainer config of the workspace, by the runtime
+directory `up` gives its daemon, and `allow` answers those of all of
+them at once:
 
 ```sh
 hostrunner allow                 # the current directory
 hostrunner allow ~/src/app       # or the workspace given
-hostrunner deny ~/src/app        # withdraw the allow
+hostrunner deny ~/src/app        # withdraw its allows
 ```
 
 Without an allow of the current rules and settings, `up` keeps a
@@ -291,32 +295,44 @@ allow`, so `devcontainer up` fails and the container does not start; it
 starts nothing and leaves a running daemon as it is. It also records
 what it asked for (the rules
 file, its digest and the daemon settings, from every flag
-devcontainer.json gave it) in `$XDG_DATA_HOME/hostrunner/allow`
-(`~/.local/share/hostrunner/allow` when it is unset). `allow` allows
-exactly that request after checking that the rules file still has the
-digest `up` saw (if it changed since, `allow` fails and allows nothing:
-run `up` again), and prints the rules file, the digest and the settings
-it allowed, each setting that differs from its default with the default
+devcontainer.json gave it) as the request of its runtime directory,
+replacing only that directory's earlier request, in
+`$XDG_DATA_HOME/hostrunner/allow` (`~/.local/share/hostrunner/allow`
+when it is unset). `allow` allows exactly the pending requests of the
+workspace, all at once, after checking that the rules file of each
+still has the digest `up` saw (if one changed since, `allow` fails
+naming that request's runtime directory, rules file and digests, and
+allows none: run `up` again), and prints for each the runtime
+directory, the rules file, the digest and the settings it allowed, each
+setting that differs from its default with the default
 (`mount_check: false (default true)`), since the flags came from
 devcontainer.json rather than from the human (a rules file is compared
 with its symbolic links followed, as the allow keeps it; if the defaults
 cannot be worked out, no setting is marked and a last line, `defaults not
-shown`, says why); the next `up` passes. Without a request, `allow` allows the
-rules file and the settings as `up` without settings flags resolves
-them for the workspace (variables, the workspace settings file, the
-host settings file), after checking the rules; a missing rules file is
-allowed too. It takes no settings flags and asks nothing. Only the
-latest allow of a workspace is kept: going back to content allowed
-before needs a new allow, and a workspace whose devcontainer configs
-give `up` different settings flags overwrites one allow with the other
-(issue #144). Settings that only tune `up`, `stop`, `restart` or
-`approve` (`ready_timeout`, `runtime_root`, `stop_timeout`,
-`approve_tail_lines`) are not part of an allow. `deny` removes the
-allow of the workspace.
+shown`, says why); the next `up` passes. `allow` allows only such a
+request, or one a daemon recorded (see below): without one it allows
+nothing and fails, telling to start the container first, since
+`hostrunner up` asks for the allow. A missing rules file is allowed
+too, as the daemon would serve it, denying every command. It takes no
+settings flags and asks nothing. Each devcontainer config of a workspace
+keeps an allow of its own, so configs whose `initializeCommand`s give
+`up` different settings flags do not replace each other's allow. Only
+the latest allow of a runtime directory is kept: going back to content
+allowed before there needs a new allow. Settings that only
+tune `up`, `stop`, `restart` or `approve` (`ready_timeout`,
+`runtime_root`, `stop_timeout`, `approve_tail_lines`) are not part of an
+allow. `deny` removes the allows of every runtime directory of the
+workspace, printing each (`hostrunner: denied <workspace> for <runtime
+directory>`), and leaves the pending requests; without an allow it says
+so and succeeds. An allow file that cannot be read or is not valid
+allows nothing: `deny` removes it too and succeeds, with a warning on
+stderr (`hostrunner: warning: removed the allow file <path>, which
+cannot be read: <why>`). The allow of a devcontainer config that is
+gone stays until a `deny`.
 
 A daemon that rereads its rules file by itself serves an edit only once
-it is allowed, and records the request with its own rules file and
-settings, so plain `hostrunner allow` allows exactly that and takes
+it is allowed for its runtime directory, and records the request there
+with its own rules file and settings, so `hostrunner allow` allows exactly that request and takes
 effect within about 2 s, without a restart (see [Rules](#rules)). With `--no-reread` an allowed
 edit takes effect at the next `up`. Adding a rule (`a`) after a hand
 edit not allowed adds none, and the old rules stay.
@@ -328,13 +344,23 @@ above and `daemon.log` still report it.
 
 A rule added from the approval session to rules that are allowed is
 allowed with the content the session wrote: the daemon records the allow
-as `hostrunner allow` would and serves the rule at once, with or without
-`reread`, so the next `up` finds it allowed. Added to rules not allowed
-(after `hostrunner deny`, say), it is not: the daemon keeps the rules it
-serves, the change waits for `hostrunner allow` as above, the session
-says the daemon kept its old rules and the request runs once. The same
-happens if the allow cannot be recorded (`allow not recorded` in
-`daemon.log`).
+as `hostrunner allow` would, for every runtime directory of the workspace
+whose allow covered the same rules file with the content before the
+write, its own included, each with its own settings, and removes the
+pending requests these allows answer. It serves the rule at once, with
+or without `reread`, so the next `up` of each of these devcontainer
+configs finds it allowed. A runtime directory whose allow did not cover
+that content (an earlier edit, another rules file) keeps its allow. An
+allow file of another runtime directory that cannot be read or is not
+valid is left as it is and logged (`damaged allow file skipped`); that
+of the daemon's own runtime directory records no allow.
+Added to rules not allowed (after `hostrunner deny`, say), it is not:
+the daemon keeps the rules it serves, the change waits for
+`hostrunner allow` as above, the session says the daemon kept its old
+rules and the request runs once. The same happens if the allow cannot
+be recorded (`allow not recorded` in `daemon.log`); a pending request
+answered that cannot be removed is only logged
+(`allow request not removed`).
 
 While rules or settings wait for an allow (the daemon found the rules
 file changed to content not allowed, or `up` armed it as above), every
@@ -351,8 +377,9 @@ upgrade that adds a daemon setting, such as `mount_check`: the allow
 covers the resolved daemon settings, so it needs a new `hostrunner
 allow`. `up --restart` and `hostrunner
 restart` check the allow before they stop the running daemon: content
-not allowed fails them, records the request as `up` does and leaves the
-daemon running.
+not allowed fails them, records the request as `up` does, for the
+runtime directory of the daemon they replace, and leaves the daemon
+running.
 
 ### Settings
 

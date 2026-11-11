@@ -36,19 +36,23 @@ the daemon rereads the file by itself once it changes, without stopping.
 - A missing file loads as the rules that deny every command, as at start.
 - A file that changes again while it is reread is left to the next look.
 - Only content allowed is reread (issue #139): before a reread the daemon
-  checks the content's digest in the allow store, for its workspace and
-  its daemon settings, as `hostrunner up` checks it. A missing file is
-  content like any other, of digest `missing`: until it is allowed the
-  old rules stay. Content not allowed keeps the rules served, logged as
-  ``rules changed but not allowed: the old rules stay until `hostrunner
-  allow` `` with the file and the digest, and the session gets the
-  notice of a change not allowed (see Approval session). The daemon also
-  records an allow request, as a refused
-  `up` does, with its own rules file, the digest and its daemon
-  settings, so `hostrunner allow` without flags allows exactly what the
-  daemon checks, settings flags `up` was given included; a request that
-  cannot be recorded is logged as `allow request not recorded` and
-  changes nothing else. An allow store that cannot be read allows nothing:
+  checks the content's digest in the allow store, for its workspace, its
+  runtime directory (the directory of its socket, the one `up` gave it)
+  and its daemon settings, as `hostrunner up` checks it; the allow of
+  another runtime directory of the workspace does not count. A missing
+  file is content like any other, of digest `missing`: until it is
+  allowed the old rules stay. Content not allowed keeps the rules
+  served, logged as ``rules changed but not allowed: the old rules stay
+  until `hostrunner allow` `` with the file and the digest, and the
+  session gets the notice of a change not allowed (see Approval
+  session). The daemon also records a pending request, as a refused `up`
+  does, under its runtime directory, with its own rules file, the digest
+  and its daemon settings, replacing only the earlier request of that
+  runtime directory, so `hostrunner allow`, which allows only pending
+  requests, allows exactly what the daemon checks, settings flags `up`
+  was given included; a request that cannot be recorded is logged as
+  `allow request not recorded` and changes nothing else. An allow store
+  that cannot be read allows nothing:
   logged as `rules change not checked: the old rules stay` with the
   error, the session getting the notice of a change whose allow cannot be
   checked, which points to the daemon log.
@@ -162,8 +166,11 @@ the daemon rereads the file by itself once it changes, without stopping.
   any other daemon the question stays. A hand edit not allowed is not
   reread: the session says it cannot add a rule, with the daemon's
   error, and asks for the answer again; the old rules stay. A rule the
-  session writes over allowed rules is allowed with the content written
-  and reread; over rules not allowed it is not, and the content written
+  session writes over allowed rules is allowed with the content written,
+  for every runtime directory of the workspace whose allow covered the
+  same rules file with the content written over, each with its own
+  settings, the pending requests these allows answer removed, and
+  reread; over rules not allowed it is not, and the content written
   waits for an allow as a hand edit does (issue #141).
 
 ### Commands

@@ -29,7 +29,7 @@ const notRecordedLog = "msg=\"allow not recorded\" file="
 // startAddRuleDaemon starts a daemon serving addRuleRules, whose allow of
 // the rules file is checked in a's store (with allowSettings) and, for a
 // rule added from the approval session, recorded through record.
-func startAddRuleDaemon(t *testing.T, a allowStore, log *slog.Logger, record func(digest string) error) harness {
+func startAddRuleDaemon(t *testing.T, a allowStore, log *slog.Logger, record func(writtenOver allow.Scope, digest string) error) harness {
 	t.Helper()
 	return startRulesDaemon(t, log, addRuleRules, false,
 		daemon.WithSettings(allowSettings), daemon.WithAllowed(a.check), daemon.WithAllowRecorder(record))
@@ -65,7 +65,7 @@ func TestAddRuleToAnAllowedFileIsAllowed(t *testing.T) {
 		t.Fatalf("got %+v, want the request to run", got)
 	}
 	digest := rules.ContentDigest([]byte(readFile(t, h.rulesFile)))
-	if ok, err := a.store.Allowed(a.workspace, allow.Scope{Digest: digest, Settings: allowSettings}); err != nil || !ok {
+	if ok, err := a.store.Allowed(a.place(), allow.Scope{Digest: digest, Settings: allowSettings}); err != nil || !ok {
 		t.Fatalf("the store allows the file as written (digest %s): %v, %v; want it allowed", digest, ok, err)
 	}
 	waitForLog(t, &log, `msg="rules reread" file=`+h.rulesFile+" digest="+digest)
@@ -89,7 +89,7 @@ func TestAddRuleToAFileNotAllowedRecordsNoAllow(t *testing.T) {
 	if got := awaitResult(t, ch); got.code != 0 {
 		t.Fatalf("got %+v, want the request to run once", got)
 	}
-	if ok, err := a.store.Allowed(a.workspace, allow.Scope{Digest: digest, Settings: allowSettings}); err != nil || ok {
+	if ok, err := a.store.Allowed(a.place(), allow.Scope{Digest: digest, Settings: allowSettings}); err != nil || ok {
 		t.Fatalf("the store allows the file as written (digest %s): %v, %v; want it not allowed", digest, ok, err)
 	}
 	waitForLog(t, &log, notAllowedLog+h.rulesFile+" digest="+digest)
@@ -110,7 +110,7 @@ func TestAddRuleKeepsTheOldRulesWhenTheAllowFails(t *testing.T) {
 	var log lockedBuffer
 	a := newAllowStore(t)
 	h := startAddRuleDaemon(t, a, slog.New(slog.NewTextHandler(&log, nil)),
-		func(string) error { return errors.New("the allow store is read-only") })
+		func(allow.Scope, string) error { return errors.New("the allow store is read-only") })
 	a.allow(t, h.rulesFile, addRuleRules)
 	s := h.startSession(t)
 	ch := h.ask(t, "touch", "-a", "marker")
@@ -134,6 +134,62 @@ func TestAddRuleKeepsTheOldRulesWhenTheAllowFails(t *testing.T) {
 	}
 	if got := h.run(t, containerRoot, "", "echo", "old"); got != (result{stdout: "old\n", stderr: notAllowedWarningLine(digest)}) {
 		t.Fatalf("a command of the old rules: got %+v, want it to run, with the warning of the change pending", got)
+	}
+}
+
+// A rule added to a rules file that is allowed, whose allow is recorded but
+// an answered request of which cannot be removed, is reread as any rule
+// allowed: the request runs under it, a later run needs no approval, and
+// the failure is logged as a warning.
+func TestAddRuleIsRereadWhenAnAnsweredRequestIsNotRemoved(t *testing.T) {
+	var log lockedBuffer
+	a := newAllowStore(t)
+	h := startAddRuleDaemon(t, a, slog.New(slog.NewTextHandler(&log, nil)),
+		func(writtenOver allow.Scope, digest string) error {
+			if err := a.record(writtenOver, digest); err != nil {
+				return err
+			}
+			return &allow.RequestsNotRemovedError{Err: errors.New("the request is read-only")}
+		})
+	a.allow(t, h.rulesFile, addRuleRules)
+	s := h.startSession(t)
+	ch := h.ask(t, "touch", "-a", "marker")
+	s.addRule(t)
+	s.waitFor(t, ruleAddedText+" · request 1 runs under it\n")
+	if got := awaitResult(t, ch); got.code != 0 {
+		t.Fatalf("got %+v, want the request to run", got)
+	}
+	waitForLog(t, &log, `level=WARN msg="allow request not removed" file=`+h.rulesFile)
+	if got := h.run(t, containerRoot, "", "touch", "-a", "marker"); got != (result{}) {
+		t.Fatalf("a later run: got %+v, want it to run without asking", got)
+	}
+}
+
+// A rule added to a rules file that is allowed, whose allow is recorded
+// while a damaged allow file of another runtime directory is skipped, is
+// reread as any rule allowed: the request runs under it, a later run needs
+// no approval, and the skipped file is logged as a warning.
+func TestAddRuleIsRereadWhenADamagedAllowFileIsSkipped(t *testing.T) {
+	var log lockedBuffer
+	a := newAllowStore(t)
+	h := startAddRuleDaemon(t, a, slog.New(slog.NewTextHandler(&log, nil)),
+		func(writtenOver allow.Scope, digest string) error {
+			if err := a.record(writtenOver, digest); err != nil {
+				return err
+			}
+			return &allow.DamagedFilesError{Files: []allow.DamagedFile{{Path: "/store/b.json", Err: errors.New("not json")}}}
+		})
+	a.allow(t, h.rulesFile, addRuleRules)
+	s := h.startSession(t)
+	ch := h.ask(t, "touch", "-a", "marker")
+	s.addRule(t)
+	s.waitFor(t, ruleAddedText+" · request 1 runs under it\n")
+	if got := awaitResult(t, ch); got.code != 0 {
+		t.Fatalf("got %+v, want the request to run", got)
+	}
+	waitForLog(t, &log, `level=WARN msg="damaged allow file skipped" file=`+h.rulesFile)
+	if got := h.run(t, containerRoot, "", "touch", "-a", "marker"); got != (result{}) {
+		t.Fatalf("a later run: got %+v, want it to run without asking", got)
 	}
 }
 
@@ -173,7 +229,7 @@ func TestAddRuleRecordsNoAllowWhenTheFileHoldsOtherContent(t *testing.T) {
 		t.Fatalf("got %+v, want an error: the daemon keeps its old rules", res)
 	}
 	for _, digest := range []string{reported, rules.ContentDigest([]byte(other))} {
-		if ok, err := a.store.Allowed(a.workspace, allow.Scope{Digest: digest, Settings: allowSettings}); err != nil || ok {
+		if ok, err := a.store.Allowed(a.place(), allow.Scope{Digest: digest, Settings: allowSettings}); err != nil || ok {
 			t.Fatalf("the store allows content of digest %s: %v, %v; want it not allowed", digest, ok, err)
 		}
 	}
@@ -198,7 +254,7 @@ func TestAddRuleRecordsNoAllowWhenTheFileDoesNotParse(t *testing.T) {
 	if res.Error == "" || res.Digest != "" {
 		t.Fatalf("got %+v, want an error: the daemon keeps its old rules", res)
 	}
-	if ok, err := a.store.Allowed(a.workspace, allow.Scope{Digest: digest, Settings: allowSettings}); err != nil || ok {
+	if ok, err := a.store.Allowed(a.place(), allow.Scope{Digest: digest, Settings: allowSettings}); err != nil || ok {
 		t.Fatalf("the store allows content of digest %s: %v, %v; want it not allowed", digest, ok, err)
 	}
 	if got := h.run(t, containerRoot, "", "echo", "old"); got != (result{stdout: "old\n"}) {
@@ -224,7 +280,7 @@ func TestAddRuleWithoutAnAllowRecordIsAHandEdit(t *testing.T) {
 	if got := awaitResult(t, ch); got.code != 0 {
 		t.Fatalf("got %+v, want the request to run once", got)
 	}
-	if ok, err := a.store.Allowed(a.workspace, allow.Scope{Digest: digest, Settings: allowSettings}); err != nil || ok {
+	if ok, err := a.store.Allowed(a.place(), allow.Scope{Digest: digest, Settings: allowSettings}); err != nil || ok {
 		t.Fatalf("the store allows the file as written (digest %s): %v, %v; want it not allowed", digest, ok, err)
 	}
 	if got := h.run(t, containerRoot, "", "touch", "-a", "marker"); got.code != protocol.ExitRejected {

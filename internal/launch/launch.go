@@ -159,9 +159,9 @@ func (p *Prepared) keepAllowed(ctx context.Context, notAllowed *NotAllowedError)
 // workspace of the Config: it answers, says its rules digest and its
 // settings (a daemon older than DaemonInfo.Settings does not), serves
 // that workspace (symbolic links followed, see allow.SameWorkspace), and
-// the store allows what it serves for it. No daemon answering is not an
-// error; a workspace that cannot be compared, or a store that cannot be
-// read, is.
+// the store allows what it serves for it in cfg.Dir. No daemon answering
+// is not an error; a workspace that cannot be compared, or a store that
+// cannot be read, is.
 func (p *Prepared) allowedDaemon(ctx context.Context) (info protocol.DaemonInfo, ok bool, err error) {
 	cfg := p.cfg
 	info, err = daemonlist.Probe(ctx, ApprovalSocket(cfg.Dir))
@@ -278,14 +278,14 @@ func (e *NotAllowedError) Error() string {
 }
 
 // checkAllowed returns a *NotAllowedError unless the allow store of the
-// Config holds exactly these rules and daemon settings for its workspace.
-// Before it refuses, it records them in the store as the workspace's
-// request (see allow.Store.Request), so the human who runs `hostrunner
-// allow` allows what this up asked for. Up and PrepareAllowed call it,
-// before the lock is taken or a running daemon touched; UpLocked does not
-// check.
-// A store that cannot be read, or where the request cannot be
-// recorded, is an error of its own, not a refusal, and is wrapped.
+// Config holds exactly these rules and daemon settings for its workspace
+// and its runtime directory, cfg.Dir. Before it refuses, it records them
+// in the store as the pending request of that runtime directory (see
+// allow.Store.Request), leaving those of the others, so the human who runs
+// `hostrunner allow` allows what this up asked for. Up and PrepareAllowed
+// call it, before the lock is taken or a running daemon touched; UpLocked
+// does not check. A store that cannot be read, or where the request cannot
+// be recorded, is an error of its own, not a refusal, and is wrapped.
 func (p *Prepared) checkAllowed() error {
 	cfg := p.cfg
 	target := allow.NewTarget(cfg.RulesFile, p.digest, cfg.Settings.Daemon())
@@ -294,7 +294,7 @@ func (p *Prepared) checkAllowed() error {
 		return err
 	}
 	if !ok {
-		if err := cfg.Allows.Request(cfg.Workspace, target); err != nil {
+		if err := cfg.Allows.Request(cfg.place(), target); err != nil {
 			return fmt.Errorf("record the request of %s: %w", hostterm.Display(cfg.Workspace), err)
 		}
 		return &NotAllowedError{Workspace: cfg.Workspace, RulesFile: cfg.RulesFile, Digest: p.digest}
@@ -302,12 +302,18 @@ func (p *Prepared) checkAllowed() error {
 	return nil
 }
 
+// place is where the allow store keeps the allow and the pending request
+// of cfg: its workspace and its runtime directory, cfg.Dir.
+func (cfg Config) place() allow.Place {
+	return allow.Place{Workspace: cfg.Workspace, RuntimeDir: cfg.Dir}
+}
+
 // allowed reports whether the allow store of cfg holds the Scope sc, the
-// rules digest and the daemon settings, for its workspace (see
-// allow.Store.Allowed). A store that cannot be read is an error naming
-// the workspace, wrapping the store's.
+// rules digest and the daemon settings, for its workspace and its runtime
+// directory, cfg.Dir (see allow.Store.Allowed). A store that cannot be
+// read is an error naming the workspace, wrapping the store's.
 func (cfg Config) allowed(sc allow.Scope) (bool, error) {
-	ok, err := cfg.Allows.Allowed(cfg.Workspace, sc)
+	ok, err := cfg.Allows.Allowed(cfg.place(), sc)
 	if err != nil {
 		return false, fmt.Errorf("check the allow of %s: %w", hostterm.Display(cfg.Workspace), err)
 	}

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"io"
@@ -33,12 +35,35 @@ func allowStore(t *testing.T) allow.Store {
 	return allow.Store{Dir: filepath.Join(os.Getenv("XDG_DATA_HOME"), "hostrunner", "allow")}
 }
 
+// runtimeDir returns the runtime directory name of an isolated test (see
+// isolate), with symbolic links followed as the allow store keys it: the
+// same path for every `up` of the test that gives the name, as for the
+// `up`s of one devcontainer config.
+func runtimeDir(t *testing.T, name string) string {
+	t.Helper()
+	data := os.Getenv("XDG_DATA_HOME")
+	if data == "" {
+		t.Fatal("runtimeDir needs an isolated test")
+	}
+	real, err := filepath.EvalSymlinks(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(real, name) // short, for the socket path limit
+}
+
 // parseUpOf parses the arguments of an `up` for ws with the extra up
-// flags, a runtime directory of the test and the environment of the
-// process, failing the test on an error.
+// flags, the runtime directory "a" of the test (see runtimeDir) and the
+// environment of the process, failing the test on an error.
 func parseUpOf(t *testing.T, ws string, extra ...string) launch.Config {
 	t.Helper()
-	args := append([]string{"--dir", filepath.Join(t.TempDir(), "d"), "--workspace", ws, "--container-workspace", "/w"}, extra...)
+	return parseUpIn(t, runtimeDir(t, "a"), ws, extra...)
+}
+
+// parseUpIn is parseUpOf with the runtime directory rd.
+func parseUpIn(t *testing.T, rd, ws string, extra ...string) launch.Config {
+	t.Helper()
+	args := append([]string{"--dir", rd, "--workspace", ws, "--container-workspace", "/w"}, extra...)
 	cfg, err := parseUp(args, "/bin/hostrunner", os.Getenv, io.Discard)
 	if err != nil {
 		t.Fatal(err)
@@ -67,22 +92,62 @@ func runAllowCmd(t *testing.T, name string, args ...string) (stdout, stderr stri
 // `up` is allowed.
 func upAllowCheck(t *testing.T, ws string, extra ...string) error {
 	t.Helper()
-	_, err := launch.PrepareAllowed(parseUpOf(t, ws, extra...))
+	return upAllowCheckIn(t, runtimeDir(t, "a"), ws, extra...)
+}
+
+// upAllowCheckIn is upAllowCheck with the runtime directory rd.
+func upAllowCheckIn(t *testing.T, rd, ws string, extra ...string) error {
+	t.Helper()
+	_, err := launch.PrepareAllowed(parseUpIn(t, rd, ws, extra...))
 	return err
 }
 
-// storeAllows reports whether the store holds ws with digest and settings.
+// refuseUp prepares an `up` for ws with the extra up flags, as
+// upAllowCheck, and fails the test unless it is refused as not allowed:
+// the refused `up` records the request that `allow` allows.
+func refuseUp(t *testing.T, ws string, extra ...string) {
+	t.Helper()
+	refuseUpIn(t, runtimeDir(t, "a"), ws, extra...)
+}
+
+// refuseUpIn is refuseUp with the runtime directory rd.
+func refuseUpIn(t *testing.T, rd, ws string, extra ...string) {
+	t.Helper()
+	var notAllowed *launch.NotAllowedError
+	if err := upAllowCheckIn(t, rd, ws, extra...); !errors.As(err, &notAllowed) {
+		t.Fatalf("up %v for %s in %s: got %v, want a *launch.NotAllowedError", extra, ws, rd, err)
+	}
+}
+
+// storeAllows reports whether the store holds ws with digest and settings
+// for the runtime directory "a" of the test (see runtimeDir).
 func storeAllows(t *testing.T, ws, digest string, settings map[string]string) bool {
 	t.Helper()
-	ok, err := allowStore(t).Allowed(ws, allow.Scope{Digest: digest, Settings: settings})
+	ok, err := allowStore(t).Allowed(allow.Place{Workspace: ws, RuntimeDir: runtimeDir(t, "a")}, allow.Scope{Digest: digest, Settings: settings})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return ok
 }
 
-// allow in the current directory records the digest of its rules file with
-// the settings up resolves, and prints what it allowed.
+// pendingOf returns the pending request of the runtime directory rd of
+// ws in store, as PendingAll returns it; ok is false when there is none.
+func pendingOf(store allow.Store, ws, rd string) (e allow.Entry, ok bool, err error) {
+	requests, err := store.PendingAll(ws)
+	if err != nil {
+		return allow.Entry{}, false, err
+	}
+	for _, e := range requests {
+		if same, err := allow.SameWorkspace(e.RuntimeDir, rd); err != nil || same {
+			return e, err == nil, err
+		}
+	}
+	return allow.Entry{}, false, nil
+}
+
+// allow in the current directory, after a refused up, records the digest
+// of its rules file with the settings up resolves, and prints what it
+// allowed.
 func TestAllowRecordsTheCurrentDirectoryAndPrintsWhatItAllowed(t *testing.T) {
 	isolate(t)
 	dir, _ := devcontainerWith(t, allowRules, "hostrunner-rules.yaml")
@@ -92,6 +157,7 @@ func TestAllowRecordsTheCurrentDirectoryAndPrintsWhatItAllowed(t *testing.T) {
 		t.Fatal(err)
 	}
 	dir = filepath.Join(ws, ".devcontainer")
+	refuseUp(t, ws)
 	stdout, stderr, err := runAllowCmd(t, "allow")
 	if err != nil {
 		t.Fatal(err)
@@ -103,6 +169,7 @@ func TestAllowRecordsTheCurrentDirectoryAndPrintsWhatItAllowed(t *testing.T) {
 		t.Error("the rules and the default settings are not allowed")
 	}
 	want := "hostrunner: allowed " + ws + "\n" +
+		"  runtime directory: " + runtimeDir(t, "a") + "\n" +
 		"  rules file: " + filepath.Join(dir, "hostrunner-rules.yaml") + "\n" +
 		"  digest: " + allowRulesDigest + "\n" +
 		"  settings:\n" +
@@ -124,6 +191,7 @@ func TestAllowRecordsTheCurrentDirectoryAndPrintsWhatItAllowed(t *testing.T) {
 func TestAllowAllowsTheWorkspaceGiven(t *testing.T) {
 	isolate(t)
 	ws, _ := devcontainerWith(t, allowRules, "hostrunner-rules.yaml")
+	refuseUp(t, ws)
 	t.Chdir(t.TempDir())
 	if _, _, err := runAllowCmd(t, "allow", ws); err != nil {
 		t.Fatal(err)
@@ -137,6 +205,7 @@ func TestAllowAllowsTheWorkspaceGiven(t *testing.T) {
 func TestAllowMakesARelativeWorkspaceAbsolute(t *testing.T) {
 	isolate(t)
 	ws, _ := devcontainerWith(t, allowRules, "hostrunner-rules.yaml")
+	refuseUp(t, ws)
 	t.Chdir(filepath.Dir(ws))
 	stdout, _, err := runAllowCmd(t, "allow", filepath.Base(ws))
 	if err != nil {
@@ -196,6 +265,7 @@ func TestAllowDoesNotMarkTheDefaultRulesFileOfAWorkspaceReachedThroughALink(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
+	refuseUp(t, link)
 	stdout, _, err := runAllowCmd(t, "allow", link)
 	if err != nil {
 		t.Fatal(err)
@@ -272,6 +342,7 @@ func TestAllowMarksTheSettingsThatDifferFromTheirDefaults(t *testing.T) {
 func TestAllowCoversTheMountCheck(t *testing.T) {
 	isolate(t)
 	ws, _ := devcontainerWith(t, allowRules, "hostrunner-rules.yaml")
+	refuseUp(t, ws)
 	if _, _, err := runAllowCmd(t, "allow", ws); err != nil {
 		t.Fatal(err)
 	}
@@ -335,21 +406,24 @@ func TestAllowRefusesRulesMadeInvalidSinceTheRefusedUp(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "hostrunner-rules.yaml"), []byte(invalidRules), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := runAllowCmd(t, "allow", ws); err == nil || !strings.HasPrefix(err.Error(), "rules file: ") {
-		t.Fatalf("got %v, want a rules file error", err)
+	_, _, err := runAllowCmd(t, "allow", ws)
+	if err == nil || !strings.HasPrefix(err.Error(), "rules file of the runtime directory "+runtimeDir(t, "a")+": ") {
+		t.Fatalf("got %v, want a rules file error naming the runtime directory", err)
 	}
 	if storeAllows(t, ws, allowRulesDigest, upSettings(t, ws)) {
 		t.Error("the rules up asked for were allowed")
 	}
 }
 
-// The workspace settings file is read as up reads it.
+// allow allows the settings the refused up read from the workspace
+// settings file.
 func TestAllowHonoursTheWorkspaceSettingsFile(t *testing.T) {
 	isolate(t)
 	ws, dir := devcontainerWith(t, allowRules, "hostrunner-rules.yaml")
 	if err := os.WriteFile(filepath.Join(dir, "hostrunner.yaml"), []byte("grace: 2m\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	refuseUp(t, ws)
 	stdout, _, err := runAllowCmd(t, "allow", ws)
 	if err != nil {
 		t.Fatal(err)
@@ -362,8 +436,8 @@ func TestAllowHonoursTheWorkspaceSettingsFile(t *testing.T) {
 	}
 }
 
-// allow takes no settings flag: it allows what up asked for, or what up
-// without flags resolves; a flag is an error and records nothing.
+// allow takes no settings flag: it allows what up asked for; a flag is an
+// error and records nothing.
 func TestAllowRejectsSettingsFlags(t *testing.T) {
 	isolate(t)
 	ws, _ := devcontainerWith(t, allowRules, "hostrunner-rules.yaml")
@@ -409,6 +483,7 @@ func TestUpPassesTheAllowCheckExactlyWhenAllowed(t *testing.T) {
 func TestAllowAllowsAMissingRulesFile(t *testing.T) {
 	isolate(t)
 	ws, _ := devcontainerWith(t, "")
+	refuseUp(t, ws)
 	stdout, _, err := runAllowCmd(t, "allow", ws)
 	if err != nil {
 		t.Fatal(err)
@@ -421,19 +496,48 @@ func TestAllowAllowsAMissingRulesFile(t *testing.T) {
 	}
 }
 
-// Invalid rules fail as in up, and nothing is recorded.
-func TestAllowRefusesInvalidRulesAndRecordsNothing(t *testing.T) {
+// Without a pending request nobody asked for an allow, so allow allows
+// nothing, whatever the rules file holds: it fails naming the workspace
+// and telling to start the container with hostrunner up, prints nothing
+// and records nothing.
+func TestAllowWithoutAPendingRequestFails(t *testing.T) {
+	for name, rules := range map[string]string{"valid rules": allowRules, "invalid rules": invalidRules} {
+		t.Run(name, func(t *testing.T) {
+			isolate(t)
+			ws, _ := devcontainerWith(t, rules, "hostrunner-rules.yaml")
+			stdout, stderr, err := runAllowCmd(t, "allow", ws)
+			if err == nil {
+				t.Fatal("allow succeeded, want an error that nothing asked for an allow")
+			}
+			for _, want := range []string{ws, "hostrunner up"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q lacks %q", err, want)
+				}
+			}
+			if stdout != "" || stderr != "" {
+				t.Errorf("printed %q on stdout and %q on stderr, want nothing", stdout, stderr)
+			}
+			if _, err := os.Stat(allowStore(t).Dir); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("the allow store was created: %v", err)
+			}
+		})
+	}
+}
+
+// allow takes the request it allows: a second allow finds none and fails,
+// naming hostrunner up, while the first allow stays.
+func TestASecondAllowFindsNoRequest(t *testing.T) {
 	isolate(t)
-	ws, _ := devcontainerWith(t, invalidRules, "hostrunner-rules.yaml")
-	stdout, _, err := runAllowCmd(t, "allow", ws)
-	if err == nil || !strings.Contains(err.Error(), "rules file") {
-		t.Fatalf("got %v, want a rules file error", err)
+	ws, _ := devcontainerWith(t, allowRules, "hostrunner-rules.yaml")
+	refuseUp(t, ws)
+	if _, _, err := runAllowCmd(t, "allow", ws); err != nil {
+		t.Fatal(err)
 	}
-	if stdout != "" {
-		t.Errorf("stdout %q, want none", stdout)
+	if _, _, err := runAllowCmd(t, "allow", ws); err == nil || !strings.Contains(err.Error(), "hostrunner up") {
+		t.Errorf("second allow: got %v, want an error naming hostrunner up", err)
 	}
-	if _, err := os.Stat(allowStore(t).Dir); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("the allow store was created: %v", err)
+	if err := upAllowCheck(t, ws); err != nil {
+		t.Errorf("up after the second allow: %v", err)
 	}
 }
 
@@ -441,12 +545,14 @@ func TestAllowRefusesInvalidRulesAndRecordsNothing(t *testing.T) {
 func TestAllowAfterTheRulesChangedReplacesTheEarlierAllow(t *testing.T) {
 	isolate(t)
 	ws, dir := devcontainerWith(t, allowRules, "hostrunner-rules.yaml")
+	refuseUp(t, ws)
 	if _, _, err := runAllowCmd(t, "allow", ws); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "hostrunner-rules.yaml"), []byte(otherRules), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	refuseUp(t, ws)
 	stdout, _, err := runAllowCmd(t, "allow", ws)
 	if err != nil {
 		t.Fatal(err)
@@ -460,23 +566,6 @@ func TestAllowAfterTheRulesChangedReplacesTheEarlierAllow(t *testing.T) {
 	}
 	if err := upAllowCheck(t, ws); err != nil {
 		t.Errorf("up with the new rules: %v", err)
-	}
-}
-
-// With both default rules files, the older one is warned of on stderr, as
-// up warns, and the newer one is allowed.
-func TestAllowWarnsOfAnIgnoredRulesFile(t *testing.T) {
-	isolate(t)
-	ws, dir := devcontainerWith(t, allowRules, "hostrunner-rules.yaml", "hostrun.yaml")
-	stdout, stderr, err := runAllowCmd(t, "allow", ws)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if want := ignoredWarning(dir); stderr != want {
-		t.Errorf("stderr %q, want %q", stderr, want)
-	}
-	if want := "  rules file: " + filepath.Join(dir, "hostrunner-rules.yaml") + "\n"; !strings.Contains(stdout, want) {
-		t.Errorf("stdout lacks %q:\n%s", want, stdout)
 	}
 }
 
@@ -527,6 +616,7 @@ func TestDenyRejectsFlags(t *testing.T) {
 func TestDenyRemovesTheAllow(t *testing.T) {
 	isolate(t)
 	ws, _ := devcontainerWith(t, allowRules, "hostrunner-rules.yaml")
+	refuseUp(t, ws)
 	if _, _, err := runAllowCmd(t, "allow", ws); err != nil {
 		t.Fatal(err)
 	}
@@ -534,7 +624,7 @@ func TestDenyRemovesTheAllow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := "hostrunner: denied " + ws + "\n"; stdout != want {
+	if want := "hostrunner: denied " + ws + " for " + runtimeDir(t, "a") + "\n"; stdout != want {
 		t.Errorf("stdout %q, want %q", stdout, want)
 	}
 	var notAllowed *launch.NotAllowedError
@@ -550,11 +640,77 @@ func TestDenyRemovesTheAllow(t *testing.T) {
 	}
 }
 
+// deny removes a damaged allow file with the valid allows: it prints the
+// valid ones to stdout, warns of the damaged one on stderr and succeeds.
+// With only a damaged file it warns and does not say there is no allow.
+func TestDenyRemovesADamagedAllowFileWithAWarning(t *testing.T) {
+	isolate(t)
+	ws, _ := devcontainerWith(t, allowRules, "hostrunner-rules.yaml")
+	a, b := runtimeDir(t, "a"), runtimeDir(t, "b")
+	refuseUpIn(t, a, ws)
+	refuseUpIn(t, b, ws)
+	if _, _, err := runAllowCmd(t, "allow", ws); err != nil {
+		t.Fatal(err)
+	}
+	damaged := allowFileOf(t, ws, b)
+	if err := os.WriteFile(damaged, []byte("not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stdout, stderr, err := runAllowCmd(t, "deny", ws)
+	if err != nil {
+		t.Fatalf("deny: %v", err)
+	}
+	if want := "hostrunner: denied " + ws + " for " + a + "\n"; stdout != want {
+		t.Errorf("stdout %q, want %q", stdout, want)
+	}
+	if want := "hostrunner: warning: removed the allow file " + damaged + ", which cannot be read: "; !strings.HasPrefix(stderr, want) || strings.Count(stderr, "\n") != 1 {
+		t.Errorf("stderr %q, want one line starting %q", stderr, want)
+	}
+	if _, err := os.Stat(damaged); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the damaged allow file is still there: %v", err)
+	}
+
+	refuseUpIn(t, a, ws)
+	if _, _, err := runAllowCmd(t, "allow", ws); err != nil {
+		t.Fatal(err)
+	}
+	damaged = allowFileOf(t, ws, a)
+	if err := os.WriteFile(damaged, []byte("not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stdout, stderr, err = runAllowCmd(t, "deny", ws)
+	if err != nil || stdout != "" || !strings.Contains(stderr, damaged) {
+		t.Errorf("deny of a damaged file only: got %q, %q and %v; want only the warning", stdout, stderr, err)
+	}
+}
+
+// allowFileOf returns the path of the allow file of the runtime directory
+// rd of ws in the store of an isolated test, as the store names it: the
+// hex SHA-256 of each key, rd's followed by .json. It fails the test
+// unless the file exists.
+func allowFileOf(t *testing.T, ws, rd string) string {
+	t.Helper()
+	wsKey, err := filepath.EvalSymlinks(ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hexOf := func(k string) string {
+		sum := sha256.Sum256([]byte(k))
+		return hex.EncodeToString(sum[:])
+	}
+	path := filepath.Join(allowStore(t).Dir, hexOf(wsKey), hexOf(rd)+".json")
+	if _, err := os.Stat(path); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
 // deny defaults to the current directory and needs no existing workspace:
 // the allow of a removed workspace can still be denied.
 func TestDenyAcceptsTheCurrentDirectoryAndAMissingWorkspace(t *testing.T) {
 	isolate(t)
 	ws, _ := devcontainerWith(t, allowRules, "hostrunner-rules.yaml")
+	refuseUp(t, ws)
 	t.Chdir(ws)
 	if _, _, err := runAllowCmd(t, "allow"); err != nil {
 		t.Fatal(err)
@@ -563,7 +719,7 @@ func TestDenyAcceptsTheCurrentDirectoryAndAMissingWorkspace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stdout, _, err := runAllowCmd(t, "deny"); err != nil || stdout != "hostrunner: denied "+wd+"\n" {
+	if stdout, _, err := runAllowCmd(t, "deny"); err != nil || stdout != "hostrunner: denied "+wd+" for "+runtimeDir(t, "a")+"\n" {
 		t.Errorf("deny: got %q and %v", stdout, err)
 	}
 	gone := filepath.Join(t.TempDir(), "gone")
@@ -605,6 +761,7 @@ func linkedWorkspace(t *testing.T) (real, link string) {
 func TestAllowThroughALinkAllowsTheUpOfTheRealPath(t *testing.T) {
 	isolate(t)
 	real, link := linkedWorkspace(t)
+	refuseUp(t, real)
 	t.Chdir(link)
 	t.Setenv("PWD", link) // os.Getwd names the directory through the link
 	if wd, err := os.Getwd(); err != nil || wd != link {
@@ -623,10 +780,110 @@ func TestAllowThroughALinkAllowsTheUpOfTheRealPath(t *testing.T) {
 func TestAllowOfTheRealPathAllowsTheUpThroughALink(t *testing.T) {
 	isolate(t)
 	real, link := linkedWorkspace(t)
+	refuseUp(t, link)
 	if _, _, err := runAllowCmd(t, "allow", real); err != nil {
 		t.Fatal(err)
 	}
 	if err := upAllowCheck(t, link); err != nil {
 		t.Errorf("up --workspace %s after the allow of %s: %v", link, real, err)
+	}
+}
+
+// allow allows the pending request of every runtime directory of the
+// workspace at once, each with the settings its refused up resolved, and
+// prints one block per allow, sorted by runtime directory, each naming its
+// runtime directory; then the up of each passes and allowing one did not
+// undo the other.
+func TestAllowAllowsTheRequestOfEveryRuntimeDir(t *testing.T) {
+	isolate(t)
+	ws, _ := devcontainerWith(t, allowRules, "hostrunner-rules.yaml")
+	a, b := runtimeDir(t, "a"), runtimeDir(t, "b")
+	refuseUpIn(t, b, ws, "--grace", "1m")
+	refuseUpIn(t, a, ws)
+	stdout, _, err := runAllowCmd(t, "allow", ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocks := strings.SplitAfter(stdout, "    startup_timeout: 30m0s\n")
+	if len(blocks) != 3 || blocks[2] != "" {
+		t.Fatalf("stdout holds %d blocks, want 2:\n%s", len(blocks)-1, stdout)
+	}
+	for i, want := range []struct{ dir, grace string }{{a, "    grace: 15s\n"}, {b, "    grace: 1m0s (default 15s)\n"}} {
+		head := "hostrunner: allowed " + ws + "\n  runtime directory: " + want.dir + "\n"
+		if !strings.HasPrefix(blocks[i], head) || !strings.Contains(blocks[i], want.grace) {
+			t.Errorf("block %d lacks %q and %q:\n%s", i, head, want.grace, blocks[i])
+		}
+	}
+	if err := upAllowCheckIn(t, a, ws); err != nil {
+		t.Errorf("up in A after the allow: %v", err)
+	}
+	if err := upAllowCheckIn(t, b, ws, "--grace", "1m"); err != nil {
+		t.Errorf("up --grace 1m in B after the allow: %v", err)
+	}
+	var notAllowed *launch.NotAllowedError
+	if err := upAllowCheckIn(t, a, ws, "--grace", "1m"); !errors.As(err, &notAllowed) {
+		t.Errorf("up --grace 1m in A: got %v, want a *launch.NotAllowedError", err)
+	}
+}
+
+// When the rules file changed since the request of one runtime directory,
+// allow allows none of the requests, names that one with its runtime
+// directory and both digests, and tells to run hostrunner up again.
+func TestAllowWithOneRequestOutOfDateAllowsNothing(t *testing.T) {
+	isolate(t)
+	ws, dir := devcontainerWith(t, allowRules, "hostrunner-rules.yaml")
+	a, b := runtimeDir(t, "a"), runtimeDir(t, "b")
+	refuseUpIn(t, a, ws)
+	if err := os.WriteFile(filepath.Join(dir, "hostrunner-rules.yaml"), []byte(otherRules), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	refuseUpIn(t, b, ws)
+	stdout, _, err := runAllowCmd(t, "allow", ws)
+	if err == nil {
+		t.Fatal("allow succeeded, want an error that a request is out of date")
+	}
+	for _, want := range []string{a, allowRulesDigest, otherRulesDigest, "run hostrunner up again"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q lacks %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), b) {
+		t.Errorf("error %q names B, whose request is up to date", err)
+	}
+	if stdout != "" {
+		t.Errorf("stdout %q, want none", stdout)
+	}
+	var notAllowed *launch.NotAllowedError
+	for _, rd := range []string{a, b} {
+		if err := upAllowCheckIn(t, rd, ws); !errors.As(err, &notAllowed) {
+			t.Errorf("up in %s after the failed allow: got %v, want a *launch.NotAllowedError", rd, err)
+		}
+	}
+}
+
+// deny removes the allows of every runtime directory of the workspace and
+// prints each, sorted by runtime directory; then the up of each is refused.
+func TestDenyRemovesTheAllowOfEveryRuntimeDir(t *testing.T) {
+	isolate(t)
+	ws, _ := devcontainerWith(t, allowRules, "hostrunner-rules.yaml")
+	a, b := runtimeDir(t, "a"), runtimeDir(t, "b")
+	refuseUpIn(t, a, ws)
+	refuseUpIn(t, b, ws, "--grace", "1m")
+	if _, _, err := runAllowCmd(t, "allow", ws); err != nil {
+		t.Fatal(err)
+	}
+	stdout, _, err := runAllowCmd(t, "deny", ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "hostrunner: denied " + ws + " for " + a + "\nhostrunner: denied " + ws + " for " + b + "\n"; stdout != want {
+		t.Errorf("stdout %q, want %q", stdout, want)
+	}
+	var notAllowed *launch.NotAllowedError
+	if err := upAllowCheckIn(t, a, ws); !errors.As(err, &notAllowed) {
+		t.Errorf("up in A after deny: got %v, want a *launch.NotAllowedError", err)
+	}
+	if err := upAllowCheckIn(t, b, ws, "--grace", "1m"); !errors.As(err, &notAllowed) {
+		t.Errorf("up in B after deny: got %v, want a *launch.NotAllowedError", err)
 	}
 }
