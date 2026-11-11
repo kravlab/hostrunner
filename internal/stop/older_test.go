@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -174,17 +175,87 @@ func (d *olderDaemon) waitTerminated(t *testing.T) {
 	}
 }
 
-// runStop runs a stop as cfg configures it, answering with answers, and
-// returns what it printed and returned.
-func runStop(t *testing.T, cfg stop.Config, answers string) (string, error) {
+// questionOut is what a stop prints; it signals asked each time the stop
+// asks a question. Every question of a stop is one write ending in "? "
+// (see term.ask): were anything else it prints to end so, the stray
+// signal would type an answer before its question, which answers
+// nothing (see hostterm.Input), and the test would fail.
+type questionOut struct {
+	mu    sync.Mutex
+	buf   bytes.Buffer
+	asked chan struct{}
+}
+
+// Write records p and signals asked when p is a question.
+func (o *questionOut) Write(p []byte) (int, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if bytes.HasSuffix(p, []byte("? ")) {
+		select {
+		case o.asked <- struct{}{}:
+		default:
+		}
+	}
+	return o.buf.Write(p)
+}
+
+// String returns what the stop printed so far.
+func (o *questionOut) String() string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.buf.String()
+}
+
+// stepTimeout bounds each wait of runStop: for a question, for an answer
+// to be read and for the stop to end.
+const stepTimeout = 10 * time.Second
+
+// runStop runs a stop as cfg configures it and returns what it printed
+// and returned. It types each of answers once the question before it
+// shows, as a human does: a line typed ahead of a question does not
+// answer it (see hostterm.Input). The input ends after the last answer.
+// A stop that ends before it asked for every answer fails the test.
+func runStop(t *testing.T, cfg stop.Config, answers ...string) (string, error) {
 	t.Helper()
-	var out bytes.Buffer
+	in, keyboard := io.Pipe()
+	defer in.Close()
+	out := &questionOut{asked: make(chan struct{}, 16)}
 	done := make(chan error, 1)
-	go func() { done <- stop.Run(context.Background(), cfg, strings.NewReader(answers), &out) }()
+	go func() { done <- stop.Run(context.Background(), cfg, in, out) }()
+	// ended returns what the stop that ended with err printed and
+	// returned, failing the test when answers were left unasked.
+	ended := func(err error, unasked []string) (string, error) {
+		if len(unasked) > 0 {
+			t.Fatalf("the stop ended (%v) before it asked for %q; printed %q", err, unasked, out.String())
+		}
+		return out.String(), err
+	}
+	for i, answer := range answers {
+		select {
+		case <-out.asked:
+		case err := <-done:
+			return ended(err, answers[i:])
+		case <-time.After(stepTimeout):
+			t.Fatalf("the stop did not ask for %q; printed %q", answer, out.String())
+		}
+		typedErr := make(chan error, 1)
+		go func() { _, err := io.WriteString(keyboard, answer+"\n"); typedErr <- err }()
+		select {
+		case err := <-typedErr:
+			if err != nil {
+				t.Fatalf("type %q: %v", answer, err)
+			}
+		case err := <-done:
+			return ended(err, answers[i+1:])
+		case <-time.After(stepTimeout):
+			t.Fatalf("the stop did not read %q", answer)
+		}
+	}
+	keyboard.Close()
 	select {
 	case err := <-done:
-		return out.String(), err
-	case <-time.After(10 * time.Second):
+		return ended(err, nil)
+	case <-time.After(stepTimeout):
 		t.Fatal("the stop did not end")
 		return "", nil
 	}
@@ -192,7 +263,7 @@ func runStop(t *testing.T, cfg stop.Config, answers string) (string, error) {
 
 func TestStopKillsAnOlderDaemonWithSIGTERM(t *testing.T) {
 	d := startOlderDaemon(t, false, "")
-	out, err := runStop(t, stop.Config{Dir: d.dir, Commands: stop.Commands{Answer: stop.Kill}}, "")
+	out, err := runStop(t, stop.Config{Dir: d.dir, Commands: stop.Commands{Answer: stop.Kill}})
 	if err != nil {
 		t.Fatalf("stop: %v; printed %q", err, out)
 	}
@@ -204,7 +275,7 @@ func TestStopKillsAnOlderDaemonWithSIGTERM(t *testing.T) {
 
 func TestStopAsksKillOrQuitForAnOlderDaemon(t *testing.T) {
 	d := startOlderDaemon(t, false, "")
-	out, err := runStop(t, stop.Config{Dir: d.dir, Commands: stop.Commands{Terminal: true}}, "w\nq\n")
+	out, err := runStop(t, stop.Config{Dir: d.dir, Commands: stop.Commands{Terminal: true}}, "w", "q")
 	if err == nil || !strings.Contains(err.Error(), "left running") {
 		t.Fatalf("got %v, want the daemon left running", err)
 	}
@@ -212,10 +283,14 @@ func TestStopAsksKillOrQuitForAnOlderDaemon(t *testing.T) {
 	if strings.Count(out, "[k/q] ? ") != 2 {
 		t.Fatalf("printed %q, want the question asked twice", out)
 	}
+	// q answered it: the input did not end under the question.
+	if !strings.HasSuffix(out, "[k/q] ? ") {
+		t.Fatalf("printed %q, want q to answer the second question", out)
+	}
 	if !d.running() {
 		t.Fatal("the older daemon was stopped")
 	}
-	if _, err := runStop(t, stop.Config{Dir: d.dir, Commands: stop.Commands{Terminal: true}}, "k\n"); err != nil {
+	if _, err := runStop(t, stop.Config{Dir: d.dir, Commands: stop.Commands{Terminal: true}}, "k"); err != nil {
 		t.Fatalf("stop: %v", err)
 	}
 	d.waitTerminated(t)
@@ -224,7 +299,7 @@ func TestStopAsksKillOrQuitForAnOlderDaemon(t *testing.T) {
 func TestStopOfAnOlderDaemonNeedsKillWithoutATerminal(t *testing.T) {
 	d := startOlderDaemon(t, false, "")
 	for _, answer := range []stop.Answer{stop.Ask, stop.Wait} {
-		_, err := runStop(t, stop.Config{Dir: d.dir, Commands: stop.Commands{Answer: answer}}, "")
+		_, err := runStop(t, stop.Config{Dir: d.dir, Commands: stop.Commands{Answer: answer}})
 		if err == nil || !strings.Contains(err.Error(), "--kill") {
 			t.Fatalf("answer %v: got %v, want an error naming --kill", answer, err)
 		}
@@ -236,7 +311,7 @@ func TestStopOfAnOlderDaemonNeedsKillWithoutATerminal(t *testing.T) {
 
 func TestStopFindsADaemonFromBeforeApprovalsByDir(t *testing.T) {
 	d := startOlderDaemon(t, true, "")
-	out, err := runStop(t, stop.Config{Dir: d.dir, Commands: stop.Commands{Answer: stop.Kill}}, "")
+	out, err := runStop(t, stop.Config{Dir: d.dir, Commands: stop.Commands{Answer: stop.Kill}})
 	if err != nil {
 		t.Fatalf("stop: %v; printed %q", err, out)
 	}
@@ -252,7 +327,7 @@ func TestStopRefusesAProcessThatServesAnotherSocket(t *testing.T) {
 	}
 	// Run for a runtime directory of its own, it listens on other's socket.
 	impostor := startOlderDaemon(t, true, filepath.Join(other, launch.SocketName))
-	_, err = runStop(t, stop.Config{Dir: other, Commands: stop.Commands{Answer: stop.Kill}}, "")
+	_, err = runStop(t, stop.Config{Dir: other, Commands: stop.Commands{Answer: stop.Kill}})
 	if err == nil || !strings.Contains(err.Error(), "no signal sent") {
 		t.Fatalf("got %v, want the process refused", err)
 	}
