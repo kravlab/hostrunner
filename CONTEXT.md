@@ -98,8 +98,15 @@ _Avoid_: rewrite, wrapper
 ### Lifecycle
 
 **Daemon**:
-The host process that runs one devcontainer's commands and
-lives as long as its armed container.
+What runs one devcontainer's commands, alone in its own host
+process or in a shared process; it lives as long as its armed
+container.
+
+**Shared process**:
+A host process that holds the daemons of several
+devcontainers, one process per version of hostrunner, and
+lives while one of its daemons does.
+_Avoid_: global daemon
 
 **Arm**:
 The signal `hostrunner up` gives the daemon, on its approval
