@@ -30,6 +30,7 @@ import (
 	"github.com/kravlab/hostrunner/internal/settings"
 	"github.com/kravlab/hostrunner/internal/shared"
 	"github.com/kravlab/hostrunner/internal/transport"
+	"github.com/kravlab/hostrunner/internal/watch"
 )
 
 // fakeDaemonEnv makes the test binary act as the daemon when Up spawns it.
@@ -1431,16 +1432,56 @@ func TestUpRefusedRecordsItsRequestWithoutTheProcess(t *testing.T) {
 	}
 }
 
-// fakeContainerRuntime puts a docker in PATH, until the test ends, that
-// answers every command with no output: the real daemon's watch, which
-// needs one, finds no container and waits for it.
+// fakeContainerRuntime puts a docker and a podman in PATH, until the test
+// ends, that answer every command with no output: the real daemon's watch,
+// which needs one, finds no container and waits for it. Both names are
+// faked because the watch runs every runtime it finds: a real one further
+// in PATH would run too.
 func fakeContainerRuntime(t *testing.T) {
 	t.Helper()
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "docker"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	writeScripts(t, dir, "exit 0", "docker", "podman")
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// writeScripts writes an executable shell script running body into dir
+// under each of names.
+func writeScripts(t *testing.T, dir, body string, names ...string) {
+	t.Helper()
+	for _, name := range names {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("#!/bin/sh\n"+body+"\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// After fakeContainerRuntime, the daemon's watch finds only the fakes,
+// never a real docker or podman later in PATH: a real podman run with the
+// test's XDG_DATA_HOME leaves storage there that TempDir cleanup cannot
+// remove.
+func TestFakeContainerRuntimeHidesEveryRealRuntime(t *testing.T) {
+	realDir := t.TempDir()
+	writeScripts(t, realDir, "exit 1", "docker", "podman")
+	t.Setenv("PATH", realDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	fakeContainerRuntime(t)
+
+	found := watch.Detect()
+	var binaries []string
+	for _, r := range found {
+		cli, ok := r.(watch.CLI)
+		if !ok {
+			t.Fatalf("the watch finds %#v, want a CLI runtime", r)
+		}
+		binaries = append(binaries, cli.Binary)
+	}
+	if len(binaries) != 2 {
+		t.Fatalf("the watch finds %q, want the fake docker and podman", binaries)
+	}
+	fakeDir := filepath.Dir(binaries[0])
+	if want := []string{filepath.Join(fakeDir, "docker"), filepath.Join(fakeDir, "podman")}; fakeDir == realDir || !slices.Equal(binaries, want) {
+		t.Errorf("the watch finds %q, want the fakes of one directory other than the real runtimes' %s", binaries, realDir)
+	}
 }
 
 // The regression of issue #144 with the real daemon: two devcontainer
