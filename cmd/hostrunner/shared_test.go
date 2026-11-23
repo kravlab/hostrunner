@@ -150,3 +150,41 @@ func daemonLog(t *testing.T, cfg serveConfig) string {
 	}
 	return string(b)
 }
+
+// A daemon of the shared process reports that process in its hello,
+// whatever its settings say: a serve started with --process shared
+// reports its own.
+func TestSharedDaemonReportsTheSharedProcess(t *testing.T) {
+	cfg := sharedWatchConfig(t)
+	d, err := newSharedDaemon(cfg, []watch.Runtime{&watchtest.Runtime{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- d.Serve(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+		d.Log.Close()
+	})
+	approvalSocket := launch.ApprovalSocket(filepath.Dir(cfg.socket))
+	waitListening(t, approvalSocket)
+	c, err := transport.Unix{Path: approvalSocket}.Dial(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+	if err := protocol.WriteJSON(c, protocol.FrameHello, protocol.Hello{Version: protocol.ApprovalVersion}); err != nil {
+		t.Fatal(err)
+	}
+	f, err := protocol.ReadFrame(c)
+	var got protocol.DaemonInfo
+	if err != nil || f.Type != protocol.FrameDaemonInfo || protocol.DecodeJSON(f, &got) != nil {
+		t.Fatalf("hello: frame %v, err %v", f.Type, err)
+	}
+	if got.Process != "shared" {
+		t.Errorf("hello: process %q, want %q", got.Process, "shared")
+	}
+}

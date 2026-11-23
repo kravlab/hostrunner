@@ -155,8 +155,9 @@ func WithSettings(daemonSettings map[string]string) Option {
 	return func(s *Server) { s.settings = daemonSettings }
 }
 
-// WithProcess sets the kind of process the Server runs in, "own" or
-// "shared" (settings.Process), which it tells approval sessions and
+// WithProcess sets the kind of process the Server actually runs in, "own"
+// or "shared" (the values of settings.Process; not the process setting,
+// which may name another), which it tells approval sessions and
 // `hostrunner restart` (protocol.DaemonInfo.Process); without it the
 // Server reports none, as a daemon older than the field does.
 func WithProcess(process string) Option {

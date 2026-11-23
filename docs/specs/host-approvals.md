@@ -335,9 +335,9 @@ without an alternate screen. The agreed screens:
 $ hostrunner approve
 hostrunner approve v1.2.0
 daemons:
-  1 * /home/u/app        v1.2.0      (container /workspaces/app)       ← current directory
-  2   /home/u/tools      v1.1.0 ⚠    (container /workspaces/tools)     served by another session
-  3   /home/u/legacy     unknown ⚠   another version: restart its container
+  1 * /home/u/app        v1.2.0      shared    (container /workspaces/app)       ← current directory
+  2   /home/u/tools      v1.1.0 ⚠    own       (container /workspaces/tools)     served by another session
+  3   /home/u/legacy     unknown ⚠   unknown   another version: restart its container
 choose [1-3, Enter = 1, q quit] ? 1
 serving /home/u/app (container /workspaces/app) · daemon v1.2.0
 waiting for requests · commands: standing, revoke <n>, out [n], runs, daemons, quit
@@ -406,6 +406,13 @@ revoked 1
   shows the list again. `hostrunner stop --choose` and `hostrunner
   restart --choose` show the same column and marks, against their own
   version.
+- Process: the daemon reports the kind of process it lives in in
+  `DaemonInfo` (`process`, `own` or `shared`; see the shared process in
+  `CONTEXT.md`); a daemon older than the field reports none, and an
+  older session ignores it. The list of daemons, in the session and in
+  `hostrunner stop --choose` and `hostrunner restart --choose`, shows it
+  in a column after the version, `unknown` for none. A session serves the
+  daemons of a shared process one by one, as it serves any other.
 - Answers are a letter and Enter: `r` refuse (then an optional note for
   the agent), `o` this request only, `s` for this session (until it
   ends), `d` standing (until the daemon stops), `a` add a rule, `c` the

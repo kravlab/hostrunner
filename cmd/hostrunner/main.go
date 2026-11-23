@@ -555,6 +555,7 @@ type serveConfig struct {
 	version           string              // the build version the daemon reports (see buildVersion)
 	allows            allow.Store         // where a hand edit of the rules file is checked as allowed
 	environment       *daemon.Environment // what its commands and secret sources run with; nil: the process's (see daemon.WithEnvironment)
+	inSharedProcess   bool                // the daemon runs in the shared process (see newSharedDaemon), not in a process of its own; its hello reports it, whatever the process setting says
 	settings.Settings                     // the daemon's settings
 }
 
@@ -676,6 +677,7 @@ func sharedDaemon(args, env []string, version string) (shared.Daemon, error) {
 // launch.OpenLog) and closed by the process once it ends (see
 // shared.Daemon).
 func newSharedDaemon(cfg serveConfig, runtimes []watch.Runtime) (shared.Daemon, error) {
+	cfg.inSharedProcess = true
 	logFile, err := launch.OpenLog(filepath.Join(filepath.Dir(cfg.socket), launch.LogName))
 	if err != nil {
 		return shared.Daemon{}, err
@@ -974,7 +976,7 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 		daemon.WithRequestTimeout(cfg.RequestTimeout),
 		daemon.WithBuildVersion(cfg.version),
 		daemon.WithSettings(cfg.Settings.AllowedSettings()),
-		daemon.WithProcess(string(cfg.Settings.Process)),
+		daemon.WithProcess(string(runsIn(cfg))),
 	}
 	opts = append(opts, allowOptions(cfg)...)
 	if cfg.environment != nil {
@@ -997,6 +999,17 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 		})
 	}
 	return srv.Serve(ctx, l)
+}
+
+// runsIn returns the process the daemon of cfg runs in: the shared
+// process when newSharedDaemon made it, else a process of its own, as
+// `hostrunner serve` runs it, whatever the process setting says (it is
+// what the arm compares, not where the daemon is).
+func runsIn(cfg serveConfig) settings.Process {
+	if cfg.inSharedProcess {
+		return settings.ProcessShared
+	}
+	return settings.ProcessOwn
 }
 
 // wireMountCheck sets up the mount check of a `serve --watch` of cfg, the

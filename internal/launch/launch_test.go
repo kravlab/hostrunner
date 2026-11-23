@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -1629,6 +1630,64 @@ func stopDaemon(t *testing.T, daemon string, cfg Config) {
 	}
 }
 
+// restartDaemon restarts the daemon of cfg as `hostrunner restart --dir
+// <dir> --kill` does, with the hostrunner executable daemon, and returns
+// what it printed. The new daemon is resolved from the command line and the
+// environment, not from cfg: the flags and variables give it the settings
+// of cfg (the rules file, the process, the mount check, the timeouts and
+// rereading), so that the allow of cfg covers it, and an empty settings
+// directory keeps the host's settings files out of it. restart installs the
+// hostrun beside daemon, so the static helper is put there under that name.
+// A restart that fails fails the test.
+func restartDaemon(t *testing.T, daemon string, cfg Config) string {
+	t.Helper()
+	out, err := restartDaemonErr(t, daemon, cfg)
+	if err != nil {
+		t.Fatalf("restart %s: %v: %s", cfg.Dir, err, out)
+	}
+	return out
+}
+
+// restartDaemonErr is restartDaemon for a restart that may fail: it returns
+// what the restart printed and its error.
+func restartDaemonErr(t *testing.T, daemon string, cfg Config) (string, error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	out, err := restartCommand(ctx, t, daemon, cfg, "--kill").CombinedOutput()
+	return string(out), err
+}
+
+// restartCommand returns the command `hostrunner restart --dir <dir>
+// <answer>` of the hostrunner executable daemon for the daemon of cfg,
+// where answer is --kill or --wait, with the flags and variables that give
+// the new daemon the settings of cfg (see restartDaemon). It ends with ctx.
+func restartCommand(ctx context.Context, t *testing.T, daemon string, cfg Config, answer string) *exec.Cmd {
+	t.Helper()
+	copyExecutable(t, mustStatic(t), filepath.Join(filepath.Dir(daemon), ClientName))
+	s := cfg.Settings
+	return hostCommand(ctx, t, daemon, []string{
+		"HOSTRUNNER_STARTUP_TIMEOUT=" + s.StartupTimeout.String(),
+		"HOSTRUNNER_GRACE=" + s.Grace.String(),
+		"HOSTRUNNER_POLL_INTERVAL=" + s.PollInterval.String(),
+		"HOSTRUNNER_ASK_TIMEOUT=" + s.AskTimeout.String(),
+		"HOSTRUNNER_REQUEST_TIMEOUT=" + s.RequestTimeout.String(),
+		"HOSTRUNNER_REREAD=" + strconv.FormatBool(s.Reread),
+	}, "restart", "--dir", cfg.Dir, answer,
+		"--rules-file", s.RulesFile, "--process", string(s.Process), boolFlag("mount-check", s.MountCheck))
+}
+
+// hostCommand returns the command `daemon <args>` of a real hostrunner
+// executable as a human runs it on the host: it ends with ctx, and runs with
+// the environment of the test plus env, and with an empty settings directory,
+// so that the host's settings files stay out of it.
+func hostCommand(ctx context.Context, t *testing.T, daemon string, env []string, args ...string) *exec.Cmd {
+	t.Helper()
+	cmd := exec.CommandContext(ctx, daemon, args...)
+	cmd.Env = append(append(os.Environ(), "XDG_CONFIG_HOME="+t.TempDir()), env...)
+	return cmd
+}
+
 // sharedPids returns the pids of the running `hostrunner shared` processes
 // whose control socket is in the runtime root root, as /proc shows them. A
 // process whose parent is itself one of them is left out: a shared process
@@ -2434,6 +2493,31 @@ func copyExecutable(t *testing.T, src, dst string) string {
 	return dst
 }
 
+// anotherBuild returns the path of a copy of the hostrunner executable src,
+// in a directory of its own, whose content differs from src's by a few
+// bytes at its end, so that it is another build of hostrunner, and that
+// runs as src does.
+func anotherBuild(t *testing.T, src string) string {
+	t.Helper()
+	build := copyExecutable(t, src, filepath.Join(t.TempDir(), "hostrunner"))
+	f, err := os.OpenFile(build, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("another build"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if out, err := exec.CommandContext(ctx, build, "version").CombinedOutput(); err != nil {
+		t.Fatalf("the changed copy does not run: %v: %s", err, out)
+	}
+	return build
+}
+
 // The control socket of the shared process takes no add from another
 // user, even one the file system lets connect: the process answers it
 // with a refusal that is not ErrEnding, so that the other user's up does
@@ -2538,6 +2622,260 @@ func TestUpWithProcessSharedListsTheDaemonsAndNotTheControlSocket(t *testing.T) 
 	}
 }
 
+// lockedBuffer is a buffer that a command's output is copied into while a
+// test reads it.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+// Write appends p to the buffer.
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+// String returns what was written so far.
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// hostSession is a subcommand of the hostrunner executable run as a human
+// runs it on the host, without a terminal: the test types its lines and
+// reads what it prints.
+type hostSession struct {
+	out  *lockedBuffer
+	in   io.WriteCloser
+	done chan struct{} // closed once the command ended and err is set
+	err  error         // what Wait returned, read only after done is closed
+	seen int           // how much of out the test has read
+}
+
+// startHostSession runs `daemon <args>` as hostCommand builds it, so that
+// the host's settings files stay out of it. It ends when the test does.
+func startHostSession(t *testing.T, daemon string, args ...string) *hostSession {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	return runHostSession(t, hostCommand(ctx, t, daemon, nil, args...), cancel)
+}
+
+// runHostSession starts cmd, which ends when its context is canceled by
+// cancel, as a host session that ends when the test does.
+func runHostSession(t *testing.T, cmd *exec.Cmd, cancel context.CancelFunc) *hostSession {
+	t.Helper()
+	cmd.WaitDelay = 5 * time.Second
+	s := &hostSession{out: &lockedBuffer{}, done: make(chan struct{})}
+	cmd.Stdout, cmd.Stderr = s.out, s.out
+	in, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.in = in
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		s.err = cmd.Wait()
+		close(s.done)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		in.Close()
+		select {
+		case <-s.done:
+		case <-time.After(10 * time.Second):
+			t.Error("the host session did not end")
+		}
+	})
+	return s
+}
+
+// waitFor waits until the session prints text after what the test has
+// read, and returns what it printed up to the end of text.
+func (s *hostSession) waitFor(t *testing.T, text string) string {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		out := s.out.String()
+		if i := strings.Index(out[s.seen:], text); i >= 0 {
+			got := out[s.seen : s.seen+i+len(text)]
+			s.seen += i + len(text)
+			return got
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the session did not print %q; it printed %q", text, out[s.seen:])
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// answer types line and Enter.
+func (s *hostSession) answer(t *testing.T, line string) {
+	t.Helper()
+	if _, err := io.WriteString(s.in, line+"\n"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// wait waits for the command to end and returns its error, the same one
+// however often it is called.
+func (s *hostSession) wait(t *testing.T) error {
+	t.Helper()
+	select {
+	case <-s.done:
+		return s.err
+	case <-time.After(10 * time.Second):
+		t.Fatalf("the host session did not end; it printed %q", s.out.String())
+		return nil
+	}
+}
+
+// listLinePrefix matches what a line of a daemon list starts with, its
+// number and its mark (see hostterm.List.Print); listFieldSep matches the
+// three or more spaces that part its fields.
+var (
+	listLinePrefix = regexp.MustCompile(`^\s*\d+ [* ] `)
+	listFieldSep   = regexp.MustCompile(`\s{3,}`)
+)
+
+// listsAs reports whether the daemon list in out has a line for the daemon
+// of the host workspace workspace, as a whole field and not as the start of
+// a longer one, that shows it in a process of the kind process. A line is
+// `<n> <mark> <workspace>   <version>   <process>   <note>`, whatever the
+// note: the one of a daemon of another version is not that of the others.
+func listsAs(out, workspace, process string) bool {
+	for _, line := range strings.Split(out, "\n") {
+		prefix := listLinePrefix.FindString(line)
+		if prefix == "" {
+			continue
+		}
+		fields := listFieldSep.Split(strings.TrimRight(line[len(prefix):], " "), -1)
+		if len(fields) >= 3 && fields[0] == workspace && fields[2] == process {
+			return true
+		}
+	}
+	return false
+}
+
+// `hostrunner stop --choose` lists the daemons of the runtime root with the
+// kind of process each runs in: shared for the two daemons of one shared
+// process, own for a third in a process of its own; quitting the list
+// stops none of them.
+func TestStopChooseListsTheProcessKindOfEachDaemon(t *testing.T) {
+	ctx := context.Background()
+	daemon := mustHostrunner(t)
+	cfgs := sharedConfigs(t, daemon, sharedRules, sharedRules, sharedRules)
+	a, b, c := cfgs[0], cfgs[1], cfgs[2]
+	c.Settings.Process = settings.ProcessOwn
+	for _, cfg := range []Config{a, b, c} {
+		if err := Up(ctx, cfg); err != nil {
+			t.Fatalf("Up of %s: %v", cfg.Dir, err)
+		}
+	}
+
+	s := startHostSession(t, daemon, "stop", "--choose", "--runtime-root", filepath.Dir(a.Dir))
+	list := s.waitFor(t, "choose [")
+	s.answer(t, "q")
+	if err := s.wait(t); err == nil {
+		t.Errorf("stop --choose quit without a choice succeeded, want it to report that nothing was stopped")
+	}
+
+	for _, w := range []struct {
+		cfg     Config
+		process string
+	}{{a, "shared"}, {b, "shared"}, {c, "own"}} {
+		if !listsAs(list, w.cfg.Workspace, w.process) {
+			t.Errorf("the list has no line of %s showing process %s: %q", w.cfg.Workspace, w.process, list)
+		}
+	}
+	for _, cfg := range []Config{a, b, c} {
+		if got, code := runIn(t, cfg, "pwd"); got != cfg.Workspace+"\n" || code != 0 {
+			t.Errorf("pwd in %s after quitting the list: got %q, exit %d; want %q, exit 0", cfg.Dir, got, code, cfg.Workspace+"\n")
+		}
+	}
+}
+
+// `hostrunner approve` serves the daemons of a shared process one by one,
+// as those of their own: the list shows both as shared, the human picks A
+// by its number, and the session shows and answers the requests of A only;
+// a request of B, which no session serves, is refused at once.
+func TestApproveServesOneDaemonOfASharedProcessAtATime(t *testing.T) {
+	ctx := context.Background()
+	daemon := mustHostrunner(t)
+	a, b := sharedPair(t, daemon)
+	for _, cfg := range []Config{a, b} {
+		if err := Up(ctx, cfg); err != nil {
+			t.Fatalf("Up of %s: %v", cfg.Dir, err)
+		}
+	}
+
+	s := startHostSession(t, daemon, "approve", "--runtime-root", filepath.Dir(a.Dir))
+	list := s.waitFor(t, "choose [")
+	for _, cfg := range []Config{a, b} {
+		if !listsAs(list, cfg.Workspace, "shared") {
+			t.Errorf("the list has no line of %s showing process shared: %q", cfg.Workspace, list)
+		}
+	}
+	number := regexp.MustCompile(`(?m)^\s+(\d+)\s.*` + regexp.QuoteMeta(a.Workspace)).FindStringSubmatch(list)
+	if number == nil {
+		t.Fatalf("the list has no numbered line of %s: %q", a.Workspace, list)
+	}
+	s.answer(t, number[1])
+	s.waitFor(t, "serving "+a.Workspace)
+	s.waitFor(t, "waiting for requests")
+
+	// A request of A is shown, and runs once approved.
+	type result struct {
+		stdout, stderr string
+		code           int
+	}
+	ask := func(cfg Config, word string) <-chan result {
+		ch := make(chan result, 1)
+		go func() {
+			ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+			defer cancel()
+			var stdout, stderr bytes.Buffer
+			code := client.Run(ctx, transport.Unix{Path: Socket(cfg.Dir)}, []string{"--ask", "echo", word}, cfg.ContainerWorkspace, strings.NewReader(""), &stdout, &stderr)
+			ch <- result{stdout.String(), stderr.String(), code}
+		}()
+		return ch
+	}
+	fromA := ask(a, "from-a")
+	if block := s.waitFor(t, "[o]nce"); !strings.Contains(block, "cmd   echo from-a") {
+		t.Errorf("the request shown %q lacks the command of A", block)
+	}
+	s.answer(t, "o")
+	select {
+	case got := <-fromA:
+		if got.code != 0 || got.stdout != "from-a\n" {
+			t.Errorf("the approved echo in A: exit %d, stdout %q, stderr %q; want exit 0, stdout %q", got.code, got.stdout, got.stderr, "from-a\n")
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("the echo in A did not finish once approved")
+	}
+
+	// B is not served by the session: its request is refused, not shown.
+	select {
+	case got := <-ask(b, "from-b"):
+		if want := "no approval session serves this devcontainer"; got.code != protocol.ExitRejected || !strings.Contains(got.stderr, want) {
+			t.Errorf("the echo in B: exit %d, stderr %q; want exit %d and %q", got.code, got.stderr, protocol.ExitRejected, want)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("the echo in B did not finish")
+	}
+	if out := s.out.String(); strings.Contains(out, "from-b") {
+		t.Errorf("the session of A shows the request of B: %q", out)
+	}
+
+	s.answer(t, "quit")
+	if err := s.wait(t); err != nil {
+		t.Errorf("approve after quit: %v: %s", err, s.out.String())
+	}
+}
+
 // Each build of hostrunner has its shared process: the ups of two runtime
 // directories whose daemon executables differ in content add their
 // daemons to two processes, each on its control socket in the root.
@@ -2545,20 +2883,7 @@ func TestUpWithProcessSharedOfAnotherExecutableStartsAnotherProcess(t *testing.T
 	ctx := context.Background()
 	daemon := mustHostrunner(t)
 	a, b := sharedPair(t, daemon)
-	b.Daemon = copyExecutable(t, daemon, filepath.Join(t.TempDir(), "hostrunner"))
-	f, err := os.OpenFile(b.Daemon, os.O_WRONLY|os.O_APPEND, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.WriteString("another build"); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if out, err := exec.CommandContext(ctx, b.Daemon, "version").CombinedOutput(); err != nil {
-		t.Fatalf("the changed copy does not run: %v: %s", err, out)
-	}
+	b.Daemon = anotherBuild(t, daemon)
 	for _, cfg := range []Config{a, b} {
 		if err := Up(ctx, cfg); err != nil {
 			t.Fatalf("Up of %s: %v", cfg.Dir, err)
@@ -2606,6 +2931,311 @@ func TestUpWithProcessSharedExitsAfterTheLastDaemonEnds(t *testing.T) {
 	if _, err := os.Lstat(control); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("the control socket %s after the process exited: %v, want it removed", control, err)
 	}
+}
+
+// A restart of one daemon of a shared process replaces that daemon alone:
+// the process, of the same build, serves the new daemon and keeps serving
+// the other.
+func TestUpWithProcessSharedRestartsOneDaemonAndLeavesTheOtherAndTheProcess(t *testing.T) {
+	ctx := context.Background()
+	daemon := mustHostrunner(t)
+	a, b := sharedPair(t, daemon)
+	for _, cfg := range []Config{a, b} {
+		if err := Up(ctx, cfg); err != nil {
+			t.Fatalf("Up of %s: %v", cfg.Dir, err)
+		}
+	}
+	pid := servingPid(t, a)
+	if got := servingPid(t, b); got != pid {
+		t.Fatalf("A is served by process %d, B by %d; want one process", pid, got)
+	}
+
+	out := restartDaemon(t, daemon, a)
+
+	if want := "hostrunner: restarted " + a.Dir; !strings.Contains(out, want) {
+		t.Errorf("restart of A printed %q, want it to say %q", out, want)
+	}
+	if strings.Contains(out, b.Dir) {
+		t.Errorf("restart of A printed %q, want no mention of B (%s)", out, b.Dir)
+	}
+	if !alivePid(pid) {
+		t.Fatalf("the shared process %d exited with the restart of A", pid)
+	}
+	for _, cfg := range []Config{a, b} {
+		if got := servingPid(t, cfg); got != pid {
+			t.Errorf("%s is served by process %d after the restart, want the shared process %d", cfg.Dir, got, pid)
+		}
+		if got, code := runIn(t, cfg, "pwd"); got != cfg.Workspace+"\n" || code != 0 {
+			t.Errorf("pwd in %s after the restart of A: got %q, exit %d; want %q, exit 0", cfg.Dir, got, code, cfg.Workspace+"\n")
+		}
+	}
+}
+
+// waitForCommand waits until a process runs the command argv, as /proc
+// shows it, and fails the test when none does within 10 seconds.
+func waitForCommand(t *testing.T, argv ...string) {
+	t.Helper()
+	want := strings.Join(argv, "\x00") + "\x00"
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		entries, err := os.ReadDir("/proc")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range entries {
+			if cmdline, err := os.ReadFile("/proc/" + e.Name() + "/cmdline"); err == nil && string(cmdline) == want {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no process runs %q", argv)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// A restart of one daemon of a shared process with --wait drains it: the
+// command that runs in that daemon finishes normally before it is replaced,
+// the other daemon answers meanwhile and afterwards, and the new daemon is
+// served by the same process.
+func TestUpWithProcessSharedRestartWithWaitLetsTheCommandOfTheDaemonFinish(t *testing.T) {
+	ctx := context.Background()
+	daemon := mustHostrunner(t)
+	cfgs := sharedConfigs(t, daemon, sharedRules+"  - command: sleep\n    args: any\n", sharedRules)
+	a, b := cfgs[0], cfgs[1]
+	for _, cfg := range []Config{a, b} {
+		if err := Up(ctx, cfg); err != nil {
+			t.Fatalf("Up of %s: %v", cfg.Dir, err)
+		}
+	}
+	pid := servingPid(t, a)
+	if got := servingPid(t, b); got != pid {
+		t.Fatalf("A is served by process %d, B by %d; want one process", pid, got)
+	}
+
+	// The restart starts once the command runs, so that it finds it running.
+	// The duration is no other process's.
+	const duration = "1.7"
+	type result struct {
+		stderr string
+		code   int
+	}
+	finished := make(chan result, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		defer cancel()
+		var stderr bytes.Buffer
+		code := client.Run(ctx, transport.Unix{Path: Socket(a.Dir)}, []string{"sleep", duration}, a.ContainerWorkspace, strings.NewReader(""), io.Discard, &stderr)
+		finished <- result{stderr.String(), code}
+	}()
+	waitForCommand(t, "sleep", duration)
+	restartCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	s := runHostSession(t, restartCommand(restartCtx, t, daemon, a, "--wait"), cancel)
+	s.waitFor(t, a.Dir+" runs:")
+
+	select {
+	case got := <-finished:
+		t.Fatalf("the command in A ended (exit %d, stderr %q) as the restart began, want it to run on until it finishes", got.code, got.stderr)
+	default:
+	}
+	if got, code := runIn(t, b, "pwd"); got != b.Workspace+"\n" || code != 0 {
+		t.Errorf("pwd in %s during the restart of A: got %q, exit %d; want %q, exit 0", b.Dir, got, code, b.Workspace+"\n")
+	}
+	if err := s.wait(t); err != nil {
+		t.Fatalf("restart of A: %v: %s", err, s.out.String())
+	}
+
+	select {
+	case got := <-finished:
+		if got.code != 0 {
+			t.Errorf("the command in A ended with exit %d (stderr %q), want it to finish normally", got.code, got.stderr)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the command in A did not end")
+	}
+	if want := "hostrunner: restarted " + a.Dir; !strings.Contains(s.out.String(), want) {
+		t.Errorf("restart of A printed %q, want it to say %q", s.out.String(), want)
+	}
+	for _, cfg := range []Config{a, b} {
+		if got := servingPid(t, cfg); got != pid {
+			t.Errorf("%s is served by process %d after the restart, want the shared process %d", cfg.Dir, got, pid)
+		}
+		if got, code := runIn(t, cfg, "pwd"); got != cfg.Workspace+"\n" || code != 0 {
+			t.Errorf("pwd in %s after the restart of A: got %q, exit %d; want %q, exit 0", cfg.Dir, got, code, cfg.Workspace+"\n")
+		}
+	}
+}
+
+// `stop --all` ends every daemon of a shared process, and the process exits
+// with the last of them, removing its control socket.
+func TestUpWithProcessSharedEndsWithStopAll(t *testing.T) {
+	ctx := context.Background()
+	daemon := mustHostrunner(t)
+	a, b := sharedPair(t, daemon)
+	for _, cfg := range []Config{a, b} {
+		if err := Up(ctx, cfg); err != nil {
+			t.Fatalf("Up of %s: %v", cfg.Dir, err)
+		}
+	}
+	pid := servingPid(t, a)
+	control, _, err := shared.Files(filepath.Dir(a.Dir), daemon)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stopCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	out, err := hostCommand(stopCtx, t, daemon, nil, "stop", "--all", "--kill", "--runtime-root", filepath.Dir(a.Dir)).CombinedOutput()
+	if err != nil {
+		t.Fatalf("stop --all: %v: %s", err, out)
+	}
+
+	for _, cfg := range []Config{a, b} {
+		if want := "hostrunner: stopped " + cfg.Dir; !strings.Contains(string(out), want) {
+			t.Errorf("stop --all printed %q, want it to say %q", out, want)
+		}
+		for _, socket := range []string{Socket(cfg.Dir), ApprovalSocket(cfg.Dir)} {
+			if err := WaitStopped(ctx, socket, 5*time.Second); err != nil {
+				t.Errorf("%s after stop --all: %v", socket, err)
+			}
+		}
+	}
+	waitGone(t, pid)
+	if _, err := os.Lstat(control); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the control socket %s after the process exited: %v, want it removed", control, err)
+	}
+}
+
+// After an update replaced the build and removed the directory of the old
+// one, the restart of a daemon with the new build puts it into the shared
+// process of the new build, and the process of the old build keeps serving
+// its other daemon until that one ends, then exits.
+func TestUpWithProcessSharedRestartWithANewBuildLeavesTheOldProcessItsOtherDaemon(t *testing.T) {
+	ctx := context.Background()
+	oldDir := t.TempDir()
+	oldBuild := copyExecutable(t, mustHostrunner(t), filepath.Join(oldDir, "hostrunner"))
+	a, b := sharedPair(t, oldBuild)
+	for _, cfg := range []Config{a, b} {
+		if err := Up(ctx, cfg); err != nil {
+			t.Fatalf("Up of %s: %v", cfg.Dir, err)
+		}
+	}
+	oldPid := servingPid(t, a)
+	if got := servingPid(t, b); got != oldPid {
+		t.Fatalf("A is served by process %d, B by %d; want one process", oldPid, got)
+	}
+
+	newBuild := anotherBuild(t, mustHostrunner(t))
+	// The cleanup of sharedPair stops the daemons with the old build, which is
+	// removed below; this one, which runs before it, stops them with the new.
+	t.Cleanup(func() {
+		for _, cfg := range []Config{a, b} {
+			stopDaemon(t, newBuild, cfg)
+		}
+	})
+	if err := os.RemoveAll(oldDir); err != nil {
+		t.Fatal(err)
+	}
+
+	out := restartDaemon(t, newBuild, a)
+
+	if want := "hostrunner: restarted " + a.Dir; !strings.Contains(out, want) {
+		t.Errorf("restart of A printed %q, want it to say %q", out, want)
+	}
+	newPid := servingPid(t, a)
+	if newPid == oldPid {
+		t.Errorf("A is served by process %d after the restart, want the process of the new build", newPid)
+	}
+	cmdline, err := os.ReadFile("/proc/" + strconv.Itoa(newPid) + "/cmdline")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if args := strings.Split(string(cmdline), "\x00"); len(args) < 2 || args[1] != "shared" {
+		t.Errorf("the process serving A runs %q, want hostrunner shared", args)
+	}
+	if got, code := runIn(t, a, "pwd"); got != a.Workspace+"\n" || code != 0 {
+		t.Errorf("pwd in %s after the restart: got %q, exit %d; want %q, exit 0", a.Dir, got, code, a.Workspace+"\n")
+	}
+	if !alivePid(oldPid) {
+		t.Fatalf("the shared process %d of the old build exited with the restart of A", oldPid)
+	}
+	if got := servingPid(t, b); got != oldPid {
+		t.Errorf("B is served by process %d after the restart of A, want the old process %d", got, oldPid)
+	}
+	if got, code := runIn(t, b, "pwd"); got != b.Workspace+"\n" || code != 0 {
+		t.Errorf("pwd in %s after the restart of A: got %q, exit %d; want %q, exit 0", b.Dir, got, code, b.Workspace+"\n")
+	}
+	control, _, err := shared.Files(filepath.Dir(a.Dir), newBuild)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(control); err != nil {
+		t.Errorf("the control socket %s of the new build: %v, want it present", control, err)
+	}
+
+	stopDaemon(t, newBuild, b)
+	waitGone(t, oldPid)
+}
+
+// No stop or restart signals a shared process: when the approval socket of
+// one of its daemons is gone, so that the stop takes the daemon for one from
+// before approvals and reaches the process on its socket, it refuses by
+// name, and the process keeps serving its daemons.
+func TestStopAndRestartOfADaemonOfASharedProcessWithoutItsApprovalSocketSignalNothing(t *testing.T) {
+	ctx := context.Background()
+	daemon := mustHostrunner(t)
+	a, b := sharedPair(t, daemon)
+	for _, cfg := range []Config{a, b} {
+		if err := Up(ctx, cfg); err != nil {
+			t.Fatalf("Up of %s: %v", cfg.Dir, err)
+		}
+	}
+	pid := servingPid(t, a)
+	if got := servingPid(t, b); got != pid {
+		t.Fatalf("A is served by process %d, B by %d; want one process", pid, got)
+	}
+	// B is stopped by the cleanup of sharedConfigs, which cannot reach A any
+	// more: SIGTERM to the shared process ends A's daemon with the rest.
+	t.Cleanup(func() {
+		if alivePid(pid) {
+			syscall.Kill(pid, syscall.SIGTERM)
+		}
+	})
+	if err := os.Remove(ApprovalSocket(a.Dir)); err != nil {
+		t.Fatal(err)
+	}
+	// stillServing checks that the process lives and both daemons answer.
+	stillServing := func(after string) {
+		t.Helper()
+		if !alivePid(pid) {
+			t.Fatalf("the shared process %d was signalled by %s", pid, after)
+		}
+		for _, cfg := range []Config{a, b} {
+			if got, code := runIn(t, cfg, "pwd"); got != cfg.Workspace+"\n" || code != 0 {
+				t.Errorf("pwd in %s after %s: got %q, exit %d; want %q, exit 0", cfg.Dir, after, got, code, cfg.Workspace+"\n")
+			}
+		}
+	}
+
+	stopCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(stopCtx, daemon, "stop", "--dir", a.Dir, "--kill").CombinedOutput()
+	if err == nil {
+		t.Errorf("stop of A succeeded: %s", out)
+	}
+	if want := a.Dir + ": process " + strconv.Itoa(pid) + " on its socket is a shared process, which is never signalled: no signal sent"; !strings.Contains(string(out), want) {
+		t.Errorf("stop of A printed %q, want it to say %q", out, want)
+	}
+	stillServing("stop")
+
+	restartOut, err := restartDaemonErr(t, daemon, a)
+	if err == nil {
+		t.Errorf("restart of A succeeded: %s", restartOut)
+	}
+	if want := "a daemon from before approvals cannot be restarted"; !strings.Contains(restartOut, want) {
+		t.Errorf("restart of A printed %q, want it to say %q", restartOut, want)
+	}
+	stillServing("restart")
 }
 
 // SIGTERM or SIGINT to the shared process ends every daemon it runs, then

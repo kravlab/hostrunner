@@ -1330,7 +1330,7 @@ func TestServeListensOnTheApprovalSocket(t *testing.T) {
 	if err != nil || f.Type != protocol.FrameDaemonInfo || protocol.DecodeJSON(f, &got) != nil {
 		t.Fatalf("hello: frame %v, err %v", f.Type, err)
 	}
-	want := protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: cfg.workspace, ContainerWorkspace: cfg.containerWorkspace, RulesFile: cfg.RulesFile, RulesDigest: "missing", Stops: true, Rereads: true, BuildVersion: "v1.2.0", Runs: true, Settings: cfg.Settings.AllowedSettings(), Process: "shared"}
+	want := protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: cfg.workspace, ContainerWorkspace: cfg.containerWorkspace, RulesFile: cfg.RulesFile, RulesDigest: "missing", Stops: true, Rereads: true, BuildVersion: "v1.2.0", Runs: true, Settings: cfg.Settings.AllowedSettings(), Process: "own"}
 	if real, err := filepath.EvalSymlinks(cfg.workspace); err == nil {
 		want.Workspace = real
 	}

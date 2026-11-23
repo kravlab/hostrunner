@@ -505,9 +505,10 @@ type Hello struct {
 // (settings.Settings.AllowedSettings: ArmSettings without the process), so
 // that `hostrunner up` can tell whether what it serves is allowed; a daemon
 // older than the field reports none, and an older session ignores it.
-// Process is the kind of process the daemon runs in, "own" or "shared"
-// (settings.Process); a daemon older than the field reports none, and an
-// older session ignores it.
+// Process is the kind of process the daemon actually runs in, "own" or
+// "shared" (the values of settings.Process; not the process setting,
+// which may name another); a daemon older than the field reports none,
+// and an older session ignores it.
 type DaemonInfo struct {
 	Version            int               `json:"version"`
 	Workspace          string            `json:"workspace"`

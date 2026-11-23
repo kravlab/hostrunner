@@ -13,6 +13,7 @@ import (
 	"github.com/kravlab/hostrunner/internal/daemonlist"
 	"github.com/kravlab/hostrunner/internal/hostterm"
 	"github.com/kravlab/hostrunner/internal/protocol"
+	"github.com/kravlab/hostrunner/internal/settings"
 )
 
 func TestDisplay(t *testing.T) {
@@ -161,9 +162,9 @@ func TestDiscardTypedAheadLeavesAPipeAlone(t *testing.T) {
 
 func daemons() []daemonlist.Daemon {
 	return []daemonlist.Daemon{
-		{Socket: "/run/u/hostrunner/a.approval.sock", Info: protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: "/home/u/a", ContainerWorkspace: "/workspaces/a", Served: true, BuildVersion: "v1.2.0"}},
+		{Socket: "/run/u/hostrunner/a.approval.sock", Info: protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: "/home/u/a", ContainerWorkspace: "/workspaces/a", Served: true, BuildVersion: "v1.2.0", Process: string(settings.ProcessShared)}},
 		{Socket: "/run/u/hostrunner/old.approval.sock", Info: protocol.DaemonInfo{Version: protocol.ApprovalVersion - 1, Workspace: "/home/u/old", ContainerWorkspace: "/workspaces/old"}},
-		{Socket: "/run/u/hostrunner/b.approval.sock", Info: protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: "/home/u/b", ContainerWorkspace: "/w/b", BuildVersion: "v1.1.0"}},
+		{Socket: "/run/u/hostrunner/b.approval.sock", Info: protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: "/home/u/b", ContainerWorkspace: "/w/b", BuildVersion: "v1.1.0", Process: string(settings.ProcessOwn)}},
 	}
 }
 
@@ -171,9 +172,9 @@ func TestListPrintsTheDaemonsNumbered(t *testing.T) {
 	var out bytes.Buffer
 	prompt := hostterm.List{Daemons: daemons(), Cwd: "/home/u/b/src", BuildVersion: "v1.2.0"}.Print(&out)
 	want := "daemons:\n" +
-		"  1   /home/u/a     v1.2.0      (container /workspaces/a)     served by another session\n" +
-		"  2   /home/u/old   unknown ⚠   another version: restart its container\n" +
-		"  3 * /home/u/b     v1.1.0 ⚠    (container /w/b)              ← current directory\n"
+		"  1   /home/u/a     v1.2.0      shared    (container /workspaces/a)     served by another session\n" +
+		"  2   /home/u/old   unknown ⚠   unknown   another version: restart its container\n" +
+		"  3 * /home/u/b     v1.1.0 ⚠    own       (container /w/b)              ← current directory\n"
 	if out.String() != want {
 		t.Errorf("list:\n%s\nwant:\n%s", out.String(), want)
 	}
@@ -189,7 +190,7 @@ func TestListOfAnyVersionLetsAnOlderDaemonBeTheDefault(t *testing.T) {
 	}
 	var out bytes.Buffer
 	l.Print(&out)
-	if !strings.Contains(out.String(), "  2 * /home/u/old   unknown ⚠   (container /workspaces/old)   ← current directory\n") {
+	if !strings.Contains(out.String(), "  2 * /home/u/old   unknown ⚠   unknown   (container /workspaces/old)   ← current directory\n") {
 		t.Errorf("list:\n%s", out.String())
 	}
 	if (hostterm.List{Daemons: daemons(), Cwd: "/home/u/old"}).Default() != -1 {
