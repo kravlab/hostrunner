@@ -166,9 +166,13 @@ func (p *process) handle(ctx context.Context, c net.Conn) {
 	_ = c.SetDeadline(time.Now().Add(requestTimeout))
 	f, err := protocol.ReadFrame(c)
 	if err != nil {
-		// No request, as from up's check that the socket listens: no
-		// add was refused, so the process goes on.
-		p.refuse(c, pid, fmt.Errorf("read the request: %w", err))
+		// A connection closed before any byte of a request, as from up's
+		// check that the socket listens, is a probe: no add was refused,
+		// so nothing is logged or answered and the process goes on. A
+		// partial or malformed request is refused.
+		if !errors.Is(err, io.EOF) {
+			p.refuse(c, pid, fmt.Errorf("read the request: %w", err))
+		}
 		return
 	}
 	req, err := decodeAdd(f)

@@ -1769,6 +1769,36 @@ func TestUpWithProcessSharedRefusesAnAddFromAnotherUser(t *testing.T) {
 	}
 }
 
+// The check of up that the control socket of a new shared process listens
+// connects and closes without a request: the process takes it for a probe,
+// not a refused add, and logs no refusal.
+func TestUpWithProcessSharedLogsNoRefusedAddForItsOwnProbe(t *testing.T) {
+	ctx := context.Background()
+	daemon := mustHostrunner(t)
+	a, _ := sharedPair(t, daemon)
+	if err := Up(ctx, a); err != nil {
+		t.Fatalf("Up of A: %v", err)
+	}
+	root := filepath.Dir(a.Dir)
+	pids := sharedPids(t, root)
+	if len(pids) != 1 {
+		t.Fatalf("shared processes %v, want one", pids)
+	}
+	stopDaemon(t, daemon, a)
+	waitGone(t, pids[0])
+	_, processLog, err := shared.Files(root, daemon)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(processLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if log := string(data); hasLine(log, `msg="add refused"`) {
+		t.Errorf("the process log has a refused add for the probe of up:\n%s", log)
+	}
+}
+
 // The daemons of a shared process are listed under the runtime root, as
 // approve, stop and restart list them, on their approval sockets; its
 // control socket, in the same root, is not taken for a daemon's.
