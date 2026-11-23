@@ -1546,10 +1546,24 @@ func TestUpOfTwoRuntimeDirsStartsTheRealDaemonOfEachOnceAllowed(t *testing.T) {
 // sharedPair returns the allowed Configs of two runtime directories, A and
 // B, under one runtime root, each of its own workspace, whose ups add
 // their daemons to the shared process of the real hostrunner daemon, with
-// a fake container runtime. Both rules allow printenv and pwd; those of B
-// also allow true. When the test ends it stops both daemons and fails if
-// a shared process in the root outlives them, killing it.
+// a fake container runtime (see sharedConfigs). Both rules allow printenv
+// and pwd; those of B also allow true.
 func sharedPair(t *testing.T, daemon string) (a, b Config) {
+	t.Helper()
+	cfgs := sharedConfigs(t, daemon, sharedRules, sharedRules+"  - command: true\n    args: none\n")
+	return cfgs[0], cfgs[1]
+}
+
+// sharedRules are rules that allow printenv and pwd.
+const sharedRules = "rules:\n  - command: printenv\n    args: any\n  - command: pwd\n    args: none\n"
+
+// sharedConfigs returns the allowed Configs of one runtime directory per
+// rules text in rulesTexts, named a, b, c and on, under one runtime root,
+// each of its own workspace whose rules file holds that text, whose ups add
+// their daemons to the shared process of the real hostrunner daemon, with
+// a fake container runtime. When the test ends it stops every daemon and
+// fails if a shared process in the root outlives them, killing it.
+func sharedConfigs(t *testing.T, daemon string, rulesTexts ...string) []Config {
 	t.Helper()
 	fakeContainerRuntime(t)
 	t.Setenv("XDG_DATA_HOME", t.TempDir()) // the store the daemons open too
@@ -1577,12 +1591,13 @@ func sharedPair(t *testing.T, daemon string) (a, b Config) {
 			},
 		}
 	}
-	common := "rules:\n  - command: printenv\n    args: any\n  - command: pwd\n    args: none\n"
-	a = config("a", common)
-	b = config("b", common+"  - command: true\n    args: none\n")
+	cfgs := make([]Config, len(rulesTexts))
+	for i, rulesText := range rulesTexts {
+		cfgs[i] = config(string(rune('a'+i)), rulesText)
+	}
 	t.Cleanup(func() {
-		pids := sharedPids(t, filepath.Dir(a.Dir))
-		for _, cfg := range []Config{a, b} {
+		pids := sharedPids(t, filepath.Join(base, "rt"))
+		for _, cfg := range cfgs {
 			stopDaemon(t, daemon, cfg)
 		}
 		for _, pid := range pids {
@@ -1596,10 +1611,10 @@ func sharedPair(t *testing.T, daemon string) (a, b Config) {
 			}
 		}
 	})
-	for _, cfg := range []Config{a, b} {
+	for _, cfg := range cfgs {
 		allowCurrent(t, cfg)
 	}
-	return a, b
+	return cfgs
 }
 
 // stopDaemon stops the daemon of cfg as `hostrunner stop --dir <dir>
@@ -1741,6 +1756,364 @@ func TestUpOfTwoRuntimeDirsWithProcessSharedServesBothInOneProcess(t *testing.T)
 	}
 	if _, code := runIn(t, a, "true"); code != protocol.ExitRejected {
 		t.Errorf("true, not in the rules of A, exits %d there, want %d", code, protocol.ExitRejected)
+	}
+}
+
+// Concurrent ups of one build, for runtime directories of one runtime
+// root, all succeed and end up in one shared process holding every daemon.
+func TestConcurrentUpsWithProcessSharedEndUpInOneSharedProcess(t *testing.T) {
+	cfgs := sharedConfigs(t, mustHostrunner(t), slices.Repeat([]string{sharedRules}, 5)...)
+	start := make(chan struct{})
+	errs := make([]error, len(cfgs))
+	var wg sync.WaitGroup
+	for i, cfg := range cfgs {
+		wg.Go(func() {
+			<-start
+			errs[i] = Up(context.Background(), cfg)
+		})
+	}
+	close(start)
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("Up of %s: %v", cfgs[i].Dir, err)
+		}
+	}
+	pid := servingPid(t, cfgs[0])
+	for _, cfg := range cfgs[1:] {
+		if got := servingPid(t, cfg); got != pid {
+			t.Errorf("%s is served by process %d, %s by %d; want one process", cfgs[0].Dir, pid, cfg.Dir, got)
+		}
+	}
+	if kind := processKind(t, pid); kind != "shared" {
+		t.Errorf("the process serving every daemon runs %s, want shared", kind)
+	}
+}
+
+// fakeEndingProcess listens on the control socket of the shared process
+// of cfg in its runtime root, as an ending shared process would, and hands
+// each of the first n connections to answer, closing it after; then it
+// closes the listener, which removes the socket. It returns a channel
+// closed once it did, and closes the listener when the test ends at the
+// latest.
+func fakeEndingProcess(t *testing.T, cfg Config, n int, answer func(c net.Conn)) <-chan struct{} {
+	t.Helper()
+	control, _, err := shared.Files(filepath.Dir(cfg.Dir), cfg.Daemon)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(control), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	l, err := transport.Unix{Path: control}.Listen()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	closed := make(chan struct{})
+	go func() {
+		defer close(closed)
+		defer l.Close()
+		for range n {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			answer(c)
+			c.Close()
+		}
+	}()
+	return closed
+}
+
+// answerEnding reads the add request on c and answers that the process is
+// ending.
+func answerEnding(c net.Conn) {
+	if _, err := protocol.ReadFrame(c); err == nil {
+		_ = protocol.WriteFrame(c, protocol.Frame{Type: protocol.FrameEnding})
+	}
+}
+
+// An up whose add reaches a shared process that is ending, which refuses
+// the add once or several times or closes the connection unanswered and
+// then stops listening, starts a new shared process and adds the daemon
+// there.
+func TestUpWithProcessSharedThatMeetsAnEndingProcessAddsTheDaemonToANewOne(t *testing.T) {
+	cases := []struct {
+		name   string
+		n      int              // the connections the ending process answers
+		answer func(c net.Conn) // how it answers each
+	}{
+		{"refused once", 1, answerEnding},
+		{"refused three times", 3, answerEnding},
+		{"closed unanswered", 1, func(c net.Conn) { _, _ = protocol.ReadFrame(c) }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, _ := sharedPair(t, mustHostrunner(t))
+			closed := fakeEndingProcess(t, a, tc.n, tc.answer)
+			if err := Up(context.Background(), a); err != nil {
+				t.Fatalf("Up of A: %v", err)
+			}
+			select {
+			case <-closed:
+			default:
+				t.Fatal("Up succeeded before the ending process stopped listening")
+			}
+			pid := servingPid(t, a)
+			if pid == os.Getpid() {
+				t.Fatal("the daemon of A is served by the test process")
+			}
+			if kind := processKind(t, pid); kind != "shared" {
+				t.Errorf("the daemon of A is served by a process that runs %s, want shared", kind)
+			}
+		})
+	}
+}
+
+// timingSlack is how much longer than its ready timeout an up of the
+// shared path may take in the tests that bound it: room for a loaded
+// machine, yet clearly less than the 5 s that one exchange on the control
+// socket or one arm takes at most, which an up whose ready timeout did
+// not bound it would wait for.
+const timingSlack = 2500 * time.Millisecond
+
+// An up whose add reaches a shared process that keeps answering it is
+// ending past the up's ready timeout fails within about that timeout,
+// saying the shared process is ending.
+func TestUpWithProcessSharedFailsWhenTheProcessKeepsEndingPastTheReadyTimeout(t *testing.T) {
+	a, _ := sharedPair(t, mustHostrunner(t))
+	a.ReadyTimeout = 500 * time.Millisecond
+	fakeEndingProcess(t, a, 200, answerEnding) // 10 s of refusals at least
+	start := time.Now()
+	err := Up(context.Background(), a)
+	elapsed := time.Since(start)
+	if err == nil || !strings.Contains(err.Error(), "the shared process is ending") {
+		t.Fatalf("Up of A: %v, want an error saying the shared process is ending", err)
+	}
+	if limit := a.ReadyTimeout + timingSlack; elapsed > limit {
+		t.Errorf("Up of A failed after %v, want within %v", elapsed, limit)
+	}
+}
+
+// answerNever reads the add request on c and never answers it, as a stuck
+// shared process would, until the connection is closed.
+func answerNever(c net.Conn) {
+	_, _ = protocol.ReadFrame(c)
+	_, _ = io.Copy(io.Discard, c)
+}
+
+// An up whose add reaches a shared process that takes the request and
+// never answers fails within about its ready timeout, well before the
+// timeout of one exchange, saying the process did not answer.
+func TestUpWithProcessSharedFailsWithinTheReadyTimeoutWhenTheProcessDoesNotAnswer(t *testing.T) {
+	a, _ := sharedPair(t, mustHostrunner(t))
+	a.ReadyTimeout = 500 * time.Millisecond
+	fakeEndingProcess(t, a, 1, answerNever)
+	start := time.Now()
+	err := Up(context.Background(), a)
+	elapsed := time.Since(start)
+	if err == nil || !strings.Contains(err.Error(), "did not answer the add request") {
+		t.Fatalf("Up of A: %v, want an error saying the shared process did not answer", err)
+	}
+	if limit := a.ReadyTimeout + timingSlack; elapsed > limit {
+		t.Errorf("Up of A failed after %v, want within %v", elapsed, limit)
+	}
+}
+
+// An up that finds the lock of the shared process held by another, which
+// keeps it, fails within about its ready timeout, saying it waited for
+// that lock.
+func TestUpWithProcessSharedFailsWithinTheReadyTimeoutWhenTheLockOfTheProcessStaysHeld(t *testing.T) {
+	a, _ := sharedPair(t, mustHostrunner(t))
+	a.ReadyTimeout = 500 * time.Millisecond
+	control, _, err := shared.Files(filepath.Dir(a.Dir), a.Daemon)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(control), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	unlock, _, err := lockFile(shared.LockFile(control), "shared process", syscall.LOCK_EX)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	start := time.Now()
+	done := make(chan error, 1)
+	go func() { done <- Up(context.Background(), a) }()
+	limit := a.ReadyTimeout + timingSlack
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "waited for the lock of the shared process") {
+			t.Fatalf("Up of A: %v, want an error saying it waited for the lock of the shared process", err)
+		}
+		if elapsed := time.Since(start); elapsed > limit {
+			t.Errorf("Up of A failed after %v, want within %v", elapsed, limit)
+		}
+	case <-time.After(limit + 2*time.Second):
+		t.Fatalf("Up of A still waits for the lock of the shared process after %v", time.Since(start))
+	}
+}
+
+// An up whose add the shared process refuses fails with the process's
+// reason and what the daemon wrote to its log meanwhile.
+func TestUpWithProcessSharedReportsTheReasonOfARefusedAddAndTheTailOfTheDaemonLog(t *testing.T) {
+	a, _ := sharedPair(t, mustHostrunner(t))
+	logPath := filepath.Join(a.Dir, LogName)
+	if err := os.MkdirAll(a.Dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	appendLine(logPath, "written before the up")
+	fakeEndingProcess(t, a, 1, func(c net.Conn) {
+		if _, err := protocol.ReadFrame(c); err != nil {
+			return
+		}
+		appendLine(logPath, "written while the add was refused")
+		_ = protocol.WriteJSON(c, protocol.FrameError, protocol.Error{Code: protocol.ExitHostrunError, Message: "the reason of the refusal"})
+	})
+	err := Up(context.Background(), a)
+	if err == nil {
+		t.Fatal("Up of A succeeded with its add refused")
+	}
+	for _, want := range []string{"refused to add the daemon: the reason of the refusal", "written while the add was refused"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Up of A: %v, want it to contain %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), "written before the up") {
+		t.Errorf("Up of A: %v, want only what the daemon log got since the up began", err)
+	}
+}
+
+// An up whose add the shared process it started refuses, here as the
+// PATH the add carries holds no container runtime, quotes no process log:
+// the process started, so its log is not part of the failure.
+func TestUpWithProcessSharedQuotesNoProcessLogForAnAddTheProcessItStartedRefuses(t *testing.T) {
+	a, _ := sharedPair(t, mustHostrunner(t))
+	t.Setenv("PATH", t.TempDir())
+	err := Up(context.Background(), a)
+	if err == nil || !strings.Contains(err.Error(), "refused to add the daemon: --watch needs docker or podman in PATH") {
+		t.Fatalf("Up of A with no container runtime in PATH: %v, want the refusal of its add", err)
+	}
+	if strings.Contains(err.Error(), "shared process log") {
+		t.Errorf("Up of A: %v, want no process log quoted for a refused add", err)
+	}
+}
+
+// An up whose shared process exits before it listens, here as something
+// that is not a socket sits at its control socket, fails saying so, with
+// what the process wrote to its log.
+func TestUpWithProcessSharedReportsTheLogOfASharedProcessThatFailsToStart(t *testing.T) {
+	a, _ := sharedPair(t, mustHostrunner(t))
+	control, _, err := shared.Files(filepath.Dir(a.Dir), a.Daemon)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(control), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(control, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err = Up(context.Background(), a)
+	if err == nil {
+		t.Fatal("Up of A succeeded with a regular file at the control socket")
+	}
+	for _, want := range []string{"shared process exited during startup", control + " exists and is not a socket"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Up of A: %v, want it to contain %q", err, want)
+		}
+	}
+}
+
+// An up that started the shared process fails at once when that process
+// exits while up waits for the daemon's arm, here as the daemon fails
+// right after its add (its runtime directory lies inside the workspace)
+// and the process ends with it: the error says how the process exited and
+// quotes both the daemon log and the process log.
+func TestUpWithProcessSharedFailsAtOnceWhenTheProcessItStartedExitsBeforeTheArm(t *testing.T) {
+	a, _ := sharedPair(t, mustHostrunner(t))
+	a.Dir = filepath.Join(a.Workspace, "rt", "c")
+	a.ReadyTimeout = 15 * time.Second
+	allowCurrent(t, a)
+	start := time.Now()
+	err := Up(context.Background(), a)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("Up of A succeeded with a daemon that fails at once")
+	}
+	for _, want := range []string{
+		"shared process exited (exit status 0)",
+		"hostrunner: ",        // the error the daemon ended with, in its log
+		`msg="daemon ended"`,  // the process log
+		ApprovalSocket(a.Dir), // named by both
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Up of A: %v, want it to contain %q", err, want)
+		}
+	}
+	if limit := 5 * time.Second; elapsed > limit {
+		t.Errorf("Up of A failed after %v, want at once, within %v", elapsed, limit)
+	}
+}
+
+// One ready timeout bounds the whole shared path of an up: an up whose
+// add is refused as ending for most of it, then taken, waits for the
+// daemon's arm only for what remains, an arm the daemon takes and never
+// answers included, then gives up and stops the daemon.
+func TestUpWithProcessSharedWaitsForTheArmOnlyForWhatRemainsOfTheReadyTimeout(t *testing.T) {
+	a, _ := sharedPair(t, mustHostrunner(t))
+	a.ReadyTimeout = time.Second
+	ending := 700 * time.Millisecond
+	gaveUp := make(chan time.Time, 1) // when the stop of the daemon first said hello
+	var once sync.Once
+	start := time.Now()
+	fakeEndingProcess(t, a, 1000, func(c net.Conn) {
+		if time.Since(start) < ending {
+			answerEnding(c)
+			return
+		}
+		if _, err := protocol.ReadFrame(c); err != nil {
+			return
+		}
+		// The daemon the add asked for: it takes arms and never answers
+		// them, and closes the connection of a stop unanswered.
+		approval, err := transport.Unix{Path: ApprovalSocket(a.Dir)}.Listen()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		t.Cleanup(func() { approval.Close() })
+		go func() {
+			for {
+				ac, err := approval.Accept()
+				if err != nil {
+					return
+				}
+				go func() {
+					defer ac.Close()
+					if f, err := protocol.ReadFrame(ac); err == nil && f.Type == protocol.FrameHello {
+						once.Do(func() { gaveUp <- time.Now() })
+						return
+					}
+					_, _ = io.Copy(io.Discard, ac)
+				}()
+			}
+		}()
+		_ = protocol.WriteFrame(c, protocol.Frame{Type: protocol.FrameDaemonAdded})
+	})
+	err := Up(context.Background(), a)
+	if err == nil || !strings.Contains(err.Error(), "daemon did not listen within 1s") {
+		t.Fatalf("Up of A: %v, want an error saying the daemon did not listen within the ready timeout", err)
+	}
+	select {
+	case at := <-gaveUp:
+		if waited, limit := at.Sub(start), a.ReadyTimeout+timingSlack; waited > limit {
+			t.Errorf("Up of A gave up on the daemon after %v, want within %v", waited, limit)
+		}
+	default:
+		t.Error("Up of A did not try to stop the daemon it gave up on")
 	}
 }
 
@@ -1919,8 +2292,10 @@ func copyExecutable(t *testing.T, src, dst string) string {
 }
 
 // The control socket of the shared process takes no add from another
-// user, even one the file system lets connect: the process closes the
-// connection unanswered and logs the refusal.
+// user, even one the file system lets connect: the process answers it
+// with a refusal that is not ErrEnding, so that the other user's up does
+// not start a process of its own for it, and logs the refusal, but not as
+// a refused add.
 func TestUpWithProcessSharedRefusesAnAddFromAnotherUser(t *testing.T) {
 	if os.Getuid() != 0 {
 		t.Skip("needs root to run a process as another user")
@@ -1957,13 +2332,16 @@ func TestUpWithProcessSharedRefusesAnAddFromAnotherUser(t *testing.T) {
 	if _, ok := errors.AsType[*exec.ExitError](err); !ok {
 		t.Fatalf("run the add as uid %d: %v", nobody, err)
 	}
+	if got := string(out); !strings.Contains(got, "refused to add the daemon: ") || strings.Contains(got, shared.ErrEnding.Error()) {
+		t.Errorf("the add of uid %d: %s, want a refusal that is not ErrEnding", nobody, got)
+	}
 	data, err := os.ReadFile(processLog)
 	if err != nil {
 		t.Fatal(err)
 	}
 	pid := "pid=" + strconv.Itoa(cmd.Process.Pid) + " "
 	if log := string(data); !hasLine(log, `msg="control socket connection refused"`, "uid="+strconv.Itoa(nobody), pid) || hasLine(log, `msg="add refused"`, pid) {
-		t.Errorf("the process log does not show the connection of uid %d refused unanswered (add: %s):\n%s", nobody, out, log)
+		t.Errorf("the process log does not show the connection of uid %d refused (add: %s):\n%s", nobody, out, log)
 	}
 }
 
@@ -2114,11 +2492,11 @@ func TestUpWithProcessSharedEndsItsDaemonsOnASignal(t *testing.T) {
 }
 
 // startSharedProcess starts `hostrunner shared` of the executable daemon
-// in the runtime root root, as up starts it, and waits until its control
-// socket accepts connections. It returns the control socket, the process
-// log and a channel closed once the process exited; the process is killed
-// when the test ends.
-func startSharedProcess(t *testing.T, daemon, root string) (control, processLog string, exited <-chan struct{}) {
+// in the runtime root root, as up starts it, with the flags flags after
+// --socket, and waits until its control socket accepts connections. It
+// returns the control socket, the process log and a channel closed once
+// the process exited; the process is killed when the test ends.
+func startSharedProcess(t *testing.T, daemon, root string, flags ...string) (control, processLog string, exited <-chan struct{}) {
 	t.Helper()
 	control, processLog, err := shared.Files(root, daemon)
 	if err != nil {
@@ -2128,7 +2506,7 @@ func startSharedProcess(t *testing.T, daemon, root string) (control, processLog 
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command(daemon, "shared", "--socket", control)
+	cmd := exec.Command(daemon, append([]string{"shared", "--socket", control}, flags...)...)
 	cmd.Stdout, cmd.Stderr = logFile, logFile
 	err = cmd.Start()
 	logFile.Close()
@@ -2169,6 +2547,151 @@ func TestSharedProcessEndsWhenAnAddIsRefusedAndNoDaemonRuns(t *testing.T) {
 	}
 }
 
+// A shared process that gets no daemon within its --ready-timeout ends
+// on its own, removing its control socket.
+func TestSharedProcessEndsWhenNoDaemonIsAddedWithinItsReadyTimeout(t *testing.T) {
+	start := time.Now()
+	control, _, exited := startSharedProcess(t, mustHostrunner(t), shortDir(t), "--ready-timeout", "300ms")
+	select {
+	case <-exited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the shared process runs on with no daemon added past its ready timeout")
+	}
+	if elapsed := time.Since(start); elapsed < 300*time.Millisecond {
+		t.Errorf("the shared process exited %v after its start, before its ready timeout of 300ms", elapsed)
+	}
+	if _, err := os.Lstat(control); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the control socket %s after the process exited: %v, want it removed", control, err)
+	}
+}
+
+// A shared process answers an add that comes after its end is decided,
+// on a connection it accepted before, with FrameEnding, which Add takes
+// for ErrEnding, so that up starts a new process: whether the process
+// cuts the connection, waiting for its request, at its end, or reads the
+// request and refuses it, the answer is FrameEnding. The connection is
+// opened well within the ready timeout, so that the process accepts it
+// before its end.
+func TestSharedProcessAnswersAnAddAfterItsEndIsDecidedWithFrameEnding(t *testing.T) {
+	control, processLog, exited := startSharedProcess(t, mustHostrunner(t), shortDir(t), "--ready-timeout", "1s")
+	c, err := net.Dial("unix", control)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		if _, err := os.Lstat(control); errors.Is(err, os.ErrNotExist) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the control socket is not removed past the ready timeout")
+		}
+	}
+	_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+	// The write fails when the process already answered and closed the
+	// connection; the answer is read all the same.
+	_ = protocol.WriteJSON(c, protocol.FrameAddDaemon, protocol.AddDaemon{Version: protocol.SharedVersion})
+	f, err := protocol.ReadFrame(c)
+	if err != nil {
+		t.Fatalf("the answer to the add after the end was decided: %v, want FrameEnding", err)
+	}
+	if f.Type != protocol.FrameEnding {
+		t.Errorf("the answer to the add after the end was decided: frame type %d, want FrameEnding (%d)", f.Type, protocol.FrameEnding)
+	}
+	select {
+	case <-exited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the shared process runs on past its end")
+	}
+	data, err := os.ReadFile(processLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if log := string(data); !hasLine(log, `msg="no daemon added"`) && !hasLine(log, `msg="add refused"`) {
+		t.Errorf("the process log records neither its end nor the refused add:\n%s", log)
+	}
+}
+
+// sharedReadyTimeout returns the --ready-timeout the shared process pid
+// runs with, as its command line in /proc shows it; ok is false when it
+// was started without one.
+func sharedReadyTimeout(t *testing.T, pid int) (timeout time.Duration, ok bool) {
+	t.Helper()
+	cmdline, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/cmdline")
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Split(strings.TrimSuffix(string(cmdline), "\x00"), "\x00")
+	i := slices.Index(args, "--ready-timeout")
+	if i < 0 || i+1 == len(args) {
+		return 0, false
+	}
+	timeout, err = time.ParseDuration(args[i+1])
+	if err != nil {
+		t.Fatalf("the --ready-timeout of the shared process %d: %v", pid, err)
+	}
+	return timeout, true
+}
+
+// An up that starts the shared process gives it, for its first add, what
+// remains of the up's own ready timeout, so that a process no daemon is
+// added to ends by the time the up gives up: here the up waits for the
+// lock of the process for part of its ready timeout before it starts it.
+func TestUpWithProcessSharedGivesTheProcessItStartsWhatRemainsOfItsReadyTimeout(t *testing.T) {
+	a, _ := sharedPair(t, mustHostrunner(t))
+	a.ReadyTimeout = 3 * time.Second
+	const held = time.Second // how long the lock of the process stays held
+	control, _, err := shared.Files(filepath.Dir(a.Dir), a.Daemon)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(control), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	unlock, _, err := lockFile(shared.LockFile(control), "shared process", syscall.LOCK_EX)
+	if err != nil {
+		t.Fatal(err)
+	}
+	released := make(chan struct{})
+	go func() {
+		defer close(released)
+		time.Sleep(held)
+		unlock()
+	}()
+	defer func() { <-released }()
+	if err := Up(context.Background(), a); err != nil {
+		t.Fatalf("Up of A: %v", err)
+	}
+	pid := servingPid(t, a)
+	got, ok := sharedReadyTimeout(t, pid)
+	if !ok {
+		t.Fatalf("the shared process %d runs without --ready-timeout, want what remains of the ready timeout of the up", pid)
+	}
+	// The up took the lock held after it began, so less than its ready
+	// timeout less half of that remained when it started the process.
+	if limit := a.ReadyTimeout - held/2; got <= 0 || got > limit {
+		t.Errorf("the shared process %d runs with --ready-timeout %v, want more than 0 and at most %v", pid, got, limit)
+	}
+}
+
+// A shared process whose first daemon is added within its ready timeout
+// runs on past that timeout: it ends with its last daemon only.
+func TestUpWithProcessSharedKeepsTheProcessPastItsReadyTimeoutOnceADaemonIsAdded(t *testing.T) {
+	a, _ := sharedPair(t, mustHostrunner(t))
+	a.ReadyTimeout = 2 * time.Second
+	if err := Up(context.Background(), a); err != nil {
+		t.Fatalf("Up of A: %v", err)
+	}
+	pid := servingPid(t, a)
+	time.Sleep(a.ReadyTimeout + time.Second)
+	if !alivePid(pid) {
+		t.Fatalf("the shared process %d exited past its ready timeout with the daemon of A running", pid)
+	}
+	if got, code := runIn(t, a, "pwd"); got != a.Workspace+"\n" || code != 0 {
+		t.Errorf("pwd in %s past the ready timeout: got %q, exit %d; want %q, exit 0", a.Dir, got, code, a.Workspace+"\n")
+	}
+}
+
 // A refused add of a shared process is in the process log by the socket
 // of the daemon it asked for.
 func TestSharedProcessLogsTheSocketOfARefusedAdd(t *testing.T) {
@@ -2188,21 +2711,176 @@ func TestSharedProcessLogsTheSocketOfARefusedAdd(t *testing.T) {
 	}
 }
 
-// An up whose wait for the daemon it added to the shared process fails
-// stops that daemon, as an up of a daemon of its own process kills it;
-// the other daemons of the process keep running.
+// An up whose wait for the daemon it added to the shared process fails,
+// here as its context is cancelled once the daemon was added, stops that
+// daemon, as an up of a daemon of its own process kills it; the other
+// daemons of the process keep running.
 func TestUpWithProcessSharedStopsTheDaemonItAddedWhenItsWaitFails(t *testing.T) {
 	ctx := context.Background()
 	a, b := sharedPair(t, mustHostrunner(t))
 	if err := Up(ctx, b); err != nil {
 		t.Fatalf("Up of B: %v", err)
 	}
-	a.ReadyTimeout = time.Millisecond
-	if err := Up(ctx, a); err == nil || !strings.Contains(err.Error(), "did not listen within") {
-		t.Fatalf("Up of A with a timeout of 1 ms: %v, want a timeout", err)
+	_, processLog, err := shared.Files(filepath.Dir(a.Dir), a.Daemon)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		// The process logs the daemon added before it answers the add, and
+		// the wait for the arm tries first 50 ms after it began: the cancel
+		// ends that wait, before the daemon is armed.
+		for upCtx.Err() == nil {
+			if data, _ := os.ReadFile(processLog); hasLine(string(data), `msg="daemon added"`, "socket="+Socket(a.Dir)+" ") {
+				cancel()
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+	if err := Up(upCtx, a); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Up of A cancelled once its daemon was added: %v, want %v", err, context.Canceled)
 	}
 	if err := WaitStopped(ctx, Socket(a.Dir), 5*time.Second); err != nil {
 		t.Error(err)
+	}
+	if got, code := runIn(t, b, "pwd"); got != b.Workspace+"\n" || code != 0 {
+		t.Errorf("pwd in %s: got %q, exit %d; want %q, exit 0", b.Dir, got, code, b.Workspace+"\n")
+	}
+}
+
+// An up whose wait for the arm of the daemon it added to the shared
+// process fails as its ready timeout passes stops that daemon once the
+// daemon answers on its approval socket; the other daemons of the process
+// keep running. The rules file of A is a FIFO the test feeds, so that the
+// daemon of A, which reads it first as it starts, listens only once the
+// test lets it, and until then the approval socket of A is the test's: it
+// takes the arms of the up and never answers them, and the hello of the
+// stop of the up tells the test that the up gave up.
+func TestUpWithProcessSharedStopsTheDaemonItAddedWhenItsReadyTimeoutPasses(t *testing.T) {
+	ctx := context.Background()
+	a, b := sharedPair(t, mustHostrunner(t))
+	if err := Up(ctx, b); err != nil {
+		t.Fatalf("Up of B: %v", err)
+	}
+	a.ReadyTimeout = 2 * time.Second
+	_, processLog, err := shared.Files(filepath.Dir(a.Dir), a.Daemon)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The FIFO keeps a second name, feed, so that a regular file with the
+	// same rules can take the name of the rules file once the daemon read
+	// the FIFO, for its rereads.
+	rules, err := os.ReadFile(a.RulesFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	feed := a.RulesFile + ".fifo"
+	if err := os.Remove(a.RulesFile); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(a.RulesFile, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(a.RulesFile, feed); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		// A reader or a writer still waiting on the FIFO gets the other
+		// end, closed at once, so that it does not wait for ever.
+		for _, flag := range []int{os.O_WRONLY, os.O_RDONLY} {
+			if f, err := os.OpenFile(feed, flag|syscall.O_NONBLOCK, 0); err == nil {
+				f.Close()
+			}
+		}
+	})
+	// feedRules waits for the next reader of the FIFO and writes it the
+	// rules.
+	feedRules := func() error {
+		f, err := os.OpenFile(feed, os.O_WRONLY, 0)
+		if err != nil {
+			return err
+		}
+		_, err = f.Write(rules)
+		return errors.Join(err, f.Close())
+	}
+	fedUp := make(chan error, 1)
+	go func() { fedUp <- feedRules() }() // for the rules the up reads first
+
+	gaveUp := make(chan struct{}) // closed once the approval socket of the test is gone
+	go func() {
+		// The process logs the daemon added before it answers the add.
+		added := func() bool {
+			data, _ := os.ReadFile(processLog)
+			return hasLine(string(data), `msg="daemon added"`, "socket="+Socket(a.Dir)+" ")
+		}
+		for deadline := time.Now().Add(30 * time.Second); !added(); time.Sleep(time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Error("the daemon of A is not added")
+				return
+			}
+		}
+		approval, err := transport.Unix{Path: ApprovalSocket(a.Dir)}.Listen()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		t.Cleanup(func() { approval.Close() })
+		var once sync.Once
+		for {
+			c, err := approval.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				if f, err := protocol.ReadFrame(c); err == nil && f.Type == protocol.FrameHello {
+					// Closed before the daemon is fed, which removes the
+					// socket, so that the daemon can listen on it.
+					once.Do(func() {
+						approval.Close()
+						close(gaveUp)
+					})
+					return
+				}
+				_, _ = io.Copy(io.Discard, c) // an arm, never answered
+			}()
+		}
+	}()
+	fedDaemon := make(chan error, 1)
+	go func() {
+		<-gaveUp
+		err := feedRules()
+		if err == nil {
+			err = os.WriteFile(feed+".rules", rules, 0o644)
+		}
+		if err == nil {
+			err = os.Rename(feed+".rules", a.RulesFile)
+		}
+		fedDaemon <- err
+	}()
+
+	err = Up(ctx, a)
+	if err == nil || !strings.Contains(err.Error(), "daemon did not listen within 2s") {
+		t.Fatalf("Up of A: %v, want an error saying the daemon did not listen within the ready timeout", err)
+	}
+	if err := <-fedUp; err != nil {
+		t.Fatalf("feed the rules to the up: %v", err)
+	}
+	select {
+	case <-gaveUp:
+	default:
+		t.Fatal("Up of A did not try to stop the daemon it gave up on")
+	}
+	if err := <-fedDaemon; err != nil {
+		t.Fatalf("feed the rules to the daemon: %v", err)
+	}
+	if err := WaitStopped(ctx, Socket(a.Dir), 5*time.Second); err != nil {
+		t.Error(err)
+	}
+	if data, err := os.ReadFile(filepath.Join(a.Dir, LogName)); err != nil || !hasLine(string(data), `msg="stopping on request`) {
+		t.Errorf("the daemon of A was not stopped on request by the up (%v):\n%s", err, data)
 	}
 	if got, code := runIn(t, b, "pwd"); got != b.Workspace+"\n" || code != 0 {
 		t.Errorf("pwd in %s: got %q, exit %d; want %q, exit 0", b.Dir, got, code, b.Workspace+"\n")

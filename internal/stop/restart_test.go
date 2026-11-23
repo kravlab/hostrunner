@@ -73,7 +73,7 @@ func runSharedProcess() {
 			},
 		}, nil
 	}
-	_ = shared.Serve(context.Background(), l, prepare, slog.New(slog.DiscardHandler))
+	_ = shared.Serve(context.Background(), l, prepare, time.Minute, slog.New(slog.DiscardHandler))
 }
 
 // nopWriteCloser is a WriteCloser whose Close does nothing.

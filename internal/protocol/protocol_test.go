@@ -99,11 +99,11 @@ func TestDecodeJSONRejectsMalformedPayload(t *testing.T) {
 }
 
 func TestReadFrameAcceptsUpToTheLastFrameType(t *testing.T) {
-	if _, err := ReadFrame(bytes.NewReader([]byte{byte(FrameDaemonAdded), 0, 0, 0, 0})); err != nil {
-		t.Fatalf("FrameDaemonAdded: %v", err)
+	if _, err := ReadFrame(bytes.NewReader([]byte{byte(FrameEnding), 0, 0, 0, 0})); err != nil {
+		t.Fatalf("FrameEnding: %v", err)
 	}
-	if _, err := ReadFrame(bytes.NewReader([]byte{byte(FrameDaemonAdded) + 1, 0, 0, 0, 0})); !errors.Is(err, ErrUnknownFrameType) {
-		t.Fatalf("the type after FrameDaemonAdded: got %v, want ErrUnknownFrameType", err)
+	if _, err := ReadFrame(bytes.NewReader([]byte{byte(FrameEnding) + 1, 0, 0, 0, 0})); !errors.Is(err, ErrUnknownFrameType) {
+		t.Fatalf("the type after FrameEnding: got %v, want ErrUnknownFrameType", err)
 	}
 }
 
@@ -115,6 +115,7 @@ func TestFrameTypesKeepTheirWireValues(t *testing.T) {
 		FrameRunning: 31, FrameRunningList: 32, FrameStop: 33, FrameStopping: 34,
 		FrameRulesReread: 35, FrameRunStarted: 36, FrameRunOutput: 37, FrameRunEnded: 38,
 		FrameMountCheckFailed: 39, FrameRulesNotAllowed: 40, FrameAddDaemon: 41, FrameDaemonAdded: 42,
+		FrameEnding: 43,
 	} {
 		if byte(typ) != want {
 			t.Errorf("frame %v has value %d, want %d", typ, byte(typ), want)

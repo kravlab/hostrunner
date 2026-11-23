@@ -59,7 +59,7 @@
 //
 // The control socket of a shared process speaks its own frames, with its
 // own version (SharedVersion): a connection carries one FrameAddDaemon,
-// answered by FrameDaemonAdded or FrameError.
+// answered by FrameDaemonAdded, FrameEnding or FrameError.
 package protocol
 
 import (
@@ -142,8 +142,9 @@ const (
 	// `hostrunner up` and the process; it refuses every other frame.
 	FrameAddDaemon   // `hostrunner up` → shared process, JSON AddDaemon
 	FrameDaemonAdded // shared process → `hostrunner up`, no payload: the daemon was added and started, not that it listens yet: up waits for its arm
+	FrameEnding      // shared process → `hostrunner up`, no payload: the process is ending and added nothing: up starts a new one and adds again
 
-	lastFrameType = FrameDaemonAdded
+	lastFrameType = FrameEnding
 )
 
 // Exit codes for failures of hostrun itself rather than of the command,
@@ -672,7 +673,8 @@ const SharedVersion = 1
 // which the daemon resolves its settings with and runs its commands with,
 // not the process's. The process answers FrameDaemonAdded once it started
 // the daemon, maybe before the daemon listens: up then waits until it
-// follows its arm.
+// follows its arm; FrameEnding when its end is decided and it added
+// nothing.
 type AddDaemon struct {
 	Version int      `json:"version"`
 	Args    []string `json:"args"`

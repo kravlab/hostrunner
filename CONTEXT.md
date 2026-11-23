@@ -105,7 +105,9 @@ container.
 **Shared process**:
 A host process that holds the daemons of several
 devcontainers, one process per version of hostrunner, and
-lives while one of its daemons does.
+lives while one of its daemons does; one that no daemon is
+added to within the ready timeout of the `up` that started it
+ends on its own.
 _Avoid_: global daemon
 
 **Arm**:
@@ -161,8 +163,10 @@ How long a waiting daemon waits for its armed container
 before it exits.
 
 **Ready timeout**:
-How long `hostrunner up` waits for the daemon it starts to
-listen; it tunes `up`, not the daemon.
+How long `hostrunner up` waits for the daemon it starts, or
+adds to a shared process, to listen; a shared process that
+`up` starts ends when no daemon is added to it within it. It
+tunes `up`, not the daemon.
 
 **Stop timeout**:
 How long a stop or restart waits for a daemon it stopped,

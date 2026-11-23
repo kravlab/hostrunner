@@ -44,7 +44,9 @@ func TestSharedProcessEndsOnlyTheDaemonWhoseWatchPanics(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	served := make(chan error, 1)
-	go func() { served <- shared.Serve(ctx, l, prepare, slog.New(slog.NewTextHandler(processLog, nil))) }()
+	go func() {
+		served <- shared.Serve(ctx, l, prepare, time.Minute, slog.New(slog.NewTextHandler(processLog, nil)))
+	}()
 	for _, name := range []string{"a", "b"} {
 		if err := shared.Add(ctx, control, protocol.AddDaemon{Args: []string{name}}); err != nil {
 			t.Fatalf("add %s: %v", name, err)

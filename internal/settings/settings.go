@@ -55,7 +55,10 @@ type Settings struct {
 	// take to send its request.
 	RequestTimeout time.Duration
 	// ReadyTimeout (ready_timeout) is how long up waits for the daemon it
-	// starts to listen; up's own, not passed to the daemon.
+	// starts to listen; with ProcessShared, for the whole add of the daemon
+	// to the shared process, the lock, the start of the process and the
+	// add included; a shared process up starts waits for its first daemon
+	// for what remains of it then. Up's own, not passed to the daemon.
 	ReadyTimeout time.Duration
 	// Process (process) is whether up starts the daemon in a process of its
 	// own (ProcessOwn) or adds it to the shared process of its build
@@ -127,11 +130,15 @@ func defaults(workspace string) Settings {
 		PollInterval:   2 * time.Second,  // how soon a stopped container or a changed rules file is seen
 		AskTimeout:     10 * time.Minute, // time for a human to come to the host and answer
 		RequestTimeout: 10 * time.Second, // so idle connections cannot pile up
-		ReadyTimeout:   10 * time.Second, // a daemon listens at once, unless something is wrong
+		ReadyTimeout:   DefaultReadyTimeout,
 		Process:        ProcessOwn,
 		MountCheck:     true,
 	}
 }
+
+// DefaultReadyTimeout is the ready_timeout no source sets: a daemon
+// listens at once, unless something is wrong.
+const DefaultReadyTimeout = 10 * time.Second
 
 // DefaultStopTimeout is the stop_timeout no source sets: as long as a
 // daemon takes to close its sockets, unless something is wrong.

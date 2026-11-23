@@ -7,7 +7,7 @@
 //	    --workspace <host-path> --container-workspace <path> [settings]
 //	hostrunner serve --socket <path> --workspace <host-path> --container-workspace <path>
 //	    [--watch] [settings]
-//	hostrunner shared --socket <path>
+//	hostrunner shared --socket <path> [--ready-timeout <duration>]
 //	hostrunner test [--settings <path>] [--workspace-settings <path>] [--rules-file <path>]
 //	    [--] <command> [args...]
 //	hostrunner allow [<workspace>]
@@ -25,8 +25,12 @@
 // replaces a daemon already serving it. With process: shared, `up`
 // adds the daemon to the shared process of its build instead, starting
 // a detached `shared` in the runtime root first when none listens on
-// its control socket there; the process runs each daemon it is asked
-// for as serve would, and ends with the last (see internal/shared).
+// its control socket there or the one listening is ending, under a lock
+// there, so that concurrent ups of one build start one process (see
+// internal/launch); the process runs each daemon it is asked
+// for as serve would, and ends with the last, or when its first is not
+// added within --ready-timeout, what remains of up's ready_timeout as up
+// starts it (see internal/shared).
 // `stop` stops a daemon from the
 // host, the one serving the current directory by default, asking what
 // becomes of the commands it runs unless --kill or --wait says; `restart`
@@ -117,7 +121,7 @@ import (
 
 const (
 	usage             = "usage: hostrunner up|serve|shared|test|allow|deny|approve|stop|restart|update|instructions|version [flags]; see `hostrunner <command> -h`"
-	sharedUsage       = "usage: hostrunner shared --socket <path>"
+	sharedUsage       = "usage: hostrunner shared --socket <path> [--ready-timeout <duration>]"
 	allowUsage        = "usage: hostrunner allow [<workspace>]"
 	denyUsage         = "usage: hostrunner deny [<workspace>]"
 	updateUsage       = "usage: hostrunner update [--check]"
@@ -231,7 +235,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 		}
 		return serve(ctx, cfg, slog.New(slog.NewTextHandler(stderr, nil)), runtimes)
 	case "shared":
-		socket, err := parseShared(args[1:], stderr)
+		socket, firstAdd, err := parseShared(args[1:], stderr)
 		if err != nil {
 			return err
 		}
@@ -241,7 +245,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 		}
 		return shared.Serve(ctx, l, func(args, env []string) (shared.Daemon, error) {
 			return sharedDaemon(args, env, version)
-		}, slog.New(slog.NewTextHandler(stderr, nil)))
+		}, firstAdd, slog.New(slog.NewTextHandler(stderr, nil)))
 	case "test":
 		cfg, err := parseTest(args[1:], os.Getenv, stderr)
 		if err != nil {
@@ -633,18 +637,22 @@ func serveRuntimes(cfg serveConfig) ([]watch.Runtime, error) {
 }
 
 // parseShared parses the flags of `hostrunner shared`: --socket, the
-// control socket, is required.
-func parseShared(args []string, output io.Writer) (socket string, err error) {
+// control socket, is required; --ready-timeout, how long the process
+// waits for its first daemon before it ends (see shared.Serve), is what
+// remains of the ready_timeout of the up that starts it as it starts it,
+// settings.DefaultReadyTimeout when not given.
+func parseShared(args []string, output io.Writer) (socket string, firstAdd time.Duration, err error) {
 	fs := flag.NewFlagSet("shared", flag.ContinueOnError)
 	fs.SetOutput(output)
 	fs.StringVar(&socket, "socket", "", "control socket to listen on")
+	fs.DurationVar(&firstAdd, "ready-timeout", settings.DefaultReadyTimeout, "how long to wait for the first daemon before exiting")
 	if err := parseFlags(fs, args, sharedUsage); err != nil {
-		return "", err
+		return "", 0, err
 	}
 	if socket == "" {
-		return "", errors.New(sharedUsage)
+		return "", 0, errors.New(sharedUsage)
 	}
-	return socket, nil
+	return socket, firstAdd, nil
 }
 
 // sharedDaemon is the daemon a shared process of build version adds for

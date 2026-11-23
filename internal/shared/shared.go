@@ -5,8 +5,9 @@
 // The process listens on its control socket in the runtime root, where
 // `hostrunner up` asks it, with Add, to add a daemon; Serve runs the
 // daemons it is asked for, each under the process's context, and returns
-// once the last of them ended. How a daemon is made from a request is the
-// caller's (see Prepare), so this package knows nothing of serve.
+// once the last of them ended, or once its first add did not come in
+// time. How a daemon is made from a request is the caller's (see
+// Prepare), so this package knows nothing of serve.
 //
 // A daemon gets from its request its arguments and environment only: the
 // attributes of the process not carried in the request, such as its
@@ -28,6 +29,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/kravlab/hostrunner/internal/contain"
@@ -48,8 +50,12 @@ const idLength = 16
 // no shared process of this build runs, and one has to be started.
 var ErrNotListening = errors.New("no shared process is listening")
 
-// errEnding is the reason an add is refused once the process is ending.
-var errEnding = errors.New("the shared process is ending")
+// ErrEnding means the shared process asked to add a daemon is ending and
+// added nothing: it refused the add once its end was decided, or closed
+// the connection without an answer, as when it closed its control socket
+// with the request still waiting to be accepted. A new process has to be
+// started, and the daemon added to it.
+var ErrEnding = errors.New("the shared process is ending")
 
 // Files returns the control socket and the log of the shared process of
 // the hostrunner executable exe, in the runtime root root: shared-<id>.sock
@@ -69,6 +75,22 @@ func Files(root, exe string) (socket, logPath string, err error) {
 	}
 	name := "shared-" + hex.EncodeToString(h.Sum(nil))[:idLength]
 	return filepath.Join(root, name+".sock"), filepath.Join(root, name+".log"), nil
+}
+
+// LockFile returns the lock file of the shared process whose control
+// socket, as Files returns it, is socket: shared-<id>.lock beside it, in
+// the runtime root. `hostrunner up` holds a flock on it while it adds a
+// daemon to that process, starting the process when none listens, so
+// that concurrent ups of one build start one process. It is derived from
+// the socket rather than returned by Files, so that the callers that need
+// only the socket and the log digest the executable once and name no lock
+// they do not take. Its name does not end in protocol.ApprovalSuffix
+// either. The file is never removed, on purpose: unlinking a file that
+// others flock breaks their mutual exclusion, as an up waiting for the
+// lock on the old inode and one opening the path anew, on a new inode,
+// would both hold "the" lock.
+func LockFile(socket string) string {
+	return strings.TrimSuffix(socket, ".sock") + ".lock"
 }
 
 // Daemon is a daemon the process was asked to add, ready to run.
@@ -93,25 +115,31 @@ type Daemon struct {
 type Prepare func(args, env []string) (Daemon, error)
 
 // Serve runs the shared process on l, its control socket: it takes the
-// AddDaemon requests of connections from its own user (others are closed
-// unanswered), makes each daemon with prepare and runs it in a goroutine
-// under a context derived from ctx, answering FrameDaemonAdded once it
-// started, or FrameError with the reason. It logs its start, each daemon
-// added and ended, and its exit to log. Once the last daemon it added has
-// ended, or an add was refused while no daemon runs, or ctx is cancelled,
-// which ends every daemon, it closes l, waits for the daemons and
-// returns; nil unless l fails otherwise. Accept errors of a momentary
-// resource shortage (see transport.IsTemporary) are retried, with a
-// backoff, rather than ending the process. A daemon that panics ends
-// alone (see serveDaemon). Serve closes l before it returns, whatever
-// ends it.
-func Serve(ctx context.Context, l net.Listener, prepare Prepare, log *slog.Logger) error {
+// AddDaemon requests of connections from its own user (others are
+// refused with FrameError), makes each daemon with prepare and runs it in
+// a goroutine under a context derived from ctx, answering
+// FrameDaemonAdded once it started, FrameEnding when it refused the add
+// as its end was decided (see ErrEnding), or FrameError with any other
+// reason. It logs its start, each daemon added and ended, and its exit to
+// log. Once the last daemon it added has ended, or an add was refused
+// while no daemon runs, or no daemon started within firstAdd of its start
+// (an add still in flight then is refused), or ctx is cancelled, which
+// ends every daemon, it closes l, waits for the daemons and the
+// connections it accepted and returns; nil unless l fails otherwise. A
+// connection whose request is not yet read then is not waited for (see
+// handle). Accept errors of a momentary resource shortage (see
+// transport.IsTemporary) are retried, with a backoff, rather than ending
+// the process. A daemon that panics ends alone (see serveDaemon). Serve
+// closes l before it returns, whatever ends it.
+func Serve(ctx context.Context, l net.Listener, prepare Prepare, firstAdd time.Duration, log *slog.Logger) error {
 	defer l.Close()
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	p := &process{prepare: prepare, log: log, cancel: cancel}
 	stop := context.AfterFunc(ctx, func() { l.Close() })
 	defer stop()
+	timer := time.AfterFunc(firstAdd, func() { p.endIfNoneAdded(ctx, firstAdd) })
+	defer timer.Stop()
 	log.Info("shared process started", "socket", l.Addr().String(), "pid", os.Getpid())
 	var (
 		err     error
@@ -156,22 +184,55 @@ type process struct {
 }
 
 // handle answers the one request of the control connection c, then
-// closes it.
+// closes it. A connection from another user is answered FrameError once
+// its request was read, unlooked at, and logged refused, but not as a
+// refused add. Once the end is decided, as ctx is done, the request is
+// not waited for any more: a connection that sent no byte of it then is
+// answered FrameEnding, with no add logged refused, and one cut in the
+// middle of it is refused with ErrEnding. A connection closed before any
+// byte of a request is a probe, neither logged nor answered.
 func (p *process) handle(ctx context.Context, c net.Conn) {
 	defer c.Close()
 	uid, pid, err := transport.PeerCred(c)
-	if err != nil || uid != os.Getuid() {
+	if err != nil {
 		p.log.Warn("control socket connection refused", "uid", uid, "pid", pid, "error", err)
 		return
 	}
 	_ = c.SetDeadline(time.Now().Add(requestTimeout))
-	f, err := protocol.ReadFrame(c)
+	// Once the end is decided, the request is not waited for any more, so
+	// that a connection that sends nothing does not keep the process
+	// alive: its read is cut at once.
+	stop := context.AfterFunc(ctx, func() { _ = c.SetReadDeadline(time.Now()) })
+	defer stop()
+	if uid != os.Getuid() {
+		p.log.Warn("control socket connection refused", "uid", uid, "pid", pid, "error", err)
+		// The request is read, unlooked at, before the answer, so that
+		// the peer's write of it does not fail on a connection already
+		// closed, which Add would take for ErrEnding.
+		_, _ = protocol.ReadFrame(c)
+		_ = protocol.WriteJSON(c, protocol.FrameError, protocol.Error{Code: protocol.ExitHostrunError, Message: "refused: the control socket serves its own user only"})
+		return
+	}
+	request := &countingReader{r: c}
+	f, err := protocol.ReadFrame(request)
 	if err != nil {
-		// A connection closed before any byte of a request, as from up's
-		// check that the socket listens, is a probe: no add was refused,
-		// so nothing is logged or answered and the process goes on. A
-		// partial or malformed request is refused.
-		if !errors.Is(err, io.EOF) {
+		switch {
+		case errors.Is(err, io.EOF):
+			// A connection closed before any byte of a request, as from
+			// up's check that the socket listens, is a probe: no add was
+			// refused, so nothing is logged or answered and the process
+			// goes on.
+		case ctx.Err() != nil && errors.Is(err, os.ErrDeadlineExceeded) && request.n == 0:
+			// Cut before any byte of a request, the connection asked for
+			// nothing, so no add is logged refused, but it is answered,
+			// if it can still take it, that the process is ending.
+			_ = protocol.WriteFrame(c, protocol.Frame{Type: protocol.FrameEnding})
+		case ctx.Err() != nil && errors.Is(err, os.ErrDeadlineExceeded):
+			// Cut in the middle of a request, the add is refused as the
+			// process is ending.
+			p.refuse(c, pid, fmt.Errorf("read the request: %w", ErrEnding))
+		default:
+			// A partial or malformed request is refused.
 			p.refuse(c, pid, fmt.Errorf("read the request: %w", err))
 		}
 		return
@@ -190,9 +251,14 @@ func (p *process) handle(ctx context.Context, c net.Conn) {
 
 // refuse logs that the request on c, of the process pid, is refused for
 // err, with the attributes attrs naming the daemon it asked for, if any,
-// and answers it with err.
+// and answers it: with FrameEnding when err is ErrEnding, so that up
+// starts a new process, otherwise with err in a FrameError.
 func (p *process) refuse(c net.Conn, pid int, err error, attrs ...any) {
 	p.log.Warn("add refused", append(append([]any{"pid", pid}, attrs...), "error", err)...)
+	if errors.Is(err, ErrEnding) {
+		_ = protocol.WriteFrame(c, protocol.Frame{Type: protocol.FrameEnding})
+		return
+	}
 	_ = protocol.WriteJSON(c, protocol.FrameError, protocol.Error{Code: protocol.ExitHostrunError, Message: err.Error()})
 }
 
@@ -222,6 +288,22 @@ func (p *process) endIfIdle() {
 		p.ending = true
 		p.cancel()
 	}
+}
+
+// endIfNoneAdded ends the process, logging so, when no daemon started
+// within firstAdd, the time it was given for its first add: nothing else
+// would end it. A process that started a daemon ends with its last, and
+// one whose end is already decided, or whose ctx is done, ends anyway: it
+// is left as it is.
+func (p *process) endIfNoneAdded(ctx context.Context, firstAdd time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.ending || p.daemons > 0 || ctx.Err() != nil {
+		return
+	}
+	p.log.Info("no daemon added", "timeout", firstAdd)
+	p.ending = true
+	p.cancel()
 }
 
 // decodeAdd returns the AddDaemon request f carries, an error when f is
@@ -256,14 +338,14 @@ func (p *process) add(ctx context.Context, req protocol.AddDaemon, pid int) erro
 // process. A panic of d other than the one it ends with (see serveDaemon),
 // a later one or one after its end, is logged, with its stack, to the
 // process log and to d's log while it is open. Once the end is decided,
-// or ctx is done, it refuses d, closing its log, with errEnding: d could
+// or ctx is done, it refuses d, closing its log, with ErrEnding: d could
 // not run.
 func (p *process) start(ctx context.Context, d Daemon, pid int) error {
 	p.mu.Lock()
 	if p.ending || ctx.Err() != nil {
 		p.mu.Unlock()
 		d.Log.Close()
-		return errEnding
+		return ErrEnding
 	}
 	p.daemons++
 	p.mu.Unlock()
@@ -343,7 +425,13 @@ func (l *daemonLog) Close() error {
 // daemon req describes, setting req.Version. It returns once the process
 // answered that it added it, with an error carrying the process's reason
 // when it refused; an error wrapping ErrNotListening when nothing accepts
-// connections on socket.
+// connections on socket; an error wrapping ErrEnding when the process
+// answered that it is ending (FrameEnding), or closed or reset the
+// connection before any byte of an answer, as one ending with the request
+// still in its listener's backlog does, whether Add was still writing the
+// request then (the write fails with EPIPE or ECONNRESET) or already
+// reading the answer (see closedByPeer). A connection closed in the middle
+// of an answer is an ordinary error: the process answered.
 func Add(ctx context.Context, socket string, req protocol.AddDaemon) error {
 	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
@@ -356,17 +444,27 @@ func Add(ctx context.Context, socket string, req protocol.AddDaemon) error {
 		_ = c.SetDeadline(deadline)
 	}
 	name := hostterm.Display(socket)
+	unanswered := fmt.Errorf("shared process on %s closed the connection unanswered: %w", name, ErrEnding)
 	req.Version = protocol.SharedVersion
 	if err := protocol.WriteJSON(c, protocol.FrameAddDaemon, req); err != nil {
+		if closedByPeer(err) {
+			return unanswered
+		}
 		return fmt.Errorf("shared process on %s did not accept the add request: %w", name, err)
 	}
-	f, err := protocol.ReadFrame(c)
+	answer := &countingReader{r: c}
+	f, err := protocol.ReadFrame(answer)
+	if answer.n == 0 && closedByPeer(err) {
+		return unanswered
+	}
 	if err != nil {
 		return fmt.Errorf("shared process on %s did not answer the add request: %w", name, err)
 	}
 	switch f.Type {
 	case protocol.FrameDaemonAdded:
 		return nil
+	case protocol.FrameEnding:
+		return fmt.Errorf("shared process on %s did not add the daemon: %w", name, ErrEnding)
 	case protocol.FrameError:
 		var e protocol.Error
 		_ = protocol.DecodeJSON(f, &e)
@@ -374,4 +472,26 @@ func Add(ctx context.Context, socket string, req protocol.AddDaemon) error {
 	default:
 		return fmt.Errorf("shared process on %s answered the add request with frame type %d", name, f.Type)
 	}
+}
+
+// closedByPeer reports whether err, of a read or a write on a control
+// connection, says that the peer closed or reset it: io.EOF, EPIPE or
+// ECONNRESET. Add takes it for ErrEnding while no byte of an answer came.
+func closedByPeer(err error) bool {
+	return errors.Is(err, io.EOF) || errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET)
+}
+
+// countingReader is a reader that counts the bytes read through it, so
+// that Add tells a connection closed before any byte of an answer from
+// one closed in the middle of it, which a reset does not.
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+// Read reads from r.r, adding the bytes read to r.n.
+func (r *countingReader) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	r.n += int64(n)
+	return n, err
 }
