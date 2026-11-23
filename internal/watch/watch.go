@@ -438,10 +438,22 @@ func (w *Watcher) query(ctx context.Context) (containers []Container, answered b
 	return containers, answered
 }
 
+// Environment is the environment a runtime's command line runs in, as a
+// daemon holds it (see daemon.Environment).
+type Environment interface {
+	// Entries returns the NAME=value entries of the environment.
+	Entries() []string
+	// LookPath returns the path of the executable file the program name
+	// stands for in the PATH of the environment.
+	LookPath(name string) (string, error)
+}
+
 // CLI is a Runtime backed by a docker-compatible command line (docker or
-// podman), which both accept the same `ps` filters.
+// podman), which both accept the same `ps` filters. Without an env, it
+// runs with the environment of the process; DetectIn gives it another.
 type CLI struct {
 	Binary string
+	env    Environment
 }
 
 // Containers lists the containers carrying the workspace's
@@ -572,6 +584,9 @@ func (c CLI) setVolumes(containers []Container, volumes map[string]Volume, inspe
 // run runs the runtime's CLI and returns its stdout and stderr.
 func (c CLI) run(ctx context.Context, args ...string) (stdout, stderr string, err error) {
 	cmd := exec.CommandContext(ctx, c.Binary, args...)
+	if c.env != nil {
+		cmd.Env = c.env.Entries()
+	}
 	var errBuf bytes.Buffer
 	cmd.Stderr = &errBuf
 	out, err := cmd.Output()
@@ -619,12 +634,25 @@ func parseMounts(raw string) ([]Mount, error) {
 // String names the runtime in logs.
 func (c CLI) String() string { return c.Binary }
 
-// Detect returns a CLI runtime for each of docker and podman found in PATH.
+// Detect returns a CLI runtime for each of docker and podman found in the
+// PATH of the process, to run with its environment.
 func Detect() []Runtime {
+	return detect(exec.LookPath, nil)
+}
+
+// DetectIn returns a CLI runtime for each of docker and podman found in the
+// PATH of env, to run with env, not with the environment of the process.
+func DetectIn(env Environment) []Runtime {
+	return detect(env.LookPath, env)
+}
+
+// detect returns a CLI runtime of env for each of docker and podman that
+// lookPath finds.
+func detect(lookPath func(string) (string, error), env Environment) []Runtime {
 	var found []Runtime
 	for _, name := range []string{"docker", "podman"} {
-		if path, err := exec.LookPath(name); err == nil {
-			found = append(found, CLI{Binary: path})
+		if path, err := lookPath(name); err == nil {
+			found = append(found, CLI{Binary: path, env: env})
 		}
 	}
 	return found

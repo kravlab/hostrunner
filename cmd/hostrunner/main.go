@@ -217,9 +217,10 @@ func run(args []string, stdout, stderr io.Writer) error {
 		if err != nil {
 			return err
 		}
+		cfg.environment = daemon.NewEnvironment(os.Environ())
 		var runtimes []watch.Runtime
 		if cfg.watch {
-			if runtimes = watch.Detect(); len(runtimes) == 0 {
+			if runtimes = watch.DetectIn(cfg.environment); len(runtimes) == 0 {
 				return errors.New("--watch needs docker or podman in PATH")
 			}
 		}
@@ -529,11 +530,12 @@ func stopCommands(parsed stop.Commands) (ctx context.Context, commands stop.Comm
 type serveConfig struct {
 	socket string // Unix socket to listen on
 	workspaceFlags
-	watch             bool        // exit once the armed container stops
-	workspaceSettings string      // the workspace settings file, absolute (see settings.Flags.WorkspaceFile)
-	version           string      // the build version the daemon reports (see buildVersion)
-	allows            allow.Store // where a hand edit of the rules file is checked as allowed
-	settings.Settings             // the daemon's settings
+	watch             bool                // exit once the armed container stops
+	workspaceSettings string              // the workspace settings file, absolute (see settings.Flags.WorkspaceFile)
+	version           string              // the build version the daemon reports (see buildVersion)
+	allows            allow.Store         // where a hand edit of the rules file is checked as allowed
+	environment       *daemon.Environment // what its commands and secret sources run with; nil: the process's (see daemon.WithEnvironment)
+	settings.Settings                     // the daemon's settings
 }
 
 // parseServe parses the flags of `hostrunner serve`; the socket and both
@@ -867,6 +869,9 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 		daemon.WithSettings(cfg.Settings.Daemon()),
 	}
 	opts = append(opts, allowOptions(cfg)...)
+	if cfg.environment != nil {
+		opts = append(opts, daemon.WithEnvironment(cfg.environment))
+	}
 	if cfg.Reread {
 		opts = append(opts, daemon.WithRereadEvery(cfg.PollInterval))
 	}
