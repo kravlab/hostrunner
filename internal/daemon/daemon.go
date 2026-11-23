@@ -40,6 +40,7 @@ import (
 	"time"
 
 	"github.com/kravlab/hostrunner/internal/allow"
+	"github.com/kravlab/hostrunner/internal/contain"
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
 	"github.com/kravlab/hostrunner/internal/transport"
@@ -311,7 +312,7 @@ func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 		s.stopServe, s.closeListeners = nil, nil
 		s.mu.Unlock()
 	}()
-	stop := context.AfterFunc(ctx, closeListeners)
+	stop := contain.AfterFunc(ctx, closeListeners)
 	defer stop()
 
 	var (
@@ -319,10 +320,10 @@ func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 		backoff time.Duration
 	)
 	if s.approvals != nil {
-		wg.Go(func() { s.serveApprovals(ctx, &wg) })
+		contain.GoIn(ctx, &wg, func() { s.serveApprovals(ctx, &wg) })
 	}
 	if s.rereadsByItself() {
-		wg.Go(func() { s.watchRules(ctx) })
+		contain.GoIn(ctx, &wg, func() { s.watchRules(ctx) })
 	}
 	for {
 		conn, err := l.Accept()
@@ -349,7 +350,7 @@ func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 			return err
 		}
 		backoff = 0
-		wg.Go(func() { s.handle(ctx, conn) })
+		contain.GoIn(ctx, &wg, func() { s.handle(ctx, conn) })
 	}
 }
 
@@ -360,16 +361,20 @@ func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 // reporting a result.
 func (s *Server) handle(ctx context.Context, conn net.Conn) {
 	daemon := ctx // the daemon's context, which the request's is derived from
+	// The goroutines reading conn (see readFrames) end once it is closed
+	// and ctx cancelled, below: handle returns after them.
+	var reads sync.WaitGroup
+	defer reads.Wait()
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	defer conn.Close()
-	stop := context.AfterFunc(ctx, func() { conn.Close() })
+	stop := contain.AfterFunc(ctx, func() { conn.Close() })
 	defer stop()
 
 	out := &frameWriter{conn: conn}
 	// The cause tells an approved run cancelled for its client from one
 	// cancelled for the daemon stopping (see cancelReason).
-	x := exchange{daemon: daemon, cancel: func() { cancel(errClientGone) }, conn: conn, out: out}
+	x := exchange{daemon: daemon, cancel: func() { cancel(errClientGone) }, conn: conn, out: out, reads: &reads}
 	// logArgs mark in the log every refusal of this connection's request,
 	// once its kind is known (a dry run).
 	var logArgs []any
@@ -620,12 +625,14 @@ func (s *Server) prepareAllowed(ctx context.Context, req protocol.Request, allow
 // its frames go, and cancel, which ends the request early. daemon is the
 // context of the daemon (see Serve), which what runs for the request
 // before its command starts, a secret's command source, runs under: it
-// ends with the daemon, not with the request.
+// ends with the daemon, not with the request. reads counts the
+// goroutines reading conn (see readFrames), which handle waits for.
 type exchange struct {
 	daemon context.Context
 	cancel context.CancelFunc
 	conn   net.Conn
 	out    *frameWriter
+	reads  *sync.WaitGroup
 }
 
 // run executes req on x if it passes prepare; x.cancel stops it early. The
@@ -683,7 +690,7 @@ func (s *Server) start(ctx context.Context, x exchange, req protocol.Request, p 
 		cmd.Stdout, cmd.Stderr = runTee{w: cmd.Stdout, run: run}, runTee{w: cmd.Stderr, run: run, stderr: true}
 	}
 	stdout, stderr := newMaskWriter(cmd.Stdout, p.masked), newMaskWriter(cmd.Stderr, p.masked)
-	cmd.Stdout, cmd.Stderr = stdout, stderr
+	cmd.Stdout, cmd.Stderr = contain.Writer(ctx, stdout), contain.Writer(ctx, stderr)
 	cmd.ExtraFiles = p.files
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -710,7 +717,7 @@ func (s *Server) start(ctx context.Context, x exchange, req protocol.Request, p 
 
 	queue := newStdinQueue(protocol.StdinWindow)
 	var streams sync.WaitGroup
-	streams.Go(func() {
+	contain.GoIn(ctx, &streams, func() {
 		if err := readClient(next, queue); err != nil {
 			s.reject(x.out, protocol.ExitHostrunError, err.Error(), err)
 		}
@@ -718,7 +725,7 @@ func (s *Server) start(ctx context.Context, x exchange, req protocol.Request, p 
 		// receive the result, so stop the command.
 		x.cancel()
 	})
-	streams.Go(func() { feedStdin(queue, stdin, x.out) })
+	contain.GoIn(ctx, &streams, func() { feedStdin(queue, stdin, x.out) })
 	_ = x.out.writeJSON(protocol.FrameStdinCredit, protocol.Credit{Bytes: protocol.StdinWindow, Warning: s.pendingAllowWarning()})
 
 	waitErr := cmd.Wait()

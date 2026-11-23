@@ -89,6 +89,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"slices"
+	"sync"
 	"syscall"
 	"time"
 
@@ -96,6 +97,7 @@ import (
 
 	"github.com/kravlab/hostrunner/internal/allow"
 	"github.com/kravlab/hostrunner/internal/approval"
+	"github.com/kravlab/hostrunner/internal/contain"
 	"github.com/kravlab/hostrunner/internal/daemon"
 	"github.com/kravlab/hostrunner/internal/hostterm"
 	"github.com/kravlab/hostrunner/internal/instructions"
@@ -649,16 +651,23 @@ func parseShared(args []string, output io.Writer) (socket string, err error) {
 // an AddDaemon request: args, the arguments of `hostrunner serve`, parsed
 // as serve parses them but with the settings resolved in env, the
 // environment of the `up` that sent it, which the daemon also runs its
-// commands with and finds the container runtimes in. It logs to daemon.log
-// in its runtime directory, the directory of its socket, opened here as
-// up opens it (see launch.OpenLog) and closed by the process once it
-// ends (see shared.Daemon).
+// commands with and finds the container runtimes in (see
+// newSharedDaemon).
 func sharedDaemon(args, env []string, version string) (shared.Daemon, error) {
 	environment := daemon.NewEnvironment(env)
 	cfg, runtimes, err := prepareServe(args, environment.Getenv, environment, io.Discard, version)
 	if err != nil {
 		return shared.Daemon{}, err
 	}
+	return newSharedDaemon(cfg, runtimes)
+}
+
+// newSharedDaemon is the daemon of a shared process that serves cfg,
+// watching with runtimes. It logs to daemon.log in its runtime directory,
+// the directory of its socket, opened here as up opens it (see
+// launch.OpenLog) and closed by the process once it ends (see
+// shared.Daemon).
+func newSharedDaemon(cfg serveConfig, runtimes []watch.Runtime) (shared.Daemon, error) {
 	logFile, err := launch.OpenLog(filepath.Join(filepath.Dir(cfg.socket), launch.LogName))
 	if err != nil {
 		return shared.Daemon{}, err
@@ -920,6 +929,10 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 	}
 	log.Info("listening", "socket", cfg.socket, "approval_socket", approvalSocket, "workspace", cfg.workspace, "container_workspace", cfg.containerWorkspace, "rules_file", cfg.RulesFile, "rules_digest", policy.Digest(), "watch", cfg.watch, "no_reread", !cfg.Reread, "mount_check", cfg.MountCheck)
 
+	// The watcher ends once ctx is cancelled, below: serve returns after
+	// it, so that no panic of it outlives the daemon.
+	var watching sync.WaitGroup
+	defer watching.Wait()
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var (
@@ -968,12 +981,12 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 	}
 	srv = daemon.New(mapper, policy, log, opts...)
 	if watcher != nil {
-		go func() {
+		contain.GoIn(ctx, &watching, func() {
 			defer cancel()
 			if err := watcher.Run(ctx); err != nil && ctx.Err() == nil {
 				log.Warn("stopping", "reason", err)
 			}
-		}()
+		})
 	}
 	return srv.Serve(ctx, l)
 }

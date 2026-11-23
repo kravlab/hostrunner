@@ -20,6 +20,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/kravlab/hostrunner/internal/contain"
 )
 
 // Errors Run returns when it gives up.
@@ -259,7 +261,7 @@ func (w *Watcher) Run(ctx context.Context) error {
 	defer ticker.Stop()
 	// Cancellation ends the watch at once, not when the loop notices it,
 	// so no arm is accepted while the daemon stops.
-	stop := context.AfterFunc(ctx, func() { w.markEnded(context.Cause(ctx)) })
+	stop := contain.AfterFunc(ctx, func() { w.markEnded(context.Cause(ctx)) })
 	defer stop()
 
 	var (

@@ -26,11 +26,11 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/kravlab/hostrunner/internal/contain"
 	"github.com/kravlab/hostrunner/internal/hostterm"
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/transport"
@@ -79,7 +79,8 @@ type Daemon struct {
 	// returned, the process writes there the error it returned, or the
 	// panic it ended with, with its stack (see serveDaemon), as
 	// "hostrunner: <error>", as main prints the error of a daemon of its
-	// own process to its log, then closes it.
+	// own process to its log, then closes it; any other panic of the
+	// daemon while it is open goes there too, likewise (see start).
 	Log io.WriteCloser
 	// Serve runs the daemon until it ends, or until ctx is cancelled.
 	Serve func(ctx context.Context) error
@@ -252,8 +253,11 @@ func (p *process) add(ctx context.Context, req protocol.AddDaemon, pid int) erro
 // start runs d, asked for by the process pid, in a goroutine under ctx,
 // counted among the daemons, and logs it added before it runs; when its
 // Serve returns, it logs that it ended and, for the last daemon, ends the
-// process. Once the end is decided, or ctx is done, it refuses d, closing
-// its log, with errEnding: d could not run.
+// process. A panic of d other than the one it ends with (see serveDaemon),
+// a later one or one after its end, is logged, with its stack, to the
+// process log and to d's log while it is open. Once the end is decided,
+// or ctx is done, it refuses d, closing its log, with errEnding: d could
+// not run.
 func (p *process) start(ctx context.Context, d Daemon, pid int) error {
 	p.mu.Lock()
 	if p.ending || ctx.Err() != nil {
@@ -264,12 +268,17 @@ func (p *process) start(ctx context.Context, d Daemon, pid int) error {
 	p.daemons++
 	p.mu.Unlock()
 	p.log.Info("daemon added", "socket", d.Socket, "runtime_dir", filepath.Dir(d.Socket), "pid", pid)
+	log := &daemonLog{w: d.Log}
+	others := func(pe *contain.PanicError) {
+		p.log.Error("daemon panicked again", "socket", d.Socket, "error", pe)
+		fmt.Fprintf(log, "hostrunner: %v\n", pe)
+	}
 	p.wg.Go(func() {
-		err := serveDaemon(ctx, d)
+		err := serveDaemon(ctx, d, others)
 		if err != nil {
-			fmt.Fprintf(d.Log, "hostrunner: %v\n", err)
+			fmt.Fprintf(log, "hostrunner: %v\n", err)
 		}
-		d.Log.Close()
+		log.Close()
 		p.log.Info("daemon ended", "socket", d.Socket, "error", err)
 		p.mu.Lock()
 		defer p.mu.Unlock()
@@ -281,17 +290,53 @@ func (p *process) start(ctx context.Context, d Daemon, pid int) error {
 	return nil
 }
 
-// serveDaemon runs d's Serve under ctx and returns its error. A panic of
-// Serve ends d alone, not the process and its other daemons: it is
-// returned as the error, with the stack, so it reaches d's log and the
-// process log as any error d ends with.
-func serveDaemon(ctx context.Context, d Daemon) (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("panic: %v\n\n%s", r, debug.Stack())
-		}
-	}()
-	return d.Serve(ctx)
+// serveDaemon runs d's Serve under a context derived from ctx, within a
+// containment of its own (see package contain), and returns its error. A
+// panic of Serve, or of code d runs under that context's containment, as
+// in a goroutine it starts with contain.Go, ends d alone, not the process
+// and its other daemons: the first one cancels d's context, as a stop
+// with --kill would, and once Serve returned it is returned as the error,
+// with the stack, so it reaches d's log and the process log as any error
+// d ends with. Every other panic, a later one or one after Serve
+// returned, is passed to others.
+func serveDaemon(ctx context.Context, d Daemon, others func(*contain.PanicError)) error {
+	ctx, cancel := contain.Within(ctx, others)
+	defer cancel() // when Serve panicked
+	return contain.Call(ctx, func() error {
+		err := d.Serve(ctx)
+		// Cancelled here, before Call looks for the panic kept: one
+		// contained from now on goes to others, not kept unread.
+		cancel()
+		return err
+	})
+}
+
+// daemonLog is a daemon's log that Writes after Close drop, safe for
+// concurrent use, as a panic of the daemon may be logged there from any
+// goroutine, even once it ended.
+type daemonLog struct {
+	mu     sync.Mutex
+	w      io.WriteCloser
+	closed bool
+}
+
+// Write writes p to l.w, or, once l is closed, drops it and returns
+// os.ErrClosed.
+func (l *daemonLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return 0, os.ErrClosed
+	}
+	return l.w.Write(p)
+}
+
+// Close closes l.w; Writes after it are dropped.
+func (l *daemonLog) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.closed = true
+	return l.w.Close()
 }
 
 // Add asks the shared process on its control socket, socket, to add the

@@ -1541,6 +1541,13 @@ func (b *logBuffer) Write(p []byte) (int, error) {
 	return b.buf.Write(p)
 }
 
+// String returns what the log holds so far.
+func (b *logBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 // waitFor waits until the log holds text, for 5 s at most.
 func (b *logBuffer) waitFor(t *testing.T, text string) {
 	t.Helper()

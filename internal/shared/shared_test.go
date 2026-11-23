@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kravlab/hostrunner/internal/contain"
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/shared"
 	"github.com/kravlab/hostrunner/internal/transport"
@@ -44,10 +45,38 @@ func (b *logBuffer) String() string {
 	return b.buf.String()
 }
 
-// A daemon of the shared process that panics ends alone: the other keeps
-// running, and the panic, with its stack, is in the daemon's log and in
-// the process log.
+// A daemon of the shared process that panics, in its Serve or in a
+// goroutine it started under its context, once or twice, ends alone: the
+// other keeps running, and each panic, with its stack, is in the daemon's
+// log and in the process log, not in the other daemon's log.
 func TestServeEndsOnlyTheDaemonThatPanics(t *testing.T) {
+	cases := []struct {
+		name      string
+		panicking func(ctx context.Context) // called from the daemon's Serve
+		panics    []string                  // the values it panics with
+	}{
+		{"in its Serve", func(context.Context) { panic("the daemon broke") }, []string{"the daemon broke"}},
+		{"in a goroutine it started", func(ctx context.Context) {
+			contain.Go(ctx, func() { panic("the daemon broke") })
+		}, []string{"the daemon broke"}},
+		{"twice in a goroutine it started", func(ctx context.Context) {
+			var wg sync.WaitGroup
+			contain.GoIn(ctx, &wg, func() {
+				contain.Run(ctx, func() { panic("the daemon broke") })
+				panic("and broke again")
+			})
+			wg.Wait()
+		}, []string{"the daemon broke", "and broke again"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) { testServeEndsOnlyTheDaemonThatPanics(t, tc.panicking, tc.panics) })
+	}
+}
+
+// testServeEndsOnlyTheDaemonThatPanics runs TestServeEndsOnlyTheDaemonThatPanics
+// for a daemon that panics with the values panics, calling panicking from
+// its Serve.
+func testServeEndsOnlyTheDaemonThatPanics(t *testing.T, panicking func(ctx context.Context), panics []string) {
 	dir := t.TempDir()
 	control := filepath.Join(dir, "control.sock")
 	l, err := transport.Unix{Path: control}.Listen()
@@ -59,7 +88,7 @@ func TestServeEndsOnlyTheDaemonThatPanics(t *testing.T) {
 		name := args[0]
 		return shared.Daemon{Socket: name, Log: logs[name], Serve: func(ctx context.Context) error {
 			if name == "panics" {
-				panic("the daemon broke")
+				panicking(ctx)
 			}
 			<-ctx.Done()
 			return nil
@@ -88,9 +117,14 @@ func TestServeEndsOnlyTheDaemonThatPanics(t *testing.T) {
 		t.Fatal("the other daemon ended with the one that panicked")
 	case <-time.After(100 * time.Millisecond):
 	}
-	for name, log := range map[string]string{"daemon": logs["panics"].String(), "process": processLog.String()} {
-		if !strings.Contains(log, "the daemon broke") || !strings.Contains(log, "shared_test.go") {
-			t.Errorf("the %s log lacks the panic and its stack:\n%s", name, log)
+	for _, value := range panics {
+		for name, log := range map[string]string{"daemon": logs["panics"].String(), "process": processLog.String()} {
+			if !strings.Contains(log, value) || !strings.Contains(log, "shared_test.go") {
+				t.Errorf("the %s log lacks the panic %q and its stack:\n%s", name, value, log)
+			}
+		}
+		if log := logs["serves"].String(); strings.Contains(log, value) {
+			t.Errorf("the other daemon's log has the panic %q:\n%s", value, log)
 		}
 	}
 	cancel()

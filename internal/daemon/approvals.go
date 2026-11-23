@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/kravlab/hostrunner/internal/contain"
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
 	"github.com/kravlab/hostrunner/internal/transport"
@@ -594,7 +595,7 @@ func (s *Server) serveApprovals(ctx context.Context, wg *sync.WaitGroup) {
 			s.log.Warn("approval socket failed", "error", err)
 			return
 		}
-		wg.Go(func() { s.handleSession(ctx, conn) })
+		contain.GoIn(ctx, wg, func() { s.handleSession(ctx, conn) })
 	}
 }
 
@@ -616,7 +617,7 @@ func (s *Server) handleSession(ctx context.Context, conn net.Conn) {
 	}
 	out := &frameWriter{conn: conn, timeout: sessionWriteTimeout}
 	c := &sessionConn{conn: conn, out: out, pid: pid}
-	stop := context.AfterFunc(ctx, func() { s.closeStopping(c) })
+	stop := contain.AfterFunc(ctx, func() { s.closeStopping(c) })
 	defer stop()
 	defer func() {
 		if feed := c.runs.Load(); feed != nil {
@@ -701,7 +702,7 @@ func (s *Server) handleSession(ctx context.Context, conn net.Conn) {
 			if sv.Runs && c.runs.Load() == nil {
 				feed := newRunFeed(out)
 				c.runs.Store(feed)
-				go feed.pump() // stopped as handleSession returns
+				contain.Go(ctx, feed.pump) // stopped as handleSession returns
 			}
 			if why := s.serveSession(c, sv.TakeOver); why != "" {
 				_ = out.writeJSON(protocol.FrameError, protocol.Error{Code: protocol.ExitRejected, Message: why})
@@ -933,7 +934,7 @@ func (s *Server) ask(ctx context.Context, x exchange, f protocol.Frame) {
 	// The connection closes when the daemon stops, as handle closes it for
 	// other requests, but while a request waits: ask then tells its client
 	// that the daemon stops first.
-	closeOnStop := context.AfterFunc(ctx, func() { x.conn.Close() })
+	closeOnStop := contain.AfterFunc(ctx, func() { x.conn.Close() })
 	defer func() { closeOnStop() }()
 	var ask protocol.Ask
 	if err := protocol.DecodeJSON(f, &ask); err != nil {
@@ -1014,7 +1015,7 @@ func (s *Server) ask(ctx context.Context, x exchange, f protocol.Frame) {
 	s.log.Info("approval requested", "approval_id", id, "argv", req.Argv, "dir", need.hostDir, "reasons", need.text.agentReasons, "guarded", guarded, "timeout", timeout)
 	_ = x.out.writeJSON(protocol.FrameWaiting, protocol.Waiting{Reasons: need.text.agentReasons, Guarded: guarded, Warning: s.pendingAllowWarning()})
 
-	frames := readFrames(ctx, x.conn)
+	frames := readFrames(ctx, x.conn, x.reads)
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	if !rechecked {
@@ -1038,7 +1039,7 @@ func (s *Server) ask(ctx context.Context, x exchange, f protocol.Frame) {
 		}
 		return
 	}
-	closeOnStop = context.AfterFunc(ctx, func() { x.conn.Close() })
+	closeOnStop = contain.AfterFunc(ctx, func() { x.conn.Close() })
 	ans := o.answer
 	if ans.Scope == "" {
 		s.log.Info("approval answered", "approval_id", id, "scope", "refused", "note", ans.Note)
@@ -1258,12 +1259,13 @@ type frameRead struct {
 	err error
 }
 
-// readFrames reads the client's frames on conn into the returned channel
-// until a read fails, which it delivers last, or ctx ends; then it closes
-// the channel.
-func readFrames(ctx context.Context, conn net.Conn) clientFrames {
+// readFrames reads the client's frames on conn into the returned channel,
+// in a goroutine counted in wg, until a read fails, which it delivers
+// last, or ctx ends; then it closes the channel. The goroutine ends once
+// conn is closed and ctx ended, whatever reads the channel.
+func readFrames(ctx context.Context, conn net.Conn, wg *sync.WaitGroup) clientFrames {
 	ch := make(clientFrames)
-	go func() {
+	contain.GoIn(ctx, wg, func() {
 		defer close(ch)
 		for {
 			f, err := protocol.ReadFrame(conn)
@@ -1276,7 +1278,7 @@ func readFrames(ctx context.Context, conn net.Conn) clientFrames {
 				return
 			}
 		}
-	}()
+	})
 	return ch
 }
 

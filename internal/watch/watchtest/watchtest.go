@@ -26,6 +26,7 @@ type Runtime struct {
 	volumesErr map[string]bool          // names of the volumes that fail to inspect
 	failing    bool
 	hold       *hold // the next Containers call waits on it; nil: none
+	panicValue any   // the next Containers call panics with it; nil: none
 }
 
 type hold struct {
@@ -33,12 +34,18 @@ type hold struct {
 }
 
 // Containers returns the containers in every state, or an error while the
-// runtime is failing. A call that Hold catches answers once released, with
-// the state at that time. Each "volume" mount carries a copy of the volume
-// SetVolume set for its name, or, for a volume none set or one FailVolume
-// fails, a VolumeErr, as watch.CLI reports a volume it cannot inspect.
+// runtime is failing. A call that Panic catches panics instead. A call
+// that Hold catches answers once released, with the state at that time.
+// Each "volume" mount carries a copy of the volume SetVolume set for its
+// name, or, for a volume none set or one FailVolume fails, a VolumeErr, as
+// watch.CLI reports a volume it cannot inspect.
 func (r *Runtime) Containers(context.Context, string) ([]watch.Container, error) {
 	r.mu.Lock()
+	if v := r.panicValue; v != nil {
+		r.panicValue = nil
+		r.mu.Unlock()
+		panic(v)
+	}
 	h := r.hold
 	r.hold = nil
 	r.mu.Unlock()
@@ -78,6 +85,15 @@ func (r *Runtime) volume(name string) (*watch.Volume, error) {
 	}
 	v.Options = maps.Clone(v.Options)
 	return &v, nil
+}
+
+// Panic makes the next Containers call panic with v, which is not nil,
+// as a bug in a runtime query would; a Hold catches the call after it. A
+// test uses it to see what a panic in a watch ends.
+func (r *Runtime) Panic(v any) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.panicValue = v
 }
 
 // SetVolume sets the volume name, which the "volume" mounts naming it
