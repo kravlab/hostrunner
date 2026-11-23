@@ -41,17 +41,13 @@ import (
 
 	"github.com/kravlab/hostrunner/internal/allow"
 	"github.com/kravlab/hostrunner/internal/contain"
+	"github.com/kravlab/hostrunner/internal/procgroup"
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
 	"github.com/kravlab/hostrunner/internal/settings"
 	"github.com/kravlab/hostrunner/internal/transport"
 	"github.com/kravlab/hostrunner/internal/workspace"
 )
-
-// waitDelay bounds how long the daemon keeps forwarding output after the
-// command exits, so a background grandchild holding stdout open cannot keep
-// the client waiting forever.
-const waitDelay = 2 * time.Second
 
 // defaultRequestTimeout bounds how long a new connection may take to send
 // its request, so idle connections cannot pile up and exhaust descriptors.
@@ -1001,7 +997,7 @@ func (s *Server) command(ctx context.Context, p *prepared, out *frameWriter) *ex
 func inDirectory(cmd *exec.Cmd, dir *os.File, hostPath string, env []string) *exec.Cmd {
 	cmd.Dir = fdPath(dir)
 	cmd.Env = commandEnv(env, hostPath)
-	ownGroup(cmd)
+	procgroup.InOwnGroup(cmd)
 	return cmd
 }
 
@@ -1010,15 +1006,6 @@ func streamTo(cmd *exec.Cmd, out *frameWriter) *exec.Cmd {
 	cmd.Stdout = streamWriter{out: out, frame: protocol.FrameStdout}
 	cmd.Stderr = streamWriter{out: out, frame: protocol.FrameStderr}
 	return cmd
-}
-
-// ownGroup starts cmd in a process group of its own, so that cancelling it
-// kills whatever it spawned too (e.g. git's ssh), and waits at most
-// waitDelay for its output after it exits.
-func ownGroup(cmd *exec.Cmd) {
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
-	cmd.WaitDelay = waitDelay
 }
 
 // commandEnv is env, the environment of a command, or of a secret's

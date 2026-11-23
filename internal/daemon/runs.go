@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/kravlab/hostrunner/internal/procgroup"
 	"github.com/kravlab/hostrunner/internal/protocol"
 )
 
@@ -37,8 +38,9 @@ const runWriteTimeout = 100 * time.Millisecond
 
 // stopReportTimeout bounds how long a stopping daemon keeps a session that
 // asked for runs, so that the approved runs the stop cancels end and the
-// session learns how: a killed command's output ends within waitDelay.
-const stopReportTimeout = waitDelay + time.Second
+// session learns how: a killed command's output ends within
+// procgroup.WaitDelay.
+const stopReportTimeout = procgroup.WaitDelay + time.Second
 
 // errClientGone is the cause of a request cancelled because its client
 // went away (or broke the protocol); any other cancellation is the daemon

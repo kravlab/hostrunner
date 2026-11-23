@@ -72,7 +72,10 @@ Synchronous, fast, idempotent (it runs on every `devcontainer up`):
 
 - Runtimes: every one of `docker` and `podman` found in `PATH`; no config.
 - Every 2 s it asks each runtime (10 s timeout per query) for running
-  containers labelled `devcontainer.local_folder=<workspace>`. (Since
+  containers labelled `devcontainer.local_folder=<workspace>`. A cancelled
+  query ends within 2 s more (the runtime's process group is killed and its
+  output is read no longer); a query whose runtime exits but leaves its
+  output open fails 2 s after the exit. (Since
   [watch-armed-container.md](watch-armed-container.md): for the
   workspace's containers in every state, with their start times.) Present if
   any runtime reports one; absent if some runtime answered and none does;

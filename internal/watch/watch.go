@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/kravlab/hostrunner/internal/contain"
+	"github.com/kravlab/hostrunner/internal/procgroup"
 )
 
 // Errors Run returns when it gives up.
@@ -583,9 +584,13 @@ func (c CLI) setVolumes(containers []Container, volumes map[string]Volume, inspe
 	}
 }
 
-// run runs the runtime's CLI and returns its stdout and stderr.
+// run runs the runtime's CLI and returns its stdout and stderr. The query is
+// bounded: once ctx ends, the CLI's process group is killed, and a CLI that
+// exits or is killed, but leaves its output open (through a process of its
+// own) fails the query procgroup.WaitDelay later.
 func (c CLI) run(ctx context.Context, args ...string) (stdout, stderr string, err error) {
 	cmd := exec.CommandContext(ctx, c.Binary, args...)
+	procgroup.InOwnGroup(cmd)
 	if c.env != nil {
 		cmd.Env = c.env.Entries()
 	}

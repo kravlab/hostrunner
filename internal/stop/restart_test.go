@@ -22,6 +22,8 @@ import (
 	"github.com/kravlab/hostrunner/internal/allow/allowtest"
 	"github.com/kravlab/hostrunner/internal/daemon"
 	"github.com/kravlab/hostrunner/internal/launch"
+	"github.com/kravlab/hostrunner/internal/procgroup"
+	"github.com/kravlab/hostrunner/internal/procgroup/procgrouptest"
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
 	"github.com/kravlab/hostrunner/internal/settings"
@@ -516,6 +518,26 @@ func TestRestartOfAnOlderDaemonNeedsAContainerRuntime(t *testing.T) {
 	_, err := runStop(t, stop.Config{Dir: d.dir, Restart: restartConfig(t), Commands: stop.Commands{Answer: stop.Kill}})
 	if err == nil || !strings.Contains(err.Error(), "docker or podman") {
 		t.Fatalf("got %v, want a container runtime asked for", err)
+	}
+	if !d.running() {
+		t.Fatal("the older daemon was stopped")
+	}
+}
+
+// A container runtime that hangs, with a child holding its output open,
+// fails the check of an older daemon's container when the query times out,
+// instead of keeping the restart waiting for the child.
+func TestRestartOfAnOlderDaemonDoesNotWaitForAHungContainerRuntime(t *testing.T) {
+	d := startOlderDaemon(t, false, "")
+	binary, _ := procgrouptest.LeakyCommand(t, nil, "wait")
+	runtime := watch.CLI{Binary: binary}
+	start := time.Now()
+	_, err := runStop(t, stop.Config{Dir: d.dir, Restart: restartConfig(t, runtime), Commands: stop.Commands{Answer: stop.Kill}})
+	if err == nil || !strings.Contains(err.Error(), "the daemon keeps running") {
+		t.Fatalf("got %v, want the restart to fail and keep the daemon", err)
+	}
+	if elapsed, limit := time.Since(start), stop.RuntimeTimeout+procgroup.WaitDelay+procgrouptest.Margin; elapsed > limit {
+		t.Fatalf("the restart took %v, want at most %v", elapsed, limit)
 	}
 	if !d.running() {
 		t.Fatal("the older daemon was stopped")
