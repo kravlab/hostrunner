@@ -111,8 +111,20 @@ added to within the ready timeout of the `up` that started it
 ends on its own.
 _Avoid_: global daemon
 
+**Activation socket**:
+The socket of one devcontainer that the host system holds when
+`process` is `per-request`, starting a request process for each
+connection; it lives until a stop or the end of the human's login
+session.
+_Avoid_: socket unit, daemonless daemon
+
+**Request process**:
+A host process an activation socket starts for one connection,
+which serves that one request as a daemon would and ends with it.
+
 **Arm**:
 The signal `hostrunner up` gives the daemon, on its approval
+socket, or records for the request processes of its activation
 socket, each time the devcontainer tooling brings a container
 of its workspace up, carrying the digest of the rules and all the
 daemon settings it resolved, `process` included; the container cannot
@@ -142,7 +154,7 @@ and `hostrunner up` starts a new daemon.
 _Avoid_: restart (a human's decision, not the daemon's)
 
 **Stop**:
-A human on the host ending a daemon.
+A human on the host ending a daemon or an activation socket.
 _Avoid_: kill, shutdown
 
 **Restart**:
@@ -235,8 +247,9 @@ file, its digest and the daemon settings but `process`, for
 _Avoid_: approval request (one command waiting for a human's answer)
 
 **Mount check**:
-The daemon's check that its armed container cannot write the files that
-configure the workspace's devcontainer and daemon, through a bind mount
+The check, by the daemon or a request process, that the armed
+container cannot write the files that configure the workspace's
+devcontainer and daemon, through a bind mount
 or a volume that binds a host directory. A human on the host
 may turn it off for a workspace (`mount_check`); the container cannot.
 _Avoid_: read-only check, writable warning
@@ -282,7 +295,8 @@ Refused by a deny pattern; one kind of guarded refusal.
 
 **Standing approval**:
 An approval of one argv from one container directory that lets
-it through until its daemon ends or the human revokes it.
+it through until its daemon ends or its activation socket stops,
+or the human revokes it.
 _Avoid_: lifetime approval, grant
 
 **Session approval**:
@@ -304,5 +318,6 @@ changed but not allowed.
 _Avoid_: message, event
 
 **Approval socket**:
-The daemon's socket for approval sessions, beside its runtime
-directory and outside the container's reach.
+The socket for approval sessions beside a runtime directory,
+outside the container's reach: the daemon's, or, with an
+activation socket, the approval session's own.
