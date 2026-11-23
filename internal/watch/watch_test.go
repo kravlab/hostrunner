@@ -15,6 +15,8 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/kravlab/hostrunner/internal/procgroup"
+	"github.com/kravlab/hostrunner/internal/procgroup/procgrouptest"
 	"github.com/kravlab/hostrunner/internal/watch"
 	"github.com/kravlab/hostrunner/internal/watch/watchtest"
 )
@@ -761,6 +763,59 @@ func TestCLIRuntimeReportsFailingBinary(t *testing.T) {
 	}
 	if _, err := (watch.CLI{Binary: path}).Containers(context.Background(), "/home/u/app"); err == nil {
 		t.Fatal("expected an error from a failing runtime binary")
+	}
+}
+
+// containersResult is what CLI.Containers returned.
+type containersResult struct {
+	containers []watch.Container
+	err        error
+}
+
+// queryContainers asks the runtime binary for the containers of a workspace
+// in the background, and returns the channel its result arrives on.
+func queryContainers(ctx context.Context, binary string) <-chan containersResult {
+	result := make(chan containersResult, 1)
+	go func() {
+		containers, err := (watch.CLI{Binary: binary}).Containers(ctx, "/home/u/app")
+		result <- containersResult{containers, err}
+	}()
+	return result
+}
+
+func TestCLIRuntimeCancelledQueryEndsWithinWaitDelayAndKillsTheRuntimesChildren(t *testing.T) {
+	binary, pidFile := procgrouptest.LeakyCommand(t, nil, "wait")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := queryContainers(ctx, binary)
+	child := procgrouptest.WaitPID(t, pidFile)
+
+	cancel()
+	select {
+	case got := <-result:
+		if got.err == nil {
+			t.Fatalf("got %v, nil; want an error from a cancelled query", got.containers)
+		}
+	case <-time.After(procgroup.WaitDelay + procgrouptest.Margin):
+		t.Fatal("the cancelled query did not return")
+	}
+	if !procgrouptest.Gone(child) {
+		t.Fatalf("the runtime's child %d still runs", child)
+	}
+}
+
+// A runtime that answers and exits, but whose child keeps its output open,
+// fails the query: the answer may be cut short, so it is never taken.
+func TestCLIRuntimeQueryOfARuntimeThatExitsLeavingItsOutputOpenFails(t *testing.T) {
+	binary, _ := procgrouptest.LeakyCommand(t, []string{"a"}, "exit 0")
+	result := queryContainers(context.Background(), binary)
+	select {
+	case got := <-result:
+		if got.err == nil || got.containers != nil {
+			t.Fatalf("got %v, %v; want no containers and an error from a runtime whose output the bound closed", got.containers, got.err)
+		}
+	case <-time.After(procgroup.WaitDelay + procgrouptest.Margin):
+		t.Fatal("the query did not return while the runtime's child held its output open")
 	}
 }
 
