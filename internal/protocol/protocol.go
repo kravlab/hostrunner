@@ -181,7 +181,7 @@ type Request struct {
 // older rules can step aside; NoReread is the `up`'s --no-reread, so a
 // daemon that rereads its rules file otherwise can too. Settings are the
 // daemon settings `up` resolved, key to value text, as
-// settings.Settings.Daemon writes them, so a daemon running with others
+// settings.Settings.ArmSettings writes them, so a daemon running with others
 // steps aside too. A daemon that predates them ignores the field and
 // still reads NoReread, which Settings' reread then repeats, and a
 // current daemon reads only Settings; an arm without the field, from an
@@ -198,11 +198,12 @@ type Arm struct {
 }
 
 // ArmNotAllowed tells a running daemon that `hostrunner up` found the rules
-// file of Digest, with the daemon settings Settings (key to value text, as
-// settings.Settings.Daemon writes them), not allowed. The daemon, which
-// serves allowed ones, is armed instead of replaced; it warns the client
-// (the Warning fields) while that change stays not allowed, until an arm
-// without the field or the allow store allows it.
+// file of Digest, with the daemon settings Settings that the allow covers
+// (key to value text, as settings.Settings.AllowedSettings writes them:
+// ArmSettings without the process), not allowed. The daemon, which serves
+// allowed ones, is armed instead of replaced; it warns the client (the
+// Warning fields) while that change stays not allowed, until an arm without
+// the field or the allow store allows it.
 type ArmNotAllowed struct {
 	Digest   string            `json:"digest"`
 	Settings map[string]string `json:"settings,omitempty"`
@@ -498,10 +499,14 @@ type Hello struct {
 // every command until a later check passes (see FrameMountCheckFailed); a
 // daemon older than the field, or one that does not check, reports none,
 // and an older session ignores it.
-// Settings are the daemon settings the daemon runs with, keyed by their
-// names as an arm carries them (settings.Settings.Daemon), so that
-// `hostrunner up` can tell whether what it serves is allowed; a daemon
+// Settings are the daemon settings the daemon runs with that the allow
+// covers, keyed by their names as an arm carries them
+// (settings.Settings.AllowedSettings: ArmSettings without the process), so
+// that `hostrunner up` can tell whether what it serves is allowed; a daemon
 // older than the field reports none, and an older session ignores it.
+// Process is the kind of process the daemon runs in, "own" or "shared"
+// (settings.Process); a daemon older than the field reports none, and an
+// older session ignores it.
 type DaemonInfo struct {
 	Version            int               `json:"version"`
 	Workspace          string            `json:"workspace"`
@@ -517,6 +522,7 @@ type DaemonInfo struct {
 	Runs               bool              `json:"runs,omitempty"`
 	Settings           map[string]string `json:"settings,omitempty"`
 	MountCheckFailed   string            `json:"mount_check_failed,omitempty"`
+	Process            string            `json:"process,omitempty"`
 }
 
 // RunningList answers FrameRunning: the commands the daemon runs, and

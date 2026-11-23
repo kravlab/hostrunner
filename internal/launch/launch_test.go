@@ -62,10 +62,10 @@ func TestMain(m *testing.M) {
 			Dir: dir, Workspace: "/w", ContainerWorkspace: "/c",
 			Daemon: os.Args[0], Client: client,
 			Allows:   allow.Store{Dir: filepath.Join(dir, "allow")},
-			Settings: settings.Settings{RulesFile: filepath.Join(dir, "missing-rules.yaml"), Reread: true, ReadyTimeout: 5 * time.Second},
+			Settings: settings.Settings{RulesFile: filepath.Join(dir, "missing-rules.yaml"), Reread: true, ReadyTimeout: 5 * time.Second, Process: settings.ProcessOwn},
 		}
 		// The rules file is missing, which has the digest "missing".
-		if _, err := cfg.Allows.AllowAll(cfg.Workspace, []allow.Entry{{Place: cfg.place(), Target: allow.Target{RulesFile: cfg.RulesFile, Scope: allow.Scope{Digest: "missing", Settings: cfg.Settings.Daemon()}}}}); err != nil {
+		if _, err := cfg.Allows.AllowAll(cfg.Workspace, []allow.Entry{{Place: cfg.place(), Target: allow.NewTarget(cfg.RulesFile, "missing", cfg.Settings.AllowedSettings())}}); err != nil {
 			os.Exit(1)
 		}
 		if err := Up(context.Background(), cfg); err != nil {
@@ -103,6 +103,7 @@ func runFakeDaemon(mode string) {
 	fs.DurationVar(&own.PollInterval, "poll-interval", 0, "")
 	fs.DurationVar(&own.AskTimeout, "ask-timeout", 0, "")
 	fs.DurationVar(&own.RequestTimeout, "request-timeout", 0, "")
+	process := fs.String("process", "", "")
 	fs.Bool("reread", false, "") // reread is !--no-reread: up passes one of the two
 	noReread := fs.Bool("no-reread", false, "")
 	fs.Bool("mount-check", false, "") // likewise, the mount check is !--no-mount-check
@@ -110,7 +111,7 @@ func runFakeDaemon(mode string) {
 	if len(os.Args) < 2 || os.Args[1] != "serve" || fs.Parse(os.Args[2:]) != nil || !*watch || *config == "" {
 		os.Exit(2)
 	}
-	own.RulesFile, own.Reread, own.MountCheck = *config, !*noReread, !*noMountCheck
+	own.RulesFile, own.Reread, own.MountCheck, own.Process = *config, !*noReread, !*noMountCheck, settings.Process(*process)
 	policy, err := rules.Load(*config)
 	if err != nil {
 		os.Exit(3)
@@ -127,12 +128,12 @@ func runFakeDaemon(mode string) {
 	}
 	d := fakeDaemon{
 		dir: dir, digest: policy.Digest(), noReread: *noReread,
-		settings: own.Daemon(), // without a duration up did not pass, which is then not compared
+		settings: own.ArmSettings(), // without a duration up did not pass, which is then not compared
 		socket:   l,
 	}
 	d.info = protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: *workspace, RulesFile: *config, RulesDigest: d.digest, Stops: true, Rereads: !*noReread, NoReread: *noReread}
 	if mode != "older" {
-		d.info.Settings = d.settings
+		d.info.Settings = own.AllowedSettings() // what the daemon says it serves: what the allow covers
 	}
 	d.answerApprovalSocket(ApprovalSocket(dir))
 	for {
@@ -150,8 +151,10 @@ func runFakeDaemon(mode string) {
 
 // fakeDaemon is what a fake daemon serves: its runtime directory, where
 // it records what it is told, the digest of its rules, its --no-reread,
-// its daemon settings, what it answers hellos with, and its socket, which
-// it closes as it steps aside.
+// its daemon settings, which an arm is compared with (its info says only
+// those of them the allow covers, without process, as the real daemon's
+// does), what it answers hellos with, and its socket, which it closes as it
+// steps aside.
 type fakeDaemon struct {
 	dir      string
 	digest   string
@@ -333,7 +336,7 @@ func fakeConfig(t *testing.T, mode string) Config {
 		Daemon:             os.Args[0],
 		Client:             mustStatic(t),
 		Allows:             allow.Store{Dir: filepath.Join(base, "allow")},
-		Settings:           settings.Settings{RulesFile: filepath.Join(base, "hostrun.yaml"), Reread: true, ReadyTimeout: 5 * time.Second},
+		Settings:           settings.Settings{RulesFile: filepath.Join(base, "hostrun.yaml"), Reread: true, ReadyTimeout: 5 * time.Second, Process: settings.ProcessOwn},
 	}
 	allowCurrent(t, cfg)
 	t.Setenv(fakeDaemonEnv, mode)
@@ -356,7 +359,7 @@ func allowCurrent(t *testing.T, cfg Config) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	allowtest.Allow(t, cfg.Allows, cfg.place(), allow.Target{RulesFile: cfg.RulesFile, Scope: allow.Scope{Digest: policy.Digest(), Settings: cfg.Settings.Daemon()}})
+	allowtest.Allow(t, cfg.Allows, cfg.place(), allow.NewTarget(cfg.RulesFile, policy.Digest(), cfg.Settings.AllowedSettings()))
 }
 
 // pendingOf returns the pending request of the runtime directory of cfg,
@@ -779,7 +782,8 @@ func TestUpReplacesDaemonWhoseRereadingDiffers(t *testing.T) {
 // The daemon `up` starts gets every setting as an explicit flag, so its
 // argv shows them and it resolves none again, and the workspace settings
 // file up resolved, which the daemon protects; rereading and the mount
-// check are explicit both ways, and ready_timeout, up's own, is no flag.
+// check are explicit both ways, the process (own or shared) is given too
+// so the daemon knows it, and ready_timeout, up's own, is no flag.
 func TestServeArgsGiveEverySetting(t *testing.T) {
 	base := Config{Workspace: "/home/u/app", ContainerWorkspace: "/workspaces/app", WorkspaceSettings: "/home/u/app/.devcontainer/hostrunner.yaml", Settings: settings.Settings{
 		RulesFile: "/home/u/app/.devcontainer/hostrun.yaml", StartupTimeout: 30 * time.Minute, Grace: 15 * time.Second,
@@ -789,17 +793,19 @@ func TestServeArgsGiveEverySetting(t *testing.T) {
 		"--startup-timeout", "30m0s", "--grace", "15s", "--poll-interval", "2s", "--ask-timeout", "10m0s", "--request-timeout", "10s"}
 	for _, tt := range []struct {
 		reread, mountCheck bool
+		process            settings.Process
 		flags              []string
 	}{
-		{reread: true, mountCheck: true, flags: []string{"--reread", "--mount-check"}},
-		{reread: false, mountCheck: true, flags: []string{"--no-reread", "--mount-check"}},
-		{reread: true, mountCheck: false, flags: []string{"--reread", "--no-mount-check"}},
+		{reread: true, mountCheck: true, process: settings.ProcessOwn, flags: []string{"--process", "own", "--reread", "--mount-check"}},
+		{reread: false, mountCheck: true, process: settings.ProcessOwn, flags: []string{"--process", "own", "--no-reread", "--mount-check"}},
+		{reread: true, mountCheck: false, process: settings.ProcessOwn, flags: []string{"--process", "own", "--reread", "--no-mount-check"}},
+		{reread: true, mountCheck: true, process: settings.ProcessShared, flags: []string{"--process", "shared", "--reread", "--mount-check"}},
 	} {
 		cfg := base
-		cfg.Reread, cfg.MountCheck = tt.reread, tt.mountCheck
+		cfg.Reread, cfg.MountCheck, cfg.Process = tt.reread, tt.mountCheck, tt.process
 		want := append(slices.Clone(start), tt.flags...)
 		if got := serveArgs(cfg, "/run/h.sock"); !slices.Equal(got, want) {
-			t.Errorf("reread %v, mount check %v: got %q, want %q", tt.reread, tt.mountCheck, got, want)
+			t.Errorf("reread %v, mount check %v, process %s: got %q, want %q", tt.reread, tt.mountCheck, tt.process, got, want)
 		}
 	}
 }
@@ -948,7 +954,7 @@ func TestSocketPaths(t *testing.T) {
 	}
 }
 
-// An arm carries the daemon settings of up as Settings.Daemon names them,
+// An arm carries the daemon settings of up as Settings.ArmSettings names them,
 // and still carries --no-reread for a daemon that predates the settings.
 func TestArmCarriesTheDaemonSettings(t *testing.T) {
 	for _, tt := range []struct {
@@ -962,11 +968,11 @@ func TestArmCarriesTheDaemonSettings(t *testing.T) {
 			s: settings.Settings{
 				RulesFile: "/w/rules.yaml", StartupTimeout: time.Hour, Grace: time.Minute, Reread: false,
 				PollInterval: time.Second, AskTimeout: time.Minute, RequestTimeout: time.Second, ReadyTimeout: time.Minute,
-				MountCheck: true,
+				Process: settings.ProcessShared, MountCheck: true,
 			},
 			want: map[string]string{
 				"rules_file": "/w/rules.yaml", "startup_timeout": "1h0m0s", "grace": "1m0s", "reread": "false",
-				"poll_interval": "1s", "ask_timeout": "1m0s", "request_timeout": "1s", "mount_check": "true",
+				"poll_interval": "1s", "ask_timeout": "1m0s", "request_timeout": "1s", "process": "shared", "mount_check": "true",
 			},
 			wantNoReread: true,
 		},
@@ -1012,11 +1018,11 @@ func TestServeArgsResolveToUpsSettings(t *testing.T) {
 	full := settings.Settings{
 		RulesFile: "/home/u/app/.devcontainer/hostrun.yaml", StartupTimeout: 30 * time.Minute, Grace: 15 * time.Second,
 		Reread: true, PollInterval: 2 * time.Second, AskTimeout: 10 * time.Minute, RequestTimeout: 10 * time.Second,
-		ReadyTimeout: 10 * time.Second, MountCheck: true,
+		ReadyTimeout: 10 * time.Second, Process: settings.ProcessOwn, MountCheck: true,
 	}
 	elsewhere := full
 	elsewhere.RulesFile, elsewhere.Reread, elsewhere.Grace = "/home/u/rules/hostrun.yaml", false, 90*time.Second
-	elsewhere.MountCheck = false
+	elsewhere.MountCheck, elsewhere.Process = false, settings.ProcessShared
 	for _, tt := range []struct {
 		name string
 		s    settings.Settings
@@ -1033,8 +1039,8 @@ func TestServeArgsResolveToUpsSettings(t *testing.T) {
 			t.Fatalf("%s: %v", tt.name, err)
 		}
 		got, err := sf.ResolveAsGiven(func(string) string { return "" }, cfg.Workspace)
-		if err != nil || !maps.Equal(got.Daemon(), tt.s.Daemon()) {
-			t.Errorf("%s: got %v, %v; want %v", tt.name, got.Daemon(), err, tt.s.Daemon())
+		if err != nil || !maps.Equal(got.ArmSettings(), tt.s.ArmSettings()) {
+			t.Errorf("%s: got %v, %v; want %v", tt.name, got.ArmSettings(), err, tt.s.ArmSettings())
 		}
 	}
 }
@@ -1180,6 +1186,26 @@ func TestUpAfterAChangeOfTheReadyTimeoutNeedsNoNewAllow(t *testing.T) {
 	onlyPid(t, cfg.Dir)
 }
 
+// process is a daemon setting outside the allow: the allow of an up in a
+// process of its own covers an up in the shared process of its build, and
+// the reverse, so a change of it needs no new allow. The check of the
+// allow is what PrepareAllowed runs; starting the shared process needs the
+// real daemon, which the tests of the shared process below start.
+func TestUpAfterAChangeOfTheProcessNeedsNoNewAllow(t *testing.T) {
+	for _, process := range []settings.Process{settings.ProcessShared, settings.ProcessOwn} {
+		t.Run(string(process), func(t *testing.T) {
+			cfg := fakeConfig(t, "serve") // allowed with process own
+			cfg.Process = process
+			if _, err := PrepareAllowed(cfg); err != nil {
+				t.Fatalf("PrepareAllowed with process %s: %v", process, err)
+			}
+			if _, ok, err := pendingOf(t, cfg); err != nil || ok {
+				t.Fatalf("Pending = %v, %v, want no request", ok, err)
+			}
+		})
+	}
+}
+
 // An up whose rules are not allowed arms a running daemon that serves
 // allowed rules and settings, which keeps serving them, so a container
 // restart does not drop them; it says so on stderr and records its
@@ -1214,6 +1240,32 @@ func TestUpOfChangedRulesNotAllowedArmsTheDaemonServingAllowedRules(t *testing.T
 	}
 }
 
+// A change of process made together with rules not allowed does not make
+// the daemon serving the allowed rules step aside: the arm of the not
+// allowed path carries the settings the daemon says it serves, which hold
+// no process, so the daemon keeps serving them.
+func TestUpOfChangedRulesNotAllowedAndProcessKeepsTheDaemonServingAllowedRules(t *testing.T) {
+	cfg := fakeConfig(t, "serve") // allowed with process own
+	if err := Up(context.Background(), cfg); err != nil {
+		t.Fatalf("first Up: %v", err)
+	}
+	first := onlyPid(t, cfg.Dir)
+	if err := os.WriteFile(cfg.RulesFile, []byte(gitStatusRules), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Process = settings.ProcessShared
+	cfg.Stderr = io.Discard
+	if err := Up(context.Background(), cfg); err != nil {
+		t.Fatalf("Up of rules not allowed and another process: %v", err)
+	}
+	if pid := onlyPid(t, cfg.Dir); pid != first || !alivePid(first) {
+		t.Fatalf("daemon pid %d, alive %v; want %d kept", pid, alivePid(first), first)
+	}
+	if got := lines(t, filepath.Join(cfg.Dir, "fake.armed")); strings.Join(got, " ") != "armed armed" {
+		t.Errorf("arms %q, want the running daemon armed twice and not stepping aside", got)
+	}
+}
+
 // The arm of a daemon serving allowed rules says what is not allowed, the
 // digest and the daemon settings up found, so the daemon warns hostrun of
 // the change. An up whose rules and settings are allowed says nothing.
@@ -1243,11 +1295,22 @@ func TestUpNotAllowedTellsTheDaemonWhatIsNotAllowed(t *testing.T) {
 				t.Fatalf("Up of a change not allowed: %v", err)
 			}
 			got := notAllowedArms(t, cfg.Dir)
-			want := protocol.ArmNotAllowed{Digest: tt.digest, Settings: cfg.Settings.Daemon()}
+			want := protocol.ArmNotAllowed{Digest: tt.digest, Settings: cfg.Settings.AllowedSettings()}
 			if len(got) != 1 || got[0].Digest != want.Digest || !maps.Equal(got[0].Settings, want.Settings) {
 				t.Fatalf("the arm reported %+v, want [%+v]", got, want)
 			}
+			lacksProcess(t, "the arm reported", got[0].Settings)
 		})
+	}
+}
+
+// lacksProcess fails the test when the settings s, which what says it
+// holds (the arm, request or daemon settings the allow covers), hold the
+// process, a setting the allow does not cover.
+func lacksProcess(t *testing.T, what string, s map[string]string) {
+	t.Helper()
+	if _, ok := s["process"]; ok {
+		t.Errorf("%s the settings %v, which hold the process the allow does not cover", what, s)
 	}
 }
 
@@ -1288,13 +1351,13 @@ func TestUpOfChangedRulesNotAllowedLeavesADaemonNotServingAllowedRules(t *testin
 			}
 		}},
 		{"other rules allowed", "serve", func(t *testing.T, cfg *Config) {
-			allowtest.Allow(t, cfg.Allows, cfg.place(), allow.Target{RulesFile: cfg.RulesFile, Scope: allow.Scope{Digest: "other", Settings: cfg.Settings.Daemon()}})
+			allowtest.Allow(t, cfg.Allows, cfg.place(), allow.NewTarget(cfg.RulesFile, "other", cfg.Settings.AllowedSettings()))
 		}},
 		{"a daemon of another workspace", "serve", func(t *testing.T, cfg *Config) {
 			// The other workspace allows what the daemon serves, for the
 			// workspace it was started for.
 			cfg.Workspace = "/home/u/other"
-			allowtest.Allow(t, cfg.Allows, cfg.place(), allow.Target{RulesFile: cfg.RulesFile, Scope: allow.Scope{Digest: "missing", Settings: cfg.Settings.Daemon()}})
+			allowtest.Allow(t, cfg.Allows, cfg.place(), allow.NewTarget(cfg.RulesFile, "missing", cfg.Settings.AllowedSettings()))
 		}},
 		{"an older daemon", "older", func(*testing.T, *Config) {}},
 	} {
@@ -1340,11 +1403,30 @@ func TestUpRefusedRecordsItsRequest(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("Pending = %v, %v, want a request", ok, err)
 	}
-	if e.Workspace != cfg.Workspace || e.RuntimeDir != cfg.Dir || e.RulesFile != cfg.RulesFile || e.Digest != gitStatusDigest || !maps.Equal(e.Settings, cfg.Settings.Daemon()) {
-		t.Fatalf("request %+v, want workspace %q, runtime directory %q, rules file %q, digest %q and settings %v", e, cfg.Workspace, cfg.Dir, cfg.RulesFile, gitStatusDigest, cfg.Settings.Daemon())
+	if e.Workspace != cfg.Workspace || e.RuntimeDir != cfg.Dir || e.RulesFile != cfg.RulesFile || e.Digest != gitStatusDigest || !maps.Equal(e.Settings, cfg.Settings.AllowedSettings()) {
+		t.Fatalf("request %+v, want workspace %q, runtime directory %q, rules file %q, digest %q and settings %v", e, cfg.Workspace, cfg.Dir, cfg.RulesFile, gitStatusDigest, cfg.Settings.AllowedSettings())
 	}
 	if e.Settings["grace"] != "1m0s" {
 		t.Errorf("request grace %q, want 1m0s", e.Settings["grace"])
+	}
+}
+
+// The request a refused up records is what the allow covers: the daemon
+// settings without process, which a human allowing it does not decide.
+func TestUpRefusedRecordsItsRequestWithoutTheProcess(t *testing.T) {
+	cfg := fakeConfig(t, "serve")
+	cfg.Process = settings.ProcessShared
+	if err := os.WriteFile(cfg.RulesFile, []byte(gitStatusRules), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	notAllowed(t, Up(context.Background(), cfg), cfg, gitStatusDigest)
+	e, ok, err := pendingOf(t, cfg)
+	if err != nil || !ok {
+		t.Fatalf("Pending = %v, %v, want a request", ok, err)
+	}
+	lacksProcess(t, "the request holds", e.Settings)
+	if !maps.Equal(e.Settings, cfg.Settings.AllowedSettings()) {
+		t.Errorf("request settings %v, want %v", e.Settings, cfg.Settings.AllowedSettings())
 	}
 }
 
@@ -1391,7 +1473,7 @@ func TestUpOfTwoRuntimeDirsStartsTheRealDaemonOfEachOnceAllowed(t *testing.T) {
 			Settings: settings.Settings{
 				RulesFile: rulesFile, StartupTimeout: 10 * time.Minute, Grace: grace,
 				PollInterval: time.Second, AskTimeout: 10 * time.Minute, RequestTimeout: 10 * time.Second,
-				Reread: true, MountCheck: true, ReadyTimeout: 10 * time.Second,
+				Reread: true, MountCheck: true, ReadyTimeout: 10 * time.Second, Process: settings.ProcessOwn,
 			},
 		}
 	}
@@ -1533,14 +1615,18 @@ func stopDaemon(t *testing.T, daemon string, cfg Config) {
 }
 
 // sharedPids returns the pids of the running `hostrunner shared` processes
-// whose control socket is in the runtime root root, as /proc shows them.
+// whose control socket is in the runtime root root, as /proc shows them. A
+// process whose parent is itself one of them is left out: a shared process
+// forks children to run the container runtime, and until a child execs its
+// /proc/<pid>/cmdline is still its parent's, so it would count as a second
+// shared process.
 func sharedPids(t *testing.T, root string) []int {
 	t.Helper()
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
 		t.Fatal(err)
 	}
-	var pids []int
+	parents := map[int]int{}
 	for _, e := range entries {
 		pid, err := strconv.Atoi(e.Name())
 		if err != nil {
@@ -1552,10 +1638,37 @@ func sharedPids(t *testing.T, root string) []int {
 		}
 		args := strings.Split(string(cmdline), "\x00")
 		if len(args) >= 4 && args[1] == "shared" && args[2] == "--socket" && filepath.Dir(args[3]) == root {
+			parents[pid] = parentPid(pid)
+		}
+	}
+	var pids []int
+	for pid, ppid := range parents {
+		if _, forked := parents[ppid]; !forked {
 			pids = append(pids, pid)
 		}
 	}
+	slices.Sort(pids)
 	return pids
+}
+
+// parentPid returns the parent pid of pid as /proc/<pid>/stat shows it, or 0
+// when the process is gone.
+func parentPid(pid int) int {
+	stat, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		return 0
+	}
+	// The command name, field 2, is in parentheses and may hold spaces: the
+	// fields that follow the last ')' are the state, then the parent pid.
+	fields := strings.Fields(string(stat[bytes.LastIndexByte(stat, ')')+1:]))
+	if len(fields) < 2 {
+		return 0
+	}
+	ppid, err := strconv.Atoi(fields[1])
+	if err != nil {
+		return 0
+	}
+	return ppid
 }
 
 // servingPid is the pid of the process listening on the socket of cfg.
@@ -1628,6 +1741,91 @@ func TestUpOfTwoRuntimeDirsWithProcessSharedServesBothInOneProcess(t *testing.T)
 	}
 	if _, code := runIn(t, a, "true"); code != protocol.ExitRejected {
 		t.Errorf("true, not in the rules of A, exits %d there, want %d", code, protocol.ExitRejected)
+	}
+}
+
+// processKind returns the hostrunner command the process pid runs, the
+// first argument after its executable in /proc: serve for a daemon in a
+// process of its own, shared for the shared process.
+func processKind(t *testing.T, pid int) string {
+	t.Helper()
+	cmdline, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/cmdline")
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Split(string(cmdline), "\x00")
+	if len(args) < 2 {
+		t.Fatalf("the command line of process %d is %q, want a hostrunner command", pid, args)
+	}
+	return args[1]
+}
+
+// A change of process alone, with no new allow, is not refused, and the
+// up moves the daemon: the one in the old kind of process, which steps
+// aside on the arm and logs the setting it changed, gives way to a new
+// one in the other kind, a process of its own or the shared process.
+func TestUpAfterAChangeOfTheProcessMovesTheDaemonIntoTheOtherKindOfProcess(t *testing.T) {
+	for _, c := range []struct {
+		name             string
+		from, to         settings.Process
+		fromKind, toKind string
+	}{
+		{"own to shared", settings.ProcessOwn, settings.ProcessShared, "serve", "shared"},
+		{"shared to own", settings.ProcessShared, settings.ProcessOwn, "shared", "serve"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			ctx := context.Background()
+			daemon := mustHostrunner(t)
+			cfg, _ := sharedPair(t, daemon) // allowed with process shared
+			cfg.Process = c.from
+			if err := Up(ctx, cfg); err != nil {
+				t.Fatalf("Up with process %s: %v", c.from, err)
+			}
+			oldPid := servingPid(t, cfg)
+			if got := processKind(t, oldPid); got != c.fromKind {
+				t.Fatalf("process %d serving with process %s runs hostrunner %s, want %s", oldPid, c.from, got, c.fromKind)
+			}
+
+			cfg.Process = c.to // only the process changes; nothing is allowed anew
+			if err := Up(ctx, cfg); err != nil {
+				t.Fatalf("Up with process %s after an allow with process %s: %v", c.to, c.from, err)
+			}
+			if e, ok, err := pendingOf(t, cfg); err != nil || ok {
+				t.Fatalf("pending request = %+v, %v, %v; want none", e, ok, err)
+			}
+			waitGone(t, oldPid)
+			newPid := servingPid(t, cfg)
+			if newPid == oldPid {
+				t.Fatalf("process %d still serves after the change of process to %s", oldPid, c.to)
+			}
+			if got := processKind(t, newPid); got != c.toKind {
+				t.Errorf("process %d serving with process %s runs hostrunner %s, want %s", newPid, c.to, got, c.toKind)
+			}
+			wantShared := []int{newPid}
+			if c.to == settings.ProcessOwn {
+				wantShared = nil
+			}
+			if got := sharedPids(t, filepath.Dir(cfg.Dir)); !slices.Equal(got, wantShared) {
+				t.Errorf("shared processes %v after the change to %s, want %v", got, c.to, wantShared)
+			}
+
+			info, err := daemonlist.Probe(ctx, ApprovalSocket(cfg.Dir))
+			if err != nil {
+				t.Fatalf("probe the new daemon: %v", err)
+			}
+			lacksProcess(t, "the new daemon says", info.Settings)
+			if got, code := runIn(t, cfg, "pwd"); got != cfg.Workspace+"\n" || code != 0 {
+				t.Errorf("pwd through the new daemon: got %q, exit %d; want %q, exit 0", got, code, cfg.Workspace+"\n")
+			}
+
+			data, err := os.ReadFile(filepath.Join(cfg.Dir, LogName))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := "process=\"" + string(c.from) + " → " + string(c.to) + "\""; !hasLine(string(data), "stepping aside: the settings changed", want) {
+				t.Errorf("the log has no step aside for %s:\n%s", want, data)
+			}
+		})
 	}
 }
 
@@ -2069,7 +2267,7 @@ func TestUpRefusedRecordsTheRequestOfItsOwnRuntimeDir(t *testing.T) {
 	notAllowed(t, Up(ctx, b), b, "missing")
 	for _, cfg := range []Config{a, b} {
 		e, ok, err := pendingOf(t, cfg)
-		if err != nil || !ok || !maps.Equal(e.Settings, cfg.Settings.Daemon()) {
+		if err != nil || !ok || !maps.Equal(e.Settings, cfg.Settings.AllowedSettings()) {
 			t.Errorf("Pending(%s) = %+v, %v, %v; want its request", cfg.Dir, e, ok, err)
 		}
 	}

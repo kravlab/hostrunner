@@ -59,8 +59,9 @@ type Settings struct {
 	ReadyTimeout time.Duration
 	// Process (process) is whether up starts the daemon in a process of its
 	// own (ProcessOwn) or adds it to the shared process of its build
-	// (ProcessShared); up's own, not passed to the daemon.
-	Process string
+	// (ProcessShared); the daemon takes it too, to compare it with the one
+	// the arm carries.
+	Process Process
 	// RuntimeRoot (runtime_root) is where stop, restart and approve look
 	// for daemons' runtime directories; empty when no source gives one
 	// and XDG_RUNTIME_DIR is unset.
@@ -78,12 +79,15 @@ type Settings struct {
 	MountCheck bool
 }
 
+// Process is the value of the setting process: where up runs the daemon.
+type Process string
+
 // The values of the setting process: ProcessOwn starts a daemon in a
 // process of its own, ProcessShared adds it to the shared process of its
 // build.
 const (
-	ProcessOwn    = "own"
-	ProcessShared = "shared"
+	ProcessOwn    Process = "own"
+	ProcessShared Process = "shared"
 )
 
 // Resolved is what resolving settings found: the Settings and, besides
@@ -104,6 +108,10 @@ const RulesFileKey = "rules_file"
 // takes and the refusals of a failed mount check name (see
 // MountCheckOffHint).
 const mountCheckKey = "mount_check"
+
+// processKey is the name of the key process, which restart also takes a
+// flag for: it starts the new daemon in the process kind it names.
+const processKey = "process"
 
 // defaults are the settings no source sets, for the workspace at the
 // host path workspace. Its rules file is the default name, which looks at
@@ -154,11 +162,12 @@ func applyDefs(s *Settings, ks []key) {
 	}
 }
 
-// Daemon returns the settings serve takes, keyed by their names, each
+// ArmSettings returns the settings serve takes, keyed by their names, each
 // value written as a settings file writes it (`1m30s`, `true`, a path):
-// what an arm of up carries to the daemon, and what the daemon compares
-// it with.
-func (s Settings) Daemon() map[string]string {
+// what an arm of up carries to the daemon and the daemon compares, every
+// daemon setting, the process included. The allow takes AllowedSettings
+// instead.
+func (s Settings) ArmSettings() map[string]string {
 	daemonKeys := keysOf(scopeDaemon)
 	out := make(map[string]string, len(daemonKeys))
 	for _, k := range daemonKeys {
@@ -167,20 +176,34 @@ func (s Settings) Daemon() map[string]string {
 	return out
 }
 
-// DaemonDefaults returns the daemon settings no source sets for the
-// workspace at the host path workspace, written as Daemon writes them:
-// what up without settings flags, files or variables resolves there,
-// its rules file chosen as resolve chooses it (see rulesfile.Choose).
-// `hostrunner allow` marks the settings it allows that differ from them.
-// The rules file is a path under workspace as given, links not followed:
-// the allow store keeps it canonical, so a caller compares the two through
+// AllowedSettings returns the daemon settings the allow covers, written as
+// ArmSettings writes them: ArmSettings without the keys marked
+// outsideAllow, which `hostrunner allow` neither records nor compares.
+func (s Settings) AllowedSettings() map[string]string {
+	out := s.ArmSettings()
+	for _, k := range keysOf(scopeDaemon) {
+		if k.outsideAllow {
+			delete(out, k.name)
+		}
+	}
+	return out
+}
+
+// DaemonDefaults returns the defaults of the daemon settings the allow
+// covers (see AllowedSettings) for the workspace at the host path
+// workspace, written as AllowedSettings writes them: what up without
+// settings flags, files or variables resolves there, its rules file
+// chosen as resolve chooses it (see rulesfile.Choose). `hostrunner allow`
+// marks the settings it allows that differ from them. The rules file is a
+// path under workspace as given, links not followed: the allow store keeps
+// it canonical, so a caller compares the two through
 // allow.CanonicalSettings.
 func DaemonDefaults(workspace string) map[string]string {
 	s := defaults(workspace)
 	// Choose's second result is the older rules file it leaves unread,
 	// not an error, and says nothing of the default.
 	s.RulesFile, _ = rulesfile.Choose(filepath.Join(workspace, rulesfile.Dir))
-	return s.Daemon()
+	return s.AllowedSettings()
 }
 
 // layer is what one source sets: values by key name (as in a settings
@@ -246,20 +269,26 @@ type key struct {
 	// container could write: only the host settings file, its common part
 	// or a workspace section, may set it, besides the flags and variables.
 	hostOnly bool
+	// outsideAllow marks a daemon key the arm carries and the daemon
+	// compares, but the allow neither records nor compares: changing it
+	// never needs a new `hostrunner allow`.
+	outsideAllow bool
 	// values are the strings a kindChoice key takes, in the order errors and
 	// usages list them; nil for the other kinds.
 	values []string
 	usage  string                // the flag's help
-	field  func(s *Settings) any // a *string, *time.Duration, *bool or *int into s
+	field  func(s *Settings) any // a *string, *Process, *time.Duration, *bool or *int into s
 	def    any                   // the value no source sets, of the kind; nil when defaults or hostDefaults give it
 }
 
 // get returns the value of k in s: a string, a time.Duration, a bool or
-// an int, as k's kind says.
+// an int, as k's kind says; a Process is returned as its string.
 func (k key) get(s *Settings) any {
 	switch p := k.field(s).(type) {
 	case *string:
 		return *p
+	case *Process:
+		return string(*p)
 	case *time.Duration:
 		return *p
 	case *bool:
@@ -271,11 +300,14 @@ func (k key) get(s *Settings) any {
 	}
 }
 
-// set sets the value of k in s to v, a value of k's kind.
+// set sets the value of k in s to v, a value of k's kind; a Process is
+// set from its string.
 func (k key) set(s *Settings, v any) {
 	switch p := k.field(s).(type) {
 	case *string:
 		*p = v.(string)
+	case *Process:
+		*p = Process(v.(string))
 	case *time.Duration:
 		*p = v.(time.Duration)
 	case *bool:
@@ -335,9 +367,9 @@ var keys = []key{
 		field: func(s *Settings) any { return &s.ReadyTimeout },
 	},
 	{
-		name: "process", kind: kindChoice, scope: scopeUp,
-		values: []string{ProcessOwn, ProcessShared},
-		usage:  "whether up starts the daemon in a process of its own or adds it to the shared process of its build",
+		name: processKey, kind: kindChoice, scope: scopeDaemon, outsideAllow: true,
+		values: []string{string(ProcessOwn), string(ProcessShared)},
+		usage:  "whether the daemon runs in a process of its own or in the shared process of its build",
 		field:  func(s *Settings) any { return &s.Process },
 	},
 	{
@@ -389,10 +421,10 @@ func (in scopes) workspaceSettable() scopes {
 // and those of up for the new daemon, which it starts as up does.
 var restartScopes = []scope{scopeRuntimeRoot, scopeStop, scopeDaemon, scopeUp}
 
-// restartKeys are the keys restart has flags for: the rules file and the
-// mount check of the new daemon, and the keys of stop.
+// restartKeys are the keys restart has flags for: the rules file, the
+// mount check and the process of the new daemon, and the keys of stop.
 func restartKeys() []key {
-	return append([]key{mustLookup(RulesFileKey), mustLookup(mountCheckKey)}, keysOf(scopeRuntimeRoot, scopeStop)...)
+	return append([]key{mustLookup(RulesFileKey), mustLookup(mountCheckKey), mustLookup(processKey)}, keysOf(scopeRuntimeRoot, scopeStop)...)
 }
 
 // MountCheckOffHint is how a human on the host turns the mount check off,
@@ -449,8 +481,8 @@ func mustLookup(name string) key {
 func Usage() string { return usageOf(keysOf(scopeDaemon)) }
 
 // UpUsage is Usage for the flags RegisterUp adds, as up's usage line
-// shows them: Usage, [--ready-timeout <duration>] and [--process
-// <own|shared>].
+// shows them: those of Usage, including [--process <own|shared>], and
+// [--ready-timeout <duration>].
 func UpUsage() string { return usageOf(keysOf(scopeDaemon, scopeUp)) }
 
 // StopUsage is the usage of the flags RegisterStop adds: [--settings

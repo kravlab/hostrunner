@@ -293,10 +293,10 @@ settings not allowed either, or is of a hostrunner older than this
 check) `up` fails, naming the rules file, its digest and `hostrunner
 allow`, so `devcontainer up` fails and the container does not start; it
 starts nothing and leaves a running daemon as it is. It also records
-what it asked for (the rules
-file, its digest and the daemon settings, from every flag
-devcontainer.json gave it) as the request of its runtime directory,
-replacing only that directory's earlier request, in
+what it asked for (the rules file, its digest and the daemon settings,
+from every flag devcontainer.json gave it but `--process`, which an
+allow leaves out) as the request of its runtime directory, replacing
+only that directory's earlier request, in
 `$XDG_DATA_HOME/hostrunner/allow` (`~/.local/share/hostrunner/allow`
 when it is unset). `allow` allows exactly the pending requests of the
 workspace, all at once, after checking that the rules file of each
@@ -375,11 +375,14 @@ The first `up` after upgrading to a hostrunner with allows fails the
 same way until the workspace is allowed. So does the first `up` after an
 upgrade that adds a daemon setting, such as `mount_check`: the allow
 covers the resolved daemon settings, so it needs a new `hostrunner
-allow`. `up --restart` and `hostrunner
-restart` check the allow before they stop the running daemon: content
-not allowed fails them, records the request as `up` does, for the
-runtime directory of the daemon they replace, and leaves the daemon
-running.
+allow`; `process` is the exception, outside the allow, so changing it
+needs none. After updating to a build that compares `process`, a daemon
+started by an older build steps aside once on the next `up` (its
+settings lack `process`), and `up` starts its replacement; no new allow
+is needed. `up --restart` and `hostrunner restart` check the allow
+before they stop the running daemon: content not allowed fails them,
+records the request as `up` does, for the runtime directory of the
+daemon they replace, and leaves the daemon running.
 
 ### Settings
 
@@ -396,7 +399,7 @@ Besides its rules, a daemon has settings:
 | `request_timeout` | `HOSTRUNNER_REQUEST_TIMEOUT` | `--request-timeout` | `10s` | how long a new connection may take to send its request |
 | `mount_check` | `HOSTRUNNER_MOUNT_CHECK` | `--mount-check`, `--no-mount-check` | `true` | whether it checks that its container cannot write its configuration (see [Mount check](#mount-check)); not in the workspace settings file |
 | `ready_timeout` | `HOSTRUNNER_READY_TIMEOUT` | `--ready-timeout` (`up` only) | `10s` | how long `up` waits for the daemon it starts to listen |
-| `process` | `HOSTRUNNER_PROCESS` | `--process` (`up` only) | `own` | whether `up` starts the daemon in a process of its own (`own`) or adds it to the shared process of its build (`shared`) |
+| `process` | `HOSTRUNNER_PROCESS` | `--process` | `own` | whether `up` starts the daemon in a process of its own (`own`) or adds it to the shared process of its build (`shared`); in the arm, outside the allow |
 
 `hostrunner stop`, `restart` and `approve` have settings of their own:
 
@@ -490,12 +493,14 @@ key`, `settings file /home/u/.config/hostrunner/settings.yaml:
 workspaces./home/u/other: grase: unknown key`, `HOSTRUNNER_GRACE:
 invalid duration "abc"`). `up` resolves the settings and starts the
 daemon with every one as a flag but `ready_timeout`, its own, so its
-command line shows them; `hostrunner serve` started by hand resolves
-them the same way, without reading or checking `ready_timeout`. A
-settings edit applies on the next container start (reopen, container
-restart or rebuild): `up` tells the running daemon the settings it
-resolved, and a daemon running with others steps aside for a new one,
-as for changed rules; it compares only the settings the arm carries.
+command line shows them (`process` included: a daemon of the other kind
+of process steps aside, and `up` starts the new one in that kind);
+`hostrunner serve` started by hand resolves them the same way, without
+reading or checking `ready_timeout`. A settings edit applies on the next
+container start (reopen, container restart or rebuild): `up` tells the
+running daemon the settings it resolved, and a daemon running with
+others steps aside for a new one, as for changed rules; it compares only
+the settings the arm carries.
 `hostrunner restart` applies a settings edit at once: it resolves the
 new daemon's settings the same way, for the workspace of the daemon it
 replaces (see [Stop and restart](#stop-and-restart)). `--reread` and
@@ -734,17 +739,18 @@ workspace the daemon serves: from the settings files as they are now,
 the variables of the terminal it runs in and its own flags
 (`--workspace-settings`, and `--rules-file` or `--config`, both read
 against the current directory and refused with `--all`, as they name one
-workspace's files, and `--mount-check` or `--no-mount-check`; the other
-daemon settings have no flag here). It
+workspace's files, `--mount-check` or `--no-mount-check`, and
+`--process`; the other daemon settings have no flag here). It
 checks them and reads and checks the rules file before stopping anything
 (an invalid setting or invalid rules leave the daemon running, the error
 naming the source, and so do rules or settings not allowed, see
 [Allow](#allow)), then starts a new daemon, the installed
 `hostrunner`, for the same workspace, with those settings, and waits
 `ready_timeout` for it to listen. It names what they change of the old
-daemon's rules file and rereading (`hostrunner: restarted <dir>;
-rules_file <old> → <new>, reread true → false`; a daemon of an older
-hostrunner does not say whether it rereads). A daemon still waiting for
+daemon's rules file, rereading and process (`hostrunner: restarted <dir>;
+rules_file <old> → <new>, reread true → false, process own → shared`; a
+daemon of an older hostrunner does not say whether it rereads or in which
+process it runs). A daemon still waiting for
 its container (right after `up`, during a rebuild) is replaced by one
 that waits the same way. A daemon that saw its container stop, and is
 about to exit, is only stopped (`hostrunner: stopped <dir>; its

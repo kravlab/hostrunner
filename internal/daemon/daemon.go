@@ -73,6 +73,7 @@ type Server struct {
 	allowRecorder    func(writtenOver allow.Scope, digest string) error   // nil: no allow is recorded; see WithAllowRecorder
 	buildVersion     string                                               // "": unknown; see WithBuildVersion
 	settings         map[string]string                                    // nil: none reported; see WithSettings
+	process          string                                               // "": none reported; see WithProcess
 	mount            mountChecker                                         // the mount check: noMountCheck unless WithMountCheck; see MountChecked
 	mountOffHint     *string                                              // nil: the mount check is off; see WithMountCheck
 	environment      *Environment                                         // what commands and secret sources run with; never nil, see WithEnvironment
@@ -144,12 +145,21 @@ func WithBuildVersion(v string) Option {
 	return func(s *Server) { s.buildVersion = v }
 }
 
-// WithSettings sets the daemon settings the Server runs with, keyed by
-// their names (settings.Settings.Daemon), which it tells approval sessions
-// and `hostrunner up` (protocol.DaemonInfo.Settings); without it the
-// Server reports none, as a daemon older than the field does.
+// WithSettings sets the daemon settings the Server runs with that the allow
+// covers, keyed by their names (settings.Settings.AllowedSettings), which
+// it tells approval sessions and `hostrunner up`
+// (protocol.DaemonInfo.Settings); without it the Server reports none, as a
+// daemon older than the field does.
 func WithSettings(daemonSettings map[string]string) Option {
 	return func(s *Server) { s.settings = daemonSettings }
+}
+
+// WithProcess sets the kind of process the Server runs in, "own" or
+// "shared" (settings.Process), which it tells approval sessions and
+// `hostrunner restart` (protocol.DaemonInfo.Process); without it the
+// Server reports none, as a daemon older than the field does.
+func WithProcess(process string) Option {
+	return func(s *Server) { s.process = process }
 }
 
 // WithReread lets an approval session make the Server reread its rules

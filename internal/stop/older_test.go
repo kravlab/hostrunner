@@ -36,7 +36,7 @@ func TestMain(m *testing.M) {
 		runOlderDaemon(mode)
 		return
 	}
-	if os.Getenv(newDaemonEnv) != "" && len(os.Args) > 1 && os.Args[1] == "serve" {
+	if os.Getenv(newDaemonEnv) != "" && len(os.Args) > 1 && (os.Args[1] == "serve" || os.Args[1] == "shared") {
 		runNewDaemon()
 		return
 	}

@@ -660,7 +660,7 @@ func (s *Server) handleSession(ctx context.Context, conn net.Conn) {
 		RulesFile: s.approvals.rulesFile, RulesDigest: s.rulesDigest(), Served: s.approvals.served(),
 		Stops: true, ContainerStopped: s.containerStopped != nil && s.containerStopped(),
 		Rereads: s.rereadsByItself(), NoReread: !s.rereadsByItself(), BuildVersion: s.buildVersion,
-		Runs: true, Settings: s.settings, MountCheckFailed: mountFailed,
+		Runs: true, Settings: s.settings, MountCheckFailed: mountFailed, Process: s.process,
 	})
 	defer func() {
 		// The daemon stopping closes the connection too: its requests end

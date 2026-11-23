@@ -84,7 +84,7 @@ type Scope struct {
 	// for a missing file.
 	Digest string `json:"digest"`
 	// Settings are the daemon settings by key name, as
-	// settings.Settings.Daemon() returns them.
+	// settings.Settings.AllowedSettings() returns them.
 	Settings map[string]string `json:"settings"`
 }
 

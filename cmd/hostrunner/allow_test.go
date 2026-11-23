@@ -71,11 +71,11 @@ func parseUpIn(t *testing.T, rd, ws string, extra ...string) launch.Config {
 	return cfg.launch
 }
 
-// upSettings returns the daemon settings an `up` resolves for ws given the
-// extra up flags: what an allow has to hold for that `up` to pass.
+// upSettings returns the daemon settings the allow covers that an `up` resolves for ws
+// given the extra up flags: what an allow has to hold for that `up` to pass.
 func upSettings(t *testing.T, ws string, extra ...string) map[string]string {
 	t.Helper()
-	return parseUpOf(t, ws, extra...).Settings.Daemon()
+	return parseUpOf(t, ws, extra...).Settings.AllowedSettings()
 }
 
 // runAllowCmd runs `hostrunner allow` and `hostrunner deny` (by name) with
@@ -183,6 +183,25 @@ func TestAllowRecordsTheCurrentDirectoryAndPrintsWhatItAllowed(t *testing.T) {
 		"    startup_timeout: 30m0s\n"
 	if stdout != want {
 		t.Errorf("stdout:\n%s\nwant:\n%s", stdout, want)
+	}
+}
+
+// The process (own or shared) is outside the allow: the request of an up
+// with process: shared holds, and allow prints and records, the settings
+// without it, so the allow of an up in the other process still covers it.
+func TestAllowDoesNotShowTheProcessOfARefusedUp(t *testing.T) {
+	isolate(t)
+	ws, _ := devcontainerWith(t, allowRules, "hostrunner-rules.yaml")
+	refuseUp(t, ws, "--process", "shared")
+	stdout, _, err := runAllowCmd(t, "allow", ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(stdout, "process") {
+		t.Errorf("stdout lists the process:\n%s", stdout)
+	}
+	if !storeAllows(t, ws, allowRulesDigest, upSettings(t, ws, "--process", "own")) {
+		t.Error("the allow of an up with process: shared does not cover the same up with process: own")
 	}
 }
 

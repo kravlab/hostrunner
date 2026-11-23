@@ -194,7 +194,7 @@ const givenRules = "/given/hostrun.yaml"
 
 // daemonFlags gives every setting but the rules file and reread that
 // serve takes as a flag; givenTimings is what they give.
-var daemonFlags = []string{"--startup-timeout", "1h", "--grace", "1m", "--poll-interval", "5s", "--ask-timeout", "20m", "--request-timeout", "30s", "--mount-check"}
+var daemonFlags = []string{"--startup-timeout", "1h", "--grace", "1m", "--poll-interval", "5s", "--ask-timeout", "20m", "--request-timeout", "30s", "--mount-check", "--process", "own"}
 
 // givenTimings is defaults with what daemonFlags gives, the rules file
 // given and reread off.
@@ -334,7 +334,7 @@ func TestResolveRefusesATildeWithoutHome(t *testing.T) {
 }
 
 func TestUsageNamesEveryFlagServeTakes(t *testing.T) {
-	want := "[--settings <path>] [--workspace-settings <path>] [--rules-file <path>] [--startup-timeout <duration>] [--grace <duration>] [--reread | --no-reread] [--poll-interval <duration>] [--ask-timeout <duration>] [--request-timeout <duration>] [--mount-check | --no-mount-check]"
+	want := "[--settings <path>] [--workspace-settings <path>] [--rules-file <path>] [--startup-timeout <duration>] [--grace <duration>] [--reread | --no-reread] [--poll-interval <duration>] [--ask-timeout <duration>] [--request-timeout <duration>] [--mount-check | --no-mount-check] [--process <own|shared>]"
 	if got := settings.Usage(); got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}
@@ -350,7 +350,7 @@ func TestMountCheckOffHint(t *testing.T) {
 }
 
 func TestUpUsageAlsoNamesTheReadyTimeout(t *testing.T) {
-	want := settings.Usage() + " [--ready-timeout <duration>] [--process <own|shared>]"
+	want := strings.TrimSuffix(settings.Usage(), " [--process <own|shared>]") + " [--ready-timeout <duration>] [--process <own|shared>]"
 	if got := settings.UpUsage(); got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}
@@ -411,20 +411,42 @@ func TestProcessRefusesAnInvalidValue(t *testing.T) {
 	}
 }
 
-// The process is up's own: serve does not take it, and the daemon is not
-// passed it.
-func TestProcessIsNotADaemonSetting(t *testing.T) {
+// ArmSettings names the process, so the arm carries it and the daemon
+// compares it.
+func TestArmSettingsNameTheProcess(t *testing.T) {
 	s := defaults
 	s.Process = settings.ProcessShared
-	if _, ok := s.Daemon()["process"]; ok {
-		t.Errorf("Daemon: got process in %v", s.Daemon())
+	if got := s.ArmSettings()["process"]; got != string(settings.ProcessShared) {
+		t.Errorf("ArmSettings: got process %q in %v, want %q", got, s.ArmSettings(), settings.ProcessShared)
 	}
-	if _, ok := settings.DaemonDefaults(noWorkspace)["process"]; ok {
-		t.Error("DaemonDefaults: got process")
+}
+
+// AllowedSettings are the ArmSettings without the process: the allow neither
+// records nor compares it, and every other daemon setting stays as
+// ArmSettings has it.
+func TestAllowedSettingsAreTheArmSettingsWithoutTheProcess(t *testing.T) {
+	s := defaults
+	s.Process = settings.ProcessShared
+	want := s.ArmSettings()
+	delete(want, "process")
+	if got := s.AllowedSettings(); !maps.Equal(got, want) {
+		t.Errorf("AllowedSettings: got %v, want %v", got, want)
 	}
-	got, err := parse(t).Resolve(env(map[string]string{"HOSTRUNNER_PROCESS": "x"}), noWorkspace)
-	if err != nil || got.Process != settings.ProcessOwn {
-		t.Errorf("serve: got %q, %v; want the default, the variable unread", got.Process, err)
+}
+
+// serve takes the process from the variable.
+func TestServeTakesTheProcessFromAVariable(t *testing.T) {
+	got, err := parse(t).Resolve(env(map[string]string{"HOSTRUNNER_PROCESS": "shared"}), noWorkspace)
+	if err != nil || got.Process != settings.ProcessShared {
+		t.Fatalf("got %q, %v; want %q", got.Process, err, settings.ProcessShared)
+	}
+}
+
+// serve takes the process from its flag.
+func TestServeTakesTheProcessFromAFlag(t *testing.T) {
+	got, err := parse(t, "--process", "shared").Resolve(env(nil), noWorkspace)
+	if err != nil || got.Process != settings.ProcessShared {
+		t.Fatalf("got %q, %v; want %q", got.Process, err, settings.ProcessShared)
 	}
 }
 

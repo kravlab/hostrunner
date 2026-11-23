@@ -163,11 +163,11 @@ func (p *Prepared) keepAllowed(ctx context.Context, notAllowed *NotAllowedError)
 // allowedDaemon returns what the daemon on the approval socket of cfg.Dir
 // says of itself, ok when it serves allowed rules and settings for the
 // workspace of the Config: it answers, says its rules digest and its
-// settings (a daemon older than DaemonInfo.Settings does not), serves
-// that workspace (symbolic links followed, see allow.SameWorkspace), and
-// the store allows what it serves for it in cfg.Dir. No daemon answering
-// is not an error; a workspace that cannot be compared, or a store that
-// cannot be read, is.
+// settings, the daemon settings its allow covers (a daemon older than
+// DaemonInfo.Settings does not say them), serves that workspace (symbolic
+// links followed, see allow.SameWorkspace), and the store allows what it
+// serves for it in cfg.Dir. No daemon answering is not an error; a
+// workspace that cannot be compared, or a store that cannot be read, is.
 func (p *Prepared) allowedDaemon(ctx context.Context) (info protocol.DaemonInfo, ok bool, err error) {
 	cfg := p.cfg
 	info, err = daemonlist.Probe(ctx, ApprovalSocket(cfg.Dir))
@@ -186,22 +186,24 @@ func (p *Prepared) allowedDaemon(ctx context.Context) (info protocol.DaemonInfo,
 }
 
 // armAllowed arms the daemon of p, on its approval socket, with the
-// digest and the daemon settings it said it serves, info, which
-// allowedDaemon found allowed, so it follows the arm and keeps serving
-// them. The arm also reports the change not allowed, the digest of p and
-// the daemon settings of the Config, exactly what checkAllowed checked
-// and recorded, so the daemon warns hostrun of it while it stays not
-// allowed. It then tells cfg.Stderr what is not allowed, notAllowed, and
-// that the daemon keeps serving the allowed rules, and returns nil. A
-// daemon that stepped aside, its rules reread since it answered, is
-// waited for until it has stopped, and notAllowed returned; an arm that
-// fails, or a daemon that does not stop after stepping aside, is joined
-// to notAllowed.
+// digest and the daemon settings the allow covers that it said it serves,
+// info, which allowedDaemon found allowed, so it follows the arm (the
+// daemon compares the settings an arm carries, so one without process does
+// not make it step aside) and keeps serving them. The arm also reports the
+// change not allowed, the digest of p and the daemon settings the allow
+// covers of the Config (settings.Settings.AllowedSettings, without
+// process), exactly what checkAllowed checked and recorded, so the daemon
+// warns hostrun of it while it stays not allowed. It then tells cfg.Stderr
+// what is not allowed, notAllowed, and that the daemon keeps serving the
+// allowed rules, and returns nil. A daemon that stepped aside, its rules
+// reread since it answered, is waited for until it has stopped, and
+// notAllowed returned; an arm that fails, or a daemon that does not stop
+// after stepping aside, is joined to notAllowed.
 func (p *Prepared) armAllowed(ctx context.Context, info protocol.DaemonInfo, notAllowed *NotAllowedError) error {
 	cfg := p.cfg
 	stepAside, err := arm(ctx, ApprovalSocket(cfg.Dir), protocol.Arm{
 		ConfigDigest: info.RulesDigest, NoReread: info.NoReread, Settings: info.Settings,
-		NotAllowed: &protocol.ArmNotAllowed{Digest: p.digest, Settings: cfg.Settings.Daemon()},
+		NotAllowed: &protocol.ArmNotAllowed{Digest: p.digest, Settings: cfg.Settings.AllowedSettings()},
 	})
 	if err != nil {
 		return errors.Join(notAllowed, err)
@@ -284,7 +286,9 @@ func (e *NotAllowedError) Error() string {
 }
 
 // checkAllowed returns a *NotAllowedError unless the allow store of the
-// Config holds exactly these rules and daemon settings for its workspace
+// Config holds exactly these rules and the daemon settings the allow
+// covers (settings.Settings.AllowedSettings: the daemon settings without
+// process, a change of which needs no new allow) for its workspace
 // and its runtime directory, cfg.Dir. Before it refuses, it records them
 // in the store as the pending request of that runtime directory (see
 // allow.Store.Request), leaving those of the others, so the human who runs
@@ -294,7 +298,7 @@ func (e *NotAllowedError) Error() string {
 // be recorded, is an error of its own, not a refusal, and is wrapped.
 func (p *Prepared) checkAllowed() error {
 	cfg := p.cfg
-	target := allow.NewTarget(cfg.RulesFile, p.digest, cfg.Settings.Daemon())
+	target := allow.NewTarget(cfg.RulesFile, p.digest, cfg.Settings.AllowedSettings())
 	ok, err := cfg.allowed(target.Scope)
 	if err != nil {
 		return err
@@ -315,9 +319,10 @@ func (cfg Config) place() allow.Place {
 }
 
 // allowed reports whether the allow store of cfg holds the Scope sc, the
-// rules digest and the daemon settings, for its workspace and its runtime
-// directory, cfg.Dir (see allow.Store.Allowed). A store that cannot be
-// read is an error naming the workspace, wrapping the store's.
+// rules digest and the daemon settings the allow covers, for its
+// workspace and its runtime directory, cfg.Dir (see allow.Store.Allowed).
+// A store that cannot be read is an error naming the workspace, wrapping
+// the store's.
 func (cfg Config) allowed(sc allow.Scope) (bool, error) {
 	ok, err := cfg.Allows.Allowed(cfg.place(), sc)
 	if err != nil {
@@ -440,7 +445,7 @@ func lockDir(dir string, how int) (unlock func(), busy bool, err error) {
 // arm asks the daemon on socket, its approval socket, to wait for its
 // devcontainer again,
 // sending it a, with the protocol version set: the digest of the rules,
-// the daemon settings by key name (as settings.Settings.Daemon returns
+// the daemon settings by key name (as settings.Settings.ArmSettings returns
 // them; a setting left out of them is not compared) and, for a daemon
 // that predates the settings, whether it is not to reread the rules by
 // itself. stepAside reports that the daemon will not follow the arm (it
@@ -484,10 +489,10 @@ func arm(ctx context.Context, socket string, a protocol.Arm) (stepAside bool, er
 }
 
 // upArm is the arm of an up for rules of digest and the settings s: their
-// daemon settings (see settings.Settings.Daemon) and, for a daemon that
+// daemon settings (see settings.Settings.ArmSettings) and, for a daemon that
 // predates the settings, whether it is not to reread the rules by itself.
 func upArm(digest string, s settings.Settings) protocol.Arm {
-	return protocol.Arm{ConfigDigest: digest, NoReread: !s.Reread, Settings: s.Daemon()}
+	return protocol.Arm{ConfigDigest: digest, NoReread: !s.Reread, Settings: s.ArmSettings()}
 }
 
 // installClient atomically replaces dir/hostrun with a copy of src, so a
@@ -763,6 +768,7 @@ func serveArgs(cfg Config, socket string) []string {
 		"--poll-interval", cfg.PollInterval.String(),
 		"--ask-timeout", cfg.AskTimeout.String(),
 		"--request-timeout", cfg.RequestTimeout.String(),
+		"--process", string(cfg.Process),
 		boolFlag("reread", cfg.Reread),
 		boolFlag("mount-check", cfg.MountCheck))
 }

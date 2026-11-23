@@ -35,12 +35,13 @@
 // as the workspace (default .devcontainer/hostrunner-rules.yaml) allows
 // a command; it exits 0 when it does, 126 when it does not, and 1 on any
 // error. `allow` is what a human on the host runs to trust a workspace's
-// rules: `up` starts a daemon only for rules and settings so allowed, and
-// an `up` refused records what it asked for (the rules file, its digest
-// and the daemon settings) in $XDG_DATA_HOME/hostrunner/allow; `allow`
-// allows exactly that request once the rules file still has that digest
-// and prints what it allowed; without a request it allows nothing and
-// fails, telling to start the container first.
+// rules: `up` starts a daemon only for rules and settings so allowed,
+// and an `up` refused records what it asked for (the rules file, its
+// digest and the daemon settings the allow covers) in
+// $XDG_DATA_HOME/hostrunner/allow; `allow` allows exactly that request
+// once the rules file still has that digest and prints what it allowed;
+// without a request it allows nothing and fails, telling to start the
+// container first.
 // Each runtime directory of a workspace keeps only its latest allow, and
 // `deny` removes those of every runtime directory, damaged allow files
 // included, with a warning naming each of these; the workspace is the
@@ -945,13 +946,14 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 		return p, p.Digest(), nil
 	}
 	opts := []daemon.Option{
-		daemon.WithArmHandler(armHandler(cfg.RulesFile, cfg.Reread, cfg.Settings.Daemon(), watcher, log)),
+		daemon.WithArmHandler(armHandler(cfg.RulesFile, cfg.Reread, cfg.Settings.ArmSettings(), watcher, log)),
 		daemon.WithApprovals(al, cfg.RulesFile),
 		daemon.WithReread(policy.Digest(), reread),
 		daemon.WithAskTimeout(cfg.AskTimeout),
 		daemon.WithRequestTimeout(cfg.RequestTimeout),
 		daemon.WithBuildVersion(cfg.version),
-		daemon.WithSettings(cfg.Settings.Daemon()),
+		daemon.WithSettings(cfg.Settings.AllowedSettings()),
+		daemon.WithProcess(string(cfg.Settings.Process)),
 	}
 	opts = append(opts, allowOptions(cfg)...)
 	if cfg.environment != nil {
@@ -1009,12 +1011,13 @@ func servePlace(cfg serveConfig) allow.Place {
 	return allow.Place{Workspace: cfg.workspace, RuntimeDir: filepath.Dir(cfg.socket)}
 }
 
-// allowOptions returns the options that have the daemon of cfg reread
-// only rules file content allowed in cfg's allow store for its workspace,
-// its runtime directory and its daemon settings, as `up` checks them (with
-// the settings the daemon gives, its own or those of a change an arm
-// reports not allowed), and record a pending request of its own rules file
-// and settings for content not allowed under its runtime directory, so
+// allowOptions returns the options that have the daemon of cfg reread only
+// rules file content allowed in cfg's allow store for its workspace, its
+// runtime directory and the daemon settings its allow covers (their
+// AllowedSettings: the allow does not cover the process), as `up` checks
+// them (with the settings the daemon gives, its own or those of a change an
+// arm reports not allowed), and record a pending request of its own rules
+// file and settings for content not allowed under its runtime directory, so
 // that `hostrunner allow` allows what the daemon checks. They also have it
 // allow a rule added from the approval session to a rules file that was
 // allowed, for every runtime directory that covered it (see
@@ -1026,7 +1029,7 @@ func allowOptions(cfg serveConfig) []daemon.Option {
 	// target is what the daemon's own rules file and settings, with the
 	// given digest of its content, are allowed as.
 	target := func(digest string) allow.Target {
-		return allow.NewTarget(cfg.RulesFile, digest, cfg.Settings.Daemon())
+		return allow.NewTarget(cfg.RulesFile, digest, cfg.Settings.AllowedSettings())
 	}
 	return []daemon.Option{
 		daemon.WithAllowed(func(sc allow.Scope) (bool, error) {
@@ -1063,15 +1066,16 @@ func checkApprovalSocket(workspace, socket string) error {
 }
 
 // armHandler answers the arms of `hostrunner up`, which arms the daemon on
-// every container start with the digest of the rules it validated and
-// the daemon settings it resolved. digest is that of the rules the daemon
+// every container start with the digest of the rules it validated and the
+// daemon settings it resolved. digest is that of the rules the daemon
 // serves from rulesFile, which a reread changes; ownSettings are the
-// daemon's settings (settings.Settings.Daemon), reread among them. The
-// daemon steps aside for a new one when the digests differ, when a
-// setting the arm carries is not its own, when an arm carrying none, from
-// an `up` that predates them, does not reread as the daemon does, or when
-// watcher has ended and will not follow the arm; otherwise watcher, if
-// any, waits for the container of this arm.
+// daemon's settings (settings.Settings.ArmSettings, not AllowedSettings:
+// the process is compared too), reread among them. The daemon steps aside
+// for a new one when the digests differ, when a setting the arm carries is
+// not its own, when an arm carrying none, from an `up` that predates them,
+// does not reread as the daemon does, or when watcher has ended and will
+// not follow the arm; otherwise watcher, if any, waits for the container of
+// this arm.
 func armHandler(rulesFile string, reread bool, ownSettings map[string]string, watcher *watch.Watcher, log *slog.Logger) func(a protocol.Arm, digest string) (stepAside bool) {
 	return func(a protocol.Arm, digest string) bool {
 		if a.ConfigDigest != digest {

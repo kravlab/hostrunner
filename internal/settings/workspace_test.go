@@ -371,7 +371,7 @@ func TestProcessIsSetByEveryFile(t *testing.T) {
 	tests := []struct {
 		name         string
 		host, wsFile string
-		want         string
+		want         settings.Process
 	}{
 		{"common part", "process: shared\n", "", settings.ProcessShared},
 		{"section over common part", "process: own\n" + section(ws, "process: shared"), "", settings.ProcessShared},
