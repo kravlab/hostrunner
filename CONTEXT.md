@@ -104,7 +104,8 @@ container.
 
 **Shared process**:
 A host process that holds the daemons of several
-devcontainers, one process per version of hostrunner, and
+devcontainers, one process per build of hostrunner (named by
+the digest of its executable), and
 lives while one of its daemons does; one that no daemon is
 added to within the ready timeout of the `up` that started it
 ends on its own.
