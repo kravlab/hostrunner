@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"unicode/utf8"
@@ -20,17 +19,32 @@ import (
 // token is that short, so it is most likely a broken source.
 const minSecretLength = 8
 
-// obtainSecrets obtains the value of every secret, fresh for this request,
-// with trailing CR and LF trimmed, into the map the injection's templates
-// are rendered from (injectFiles adds to it). A command source runs, and a
-// relative file source is read, in the working directory dir, whose real
-// path is hostPath. A secret that yields no usable value refuses the
-// request with ExitHostrunError and a message naming the secret only; the
-// reason, never the value, goes to the error for the log.
-func obtainSecrets(secrets []rules.Secret, dir *os.File, hostPath string) (map[string]string, *refusal) {
+// errSourceTimeout is the cause of a command source's context ending
+// because the source ran out of time, as opposed to the context it runs
+// under ending, with a deadline of its own or not.
+var errSourceTimeout = errors.New("the secret source timed out")
+
+// secretSources is where the secrets of one request are obtained from: a
+// command source runs, and a relative file source is read, in the working
+// directory dir, whose real path is hostPath. An env source is read from
+// env, which also gives a command source its environment and looks its
+// program up.
+type secretSources struct {
+	env      *Environment
+	dir      *os.File
+	hostPath string
+}
+
+// obtain obtains the value of every secret, fresh for this request, with
+// trailing CR and LF trimmed, into the map the injection's templates are
+// rendered from (injectFiles adds to it). A secret that yields no usable
+// value refuses the request with ExitHostrunError and a message naming the
+// secret only; the reason, never the value, goes to the error for the log.
+// Ending ctx kills a command source that runs.
+func (src secretSources) obtain(ctx context.Context, secrets []rules.Secret) (map[string]string, *refusal) {
 	values := make(map[string]string, len(secrets))
 	for _, sec := range secrets {
-		value, err := obtain(sec, dir, hostPath)
+		value, err := src.read(ctx, sec)
 		if err != nil {
 			return nil, unavailable(sec, err)
 		}
@@ -52,24 +66,24 @@ func unavailable(sec rules.Secret, err error) *refusal {
 	return &refusal{protocol.ExitHostrunError, fmt.Sprintf("secret %q is not available", sec.Name), fmt.Errorf("secret %q: %w", sec.Name, err)}
 }
 
-// checkSources checks, for a dry run, what obtainSecrets would need without
-// obtaining anything: a command source's program is found and executable
-// in the working directory dir, as starting it would look it up, but it is
-// not run; an env source's variable is set; a file source opens for
-// reading. A failed check refuses as obtaining the value would.
-func checkSources(secrets []rules.Secret, dir *os.File) *refusal {
+// check checks, for a dry run, what obtain would need without obtaining
+// anything: a command source's program is found and executable in the
+// working directory, as starting it would look it up, but it is not run; an
+// env source's variable is set; a file source opens for reading. A failed
+// check refuses as obtaining the value would.
+func (src secretSources) check(secrets []rules.Secret) *refusal {
 	for _, sec := range secrets {
 		var err error
 		switch sec.Kind {
 		case rules.SourceCommand:
-			err = lookupProgram(sec.Command[0], dir)
+			err = lookupProgram(src.env, sec.Command[0], src.dir)
 		case rules.SourceFile:
 			var f *os.File
-			if f, err = os.Open(sourcePath(sec, dir)); err == nil {
+			if f, err = os.Open(src.filePath(sec)); err == nil {
 				f.Close()
 			}
 		default:
-			if _, ok := os.LookupEnv(sec.Env); !ok {
+			if _, ok := src.env.lookup(sec.Env); !ok {
 				err = fmt.Errorf("environment variable %s is not set", sec.Env)
 			}
 		}
@@ -80,27 +94,26 @@ func checkSources(secrets []rules.Secret, dir *os.File) *refusal {
 	return nil
 }
 
-// sourcePath is the path a file source is read from: as written when
-// absolute, from the working directory dir otherwise. The rules author
-// decides where the file lies, the workspace included, so symlinks are
-// followed.
-func sourcePath(sec rules.Secret, dir *os.File) string {
+// filePath is the path a file source is read from: as written when
+// absolute, from the working directory otherwise. The rules author decides
+// where the file lies, the workspace included, so symlinks are followed.
+func (src secretSources) filePath(sec rules.Secret) string {
 	if filepath.IsAbs(sec.File) {
 		return sec.File
 	}
-	return filepath.Join(fdPath(dir), sec.File)
+	return filepath.Join(fdPath(src.dir), sec.File)
 }
 
-// obtain reads the raw value of sec from its source.
-func obtain(sec rules.Secret, dir *os.File, hostPath string) (string, error) {
+// read reads the raw value of sec from its source.
+func (src secretSources) read(ctx context.Context, sec rules.Secret) (string, error) {
 	switch sec.Kind {
 	case rules.SourceCommand:
-		return runSource(sec, dir, hostPath)
+		return src.run(ctx, sec)
 	case rules.SourceFile:
-		data, err := os.ReadFile(sourcePath(sec, dir))
+		data, err := os.ReadFile(src.filePath(sec))
 		return string(data), err
 	default:
-		value, ok := os.LookupEnv(sec.Env)
+		value, ok := src.env.lookup(sec.Env)
 		if !ok {
 			return "", fmt.Errorf("environment variable %s is not set", sec.Env)
 		}
@@ -108,25 +121,25 @@ func obtain(sec rules.Secret, dir *os.File, hostPath string) (string, error) {
 	}
 }
 
-// runSource runs the command source of sec as the command itself would
-// run (working directory, environment, own process group), with an empty
+// run runs the command source of sec as the command itself would run
+// (working directory, environment, own process group), with an empty
 // stdin, which no source waiting for a password can get past, and its
-// timeout, after which the whole group is killed. It returns the stdout.
+// timeout, after which the whole group is killed, as it is when ctx ends.
+// It returns the stdout.
 // The stderr of a failed source is part of the error, for the log; a
 // successful source's is discarded, as it may carry the value.
-func runSource(sec rules.Secret, dir *os.File, hostPath string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), sec.Timeout)
+func (src secretSources) run(ctx context.Context, sec rules.Secret) (string, error) {
+	ctx, cancel := context.WithTimeoutCause(ctx, sec.Timeout, errSourceTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, sec.Command[0], sec.Command[1:]...)
-	cmd.Dir = fdPath(dir)
-	cmd.Env = commandEnv(hostPath)
+	cmd := inDirectory(src.env.command(ctx, sec.Command), src.dir, src.hostPath, src.env.with())
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	ownGroup(cmd)
 	err := cmd.Run()
 	switch {
-	case ctx.Err() != nil:
+	case errors.Is(context.Cause(ctx), errSourceTimeout):
 		return "", fmt.Errorf("command %q timed out after %s; stderr: %q", sec.Command, sec.Timeout, stderr.String())
+	case ctx.Err() != nil:
+		return "", fmt.Errorf("command %q cancelled; stderr: %q", sec.Command, stderr.String())
 	case err != nil:
 		return "", fmt.Errorf("command %q: %w; stderr: %q", sec.Command, err, stderr.String())
 	}

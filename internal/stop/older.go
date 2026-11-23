@@ -21,7 +21,8 @@ import (
 // not stop on request, by SIGTERM, which kills what it runs: the process
 // on the other end of conn, a connection to one of its sockets, once it
 // is the user's and its command line is `hostrunner serve --socket
-// <dir>/hostrunner.sock …`. The process is held by a pidfd (see
+// <dir>/hostrunner.sock …`; a shared process (`hostrunner shared …`) is
+// never signalled. The process is held by a pidfd (see
 // os.FindProcess) from before its command line is read, so a process
 // taking its PID meanwhile is not the one signalled. What it runs is
 // unknown, so the human can only kill it or leave it running; --wait is
@@ -44,6 +45,9 @@ func (t *term) stopOlder(ctx context.Context, cfg Config, dir string, conn net.C
 	argv, err := cmdline(pid)
 	if err == nil {
 		err = checkServe(argv, socket)
+	}
+	if errors.Is(err, errSharedProcess) {
+		return fmt.Errorf("%s: process %d on its socket is a shared process, which is never signalled: no signal sent", name, pid)
 	}
 	if err != nil {
 		return fmt.Errorf("%s: process %d on its socket is not `hostrunner serve --socket %s`: %v; no signal sent", name, pid, hostterm.Display(socket), err)
@@ -88,11 +92,25 @@ func cmdline(pid int) ([]string, error) {
 	return strings.Split(string(bytes.TrimSuffix(b, []byte{0})), "\x00"), nil
 }
 
+// errSharedProcess is what checkServe returns for the command line of a
+// shared process (`hostrunner shared …`), which no stop or restart ever
+// signals.
+var errSharedProcess = errors.New("it is a shared process")
+
 // checkServe returns an error unless argv is the command line of
 // `hostrunner serve` with --socket socket, the flag in any form the flag
-// package reads.
+// package reads; errSharedProcess for that of a `shared` subcommand,
+// whatever the program is called, so a renamed or wrapped hostrunner
+// is never signalled either.
 func checkServe(argv []string, socket string) error {
-	if len(argv) < 2 || filepath.Base(argv[0]) != "hostrunner" || argv[1] != "serve" {
+	var program, subcommand string
+	if len(argv) >= 2 {
+		program, subcommand = filepath.Base(argv[0]), argv[1]
+	}
+	if subcommand == "shared" {
+		return errSharedProcess
+	}
+	if program != "hostrunner" || subcommand != "serve" {
 		return fmt.Errorf("it runs %q", argv)
 	}
 	for i, arg := range argv[2:] {

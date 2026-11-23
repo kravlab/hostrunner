@@ -40,8 +40,11 @@ import (
 	"time"
 
 	"github.com/kravlab/hostrunner/internal/allow"
+	"github.com/kravlab/hostrunner/internal/contain"
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
+	"github.com/kravlab/hostrunner/internal/settings"
+	"github.com/kravlab/hostrunner/internal/transport"
 	"github.com/kravlab/hostrunner/internal/workspace"
 )
 
@@ -72,8 +75,10 @@ type Server struct {
 	allowRecorder    func(writtenOver allow.Scope, digest string) error   // nil: no allow is recorded; see WithAllowRecorder
 	buildVersion     string                                               // "": unknown; see WithBuildVersion
 	settings         map[string]string                                    // nil: none reported; see WithSettings
+	process          string                                               // "": none reported; see WithProcess
 	mount            mountChecker                                         // the mount check: noMountCheck unless WithMountCheck; see MountChecked
 	mountOffHint     *string                                              // nil: the mount check is off; see WithMountCheck
+	environment      *Environment                                         // what commands and secret sources run with; never nil, see WithEnvironment
 
 	// The order of the locks: a goroutine takes one only while it holds
 	// none listed after it, so they never wait for each other in a cycle.
@@ -142,12 +147,21 @@ func WithBuildVersion(v string) Option {
 	return func(s *Server) { s.buildVersion = v }
 }
 
-// WithSettings sets the daemon settings the Server runs with, keyed by
-// their names (settings.Settings.Daemon), which it tells approval sessions
-// and `hostrunner up` (protocol.DaemonInfo.Settings); without it the
-// Server reports none, as a daemon older than the field does.
+// WithSettings sets the daemon settings the Server runs with that the allow
+// covers, keyed by their names (settings.Settings.AllowedSettings), which
+// it tells approval sessions and `hostrunner up`
+// (protocol.DaemonInfo.Settings); without it the Server reports none, as a
+// daemon older than the field does.
 func WithSettings(daemonSettings map[string]string) Option {
 	return func(s *Server) { s.settings = daemonSettings }
+}
+
+// WithProcess sets the kind of process the Server actually runs in, own or
+// shared (not the process setting, which may name another), which it tells
+// approval sessions and `hostrunner restart` (protocol.DaemonInfo.Process);
+// without it the Server reports none, as a daemon older than the field does.
+func WithProcess(process settings.Process) Option {
+	return func(s *Server) { s.process = string(process) }
 }
 
 // WithReread lets an approval session make the Server reread its rules
@@ -158,6 +172,21 @@ func WithSettings(daemonSettings map[string]string) Option {
 // commands are untouched; new requests are checked against the new rules.
 func WithReread(digest string, reread func() (Policy, string, error)) Option {
 	return func(s *Server) { s.digest, s.rereadFile = digest, reread }
+}
+
+// WithEnvironment sets the environment the Server's commands and secret
+// sources run with, and where their programs and env secrets are looked
+// up; env is never read from the process. Without it the Server uses the
+// environment of its process, as it is when a command starts: right for a
+// daemon alone in its process, wrong for one that shares it with others,
+// which has to be given its own. The entries of a rule's injected variables
+// go over env's, and PWD is the command's working directory. A nil env
+// panics, as a nil Policy does for New.
+func WithEnvironment(env *Environment) Option {
+	if env == nil {
+		panic("daemon: nil Environment")
+	}
+	return func(s *Server) { s.environment = env }
 }
 
 // rulesDigest returns the digest of the rules the Server serves, as
@@ -240,7 +269,7 @@ func New(mapper *workspace.Mapper, policy Policy, log *slog.Logger, opts ...Opti
 		mapper: mapper, policy: policy, log: log,
 		requestTimeout: defaultRequestTimeout, askTimeout: defaultAskTimeout,
 		running: map[uint64]protocol.RunningCommand{}, draining: make(chan struct{}),
-		mount: noMountCheck{},
+		mount: noMountCheck{}, environment: ProcessEnvironment(),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -284,7 +313,7 @@ func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 		s.stopServe, s.closeListeners = nil, nil
 		s.mu.Unlock()
 	}()
-	stop := context.AfterFunc(ctx, closeListeners)
+	stop := contain.AfterFunc(ctx, closeListeners)
 	defer stop()
 
 	var (
@@ -292,15 +321,15 @@ func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 		backoff time.Duration
 	)
 	if s.approvals != nil {
-		wg.Go(func() { s.serveApprovals(ctx, &wg) })
+		contain.GoIn(ctx, &wg, func() { s.serveApprovals(ctx, &wg) })
 	}
 	if s.rereadsByItself() {
-		wg.Go(func() { s.watchRules(ctx) })
+		contain.GoIn(ctx, &wg, func() { s.watchRules(ctx) })
 	}
 	for {
 		conn, err := l.Accept()
 		if err != nil {
-			if isTemporary(err) && ctx.Err() == nil {
+			if transport.IsTemporary(err) && ctx.Err() == nil {
 				backoff = min(max(2*backoff, 5*time.Millisecond), time.Second)
 				s.log.Warn("accept failed, retrying", "error", err, "backoff", backoff)
 				select {
@@ -322,19 +351,8 @@ func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 			return err
 		}
 		backoff = 0
-		wg.Go(func() { s.handle(ctx, conn) })
+		contain.GoIn(ctx, &wg, func() { s.handle(ctx, conn) })
 	}
-}
-
-// isTemporary reports accept errors caused by momentary resource shortage,
-// after which accepting can succeed again.
-func isTemporary(err error) bool {
-	for _, errno := range []syscall.Errno{syscall.EMFILE, syscall.ENFILE, syscall.ENOBUFS, syscall.ENOMEM, syscall.ECONNABORTED} {
-		if errors.Is(err, errno) {
-			return true
-		}
-	}
-	return false
 }
 
 // handle serves one connection to the container's socket: a dry run or
@@ -343,16 +361,21 @@ func isTemporary(err error) bool {
 // Cancelling ctx, or the client going away, kills the command without
 // reporting a result.
 func (s *Server) handle(ctx context.Context, conn net.Conn) {
+	daemon := ctx // the daemon's context, which the request's is derived from
+	// The goroutines reading conn (see readFrames) end once it is closed
+	// and ctx cancelled, below: handle returns after them.
+	var reads sync.WaitGroup
+	defer reads.Wait()
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	defer conn.Close()
-	stop := context.AfterFunc(ctx, func() { conn.Close() })
+	stop := contain.AfterFunc(ctx, func() { conn.Close() })
 	defer stop()
 
 	out := &frameWriter{conn: conn}
 	// The cause tells an approved run cancelled for its client from one
 	// cancelled for the daemon stopping (see cancelReason).
-	x := exchange{cancel: func() { cancel(errClientGone) }, conn: conn, out: out}
+	x := exchange{daemon: daemon, cancel: func() { cancel(errClientGone) }, conn: conn, out: out, reads: &reads}
 	// logArgs mark in the log every refusal of this connection's request,
 	// once its kind is known (a dry run).
 	var logArgs []any
@@ -386,7 +409,7 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 		return
 	}
 	if f.Type == protocol.FrameDryRun {
-		s.dryRun(out, req)
+		s.dryRun(daemon, out, req)
 		return
 	}
 	s.run(ctx, x, req)
@@ -399,17 +422,17 @@ var dryRunLogArgs = []any{"dry_run", true}
 // then looks the program up as starting it would, and releases what the
 // checks opened, never starting the command or reading stdin. The answer
 // carries the warning of the daemon (see pendingAllowWarning).
-func (s *Server) dryRun(out *frameWriter, req protocol.Request) {
+func (s *Server) dryRun(ctx context.Context, out *frameWriter, req protocol.Request) {
 	if r := s.mount.refusal(); r != nil {
 		s.reject(out, r.code, r.message, r.err, dryRunLogArgs...)
 		return
 	}
-	p, r := s.prepare(req, true)
+	p, r := s.prepare(ctx, req, true)
 	if r == nil {
-		r = lookupStart(p, req)
+		r = lookupStart(s.environment, p, req)
 	}
 	if r != nil {
-		r = s.withAskHint(req, r)
+		r = s.withAskHint(ctx, req, r)
 		s.reject(out, r.code, r.message, r.err, dryRunLogArgs...)
 		return
 	}
@@ -518,13 +541,14 @@ type refusal struct {
 // fixed directory, which is opened last and replaces it as the working
 // directory. The secrets are obtained once every check has passed, and the
 // rule's injection is placed in the argv to run; for a dry run they are
-// only checked (see checkSources), and the argv is the container's. On
-// refusal nothing is left open.
+// only checked (see secretSources.check), and the argv is the container's. On
+// refusal nothing is left open. A secret's command source runs under ctx,
+// which is the daemon's context (see exchange), not a request's.
 //
 // A standing or session approval for req lets it through what the rules
 // refuse, as the rule that refused it would run it, and passes as given
 // the path failures the human saw when granting it.
-func (s *Server) prepare(req protocol.Request, dryRun bool) (*prepared, *refusal) {
+func (s *Server) prepare(ctx context.Context, req protocol.Request, dryRun bool) (*prepared, *refusal) {
 	allowed, err := s.rules().Check(req.Argv)
 	held := s.approvals.approvalFor(req)
 	// byApproval: the rules refuse req, and its approval overrides them.
@@ -540,7 +564,7 @@ func (s *Server) prepare(req protocol.Request, dryRun bool) (*prepared, *refusal
 	if held != nil {
 		passes = held.passes
 	}
-	p, r := s.prepareAllowed(req, allowed, dryRun, passes)
+	p, r := s.prepareAllowed(ctx, req, allowed, dryRun, passes)
 	if p != nil && held != nil && (byApproval || len(p.pathFailures) > 0) {
 		p.approval = held.kind()
 	}
@@ -552,7 +576,7 @@ func (s *Server) prepare(req protocol.Request, dryRun bool) (*prepared, *refusal
 // directory, path checks, fixed directory and secrets (see prepare). A
 // path failure that passes.pass lets through does not refuse it: the
 // argument is passed as given, and the failure is in pathFailures.
-func (s *Server) prepareAllowed(req protocol.Request, allowed rules.Allowed, dryRun bool, passes pathPasses) (*prepared, *refusal) {
+func (s *Server) prepareAllowed(ctx context.Context, req protocol.Request, allowed rules.Allowed, dryRun bool, passes pathPasses) (*prepared, *refusal) {
 	var err error
 	p := &prepared{rule: allowed.Rule, fixedDir: allowed.Dir, secrets: allowed.SecretNames()}
 	if p.dir, p.hostPath, err = s.mapper.Open(req.Cwd); err != nil {
@@ -574,15 +598,16 @@ func (s *Server) prepareAllowed(req protocol.Request, allowed rules.Allowed, dry
 			return refuse(protocol.ExitRejected, fixedMessage(allowed.Dir, err), err)
 		}
 	}
+	sources := secretSources{s.environment, p.dir, p.hostPath}
 	if dryRun {
 		// Nothing is obtained, run or created: the sources are only
 		// checked, and the argv is not assembled, which needs the values.
-		if r := checkSources(allowed.Secrets, p.dir); r != nil {
+		if r := sources.check(allowed.Secrets); r != nil {
 			return refuse(r.code, r.message, r.err)
 		}
 		return p, nil
 	}
-	values, r := obtainSecrets(allowed.Secrets, p.dir, p.hostPath)
+	values, r := sources.obtain(ctx, allowed.Secrets)
 	if r != nil {
 		return refuse(r.code, r.message, r.err)
 	}
@@ -598,11 +623,17 @@ func (s *Server) prepareAllowed(req protocol.Request, allowed rules.Allowed, dry
 }
 
 // exchange is the connection a request is served on: conn, out, where
-// its frames go, and cancel, which ends the request early.
+// its frames go, and cancel, which ends the request early. daemon is the
+// context of the daemon (see Serve), which what runs for the request
+// before its command starts, a secret's command source, runs under: it
+// ends with the daemon, not with the request. reads counts the
+// goroutines reading conn (see readFrames), which handle waits for.
 type exchange struct {
+	daemon context.Context
 	cancel context.CancelFunc
 	conn   net.Conn
 	out    *frameWriter
+	reads  *sync.WaitGroup
 }
 
 // run executes req on x if it passes prepare; x.cancel stops it early. The
@@ -613,9 +644,9 @@ func (s *Server) run(ctx context.Context, x exchange, req protocol.Request) {
 		s.reject(x.out, r.code, r.message, r.err)
 		return
 	}
-	p, r := s.prepare(req, false)
+	p, r := s.prepare(x.daemon, req, false)
 	if r != nil {
-		r = s.withAskHint(req, r)
+		r = s.withAskHint(x.daemon, req, r)
 		s.reject(x.out, r.code, r.message, r.err)
 		return
 	}
@@ -654,13 +685,13 @@ func (s *Server) start(ctx context.Context, x exchange, req protocol.Request, p 
 	}
 	defer s.untrack(key)
 
-	cmd := newCommand(ctx, p.argv, p.dir, p.hostPath, p.env, x.out)
+	cmd := s.command(ctx, p, x.out)
 	if run != nil {
 		// The session gets what the container gets: the masked output.
 		cmd.Stdout, cmd.Stderr = runTee{w: cmd.Stdout, run: run}, runTee{w: cmd.Stderr, run: run, stderr: true}
 	}
 	stdout, stderr := newMaskWriter(cmd.Stdout, p.masked), newMaskWriter(cmd.Stderr, p.masked)
-	cmd.Stdout, cmd.Stderr = stdout, stderr
+	cmd.Stdout, cmd.Stderr = contain.Writer(ctx, stdout), contain.Writer(ctx, stderr)
 	cmd.ExtraFiles = p.files
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -687,7 +718,7 @@ func (s *Server) start(ctx context.Context, x exchange, req protocol.Request, p 
 
 	queue := newStdinQueue(protocol.StdinWindow)
 	var streams sync.WaitGroup
-	streams.Go(func() {
+	contain.GoIn(ctx, &streams, func() {
 		if err := readClient(next, queue); err != nil {
 			s.reject(x.out, protocol.ExitHostrunError, err.Error(), err)
 		}
@@ -695,7 +726,7 @@ func (s *Server) start(ctx context.Context, x exchange, req protocol.Request, p 
 		// receive the result, so stop the command.
 		x.cancel()
 	})
-	streams.Go(func() { feedStdin(queue, stdin, x.out) })
+	contain.GoIn(ctx, &streams, func() { feedStdin(queue, stdin, x.out) })
 	_ = x.out.writeJSON(protocol.FrameStdinCredit, protocol.Credit{Bytes: protocol.StdinWindow, Warning: s.pendingAllowWarning()})
 
 	waitErr := cmd.Wait()
@@ -950,22 +981,34 @@ func fdPath(dir *os.File) string {
 	return fmt.Sprintf("/proc/self/fd/%d", dir.Fd())
 }
 
-// newCommand prepares argv to run in the open directory dir, whose real
-// path is hostPath. The child changes into the directory through
+// command prepares p's argv to run in the daemon's environment, which
+// finds its program in its PATH (see Environment.command), with the rule's
+// injected variables over the environment (see Environment.with), its
+// output streamed to out.
+func (s *Server) command(ctx context.Context, p *prepared, out *frameWriter) *exec.Cmd {
+	cmd := inDirectory(s.environment.command(ctx, p.argv), p.dir, p.hostPath, s.environment.with(p.env...))
+	return streamTo(cmd, out)
+}
+
+// inDirectory makes cmd run in the open directory dir, whose real path is
+// hostPath, with the environment env, which is complete: nothing comes from
+// the container. The child changes into the directory through
 // /proc/self/fd (it inherits the descriptor until exec), so a symlink the
 // container swaps into the path after the check cannot redirect it; PWD is
-// set to hostPath because the /proc path is meaningless once the child runs.
-// The environment is otherwise the daemon's (host) environment with env,
-// the rule's injected variables, over it; nothing comes from the
-// container. The command gets its own process group so
-// cancellation also kills whatever it spawned (e.g. git's ssh).
-func newCommand(ctx context.Context, argv []string, dir *os.File, hostPath string, env []string, out *frameWriter) *exec.Cmd {
-	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+// set to hostPath because the /proc path is meaningless once the child
+// runs. The command gets its own process group so cancellation also kills
+// whatever it spawned (e.g. git's ssh).
+func inDirectory(cmd *exec.Cmd, dir *os.File, hostPath string, env []string) *exec.Cmd {
 	cmd.Dir = fdPath(dir)
-	cmd.Env = commandEnv(hostPath, env...)
+	cmd.Env = commandEnv(env, hostPath)
+	ownGroup(cmd)
+	return cmd
+}
+
+// streamTo has the output of cmd streamed to out, as frames.
+func streamTo(cmd *exec.Cmd, out *frameWriter) *exec.Cmd {
 	cmd.Stdout = streamWriter{out: out, frame: protocol.FrameStdout}
 	cmd.Stderr = streamWriter{out: out, frame: protocol.FrameStderr}
-	ownGroup(cmd)
 	return cmd
 }
 
@@ -978,19 +1021,11 @@ func ownGroup(cmd *exec.Cmd) {
 	cmd.WaitDelay = waitDelay
 }
 
-// commandEnv is the environment a command, or a secret's command source,
-// runs with in the directory whose real path is hostPath: the daemon's,
-// with PWD set to hostPath, then the NAME=value entries of extra (a rule's
-// injected variables) over it.
-func commandEnv(hostPath string, extra ...string) []string {
-	set := append([]string{"PWD=" + hostPath}, extra...)
-	env := slices.DeleteFunc(os.Environ(), func(kv string) bool {
-		return slices.ContainsFunc(set, func(e string) bool {
-			name, _, _ := strings.Cut(e, "=")
-			return strings.HasPrefix(kv, name+"=")
-		})
-	})
-	return append(env, set...)
+// commandEnv is env, the environment of a command, or of a secret's
+// command source, with PWD set to hostPath, the real path of the directory
+// it runs in.
+func commandEnv(env []string, hostPath string) []string {
+	return withEntries(env, "PWD="+hostPath)
 }
 
 // xOK is access(2)'s X_OK, which package syscall does not export.
@@ -999,8 +1034,8 @@ const xOK = 0x1
 // lookupStart looks the program of p, prepared for req, up as starting it
 // would (see lookupProgram). On failure it releases p and returns the
 // refusal starting it would get.
-func lookupStart(p *prepared, req protocol.Request) *refusal {
-	err := lookupProgram(p.argv[0], p.dir)
+func lookupStart(env *Environment, p *prepared, req protocol.Request) *refusal {
+	err := lookupProgram(env, p.argv[0], p.dir)
 	if err == nil {
 		return nil
 	}
@@ -1012,27 +1047,19 @@ func lookupStart(p *prepared, req protocol.Request) *refusal {
 // lookupProgram returns the error starting program in the working
 // directory dir would fail with, as far as it can be told without
 // starting it, so that startFailure classifies both alike. A name is
-// looked up in the daemon's PATH, as newCommand's exec.Cmd does; a path
+// looked up in the PATH of env, as Server.command does; a path
 // is resolved from dir, as execve does after the child changed into it,
 // and must be an executable file: execve refuses a directory with EACCES.
-func lookupProgram(program string, dir *os.File) error {
+func lookupProgram(env *Environment, program string, dir *os.File) error {
 	if !strings.Contains(program, "/") {
-		_, err := exec.LookPath(program)
+		_, err := env.LookPath(program)
 		return err
 	}
 	path := program
 	if !filepath.IsAbs(path) {
 		path = filepath.Join(fdPath(dir), path)
 	}
-	if err := syscall.Access(path, xOK); err != nil {
-		return err
-	}
-	if fi, err := os.Stat(path); err != nil {
-		return err
-	} else if fi.IsDir() {
-		return syscall.EACCES
-	}
-	return nil
+	return checkExecutable(path)
 }
 
 // startFailure classifies why program could not start and describes it

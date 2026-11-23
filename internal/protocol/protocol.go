@@ -56,6 +56,10 @@
 // of FrameHello carries that one arm, answered by FrameArmed or
 // FrameError. The container's socket refuses FrameArm, so only the host
 // arms the daemon.
+//
+// The control socket of a shared process speaks its own frames, with its
+// own version (SharedVersion): a connection carries one FrameAddDaemon,
+// answered by FrameDaemonAdded, FrameEnding or FrameError.
 package protocol
 
 import (
@@ -134,7 +138,13 @@ const (
 	FrameMountCheckFailed // daemon → session, JSON MountCheckFailed: the check of the armed container's mounts failed, to a session that said it reads this (Serve.MountCheck)
 	FrameRulesNotAllowed  // daemon → session, JSON RulesNotAllowed: the rules or the daemon settings changed to ones not allowed, to a session that said it reads this (Serve.RulesNotAllowed)
 
-	lastFrameType = FrameRulesNotAllowed
+	// Frames of the control socket of a shared process, between
+	// `hostrunner up` and the process; it refuses every other frame.
+	FrameAddDaemon   // `hostrunner up` → shared process, JSON AddDaemon
+	FrameDaemonAdded // shared process → `hostrunner up`, no payload: the daemon was added and started, not that it listens yet: up waits for its arm
+	FrameEnding      // shared process → `hostrunner up`, no payload: the process is ending and added nothing: up starts a new one and adds again
+
+	lastFrameType = FrameEnding
 )
 
 // Exit codes for failures of hostrun itself rather than of the command,
@@ -172,7 +182,7 @@ type Request struct {
 // older rules can step aside; NoReread is the `up`'s --no-reread, so a
 // daemon that rereads its rules file otherwise can too. Settings are the
 // daemon settings `up` resolved, key to value text, as
-// settings.Settings.Daemon writes them, so a daemon running with others
+// settings.Settings.ArmSettings writes them, so a daemon running with others
 // steps aside too. A daemon that predates them ignores the field and
 // still reads NoReread, which Settings' reread then repeats, and a
 // current daemon reads only Settings; an arm without the field, from an
@@ -189,11 +199,12 @@ type Arm struct {
 }
 
 // ArmNotAllowed tells a running daemon that `hostrunner up` found the rules
-// file of Digest, with the daemon settings Settings (key to value text, as
-// settings.Settings.Daemon writes them), not allowed. The daemon, which
-// serves allowed ones, is armed instead of replaced; it warns the client
-// (the Warning fields) while that change stays not allowed, until an arm
-// without the field or the allow store allows it.
+// file of Digest, with the daemon settings Settings that the allow covers
+// (key to value text, as settings.Settings.AllowedSettings writes them:
+// ArmSettings without the process), not allowed. The daemon, which serves
+// allowed ones, is armed instead of replaced; it warns the client (the
+// Warning fields) while that change stays not allowed, until an arm without
+// the field or the allow store allows it.
 type ArmNotAllowed struct {
 	Digest   string            `json:"digest"`
 	Settings map[string]string `json:"settings,omitempty"`
@@ -489,10 +500,15 @@ type Hello struct {
 // every command until a later check passes (see FrameMountCheckFailed); a
 // daemon older than the field, or one that does not check, reports none,
 // and an older session ignores it.
-// Settings are the daemon settings the daemon runs with, keyed by their
-// names as an arm carries them (settings.Settings.Daemon), so that
-// `hostrunner up` can tell whether what it serves is allowed; a daemon
+// Settings are the daemon settings the daemon runs with that the allow
+// covers, keyed by their names as an arm carries them
+// (settings.Settings.AllowedSettings: ArmSettings without the process), so
+// that `hostrunner up` can tell whether what it serves is allowed; a daemon
 // older than the field reports none, and an older session ignores it.
+// Process is the kind of process the daemon actually runs in, "own" or
+// "shared" (the values of settings.Process; not the process setting,
+// which may name another); a daemon older than the field reports none,
+// and an older session ignores it.
 type DaemonInfo struct {
 	Version            int               `json:"version"`
 	Workspace          string            `json:"workspace"`
@@ -508,6 +524,7 @@ type DaemonInfo struct {
 	Runs               bool              `json:"runs,omitempty"`
 	Settings           map[string]string `json:"settings,omitempty"`
 	MountCheckFailed   string            `json:"mount_check_failed,omitempty"`
+	Process            string            `json:"process,omitempty"`
 }
 
 // RunningList answers FrameRunning: the commands the daemon runs, and
@@ -645,6 +662,25 @@ const (
 	WithdrawnStopping   EndReason = "ended: the daemon is stopping" // the daemon drains; a session that predates it shows the text as is
 	WithdrawnMountCheck EndReason = "ended: the mount check failed" // the check of the armed container's mounts failed; likewise
 )
+
+// SharedVersion is the version of the control socket's protocol, which
+// `hostrunner up` sends in AddDaemon. The shared process refuses a request
+// of any other version.
+const SharedVersion = 1
+
+// AddDaemon asks a shared process to add a daemon. Args are the arguments
+// of `hostrunner serve` for that daemon, without the word serve; Env is the
+// environment, in os.Environ's form, of the `hostrunner up` that sends it,
+// which the daemon resolves its settings with and runs its commands with,
+// not the process's. The process answers FrameDaemonAdded once it started
+// the daemon, maybe before the daemon listens: up then waits until it
+// follows its arm; FrameEnding when its end is decided and it added
+// nothing.
+type AddDaemon struct {
+	Version int      `json:"version"`
+	Args    []string `json:"args"`
+	Env     []string `json:"env"`
+}
 
 // Exit reports the exit code of a command that ran.
 type Exit struct {

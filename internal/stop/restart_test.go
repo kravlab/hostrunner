@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -24,6 +25,7 @@ import (
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
 	"github.com/kravlab/hostrunner/internal/settings"
+	"github.com/kravlab/hostrunner/internal/shared"
 	"github.com/kravlab/hostrunner/internal/stop"
 	"github.com/kravlab/hostrunner/internal/transport"
 	"github.com/kravlab/hostrunner/internal/watch"
@@ -34,19 +36,62 @@ import (
 // `<it> serve …`, act as the new daemon: it records its arguments in
 // new.args and its pid in new.pid beside its socket, listens on the
 // socket, and answers every arm request on its approval socket, where
-// `up` arms it.
+// `up` arms it. Started as `<it> shared --socket …`, it acts as the shared
+// process: it takes the daemon an AddDaemon request asks for, and acts as
+// that daemon, recording the arguments of the request.
 const newDaemonEnv = "HOSTRUNNER_STOP_TEST_NEW_DAEMON"
 
 // runNewDaemon is the process a newDaemonEnv test binary runs.
 func runNewDaemon() {
-	socket := ""
+	if os.Args[1] == "shared" {
+		runSharedProcess()
+		return
+	}
+	serveNewDaemon(context.Background(), os.Args[1:])
+}
+
+// runSharedProcess is the shared process a newDaemonEnv test binary runs,
+// listening on the control socket of its --socket argument.
+func runSharedProcess() {
+	var control string
 	for i, a := range os.Args {
 		if a == "--socket" && i+1 < len(os.Args) {
-			socket = os.Args[i+1]
+			control = os.Args[i+1]
+		}
+	}
+	l, err := transport.Unix{Path: control}.Listen()
+	if err != nil {
+		os.Exit(3)
+	}
+	prepare := func(args, _ []string) (shared.Daemon, error) {
+		return shared.Daemon{
+			Socket: "",
+			Log:    nopWriteCloser{io.Discard},
+			Serve: func(ctx context.Context) error {
+				serveNewDaemon(ctx, args)
+				return nil
+			},
+		}, nil
+	}
+	_ = shared.Serve(context.Background(), l, prepare, time.Minute, slog.New(slog.DiscardHandler))
+}
+
+// nopWriteCloser is a WriteCloser whose Close does nothing.
+type nopWriteCloser struct{ io.Writer }
+
+func (nopWriteCloser) Close() error { return nil }
+
+// serveNewDaemon acts as the new daemon started with args, the arguments
+// of `hostrunner serve` as a restart gives them, until ctx ends.
+func serveNewDaemon(ctx context.Context, args []string) {
+	socket := ""
+	for i, a := range args {
+		if a == "--socket" && i+1 < len(args) {
+			socket = args[i+1]
 		}
 	}
 	dir := filepath.Dir(socket)
-	_ = os.WriteFile(filepath.Join(dir, "new.args"), []byte(strings.Join(os.Args[1:], "\n")), 0o600)
+	_ = os.WriteFile(filepath.Join(dir, "new.args"), []byte(strings.Join(args, "\n")), 0o600)
 	_ = os.WriteFile(filepath.Join(dir, "new.pid"), []byte(strconv.Itoa(os.Getpid())), 0o600)
 	l, err := transport.Unix{Path: socket}.Listen()
 	if err != nil {
@@ -57,10 +102,11 @@ func runNewDaemon() {
 	if err != nil {
 		os.Exit(3)
 	}
+	defer context.AfterFunc(ctx, func() { al.Close() })()
 	for {
 		c, err := al.Accept()
 		if err != nil {
-			os.Exit(0)
+			return
 		}
 		go func(c net.Conn) {
 			defer c.Close()
@@ -166,7 +212,7 @@ func allowRestart(t *testing.T, r *stop.Restart, workspace string, dirs ...strin
 		t.Fatal(err)
 	}
 	for _, dir := range dirs {
-		allowtest.Allow(t, r.Allows, allow.Place{Workspace: workspace, RuntimeDir: dir}, allow.Target{RulesFile: s.RulesFile, Scope: allow.Scope{Digest: policy.Digest(), Settings: s.Settings.Daemon()}})
+		allowtest.Allow(t, r.Allows, allow.Place{Workspace: workspace, RuntimeDir: dir}, allow.NewTarget(s.RulesFile, policy.Digest(), s.Settings.AllowedSettings()))
 	}
 }
 
@@ -302,8 +348,10 @@ func TestRestartReplacesTheDaemon(t *testing.T) {
 	}
 	d.waitStopped(t)
 	args := newDaemonArgs(t, d.dir)
-	want := []string{"serve", "--socket", filepath.Join(d.dir, launch.SocketName), "--workspace", d.workspace, "--container-workspace", "/workspaces/app", "--workspace-settings", filepath.Join(d.workspace, ".devcontainer", "hostrunner.yaml"), "--rules-file", d.rulesFile, "--watch",
-		"--startup-timeout", "30m0s", "--grace", "15s", "--poll-interval", "2s", "--ask-timeout", "10m0s", "--request-timeout", "10s", "--reread", "--mount-check"}
+	// Added to the shared process, the default: the arguments are the add
+	// request's, which carry no subcommand.
+	want := []string{"--socket", filepath.Join(d.dir, launch.SocketName), "--workspace", d.workspace, "--container-workspace", "/workspaces/app", "--workspace-settings", filepath.Join(d.workspace, ".devcontainer", "hostrunner.yaml"), "--rules-file", d.rulesFile, "--watch",
+		"--startup-timeout", "30m0s", "--grace", "15s", "--poll-interval", "2s", "--ask-timeout", "10m0s", "--request-timeout", "10s", "--process", "shared", "--reread", "--mount-check"}
 	if strings.Join(args, " ") != strings.Join(want, " ") {
 		t.Fatalf("the new daemon runs %q, want %q", args, want)
 	}
@@ -490,6 +538,25 @@ func TestRestartSaysWhatTheSettingsChange(t *testing.T) {
 		t.Fatalf("restart: %v; printed %q, want %q", err, out, want)
 	}
 	d.waitStopped(t)
+}
+
+// A restart into the other kind of process says so, and starts the new
+// daemon there: added to the shared process of the installed hostrunner,
+// with --process shared.
+func TestRestartSaysAndStartsAProcessChange(t *testing.T) {
+	d := startCurrentDaemon(t, validRules, false, append([]daemon.Option{daemon.WithProcess(settings.ProcessOwn)}, rereading...)...)
+	r := restartConfig(t)
+	r.Settings = resolving(t, besideRules, "--process", "shared")
+	allowRestart(t, r, d.workspace, d.dir)
+	out, err := runStop(t, stop.Config{Dir: d.dir, Restart: r})
+	if want := "hostrunner: restarted " + d.dir + "; process own → shared\n"; err != nil || out != want {
+		t.Fatalf("restart: %v; printed %q, want %q", err, out, want)
+	}
+	d.waitStopped(t)
+	args := newDaemonArgs(t, d.dir)
+	if i := slices.Index(args, "--process"); i < 0 || i+1 >= len(args) || args[i+1] != "shared" {
+		t.Fatalf("the new daemon runs %q, want --process shared", args)
+	}
 }
 
 // The new daemon rereads its rules file by itself as its settings say,

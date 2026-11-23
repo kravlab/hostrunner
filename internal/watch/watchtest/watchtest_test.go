@@ -106,3 +106,20 @@ func TestVolumeMountsCarryTheirVolumes(t *testing.T) {
 		t.Fatalf("v again: got %+v; want its volume", m)
 	}
 }
+
+// Panic makes the next Containers call panic with the value given, and
+// that call only.
+func TestPanicMakesTheNextContainersCallPanic(t *testing.T) {
+	r := &watchtest.Runtime{}
+	r.Panic("runtime panic")
+	func() {
+		defer func() {
+			if got := recover(); got != "runtime panic" {
+				t.Fatalf("recovered %v; want the panic value", got)
+			}
+		}()
+		containers(t, r)
+		t.Fatal("Containers returned; want a panic")
+	}()
+	containers(t, r)
+}

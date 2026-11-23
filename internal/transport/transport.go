@@ -5,7 +5,9 @@ package transport
 
 import (
 	"context"
+	"errors"
 	"net"
+	"syscall"
 )
 
 // Transport opens both ends of a client–daemon connection.
@@ -14,4 +16,15 @@ type Transport interface {
 	Listen() (net.Listener, error)
 	// Dial connects the client to a listening daemon.
 	Dial(ctx context.Context) (net.Conn, error)
+}
+
+// IsTemporary reports accept errors caused by momentary resource shortage,
+// after which accepting can succeed again.
+func IsTemporary(err error) bool {
+	for _, errno := range []syscall.Errno{syscall.EMFILE, syscall.ENFILE, syscall.ENOBUFS, syscall.ENOMEM, syscall.ECONNABORTED} {
+		if errors.Is(err, errno) {
+			return true
+		}
+	}
+	return false
 }

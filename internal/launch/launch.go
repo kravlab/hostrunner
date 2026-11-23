@@ -97,7 +97,9 @@ type Config struct {
 	// Settings are the settings up, or restart, resolved. Each the daemon
 	// takes is given to it as its flag and carried in every arm;
 	// ReadyTimeout, up's own, is how long to wait for the daemon's socket
-	// and is not passed on.
+	// (with process: shared, for its whole add, see addShared) and is not
+	// passed to the daemon; a shared process up starts gets what remains
+	// of it (see startShared).
 	settings.Settings
 }
 
@@ -157,11 +159,11 @@ func (p *Prepared) keepAllowed(ctx context.Context, notAllowed *NotAllowedError)
 // allowedDaemon returns what the daemon on the approval socket of cfg.Dir
 // says of itself, ok when it serves allowed rules and settings for the
 // workspace of the Config: it answers, says its rules digest and its
-// settings (a daemon older than DaemonInfo.Settings does not), serves
-// that workspace (symbolic links followed, see allow.SameWorkspace), and
-// the store allows what it serves for it in cfg.Dir. No daemon answering
-// is not an error; a workspace that cannot be compared, or a store that
-// cannot be read, is.
+// settings, the daemon settings its allow covers (a daemon older than
+// DaemonInfo.Settings does not say them), serves that workspace (symbolic
+// links followed, see allow.SameWorkspace), and the store allows what it
+// serves for it in cfg.Dir. No daemon answering is not an error; a
+// workspace that cannot be compared, or a store that cannot be read, is.
 func (p *Prepared) allowedDaemon(ctx context.Context) (info protocol.DaemonInfo, ok bool, err error) {
 	cfg := p.cfg
 	info, err = daemonlist.Probe(ctx, ApprovalSocket(cfg.Dir))
@@ -180,22 +182,24 @@ func (p *Prepared) allowedDaemon(ctx context.Context) (info protocol.DaemonInfo,
 }
 
 // armAllowed arms the daemon of p, on its approval socket, with the
-// digest and the daemon settings it said it serves, info, which
-// allowedDaemon found allowed, so it follows the arm and keeps serving
-// them. The arm also reports the change not allowed, the digest of p and
-// the daemon settings of the Config, exactly what checkAllowed checked
-// and recorded, so the daemon warns hostrun of it while it stays not
-// allowed. It then tells cfg.Stderr what is not allowed, notAllowed, and
-// that the daemon keeps serving the allowed rules, and returns nil. A
-// daemon that stepped aside, its rules reread since it answered, is
-// waited for until it has stopped, and notAllowed returned; an arm that
-// fails, or a daemon that does not stop after stepping aside, is joined
-// to notAllowed.
+// digest and the daemon settings the allow covers that it said it serves,
+// info, which allowedDaemon found allowed, so it follows the arm (the
+// daemon compares the settings an arm carries, so one without process does
+// not make it step aside) and keeps serving them. The arm also reports the
+// change not allowed, the digest of p and the daemon settings the allow
+// covers of the Config (settings.Settings.AllowedSettings, without
+// process), exactly what checkAllowed checked and recorded, so the daemon
+// warns hostrun of it while it stays not allowed. It then tells cfg.Stderr
+// what is not allowed, notAllowed, and that the daemon keeps serving the
+// allowed rules, and returns nil. A daemon that stepped aside, its rules
+// reread since it answered, is waited for until it has stopped, and
+// notAllowed returned; an arm that fails, or a daemon that does not stop
+// after stepping aside, is joined to notAllowed.
 func (p *Prepared) armAllowed(ctx context.Context, info protocol.DaemonInfo, notAllowed *NotAllowedError) error {
 	cfg := p.cfg
 	stepAside, err := arm(ctx, ApprovalSocket(cfg.Dir), protocol.Arm{
 		ConfigDigest: info.RulesDigest, NoReread: info.NoReread, Settings: info.Settings,
-		NotAllowed: &protocol.ArmNotAllowed{Digest: p.digest, Settings: cfg.Settings.Daemon()},
+		NotAllowed: &protocol.ArmNotAllowed{Digest: p.digest, Settings: cfg.Settings.AllowedSettings()},
 	})
 	if err != nil {
 		return errors.Join(notAllowed, err)
@@ -278,7 +282,9 @@ func (e *NotAllowedError) Error() string {
 }
 
 // checkAllowed returns a *NotAllowedError unless the allow store of the
-// Config holds exactly these rules and daemon settings for its workspace
+// Config holds exactly these rules and the daemon settings the allow
+// covers (settings.Settings.AllowedSettings: the daemon settings without
+// process, a change of which needs no new allow) for its workspace
 // and its runtime directory, cfg.Dir. Before it refuses, it records them
 // in the store as the pending request of that runtime directory (see
 // allow.Store.Request), leaving those of the others, so the human who runs
@@ -288,7 +294,7 @@ func (e *NotAllowedError) Error() string {
 // be recorded, is an error of its own, not a refusal, and is wrapped.
 func (p *Prepared) checkAllowed() error {
 	cfg := p.cfg
-	target := allow.NewTarget(cfg.RulesFile, p.digest, cfg.Settings.Daemon())
+	target := allow.NewTarget(cfg.RulesFile, p.digest, cfg.Settings.AllowedSettings())
 	ok, err := cfg.allowed(target.Scope)
 	if err != nil {
 		return err
@@ -309,9 +315,10 @@ func (cfg Config) place() allow.Place {
 }
 
 // allowed reports whether the allow store of cfg holds the Scope sc, the
-// rules digest and the daemon settings, for its workspace and its runtime
-// directory, cfg.Dir (see allow.Store.Allowed). A store that cannot be
-// read is an error naming the workspace, wrapping the store's.
+// rules digest and the daemon settings the allow covers, for its
+// workspace and its runtime directory, cfg.Dir (see allow.Store.Allowed).
+// A store that cannot be read is an error naming the workspace, wrapping
+// the store's.
 func (cfg Config) allowed(sc allow.Scope) (bool, error) {
 	ok, err := cfg.Allows.Allowed(cfg.place(), sc)
 	if err != nil {
@@ -350,6 +357,9 @@ func (p *Prepared) UpLocked(ctx context.Context) error {
 	}
 	if err := installClient(cfg.Client, cfg.Dir); err != nil {
 		return err
+	}
+	if cfg.Process == settings.ProcessShared {
+		return addShared(ctx, cfg, socket, a)
 	}
 	return startDaemon(ctx, cfg, socket, a)
 }
@@ -414,7 +424,18 @@ func TryLockDir(dir string) (unlock func(), busy bool, err error) {
 // lockDir takes the lock of LockDir with the flock operation how; busy
 // reports that a non-blocking how found it held.
 func lockDir(dir string, how int) (unlock func(), busy bool, err error) {
-	f, err := os.OpenFile(filepath.Join(dir, lockName), os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
+	return lockFile(filepath.Join(dir, lockName), "runtime directory", how)
+}
+
+// lockFile takes a flock on the lock file path, created owner-only (mode
+// 0600) when missing, with the flock operation how, what naming what the
+// lock guards in its errors; the returned function releases it. A
+// symbolic link at path is refused rather than followed. The file is
+// close-on-exec, as os.OpenFile opens every file, so a process spawned
+// while the lock is held does not inherit (and hold) it. busy reports that
+// a non-blocking how found the lock held, unlock nil then.
+func lockFile(path, what string, how int) (unlock func(), busy bool, err error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return nil, false, fmt.Errorf("open lock: %w", err)
 	}
@@ -423,7 +444,7 @@ func lockDir(dir string, how int) (unlock func(), busy bool, err error) {
 		if errors.Is(err, syscall.EWOULDBLOCK) {
 			return nil, true, nil
 		}
-		return nil, false, fmt.Errorf("lock runtime directory: %w", err)
+		return nil, false, fmt.Errorf("lock %s: %w", what, err)
 	}
 	return func() { f.Close() }, false, nil
 }
@@ -431,7 +452,7 @@ func lockDir(dir string, how int) (unlock func(), busy bool, err error) {
 // arm asks the daemon on socket, its approval socket, to wait for its
 // devcontainer again,
 // sending it a, with the protocol version set: the digest of the rules,
-// the daemon settings by key name (as settings.Settings.Daemon returns
+// the daemon settings by key name (as settings.Settings.ArmSettings returns
 // them; a setting left out of them is not compared) and, for a daemon
 // that predates the settings, whether it is not to reread the rules by
 // itself. stepAside reports that the daemon will not follow the arm (it
@@ -475,10 +496,10 @@ func arm(ctx context.Context, socket string, a protocol.Arm) (stepAside bool, er
 }
 
 // upArm is the arm of an up for rules of digest and the settings s: their
-// daemon settings (see settings.Settings.Daemon) and, for a daemon that
+// daemon settings (see settings.Settings.ArmSettings) and, for a daemon that
 // predates the settings, whether it is not to reread the rules by itself.
 func upArm(digest string, s settings.Settings) protocol.Arm {
-	return protocol.Arm{ConfigDigest: digest, NoReread: !s.Reread, Settings: s.Daemon()}
+	return protocol.Arm{ConfigDigest: digest, NoReread: !s.Reread, Settings: s.ArmSettings()}
 }
 
 // installClient atomically replaces dir/hostrun with a copy of src, so a
@@ -528,55 +549,165 @@ func checkStatic(path string) error {
 	return nil
 }
 
-// startDaemon spawns the daemon in its own session with output going to the
-// log, so it outlives `hostrunner up` and never holds the caller's stdio
-// (which would make devcontainer wait for it), then waits until it
-// follows the arm a, sent to its approval socket.
+// startDaemon spawns the daemon (see spawn), then waits until it follows
+// the arm a, sent to its approval socket.
 func startDaemon(ctx context.Context, cfg Config, socket string, a protocol.Arm) error {
 	logPath := filepath.Join(cfg.Dir, LogName)
-	logFile, err := openLog(logPath)
+	s, err := spawn("daemon", cfg.Daemon, serveArgs(cfg, socket), cfg.Dir, logPath) // cfg.Dir: do not keep the workspace busy
 	if err != nil {
 		return err
 	}
+	return waitReady(ctx, newReadyDeadline(cfg.ReadyTimeout), s, armReady(ctx, cfg, a))
+}
+
+// readyDeadline is when a wait of up for a process ends, at, and the
+// ready timeout it is counted from, timeout, which the errors of a wait
+// that it ends name.
+type readyDeadline struct {
+	at      time.Time
+	timeout time.Duration
+}
+
+// newReadyDeadline is the readyDeadline of a wait that begins now and
+// lasts timeout.
+func newReadyDeadline(timeout time.Duration) readyDeadline {
+	return readyDeadline{at: time.Now().Add(timeout), timeout: timeout}
+}
+
+// passed reports whether the deadline d has come.
+func (d readyDeadline) passed() bool { return !time.Now().Before(d.at) }
+
+// spawned is a process spawn started, as waitReady watches it.
+type spawned struct {
+	what     string        // names the process in errors
+	exited   <-chan string // yields how the process ended, once it did; nil for one that cannot be watched
+	kill     func()        // kills it; for a daemon of a shared process, stops it (see stopAdded)
+	logPath  string        // its log
+	logStart int64         // where its output starts in its log
+	// host is, for a daemon added to a shared process this up started,
+	// that process: waitReady fails at once when it exits, and the errors
+	// of the wait quote its log too (see startFailureLogs). nil otherwise.
+	host *spawned
+}
+
+// ownLogSinceStart is what s wrote to its own log since it started, as
+// up's errors quote it (see logTail): "" when the log is missing or got
+// nothing since.
+func (s spawned) ownLogSinceStart() string {
+	if info, err := os.Lstat(s.logPath); err != nil || info.Size() <= s.logStart {
+		return ""
+	}
+	return logTail(s.logPath, s.logStart)
+}
+
+// startFailureLogs is what up's errors quote for s when its start fails:
+// the tail of the log of s since it started (see logTail), a placeholder
+// when that log is missing or unreadable. For an s with a host, it is
+// instead what s wrote to its own log since it started (see
+// ownLogSinceStart) followed by "; <host's what> log: " and what the host
+// wrote to its log since it started, each part left out when its log got
+// nothing; "" when neither wrote anything.
+func (s spawned) startFailureLogs() string {
+	if s.host == nil {
+		return logTail(s.logPath, s.logStart)
+	}
+	own := s.ownLogSinceStart()
+	host := s.host.ownLogSinceStart()
+	switch {
+	case host == "":
+		return own
+	case own == "":
+		return s.host.what + " log: " + host
+	}
+	return own + "; " + s.host.what + " log: " + host
+}
+
+// spawn starts exe with args, the process what names in errors, in its
+// own session, in the directory dir, with output going to the log at
+// logPath (see OpenLog), so it outlives `hostrunner up` and never holds
+// the caller's stdio (which would make devcontainer wait for it). A log
+// that cannot be opened is OpenLog's error.
+func spawn(what, exe string, args []string, dir, logPath string) (spawned, error) {
+	logFile, err := OpenLog(logPath)
+	if err != nil {
+		return spawned{}, err
+	}
 	logStart, _ := logFile.Seek(0, io.SeekEnd)
 
-	cmd := exec.Command(cfg.Daemon, serveArgs(cfg, socket)...)
-	cmd.Dir = cfg.Dir // do not keep the workspace busy
+	cmd := exec.Command(exe, args...)
+	cmd.Dir = dir
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	err = cmd.Start()
 	logFile.Close()
 	if err != nil {
-		return fmt.Errorf("start daemon: %w", err)
+		return spawned{}, fmt.Errorf("start %s: %w", what, err)
 	}
-	exited := make(chan error, 1)
-	go func() { exited <- cmd.Wait() }()
+	exited := make(chan string, 1)
+	go func() {
+		_ = cmd.Wait()
+		exited <- cmd.ProcessState.String()
+	}()
+	return spawned{what: what, exited: exited, kill: func() { _ = cmd.Process.Kill() }, logPath: logPath, logStart: logStart}, nil
+}
 
+// armReady is the ready check of waitReady for a daemon that must follow
+// the arm a, sent to the approval socket of cfg.Dir: done once it does,
+// not yet while nothing listens there, and an error when it steps aside
+// or the arm fails otherwise.
+func armReady(ctx context.Context, cfg Config, a protocol.Arm) func() (bool, error) {
+	return func() (bool, error) {
+		stepAside, err := arm(ctx, ApprovalSocket(cfg.Dir), a)
+		switch {
+		case err == nil && !stepAside:
+			return true, nil
+		case err == nil: // e.g. the rules changed again while it started
+			return false, errors.New("the new daemon stepped aside; retry")
+		case errors.Is(err, errNotListening):
+			return false, nil
+		}
+		return false, err
+	}
+}
+
+// waitReady calls ready every 50 ms until it reports done, until the
+// deadline d at most. It fails when the process s ends first, when the
+// host of s (see spawned.host) ends first, when d passes, saying s did not
+// listen within d's ready timeout, when ready returns an error or when ctx
+// ends; it kills s in each case but the first two (an s whose host ended
+// ended with it), and but for ctx the error carries the tail of the log of
+// s since s started, and that of its host's log when it has one (see
+// spawned.startFailureLogs). An s whose exited is nil is not watched for its
+// end: only its host, d, ready and ctx end the wait.
+func waitReady(ctx context.Context, d readyDeadline, s spawned, ready func() (bool, error)) error {
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
-	deadline := time.After(cfg.ReadyTimeout)
+	deadline := time.After(time.Until(d.at))
+	var hostExited <-chan string
+	if s.host != nil {
+		hostExited = s.host.exited
+	}
 	for {
 		select {
-		case <-exited:
-			return fmt.Errorf("daemon exited during startup (%s): %s", cmd.ProcessState, logTail(logPath, logStart))
+		case state := <-s.exited:
+			return fmt.Errorf("%s exited during startup (%s): %s", s.what, state, s.startFailureLogs())
+		case state := <-hostExited:
+			return fmt.Errorf("%s exited (%s) while up waited for its %s to listen: %s", s.host.what, state, s.what, s.startFailureLogs())
 		case <-deadline:
-			_ = cmd.Process.Kill()
-			return fmt.Errorf("daemon did not listen within %v: %s", cfg.ReadyTimeout, logTail(logPath, logStart))
+			s.kill()
+			return fmt.Errorf("%s did not listen within %v: %s", s.what, d.timeout, s.startFailureLogs())
 		case <-ctx.Done():
-			_ = cmd.Process.Kill()
+			s.kill()
 			return ctx.Err()
 		case <-ticker.C:
-			stepAside, err := arm(ctx, ApprovalSocket(cfg.Dir), a)
-			if err == nil && !stepAside {
+			done, err := ready()
+			if done {
 				return nil
 			}
-			if err == nil { // e.g. the rules changed again while it started
-				err = errors.New("the new daemon stepped aside; retry")
-			}
-			if !errors.Is(err, errNotListening) {
-				_ = cmd.Process.Kill()
-				return fmt.Errorf("%w: %s", err, logTail(logPath, logStart))
+			if err != nil {
+				s.kill()
+				return fmt.Errorf("%w: %s", err, s.startFailureLogs())
 			}
 		}
 	}
@@ -605,6 +736,7 @@ func serveArgs(cfg Config, socket string) []string {
 		"--poll-interval", cfg.PollInterval.String(),
 		"--ask-timeout", cfg.AskTimeout.String(),
 		"--request-timeout", cfg.RequestTimeout.String(),
+		"--process", string(cfg.Process),
 		boolFlag("reread", cfg.Reread),
 		boolFlag("mount-check", cfg.MountCheck))
 }
@@ -618,17 +750,18 @@ func boolFlag(name string, on bool) string {
 	return "--no-" + name
 }
 
-// openLog opens the daemon log for appending. It refuses anything but a
-// regular file: the log lives in a directory mounted into the container,
-// and a planted symlink or FIFO must not redirect or block the daemon.
-func openLog(path string) (*os.File, error) {
+// OpenLog opens the daemon log, or the log of a shared process, for
+// appending. It refuses anything but a regular file: the daemon log lives
+// in a directory mounted into the container, and a planted symlink or FIFO
+// must not redirect or block the daemon.
+func OpenLog(path string) (*os.File, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0o600)
 	if err != nil {
-		return nil, fmt.Errorf("open daemon log: %w", err)
+		return nil, fmt.Errorf("open log %s: %w", hostterm.Display(path), err)
 	}
 	if info, err := f.Stat(); err != nil || !info.Mode().IsRegular() {
 		f.Close()
-		return nil, fmt.Errorf("daemon log %s is not a regular file", hostterm.Display(path))
+		return nil, fmt.Errorf("log %s is not a regular file", hostterm.Display(path))
 	}
 	return f, nil
 }

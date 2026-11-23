@@ -25,6 +25,7 @@ type Flags struct {
 	durations     map[string]*time.Duration // by key name
 	bools         map[string]*bool          // by key name
 	ints          map[string]*int           // by key name
+	choices       map[string]*string        // by key name
 	negated       map[string]*bool          // the --no- flags, by key name
 	scopes        scopes                    // the keys the command takes, which alone are read
 }
@@ -93,6 +94,7 @@ func (f *Flags) register(fs *flag.FlagSet, flagged []key, in ...scope) {
 	f.paths, f.durations = map[string]*string{}, map[string]*time.Duration{}
 	f.bools, f.negated = map[string]*bool{}, map[string]*bool{}
 	f.ints = map[string]*int{}
+	f.choices = map[string]*string{}
 	fs.StringVar(&f.file, "settings", "", "host settings file (default $XDG_CONFIG_HOME/hostrunner/settings.yaml)")
 	if f.scopes.knowWorkspace() {
 		fs.StringVar(&f.workspaceFile, "workspace-settings", "", "workspace settings file (default <workspace>/.devcontainer/hostrunner.yaml)")
@@ -114,6 +116,8 @@ func (f *Flags) register(fs *flag.FlagSet, flagged []key, in ...scope) {
 			n := decimal(k.get(&defaults).(int))
 			fs.Var(&n, k.flagName(), k.usage)
 			f.ints[k.name] = (*int)(&n)
+		case kindChoice:
+			f.choices[k.name] = fs.String(k.flagName(), k.get(&defaults).(string), k.usage)
 		}
 	}
 }
@@ -246,6 +250,8 @@ func (f *Flags) layer() (layer, error) {
 				return
 			}
 			l[name] = p
+		case f.choices[name] != nil:
+			err = f.setChoice(l, name, fl.Name)
 		case f.bools[name] != nil:
 			err = setBool(l, name, *f.bools[name]) // --reread=X rereads X
 		case negating && f.negated[negatedName] != nil:
@@ -267,6 +273,18 @@ func (f *Flags) setChecked(l layer, name, flagName string) error {
 		v = *f.ints[name]
 	}
 	if err := k.kind.check(v); err != nil {
+		return &FlagError{fmt.Errorf("--%s: %w", flagName, err)}
+	}
+	l[name] = v
+	return nil
+}
+
+// setChoice sets the choice key named name in l to the value of its flag,
+// flagName; a value that is none of the key's values (`--process: invalid
+// value "x" (want own or shared)`) is a *FlagError.
+func (f *Flags) setChoice(l layer, name, flagName string) error {
+	v, err := mustLookup(name).parse(*f.choices[name])
+	if err != nil {
 		return &FlagError{fmt.Errorf("--%s: %w", flagName, err)}
 	}
 	l[name] = v

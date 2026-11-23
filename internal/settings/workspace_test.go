@@ -362,3 +362,32 @@ func TestResolveAsGivenReadsNoWorkspaceFileWhenFlagsSetEveryKey(t *testing.T) {
 		t.Fatal("Resolve: got no error for a broken workspace settings file")
 	}
 }
+
+// The process of up comes from every file source: the common part of the
+// host settings file, a section of it and the workspace settings file, the
+// highest of them winning.
+func TestProcessIsSetByEveryFile(t *testing.T) {
+	ws := t.TempDir()
+	tests := []struct {
+		name         string
+		host, wsFile string
+		want         settings.Process
+	}{
+		{"common part", "process: shared\n", "", settings.ProcessShared},
+		{"section over common part", "process: own\n" + section(ws, "process: shared"), "", settings.ProcessShared},
+		{"workspace file", "", "process: shared\n", settings.ProcessShared},
+		{"workspace file over section", section(ws, "process: shared"), "process: own\n", settings.ProcessOwn},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vars := map[string]string{"HOSTRUNNER_SETTINGS": writeFile(t, tt.host)}
+			if tt.wsFile != "" {
+				vars["HOSTRUNNER_WORKSPACE_SETTINGS"] = writeFile(t, tt.wsFile)
+			}
+			got, err := parseUp(t).Resolve(env(vars), ws)
+			if err != nil || got.Process != tt.want {
+				t.Fatalf("got %q, %v; want %q", got.Process, err, tt.want)
+			}
+		})
+	}
+}

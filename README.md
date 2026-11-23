@@ -292,10 +292,10 @@ settings not allowed either, or is of a hostrunner older than this
 check) `up` fails, naming the rules file, its digest and `hostrunner
 allow`, so `devcontainer up` fails and the container does not start; it
 starts nothing and leaves a running daemon as it is. It also records
-what it asked for (the rules
-file, its digest and the daemon settings, from every flag
-devcontainer.json gave it) as the request of its runtime directory,
-replacing only that directory's earlier request, in
+what it asked for (the rules file, its digest and the daemon settings,
+from every flag devcontainer.json gave it but `--process`, which an
+allow leaves out) as the request of its runtime directory, replacing
+only that directory's earlier request, in
 `$XDG_DATA_HOME/hostrunner/allow` (`~/.local/share/hostrunner/allow`
 when it is unset). `allow` allows exactly the pending requests of the
 workspace, all at once, after checking that the rules file of each
@@ -374,11 +374,15 @@ The first `up` after upgrading to a hostrunner with allows fails the
 same way until the workspace is allowed. So does the first `up` after an
 upgrade that adds a daemon setting, such as `mount_check`: the allow
 covers the resolved daemon settings, so it needs a new `hostrunner
-allow`. `up --restart` and `hostrunner
-restart` check the allow before they stop the running daemon: content
-not allowed fails them, records the request as `up` does, for the
-runtime directory of the daemon they replace, and leaves the daemon
-running.
+allow`; `process` is the exception, outside the allow, so changing it
+needs none. After updating to a build that compares `process`, a daemon
+started by an older build steps aside once on the next `up` (its
+settings lack `process`), and `up` starts its replacement, in the shared
+process unless `process` is `own`; no new allow is needed. `up
+--restart` and `hostrunner restart` check the allow before they stop the
+running daemon: content not allowed fails them, records the request as
+`up` does, for the runtime directory of the daemon they replace, and
+leaves the daemon running.
 
 ### Settings
 
@@ -394,7 +398,8 @@ Besides its rules, a daemon has settings:
 | `ask_timeout` | `HOSTRUNNER_ASK_TIMEOUT` | `--ask-timeout` | `10m` | how long an `--ask` request waits for an answer when hostrun sets no limit |
 | `request_timeout` | `HOSTRUNNER_REQUEST_TIMEOUT` | `--request-timeout` | `10s` | how long a new connection may take to send its request |
 | `mount_check` | `HOSTRUNNER_MOUNT_CHECK` | `--mount-check`, `--no-mount-check` | `true` | whether it checks that its container cannot write its configuration (see [Mount check](#mount-check)); not in the workspace settings file |
-| `ready_timeout` | `HOSTRUNNER_READY_TIMEOUT` | `--ready-timeout` (`up` only) | `10s` | how long `up` waits for the daemon it starts to listen |
+| `ready_timeout` | `HOSTRUNNER_READY_TIMEOUT` | `--ready-timeout` (`up` only) | `10s` | how long `up` waits for the daemon it starts to listen; with `process: shared`, for the whole add to the shared process; a shared process `up` starts waits for its first daemon for what remains of it |
+| `process` | `HOSTRUNNER_PROCESS` | `--process` | `shared` | whether `up` adds the daemon to the shared process of its build (`shared`, see [Shared process](#shared-process)) or starts it in a process of its own (`own`); in the arm, outside the allow |
 
 `hostrunner stop`, `restart` and `approve` have settings of their own:
 
@@ -488,12 +493,14 @@ key`, `settings file /home/u/.config/hostrunner/settings.yaml:
 workspaces./home/u/other: grase: unknown key`, `HOSTRUNNER_GRACE:
 invalid duration "abc"`). `up` resolves the settings and starts the
 daemon with every one as a flag but `ready_timeout`, its own, so its
-command line shows them; `hostrunner serve` started by hand resolves
-them the same way, without reading or checking `ready_timeout`. A
-settings edit applies on the next container start (reopen, container
-restart or rebuild): `up` tells the running daemon the settings it
-resolved, and a daemon running with others steps aside for a new one,
-as for changed rules; it compares only the settings the arm carries.
+command line shows them (`process` included: a daemon of the other kind
+of process steps aside, and `up` starts the new one in that kind);
+`hostrunner serve` started by hand resolves them the same way, without
+reading or checking `ready_timeout`. A settings edit applies on the next
+container start (reopen, container restart or rebuild): `up` tells the
+running daemon the settings it resolved, and a daemon running with
+others steps aside for a new one, as for changed rules; it compares only
+the settings the arm carries.
 `hostrunner restart` applies a settings edit at once: it resolves the
 new daemon's settings the same way, for the workspace of the daemon it
 replaces (see [Stop and restart](#stop-and-restart)). `--reread` and
@@ -732,17 +739,18 @@ workspace the daemon serves: from the settings files as they are now,
 the variables of the terminal it runs in and its own flags
 (`--workspace-settings`, and `--rules-file` or `--config`, both read
 against the current directory and refused with `--all`, as they name one
-workspace's files, and `--mount-check` or `--no-mount-check`; the other
-daemon settings have no flag here). It
+workspace's files, `--mount-check` or `--no-mount-check`, and
+`--process`; the other daemon settings have no flag here). It
 checks them and reads and checks the rules file before stopping anything
 (an invalid setting or invalid rules leave the daemon running, the error
 naming the source, and so do rules or settings not allowed, see
 [Allow](#allow)), then starts a new daemon, the installed
 `hostrunner`, for the same workspace, with those settings, and waits
 `ready_timeout` for it to listen. It names what they change of the old
-daemon's rules file and rereading (`hostrunner: restarted <dir>;
-rules_file <old> → <new>, reread true → false`; a daemon of an older
-hostrunner does not say whether it rereads). A daemon still waiting for
+daemon's rules file, rereading and process (`hostrunner: restarted <dir>;
+rules_file <old> → <new>, reread true → false, process own → shared`; a
+daemon of an older hostrunner does not say whether it rereads or in which
+process it runs). A daemon still waiting for
 its container (right after `up`, during a rebuild) is replaced by one
 that waits the same way. A daemon that saw its container stop, and is
 about to exit, is only stopped (`hostrunner: stopped <dir>; its
@@ -760,6 +768,52 @@ stopped by SIGTERM, which kills what it runs (`k` or `--kill`; `--wait`
 is refused), once the process on its socket is the user's
 `hostrunner serve --socket <that socket>`. One from before approvals is
 found only by `--dir` and cannot be restarted.
+
+### Shared process
+
+By default (`process: shared`) the daemons of all your devcontainers
+live in one host process, the shared process (`hostrunner shared`),
+rather than in a `hostrunner serve` each. The first `hostrunner up` that
+starts a daemon starts it, the next ones add their daemons to it, and it
+ends with its last daemon; one that no daemon is added to within the
+`ready_timeout` of the `up` that started it ends on its own. Only the
+process is shared: each daemon keeps its runtime directory, sockets,
+`daemon.log`, rules, settings, allow, mount check, approvals and
+approval session, its commands and secret sources get the environment
+of the `up` that added it, and a container cannot reach the daemon of
+another workspace. A panic in one daemon ends that daemon alone, with
+the panic and its stack in its `daemon.log` and in the process log.
+
+There is one shared process per runtime root and build: builds of
+different content, also builds from source that are all `dev`, get one
+each. After `hostrunner update`, `up` and `restart` put their daemon
+into the process of the new build, and the older process keeps its other
+daemons, though update removed its version directory, until its last one
+ends. `stop`, `restart` and step aside act on one daemon and never
+signal the process; `stop --all` ends every daemon, and with them the
+shared processes. SIGINT or SIGTERM sent to the shared process ends its
+daemons as it ends a daemon of its own. The daemon lines of `hostrunner
+approve` and `hostrunner stop --choose` say `own` or `shared` (`unknown`
+for a daemon of an older hostrunner).
+
+The shared process listens on `shared-<id>.sock` in the runtime root,
+the parent of the runtime directory (`$XDG_RUNTIME_DIR/hostrunner` in
+the example), owner-only and refusing other users, and logs to
+`shared-<id>.log` beside it, both out of every container's reach: when
+it started, the daemons added and ended, adds refused, and why it
+exited. `<id>` is the start of the digest of the `hostrunner`
+executable. When `up` cannot add its daemon, it names the reason with
+the tail of the daemon's `daemon.log` and, for a shared process that
+failed to start, of its log.
+
+`process: own` (in a settings file, `HOSTRUNNER_PROCESS=own`, or
+`--process own` on `up` and `restart`) keeps a process of its own for
+each daemon. Changing `process` needs no new allow: the running daemon
+steps aside on the next `up`, which starts it in the other kind of
+process.
+
+The accepted risk of sharing one process is in
+[Limitations](#limitations).
 
 ## Rules
 
@@ -1071,8 +1125,9 @@ How it works:
 - `hostrunner up` runs on the host before every container start. It
   creates the per-container runtime directory and either arms the daemon
   already serving it, over the daemon's approval socket, or copies
-  `hostrun` into it and starts a detached daemon. The socket the container
-  reaches refuses an arm.
+  `hostrun` into it and starts a detached daemon, in the shared process
+  unless `process` is `own` (see [Shared process](#shared-process)). The
+  socket the container reaches refuses an arm.
 - The directory is mounted read-only at `/run/hostrunner`; the client
   talks to the daemon over the Unix socket in it.
 - The daemon follows its armed container, the one the latest `up` started
@@ -1123,6 +1178,10 @@ How it works:
   `hostrunner restart`; after changing `workspaceFolder`, which a
   restart keeps, run `hostrunner stop` before the next `up`, or give `up`
   `--restart` (see [Stop and restart](#stop-and-restart)).
+- A [shared process](#shared-process) that falls as a whole (out of
+  memory, killed) takes the daemons of every workspace it held with it:
+  `hostrun` fails there until their next `up` (reopen or restart the
+  container) or `hostrunner up` by hand. No supervisor restarts it.
 - The container user must be root or have your host UID (devcontainers
   do this by default on Linux via `updateRemoteUserUID`): the runtime
   directory and socket are owner-only.

@@ -55,8 +55,16 @@ type Settings struct {
 	// take to send its request.
 	RequestTimeout time.Duration
 	// ReadyTimeout (ready_timeout) is how long up waits for the daemon it
-	// starts to listen; up's own, not passed to the daemon.
+	// starts to listen; with ProcessShared, for the whole add of the daemon
+	// to the shared process, the lock, the start of the process and the
+	// add included; a shared process up starts waits for its first daemon
+	// for what remains of it then. Up's own, not passed to the daemon.
 	ReadyTimeout time.Duration
+	// Process (process) is whether up starts the daemon in a process of its
+	// own (ProcessOwn) or adds it to the shared process of its build
+	// (ProcessShared, the default); the daemon takes it too, to compare it
+	// with the one the arm carries.
+	Process Process
 	// RuntimeRoot (runtime_root) is where stop, restart and approve look
 	// for daemons' runtime directories; empty when no source gives one
 	// and XDG_RUNTIME_DIR is unset.
@@ -73,6 +81,17 @@ type Settings struct {
 	// check); only a human on the host may turn it off.
 	MountCheck bool
 }
+
+// Process is the value of the setting process: where up runs the daemon.
+type Process string
+
+// The values of the setting process: ProcessOwn starts a daemon in a
+// process of its own, ProcessShared adds it to the shared process of its
+// build.
+const (
+	ProcessOwn    Process = "own"
+	ProcessShared Process = "shared"
+)
 
 // Resolved is what resolving settings found: the Settings and, besides
 // them, what no key holds, which a daemon is not passed and an arm does
@@ -93,6 +112,10 @@ const RulesFileKey = "rules_file"
 // MountCheckOffHint).
 const mountCheckKey = "mount_check"
 
+// processKey is the name of the key process, which restart also takes a
+// flag for: it starts the new daemon in the process kind it names.
+const processKey = "process"
+
 // defaults are the settings no source sets, for the workspace at the
 // host path workspace. Its rules file is the default name, which looks at
 // no file: the value where nothing chooses (flagDefaults, and
@@ -107,10 +130,15 @@ func defaults(workspace string) Settings {
 		PollInterval:   2 * time.Second,  // how soon a stopped container or a changed rules file is seen
 		AskTimeout:     10 * time.Minute, // time for a human to come to the host and answer
 		RequestTimeout: 10 * time.Second, // so idle connections cannot pile up
-		ReadyTimeout:   10 * time.Second, // a daemon listens at once, unless something is wrong
+		ReadyTimeout:   DefaultReadyTimeout,
+		Process:        ProcessShared, // fewer host processes; own is the opt-out
 		MountCheck:     true,
 	}
 }
+
+// DefaultReadyTimeout is the ready_timeout no source sets: a daemon
+// listens at once, unless something is wrong.
+const DefaultReadyTimeout = 10 * time.Second
 
 // DefaultStopTimeout is the stop_timeout no source sets: as long as a
 // daemon takes to close its sockets, unless something is wrong.
@@ -141,11 +169,12 @@ func applyDefs(s *Settings, ks []key) {
 	}
 }
 
-// Daemon returns the settings serve takes, keyed by their names, each
+// ArmSettings returns the settings serve takes, keyed by their names, each
 // value written as a settings file writes it (`1m30s`, `true`, a path):
-// what an arm of up carries to the daemon, and what the daemon compares
-// it with.
-func (s Settings) Daemon() map[string]string {
+// what an arm of up carries to the daemon and the daemon compares, every
+// daemon setting, the process included. The allow takes AllowedSettings
+// instead.
+func (s Settings) ArmSettings() map[string]string {
 	daemonKeys := keysOf(scopeDaemon)
 	out := make(map[string]string, len(daemonKeys))
 	for _, k := range daemonKeys {
@@ -154,20 +183,34 @@ func (s Settings) Daemon() map[string]string {
 	return out
 }
 
-// DaemonDefaults returns the daemon settings no source sets for the
-// workspace at the host path workspace, written as Daemon writes them:
-// what up without settings flags, files or variables resolves there,
-// its rules file chosen as resolve chooses it (see rulesfile.Choose).
-// `hostrunner allow` marks the settings it allows that differ from them.
-// The rules file is a path under workspace as given, links not followed:
-// the allow store keeps it canonical, so a caller compares the two through
+// AllowedSettings returns the daemon settings the allow covers, written as
+// ArmSettings writes them: ArmSettings without the keys marked
+// outsideAllow, which `hostrunner allow` neither records nor compares.
+func (s Settings) AllowedSettings() map[string]string {
+	out := s.ArmSettings()
+	for _, k := range keysOf(scopeDaemon) {
+		if k.outsideAllow {
+			delete(out, k.name)
+		}
+	}
+	return out
+}
+
+// DaemonDefaults returns the defaults of the daemon settings the allow
+// covers (see AllowedSettings) for the workspace at the host path
+// workspace, written as AllowedSettings writes them: what up without
+// settings flags, files or variables resolves there, its rules file
+// chosen as resolve chooses it (see rulesfile.Choose). `hostrunner allow`
+// marks the settings it allows that differ from them. The rules file is a
+// path under workspace as given, links not followed: the allow store keeps
+// it canonical, so a caller compares the two through
 // allow.CanonicalSettings.
 func DaemonDefaults(workspace string) map[string]string {
 	s := defaults(workspace)
 	// Choose's second result is the older rules file it leaves unread,
 	// not an error, and says nothing of the default.
 	s.RulesFile, _ = rulesfile.Choose(filepath.Join(workspace, rulesfile.Dir))
-	return s.Daemon()
+	return s.AllowedSettings()
 }
 
 // layer is what one source sets: values by key name (as in a settings
@@ -184,6 +227,7 @@ const (
 	kindPath                 // a file path, not empty; a relative one is read against the workspace
 	kindAbsPath              // a directory path, not empty; a relative one is an error
 	kindCount                // a non-negative int, written in decimal
+	kindChoice               // one of the strings its key lists (values)
 )
 
 // String names the kind in errors ("invalid duration") and usages.
@@ -195,6 +239,8 @@ func (k kind) String() string {
 		return "path"
 	case kindCount:
 		return "integer"
+	case kindChoice:
+		return "value"
 	}
 	return "duration"
 }
@@ -230,17 +276,26 @@ type key struct {
 	// container could write: only the host settings file, its common part
 	// or a workspace section, may set it, besides the flags and variables.
 	hostOnly bool
-	usage    string                // the flag's help
-	field    func(s *Settings) any // a *string, *time.Duration, *bool or *int into s
-	def      any                   // the value no source sets, of the kind; nil when defaults or hostDefaults give it
+	// outsideAllow marks a daemon key the arm carries and the daemon
+	// compares, but the allow neither records nor compares: changing it
+	// never needs a new `hostrunner allow`.
+	outsideAllow bool
+	// values are the strings a kindChoice key takes, in the order errors and
+	// usages list them; nil for the other kinds.
+	values []string
+	usage  string                // the flag's help
+	field  func(s *Settings) any // a *string, *Process, *time.Duration, *bool or *int into s
+	def    any                   // the value no source sets, of the kind; nil when defaults or hostDefaults give it
 }
 
 // get returns the value of k in s: a string, a time.Duration, a bool or
-// an int, as k's kind says.
+// an int, as k's kind says; a Process is returned as its string.
 func (k key) get(s *Settings) any {
 	switch p := k.field(s).(type) {
 	case *string:
 		return *p
+	case *Process:
+		return string(*p)
 	case *time.Duration:
 		return *p
 	case *bool:
@@ -252,11 +307,14 @@ func (k key) get(s *Settings) any {
 	}
 }
 
-// set sets the value of k in s to v, a value of k's kind.
+// set sets the value of k in s to v, a value of k's kind; a Process is
+// set from its string.
 func (k key) set(s *Settings, v any) {
 	switch p := k.field(s).(type) {
 	case *string:
 		*p = v.(string)
+	case *Process:
+		*p = Process(v.(string))
 	case *time.Duration:
 		*p = v.(time.Duration)
 	case *bool:
@@ -316,6 +374,12 @@ var keys = []key{
 		field: func(s *Settings) any { return &s.ReadyTimeout },
 	},
 	{
+		name: processKey, kind: kindChoice, scope: scopeDaemon, outsideAllow: true,
+		values: []string{string(ProcessOwn), string(ProcessShared)},
+		usage:  "whether the daemon runs in a process of its own or in the shared process of its build",
+		field:  func(s *Settings) any { return &s.Process },
+	},
+	{
 		name: "runtime_root", kind: kindAbsPath, scope: scopeRuntimeRoot,
 		usage: "where to look for daemons (default $XDG_RUNTIME_DIR/hostrunner)",
 		field: func(s *Settings) any { return &s.RuntimeRoot },
@@ -364,10 +428,10 @@ func (in scopes) workspaceSettable() scopes {
 // and those of up for the new daemon, which it starts as up does.
 var restartScopes = []scope{scopeRuntimeRoot, scopeStop, scopeDaemon, scopeUp}
 
-// restartKeys are the keys restart has flags for: the rules file and the
-// mount check of the new daemon, and the keys of stop.
+// restartKeys are the keys restart has flags for: the rules file, the
+// mount check and the process of the new daemon, and the keys of stop.
 func restartKeys() []key {
-	return append([]key{mustLookup(RulesFileKey), mustLookup(mountCheckKey)}, keysOf(scopeRuntimeRoot, scopeStop)...)
+	return append([]key{mustLookup(RulesFileKey), mustLookup(mountCheckKey), mustLookup(processKey)}, keysOf(scopeRuntimeRoot, scopeStop)...)
 }
 
 // MountCheckOffHint is how a human on the host turns the mount check off,
@@ -424,7 +488,8 @@ func mustLookup(name string) key {
 func Usage() string { return usageOf(keysOf(scopeDaemon)) }
 
 // UpUsage is Usage for the flags RegisterUp adds, as up's usage line
-// shows them: Usage and [--ready-timeout <duration>].
+// shows them: those of Usage, including [--process <own|shared>], and
+// [--ready-timeout <duration>].
 func UpUsage() string { return usageOf(keysOf(scopeDaemon, scopeUp)) }
 
 // StopUsage is the usage of the flags RegisterStop adds: [--settings
@@ -466,10 +531,14 @@ const (
 	workspaceFlagUsage = "[--workspace-settings <path>]"
 )
 
-// usageOf is k's flag as a usage line shows it: [--grace <duration>].
+// usageOf is k's flag as a usage line shows it: [--grace <duration>]; a
+// choice lists its values: [--process <own|shared>].
 func (k key) usageOf() string {
 	if k.kind == kindBool {
 		return fmt.Sprintf("[--%s | --no-%[1]s]", k.flagName())
+	}
+	if k.kind == kindChoice {
+		return fmt.Sprintf("[--%s <%s>]", k.flagName(), strings.Join(k.values, "|"))
 	}
 	return fmt.Sprintf("[--%s <%s>]", k.flagName(), k.kind)
 }
@@ -484,6 +553,14 @@ var errEmptyPath = errors.New("empty path")
 // errNegative is the problem with an integer below zero, which no
 // setting can mean.
 var errNegative = errors.New("must not be negative")
+
+// parse reads raw, the text a variable or a file gives, as a value of
+// k's kind; the error describes the problem without naming the source. A
+// kindChoice value must be one of k's values: `invalid value "x" (want own
+// or shared)`.
+func (k key) parse(raw string) (any, error) {
+	return k.kind.parse(raw, k.values)
+}
 
 // check returns the problem with v, a value of kind k, that no setting
 // can mean whatever its source: errNotPositive for a duration at or
@@ -504,8 +581,14 @@ func (k kind) check(v any) error {
 
 // parse reads raw, the text a variable or a file gives, as a value of
 // kind k; the error describes the problem without naming the source.
-func (k kind) parse(raw string) (any, error) {
+// values are the strings a kindChoice takes, which no other kind reads.
+func (k kind) parse(raw string, values []string) (any, error) {
 	switch k {
+	case kindChoice:
+		if !slices.Contains(values, raw) {
+			return nil, fmt.Errorf("invalid %s %q (want %s)", k, raw, strings.Join(values, " or "))
+		}
+		return raw, nil
 	case kindPath, kindAbsPath:
 		if raw == "" {
 			return nil, errEmptyPath
@@ -673,7 +756,7 @@ func env(in scopes, getenv func(string) string) (layer, error) {
 		if raw == "" {
 			continue
 		}
-		v, err := k.kind.parse(raw)
+		v, err := k.parse(raw)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", k.variable(), err)
 		}

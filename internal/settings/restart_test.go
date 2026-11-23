@@ -12,17 +12,17 @@ import (
 
 // restart takes the flags of stop, the paths of the new daemon's
 // settings files, --workspace-settings and --rules-file with --config,
-// and the new daemon's --mount-check and --no-mount-check.
+// and the new daemon's --mount-check, --no-mount-check and --process.
 func TestRegisterRestartAddsTheFlagsOfStopAndTheDaemonsPaths(t *testing.T) {
 	var f settings.Flags
 	fs := flag.NewFlagSet("restart", flag.ContinueOnError)
 	f.RegisterRestart(fs)
 	var got []string
 	fs.VisitAll(func(fl *flag.Flag) { got = append(got, fl.Name) })
-	if want := []string{"config", "mount-check", "no-mount-check", "rules-file", "runtime-root", "settings", "stop-timeout", "workspace-settings"}; !slices.Equal(got, want) {
+	if want := []string{"config", "mount-check", "no-mount-check", "process", "rules-file", "runtime-root", "settings", "stop-timeout", "workspace-settings"}; !slices.Equal(got, want) {
 		t.Fatalf("got %q, want %q", got, want)
 	}
-	if got, want := settings.RestartUsage(), "[--settings <path>] [--workspace-settings <path>] [--rules-file <path>] [--mount-check | --no-mount-check] [--runtime-root <path>] [--stop-timeout <duration>]"; got != want {
+	if got, want := settings.RestartUsage(), "[--settings <path>] [--workspace-settings <path>] [--rules-file <path>] [--mount-check | --no-mount-check] [--process <own|shared>] [--runtime-root <path>] [--stop-timeout <duration>]"; got != want {
 		t.Fatalf("RestartUsage: got %q, want %q", got, want)
 	}
 }
@@ -67,5 +67,15 @@ func TestRestartWorkspaceSettingsFlagIsReadAgainstTheCurrentDirectory(t *testing
 	got, err := parseWith(t, (*settings.Flags).RegisterRestart, "--workspace-settings", filepath.Base(file)).Resolve(env(nil), t.TempDir())
 	if err != nil || got.Grace != 7*time.Minute {
 		t.Fatalf("got grace %v, %v; want 7m0s from the file beside", got.Grace, err)
+	}
+}
+
+// restart's --process chooses the process of the new daemon, over the
+// host settings file.
+func TestRestartProcessFlagChoosesTheNewDaemonsProcess(t *testing.T) {
+	file := writeFile(t, "process: own\n")
+	got, err := parseWith(t, (*settings.Flags).RegisterRestart, "--settings", file, "--process", "shared").Resolve(env(nil), noWorkspace)
+	if err != nil || got.Process != settings.ProcessShared {
+		t.Fatalf("got process %q, %v; want %q", got.Process, err, settings.ProcessShared)
 	}
 }

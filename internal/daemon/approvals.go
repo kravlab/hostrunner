@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/kravlab/hostrunner/internal/contain"
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
 	"github.com/kravlab/hostrunner/internal/transport"
@@ -587,14 +588,14 @@ func (s *Server) serveApprovals(ctx context.Context, wg *sync.WaitGroup) {
 			if ctx.Err() != nil || s.isDraining() {
 				return
 			}
-			if isTemporary(err) {
+			if transport.IsTemporary(err) {
 				time.Sleep(50 * time.Millisecond)
 				continue
 			}
 			s.log.Warn("approval socket failed", "error", err)
 			return
 		}
-		wg.Go(func() { s.handleSession(ctx, conn) })
+		contain.GoIn(ctx, wg, func() { s.handleSession(ctx, conn) })
 	}
 }
 
@@ -616,7 +617,7 @@ func (s *Server) handleSession(ctx context.Context, conn net.Conn) {
 	}
 	out := &frameWriter{conn: conn, timeout: sessionWriteTimeout}
 	c := &sessionConn{conn: conn, out: out, pid: pid}
-	stop := context.AfterFunc(ctx, func() { s.closeStopping(c) })
+	stop := contain.AfterFunc(ctx, func() { s.closeStopping(c) })
 	defer stop()
 	defer func() {
 		if feed := c.runs.Load(); feed != nil {
@@ -660,7 +661,7 @@ func (s *Server) handleSession(ctx context.Context, conn net.Conn) {
 		RulesFile: s.approvals.rulesFile, RulesDigest: s.rulesDigest(), Served: s.approvals.served(),
 		Stops: true, ContainerStopped: s.containerStopped != nil && s.containerStopped(),
 		Rereads: s.rereadsByItself(), NoReread: !s.rereadsByItself(), BuildVersion: s.buildVersion,
-		Runs: true, Settings: s.settings, MountCheckFailed: mountFailed,
+		Runs: true, Settings: s.settings, MountCheckFailed: mountFailed, Process: s.process,
 	})
 	defer func() {
 		// The daemon stopping closes the connection too: its requests end
@@ -701,7 +702,7 @@ func (s *Server) handleSession(ctx context.Context, conn net.Conn) {
 			if sv.Runs && c.runs.Load() == nil {
 				feed := newRunFeed(out)
 				c.runs.Store(feed)
-				go feed.pump() // stopped as handleSession returns
+				contain.Go(ctx, feed.pump) // stopped as handleSession returns
 			}
 			if why := s.serveSession(c, sv.TakeOver); why != "" {
 				_ = out.writeJSON(protocol.FrameError, protocol.Error{Code: protocol.ExitRejected, Message: why})
@@ -735,7 +736,7 @@ func (s *Server) handleSession(ctx context.Context, conn net.Conn) {
 				s.sessionRefused(out, pid, err)
 				return
 			}
-			_ = out.writeJSON(protocol.FrameRereadResult, s.reread(c, rr))
+			_ = out.writeJSON(protocol.FrameRereadResult, s.reread(ctx, c, rr))
 		case protocol.FrameRunning:
 			_ = out.writeJSON(protocol.FrameRunningList, s.runningList())
 		case protocol.FrameStop:
@@ -772,7 +773,7 @@ func (s *Server) closeStopping(c *sessionConn) {
 // rules stay, and the result says why (see refuseNotAllowed). A hand edit
 // is checked as it is; a rule is allowed when the file it was written over
 // was, and the allow is recorded as the file is reread (see allowAddedRule).
-func (s *Server) reread(c *sessionConn, rr protocol.Reread) protocol.RereadResult {
+func (s *Server) reread(ctx context.Context, c *sessionConn, rr protocol.Reread) protocol.RereadResult {
 	if why := s.approvals.heard(c); why != "" {
 		return protocol.RereadResult{Error: why}
 	}
@@ -800,7 +801,7 @@ func (s *Server) reread(c *sessionConn, rr protocol.Reread) protocol.RereadResul
 	if msg, ok := s.approvals.waitingMsg(rr.ID); ok {
 		// As the request will be run once answered (see ask): its checks
 		// under the new rules, as a dry run.
-		p, r := s.prepare(protocol.Request{Version: protocol.Version, Argv: msg.Argv, Cwd: msg.Cwd}, true)
+		p, r := s.prepare(ctx, protocol.Request{Version: protocol.Version, Argv: msg.Argv, Cwd: msg.Cwd}, true)
 		if r != nil {
 			res.RunsOnce = r.message
 		} else {
@@ -933,7 +934,7 @@ func (s *Server) ask(ctx context.Context, x exchange, f protocol.Frame) {
 	// The connection closes when the daemon stops, as handle closes it for
 	// other requests, but while a request waits: ask then tells its client
 	// that the daemon stops first.
-	closeOnStop := context.AfterFunc(ctx, func() { x.conn.Close() })
+	closeOnStop := contain.AfterFunc(ctx, func() { x.conn.Close() })
 	defer func() { closeOnStop() }()
 	var ask protocol.Ask
 	if err := protocol.DecodeJSON(f, &ask); err != nil {
@@ -959,7 +960,7 @@ func (s *Server) ask(ctx context.Context, x exchange, f protocol.Frame) {
 		s.reject(x.out, r.code, r.message, r.err)
 		return
 	}
-	need, r := s.assessApproval(req)
+	need, r := s.assessApproval(x.daemon, req)
 	if r != nil {
 		s.reject(x.out, r.code, r.message, r.err)
 		return
@@ -967,7 +968,7 @@ func (s *Server) ask(ctx context.Context, x exchange, f protocol.Frame) {
 	if need == nil {
 		// It runs as a plain request does, but a refusal (a file changed
 		// since the assessment) does not hint at --ask: it was asked with it.
-		p, r := s.prepare(req, false)
+		p, r := s.prepare(x.daemon, req, false)
 		if r != nil {
 			s.reject(x.out, r.code, r.message, r.err)
 			return
@@ -1014,7 +1015,7 @@ func (s *Server) ask(ctx context.Context, x exchange, f protocol.Frame) {
 	s.log.Info("approval requested", "approval_id", id, "argv", req.Argv, "dir", need.hostDir, "reasons", need.text.agentReasons, "guarded", guarded, "timeout", timeout)
 	_ = x.out.writeJSON(protocol.FrameWaiting, protocol.Waiting{Reasons: need.text.agentReasons, Guarded: guarded, Warning: s.pendingAllowWarning()})
 
-	frames := readFrames(ctx, x.conn)
+	frames := readFrames(ctx, x.conn, x.reads)
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	if !rechecked {
@@ -1038,7 +1039,7 @@ func (s *Server) ask(ctx context.Context, x exchange, f protocol.Frame) {
 		}
 		return
 	}
-	closeOnStop = context.AfterFunc(ctx, func() { x.conn.Close() })
+	closeOnStop = contain.AfterFunc(ctx, func() { x.conn.Close() })
 	ans := o.answer
 	if ans.Scope == "" {
 		s.log.Info("approval answered", "approval_id", id, "scope", "refused", "note", ans.Note)
@@ -1058,7 +1059,7 @@ func (s *Server) ask(ctx context.Context, x exchange, f protocol.Frame) {
 		// refuse it now all the same (the host changed meanwhile), it runs
 		// as approved once, and the agent and the log are told so.
 		var r *refusal
-		if p, r = s.prepare(req, false); r != nil {
+		if p, r = s.prepare(x.daemon, req, false); r != nil {
 			scope = protocol.ScopeOnce
 		}
 	}
@@ -1093,7 +1094,7 @@ func (s *Server) ask(ctx context.Context, x exchange, f protocol.Frame) {
 	seen := seenPaths(need.pathFailures)
 	if p == nil {
 		var r *refusal
-		if p, r = s.prepareAllowed(req, need.approved, false, seen); r != nil {
+		if p, r = s.prepareAllowed(x.daemon, req, need.approved, false, seen); r != nil {
 			s.rejectRun(x.out, run, *r, r.message)
 			return
 		}
@@ -1137,11 +1138,11 @@ type approvalNeed struct {
 // the human would be asked. A command whose approval no longer lets it
 // through (a path check failing for a reason the human did not see) is
 // assessed as if it had none, so the human is asked again.
-func (s *Server) assessApproval(req protocol.Request) (*approvalNeed, *refusal) {
+func (s *Server) assessApproval(ctx context.Context, req protocol.Request) (*approvalNeed, *refusal) {
 	if s.approvals.approvalFor(req) != nil {
-		p, r := s.prepare(req, true)
+		p, r := s.prepare(ctx, req, true)
 		if r == nil {
-			r = lookupStart(p, req)
+			r = lookupStart(s.environment, p, req)
 		}
 		if r == nil {
 			p.close()
@@ -1159,9 +1160,9 @@ func (s *Server) assessApproval(req protocol.Request) (*approvalNeed, *refusal) 
 	}
 	// Starting the command checks all of it again. Every path check may
 	// fail here: its failure is asked about.
-	p, r := s.prepareAllowed(req, approved, true, pathPasses{all: true})
+	p, r := s.prepareAllowed(ctx, req, approved, true, pathPasses{all: true})
 	if r == nil {
-		r = lookupStart(p, req)
+		r = lookupStart(s.environment, p, req)
 	}
 	if r != nil {
 		return nil, r
@@ -1183,12 +1184,12 @@ func (s *Server) assessApproval(req protocol.Request) (*approvalNeed, *refusal) 
 // daemon and --ask would ask a human about req; the hint says whether
 // approving it is guarded, judged over every reason. Otherwise it returns
 // r.
-func (s *Server) withAskHint(req protocol.Request, r *refusal) *refusal {
+func (s *Server) withAskHint(ctx context.Context, req protocol.Request, r *refusal) *refusal {
 	if s.approvals == nil || !s.approvals.served() {
 		return r
 	}
 	// A refusal --ask would get comes without what it would ask.
-	need, _ := s.assessApproval(req)
+	need, _ := s.assessApproval(ctx, req)
 	if need == nil {
 		return r
 	}
@@ -1258,12 +1259,13 @@ type frameRead struct {
 	err error
 }
 
-// readFrames reads the client's frames on conn into the returned channel
-// until a read fails, which it delivers last, or ctx ends; then it closes
-// the channel.
-func readFrames(ctx context.Context, conn net.Conn) clientFrames {
+// readFrames reads the client's frames on conn into the returned channel,
+// in a goroutine counted in wg, until a read fails, which it delivers
+// last, or ctx ends; then it closes the channel. The goroutine ends once
+// conn is closed and ctx ended, whatever reads the channel.
+func readFrames(ctx context.Context, conn net.Conn, wg *sync.WaitGroup) clientFrames {
 	ch := make(clientFrames)
-	go func() {
+	contain.GoIn(ctx, wg, func() {
 		defer close(ch)
 		for {
 			f, err := protocol.ReadFrame(conn)
@@ -1276,7 +1278,7 @@ func readFrames(ctx context.Context, conn net.Conn) clientFrames {
 				return
 			}
 		}
-	}()
+	})
 	return ch
 }
 

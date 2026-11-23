@@ -98,14 +98,25 @@ _Avoid_: rewrite, wrapper
 ### Lifecycle
 
 **Daemon**:
-The host process that runs one devcontainer's commands and
-lives as long as its armed container.
+What runs one devcontainer's commands, alone in its own host
+process or in a shared process; it lives as long as its armed
+container.
+
+**Shared process**:
+A host process that holds the daemons of several
+devcontainers, one process per build of hostrunner (named by
+the digest of its executable), and
+lives while one of its daemons does; one that no daemon is
+added to within the ready timeout of the `up` that started it
+ends on its own.
+_Avoid_: global daemon
 
 **Arm**:
 The signal `hostrunner up` gives the daemon, on its approval
 socket, each time the devcontainer tooling brings a container
-of its workspace up, carrying the digest of the rules and the
-daemon settings it resolved; the container cannot give one.
+of its workspace up, carrying the digest of the rules and all the
+daemon settings it resolved, `process` included; the container cannot
+give one.
 _Avoid_: rearm
 
 **Armed container**:
@@ -153,8 +164,10 @@ How long a waiting daemon waits for its armed container
 before it exits.
 
 **Ready timeout**:
-How long `hostrunner up` waits for the daemon it starts to
-listen; it tunes `up`, not the daemon.
+How long `hostrunner up` waits for the daemon it starts, or
+adds to a shared process, to listen; a shared process that
+`up` starts ends when no daemon is added to it within it. It
+tunes `up`, not the daemon.
 
 **Stop timeout**:
 How long a stop or restart waits for a daemon it stopped,
@@ -207,18 +220,18 @@ It cannot turn the mount check off.
 **Allow**:
 A human on the host trusting, for one runtime directory of a workspace,
 one content of its rules file together with the daemon settings resolved
-for it.
+for it, except `process`.
 _Avoid_: trust, approve (an approval lets one command through)
 
 **Allowed**:
-Said of rules and daemon settings an allow covers; a daemon serves no
-others.
+Said of rules and daemon settings an allow covers (all but `process`);
+a daemon serves no others.
 
 **Pending request**:
 What a refused `up` or `restart`, or a daemon finding content not
 allowed, recorded for one runtime directory of a workspace: the rules
-file, its digest and the daemon settings, for `hostrunner allow` to
-allow.
+file, its digest and the daemon settings but `process`, for
+`hostrunner allow` to allow.
 _Avoid_: approval request (one command waiting for a human's answer)
 
 **Mount check**:

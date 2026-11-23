@@ -41,6 +41,10 @@ func OtherVersion(info protocol.DaemonInfo, version string) bool {
 	return info.BuildVersion == "" || info.BuildVersion != version
 }
 
+// unknownText is what the list shows for a build version or a kind of
+// process a daemon reports none of.
+const unknownText = "unknown"
+
 // ShownVersion returns info's build version as Display shows it, or
 // unknown when the daemon reports none (see OtherVersion).
 func ShownVersion(info protocol.DaemonInfo, unknown string) string {
@@ -75,10 +79,11 @@ func (l List) Pick(text string) (int, bool) {
 // Print prints the daemons, of which there is at least one, to w and
 // returns the prompt that asks to choose one, for the caller to print.
 func (l List) Print(w io.Writer) (prompt string) {
-	width, vwidth, cwidth := 0, 0, 0
+	width, vwidth, pwidth, cwidth := 0, 0, 0, 0
 	for _, d := range l.Daemons {
 		width = max(width, len([]rune(Display(d.Info.Workspace))))
 		vwidth = max(vwidth, len([]rune(l.version(d))))
+		pwidth = max(pwidth, len([]rune(l.processKind(d))))
 		cwidth = max(cwidth, len([]rune(Display(d.Info.ContainerWorkspace))))
 	}
 	def := l.Default()
@@ -88,10 +93,9 @@ func (l List) Print(w io.Writer) (prompt string) {
 		if i == def {
 			mark = "*"
 		}
-		ws := Display(d.Info.Workspace)
-		ws += strings.Repeat(" ", width-len([]rune(ws)))
-		v := l.version(d)
-		v += strings.Repeat(" ", vwidth-len([]rune(v)))
+		ws := padRight(Display(d.Info.Workspace), width)
+		v := padRight(l.version(d), vwidth)
+		p := padRight(l.processKind(d), pwidth)
 		var note string
 		switch {
 		case !l.choosable(d):
@@ -110,7 +114,7 @@ func (l List) Print(w io.Writer) (prompt string) {
 				note += "   " + strings.Join(marks, ", ")
 			}
 		}
-		fmt.Fprintf(w, "  %d %s %s   %s   %s\n", i+1, mark, ws, v, strings.TrimRight(note, " "))
+		fmt.Fprintf(w, "  %d %s %s   %s   %s   %s\n", i+1, mark, ws, v, p, strings.TrimRight(note, " "))
 	}
 	choices := fmt.Sprintf("1-%d", len(l.Daemons))
 	if def >= 0 {
@@ -119,14 +123,29 @@ func (l List) Print(w io.Writer) (prompt string) {
 	return "choose [" + choices + ", q quit] ? "
 }
 
-// version returns d's build version as the list shows it, "unknown"
+// padRight returns s followed by spaces up to width runes.
+func padRight(s string, width int) string {
+	return s + strings.Repeat(" ", width-len([]rune(s)))
+}
+
+// version returns d's build version as the list shows it, unknownText
 // when it reports none, followed by " ⚠" when it is not l.BuildVersion.
 func (l List) version(d daemonlist.Daemon) string {
-	v := ShownVersion(d.Info, "unknown")
+	v := ShownVersion(d.Info, unknownText)
 	if OtherVersion(d.Info, l.BuildVersion) {
 		v += " ⚠"
 	}
 	return v
+}
+
+// processKind returns the kind of process d runs in as the list shows it,
+// own or shared (protocol.DaemonInfo.Process), or unknownText when it
+// reports none, as a daemon older than the field does.
+func (l List) processKind(d daemonlist.Daemon) string {
+	if d.Info.Process == "" {
+		return unknownText
+	}
+	return Display(d.Info.Process)
 }
 
 // choosable reports whether d can be chosen from the list.

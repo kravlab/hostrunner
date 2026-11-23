@@ -11,7 +11,8 @@ on the host (`git checkout`, any tool writing the workspace) changes
 them past every read-only mount. A daemon now serves only allowed rules
 and settings: a human on the host runs `hostrunner allow` in the
 workspace, as with direnv, which records the digest of the rules file
-together with the daemon settings resolved for it in
+together with the daemon settings resolved for it (all but a setting
+marked outside the allow, `process`, see ADR 0010) in
 `$XDG_DATA_HOME/hostrunner/allow`; `hostrunner deny` removes it.
 
 ## Considered Options
@@ -27,7 +28,8 @@ together with the daemon settings resolved for it in
   and nothing answers when `up` finds no daemon. Rejected for a command.
 - **Allowing the rules file alone**: the workspace settings file could
   still change the timeouts, `reread` and `ask_timeout` unasked.
-  Rejected: the allow covers the resolved daemon settings.
+  Rejected: the allow covers the resolved daemon settings (but
+  `process`, kept in the arm only).
 - **`hostrunner allow` resolving the settings itself, with no request
   from `up`**: the settings flags `up` gets from `initializeCommand`
   (`--grace`, `--no-mount-check`, a `--rules-file`) cannot be reproduced

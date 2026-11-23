@@ -157,7 +157,7 @@ func TestRegisterUpAddsTheReadyTimeout(t *testing.T) {
 		return got
 	}
 	serve := names((*settings.Flags).Register)
-	for _, name := range []string{"poll-interval", "ask-timeout", "request-timeout"} {
+	for _, name := range []string{"poll-interval", "ask-timeout", "request-timeout", "process"} {
 		if !serve[name] {
 			t.Errorf("Register: no --%s", name)
 		}

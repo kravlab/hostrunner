@@ -424,7 +424,7 @@ func (t *term) warnIgnoredRules(s settings.Resolved) {
 
 // changes names, as `<key> <old> → <new>`, what the settings s change of
 // what a daemon said of itself, info: its rules file and, when it says,
-// whether it rereads that by itself.
+// whether it rereads that by itself and the kind of process it runs in.
 func changes(info *protocol.DaemonInfo, s settings.Settings) []string {
 	var out []string
 	if info.RulesFile != s.RulesFile {
@@ -432,6 +432,9 @@ func changes(info *protocol.DaemonInfo, s settings.Settings) []string {
 	}
 	if (info.Rereads || info.NoReread) && info.Rereads != s.Reread {
 		out = append(out, fmt.Sprintf("reread %t → %t", info.Rereads, s.Reread))
+	}
+	if info.Process != "" && info.Process != string(s.Process) {
+		out = append(out, fmt.Sprintf("process %s → %s", info.Process, s.Process))
 	}
 	return out
 }

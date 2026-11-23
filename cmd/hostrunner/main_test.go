@@ -23,12 +23,14 @@ import (
 	"github.com/kravlab/hostrunner/internal/allow"
 	"github.com/kravlab/hostrunner/internal/allow/allowtest"
 	"github.com/kravlab/hostrunner/internal/client"
+	"github.com/kravlab/hostrunner/internal/daemon"
 	"github.com/kravlab/hostrunner/internal/fakedaemon"
 	"github.com/kravlab/hostrunner/internal/instructions"
 	"github.com/kravlab/hostrunner/internal/launch"
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
 	"github.com/kravlab/hostrunner/internal/settings"
+	"github.com/kravlab/hostrunner/internal/settings/settingstest"
 	"github.com/kravlab/hostrunner/internal/stop"
 	"github.com/kravlab/hostrunner/internal/transport"
 	"github.com/kravlab/hostrunner/internal/update"
@@ -151,6 +153,8 @@ func TestParseServeAcceptsAllFlags(t *testing.T) {
 		workspaceFlags:    workspaceFlags{workspace: "/home/u/app", containerWorkspace: "/workspaces/app"},
 		workspaceSettings: "/home/u/app/.devcontainer/hostrunner.yaml",
 		allows:            allow.Store{Dir: "/data/hostrunner/allow"},
+		runsIn:            settings.ProcessOwn,
+		environment:       daemon.ProcessEnvironment(),
 		Settings:          tuned("/home/u/app/.devcontainer/hostrunner-rules.yaml", 30*time.Minute, 15*time.Second, true),
 	}
 	if got != want {
@@ -292,20 +296,12 @@ func TestParseNoReread(t *testing.T) {
 	}
 }
 
-// tuned is the built-in settings with the rules file, the startup
-// timeout, the grace and reread given.
+// tuned is the built-in settings (settingstest.Defaults) with the rules
+// file, the startup timeout, the grace and reread given.
 func tuned(rulesFile string, startupTimeout, grace time.Duration, reread bool) settings.Settings {
-	return settings.Settings{
-		RulesFile:      rulesFile,
-		StartupTimeout: startupTimeout,
-		Grace:          grace,
-		Reread:         reread,
-		PollInterval:   2 * time.Second,
-		AskTimeout:     10 * time.Minute,
-		RequestTimeout: 10 * time.Second,
-		ReadyTimeout:   10 * time.Second,
-		MountCheck:     true,
-	}
+	s := settingstest.Defaults(rulesFile)
+	s.StartupTimeout, s.Grace, s.Reread = startupTimeout, grace, reread
+	return s
 }
 
 // noEnv is a getenv for an empty environment: no HOSTRUNNER_* variable,
@@ -472,10 +468,11 @@ func TestServeGivenEverySettingReadsNoOtherSource(t *testing.T) {
 		t.Errorf("read %s", name)
 		return ""
 	}
-	flags := []string{"--settings", settingsFile(t, "grase: [\n"), "--workspace-settings", settingsFile(t, "grase: [\n"), "--rules-file", "/r.yaml", "--startup-timeout", "1h", "--grace", "1m", "--reread", "--poll-interval", "1s", "--ask-timeout", "1m", "--request-timeout", "1s", "--mount-check"}
+	flags := []string{"--settings", settingsFile(t, "grase: [\n"), "--workspace-settings", settingsFile(t, "grase: [\n"), "--rules-file", "/r.yaml", "--startup-timeout", "1h", "--grace", "1m", "--reread", "--poll-interval", "1s", "--ask-timeout", "1m", "--request-timeout", "1s", "--mount-check", "--process", string(settingstest.GivenProcess)}
 	got, err := resolveServe(flags, getenv)
 	want := tuned("/r.yaml", time.Hour, time.Minute, true)
 	want.PollInterval, want.AskTimeout, want.RequestTimeout = time.Second, time.Minute, time.Second
+	want.Process = settingstest.GivenProcess
 	if err != nil || got != want {
 		t.Fatalf("got %+v, %v; want %+v", got, err, want)
 	}
@@ -744,6 +741,8 @@ func watchConfig(t *testing.T) serveConfig {
 	t.Cleanup(func() { os.RemoveAll(base) })
 	return serveConfig{
 		socket:         filepath.Join(base, "h.sock"),
+		runsIn:         settings.ProcessOwn,
+		environment:    daemon.ProcessEnvironment(),
 		workspaceFlags: workspaceFlags{workspace: base, containerWorkspace: "/workspaces/app"},
 		watch:          true,
 		Settings: settings.Settings{
@@ -1155,15 +1154,46 @@ func TestServeStepsAsideWhenSettingsDiffer(t *testing.T) {
 		rt := &watchtest.Runtime{}
 		rt.Start("c")
 		done := startServe(t, cfg, rt)
-		if stepAside := armServeWith(t, cfg, rulesDigest(t, cfg), cfg.Settings.Daemon()); stepAside {
+		if stepAside := armServeWith(t, cfg, rulesDigest(t, cfg), cfg.Settings.ArmSettings()); stepAside {
 			t.Fatalf("%s: serve stepped aside for its own settings", tt.name)
 		}
 		other := cfg.Settings
 		tt.change(&other)
-		if stepAside := armServeWith(t, cfg, rulesDigest(t, cfg), other.Daemon()); !stepAside {
+		if stepAside := armServeWith(t, cfg, rulesDigest(t, cfg), other.ArmSettings()); !stepAside {
 			t.Fatalf("%s: serve kept running with other settings", tt.name)
 		}
 		expectServeExit(t, done, cfg.socket)
+	}
+}
+
+// serve keeps running for an arm carrying its own process and steps aside
+// for one carrying the other, whichever it runs in: the process is a
+// daemon setting the arm carries and the daemon compares, though the allow
+// does not cover it.
+func TestServeStepsAsideWhenTheProcessDiffers(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		own, other settings.Process
+	}{
+		{"own to shared", settings.ProcessOwn, settings.ProcessShared},
+		{"shared to own", settings.ProcessShared, settings.ProcessOwn},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := watchConfig(t)
+			cfg.Process = tt.own
+			rt := &watchtest.Runtime{}
+			rt.Start("c")
+			done := startServe(t, cfg, rt)
+			if stepAside := armServeWith(t, cfg, rulesDigest(t, cfg), cfg.Settings.ArmSettings()); stepAside {
+				t.Fatalf("serve stepped aside for an arm with its own process %q", tt.own)
+			}
+			other := cfg.Settings
+			other.Process = tt.other
+			if stepAside := armServeWith(t, cfg, rulesDigest(t, cfg), other.ArmSettings()); !stepAside {
+				t.Fatalf("serve in process %q kept running for an arm with %q", tt.own, tt.other)
+			}
+			expectServeExit(t, done, cfg.socket)
+		})
 	}
 }
 
@@ -1235,7 +1265,7 @@ func TestRunDispatchesUpdate(t *testing.T) {
 // TestUsageListsTheSubcommands checks that the top-level usage names
 // every subcommand.
 func TestUsageListsTheSubcommands(t *testing.T) {
-	if err := run(nil, io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "up|serve|test|allow|deny|approve|stop|restart|update|instructions|version") {
+	if err := run(nil, io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "up|serve|shared|test|allow|deny|approve|stop|restart|update|instructions|version") {
 		t.Fatalf("got %v, want the usage listing every subcommand", err)
 	}
 }
@@ -1262,9 +1292,11 @@ func TestUpdateMessage(t *testing.T) {
 // serve listens for approval sessions beside its socket's directory, the
 // runtime directory, which the container mounts, so the container cannot
 // reach it; it removes the socket when it stops. Its hello reports the
-// build version it is given and the daemon settings it runs with.
+// build version it is given and the settings it runs with that the allow
+// covers (settings.Settings.AllowedSettings: not its process).
 func TestServeListensOnTheApprovalSocket(t *testing.T) {
 	cfg := watchConfig(t)
+	cfg.Process = settings.ProcessShared
 	cfg.watch = false
 	cfg.RulesFile = filepath.Join(cfg.workspace, "hostrun.yaml")
 	cfg.version = "v1.2.0"
@@ -1296,7 +1328,7 @@ func TestServeListensOnTheApprovalSocket(t *testing.T) {
 	if err != nil || f.Type != protocol.FrameDaemonInfo || protocol.DecodeJSON(f, &got) != nil {
 		t.Fatalf("hello: frame %v, err %v", f.Type, err)
 	}
-	want := protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: cfg.workspace, ContainerWorkspace: cfg.containerWorkspace, RulesFile: cfg.RulesFile, RulesDigest: "missing", Stops: true, Rereads: true, BuildVersion: "v1.2.0", Runs: true, Settings: cfg.Settings.Daemon()}
+	want := protocol.DaemonInfo{Version: protocol.ApprovalVersion, Workspace: cfg.workspace, ContainerWorkspace: cfg.containerWorkspace, RulesFile: cfg.RulesFile, RulesDigest: "missing", Stops: true, Rereads: true, BuildVersion: "v1.2.0", Runs: true, Settings: cfg.Settings.AllowedSettings(), Process: "own"}
 	if real, err := filepath.EvalSymlinks(cfg.workspace); err == nil {
 		want.Workspace = real
 	}
@@ -1416,7 +1448,7 @@ func TestServeRereadsItsRulesOnceARuleIsAdded(t *testing.T) {
 		t.Fatal(err)
 	}
 	store := allowStore(t)
-	allowtest.Allow(t, store, servePlace(cfg), allow.Target{RulesFile: cfg.RulesFile, Scope: allow.Scope{Digest: rules.ContentDigest(loaded), Settings: cfg.Settings.Daemon()}})
+	allowtest.Allow(t, store, servePlace(cfg), allow.NewTarget(cfg.RulesFile, rules.ContentDigest(loaded), cfg.Settings.AllowedSettings()))
 	elsewhereFile := filepath.Join(cfg.workspace, "other.yaml")
 	if err := os.WriteFile(elsewhereFile, loaded, 0o644); err != nil {
 		t.Fatal(err)
@@ -1481,7 +1513,7 @@ func TestServeRereadsItsRulesOnceARuleIsAdded(t *testing.T) {
 	if res.Error != "" || res.Digest != p.Digest() {
 		t.Fatalf("reread: got %+v, want the new file's digest %s", res, p.Digest())
 	}
-	if ok, err := store.Allowed(servePlace(cfg), allow.Scope{Digest: p.Digest(), Settings: cfg.Settings.Daemon()}); err != nil || !ok {
+	if ok, err := store.Allowed(servePlace(cfg), allow.Scope{Digest: p.Digest(), Settings: cfg.Settings.AllowedSettings()}); err != nil || !ok {
 		t.Fatalf("the store allows the file as written: %v, %v; want it allowed", ok, err)
 	}
 	for _, o := range others {
@@ -1505,6 +1537,13 @@ func (b *logBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.Write(p)
+}
+
+// String returns what the log holds so far.
+func (b *logBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 // waitFor waits until the log holds text, for 5 s at most.
@@ -1570,7 +1609,7 @@ func TestServeRereadsAHandEditOnceAllowed(t *testing.T) {
 	if code := runServed(cfg, "sh", "-c", "exit 3"); code != protocol.ExitRejected {
 		t.Fatalf("a command of the edit not allowed exited %d, want %d", code, protocol.ExitRejected)
 	}
-	allowtest.Allow(t, store, servePlace(cfg), allow.Target{RulesFile: cfg.RulesFile, Scope: allow.Scope{Digest: rules.ContentDigest([]byte(handEdited)), Settings: cfg.Settings.Daemon()}})
+	allowtest.Allow(t, store, servePlace(cfg), allow.NewTarget(cfg.RulesFile, rules.ContentDigest([]byte(handEdited)), cfg.Settings.AllowedSettings()))
 	waitServed(t, cfg)
 }
 
@@ -1600,7 +1639,7 @@ func TestServeChecksAndRecordsTheAllowOfItsOwnRuntimeDir(t *testing.T) {
 	cfg.socket = filepath.Join(own, "h.sock")
 	t.Cleanup(func() { os.Remove(launch.ApprovalSocket(own)) })
 	other := filepath.Join(t.TempDir(), "other")
-	edited := allow.Target{RulesFile: cfg.RulesFile, Scope: allow.Scope{Digest: rules.ContentDigest([]byte(handEdited)), Settings: cfg.Settings.Daemon()}}
+	edited := allow.NewTarget(cfg.RulesFile, rules.ContentDigest([]byte(handEdited)), cfg.Settings.AllowedSettings())
 	allowtest.Allow(t, store, allow.Place{Workspace: cfg.workspace, RuntimeDir: other}, edited)
 	if err := store.Request(allow.Place{Workspace: cfg.workspace, RuntimeDir: other}, allow.NewTarget(cfg.RulesFile, "other request", nil)); err != nil {
 		t.Fatal(err)
@@ -1647,7 +1686,7 @@ func TestServeWithoutRereadLeavesAnAllowedHandEditToTheNextUp(t *testing.T) {
 		t.Fatal(err)
 	}
 	digest := rules.ContentDigest([]byte(handEdited))
-	allowtest.Allow(t, store, servePlace(cfg), allow.Target{RulesFile: cfg.RulesFile, Scope: allow.Scope{Digest: digest, Settings: cfg.Settings.Daemon()}})
+	allowtest.Allow(t, store, servePlace(cfg), allow.NewTarget(cfg.RulesFile, digest, cfg.Settings.AllowedSettings()))
 	time.Sleep(20 * cfg.PollInterval)
 	if code := runServed(cfg, "sh", "-c", "exit 3"); code != protocol.ExitRejected {
 		t.Fatalf("a command of the edit exited %d, want %d", code, protocol.ExitRejected)
