@@ -348,8 +348,10 @@ func TestRestartReplacesTheDaemon(t *testing.T) {
 	}
 	d.waitStopped(t)
 	args := newDaemonArgs(t, d.dir)
-	want := []string{"serve", "--socket", filepath.Join(d.dir, launch.SocketName), "--workspace", d.workspace, "--container-workspace", "/workspaces/app", "--workspace-settings", filepath.Join(d.workspace, ".devcontainer", "hostrunner.yaml"), "--rules-file", d.rulesFile, "--watch",
-		"--startup-timeout", "30m0s", "--grace", "15s", "--poll-interval", "2s", "--ask-timeout", "10m0s", "--request-timeout", "10s", "--process", "own", "--reread", "--mount-check"}
+	// Added to the shared process, the default: the arguments are the add
+	// request's, which carry no subcommand.
+	want := []string{"--socket", filepath.Join(d.dir, launch.SocketName), "--workspace", d.workspace, "--container-workspace", "/workspaces/app", "--workspace-settings", filepath.Join(d.workspace, ".devcontainer", "hostrunner.yaml"), "--rules-file", d.rulesFile, "--watch",
+		"--startup-timeout", "30m0s", "--grace", "15s", "--poll-interval", "2s", "--ask-timeout", "10m0s", "--request-timeout", "10s", "--process", "shared", "--reread", "--mount-check"}
 	if strings.Join(args, " ") != strings.Join(want, " ") {
 		t.Fatalf("the new daemon runs %q, want %q", args, want)
 	}

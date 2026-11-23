@@ -12,21 +12,11 @@ import (
 	"time"
 
 	"github.com/kravlab/hostrunner/internal/settings"
+	"github.com/kravlab/hostrunner/internal/settings/settingstest"
 )
 
 // defaults are the built-in settings of noWorkspace.
-var defaults = settings.Settings{
-	RulesFile:      rulesIn(noWorkspace),
-	StartupTimeout: 30 * time.Minute,
-	Grace:          15 * time.Second,
-	Reread:         true,
-	PollInterval:   2 * time.Second,
-	AskTimeout:     10 * time.Minute,
-	RequestTimeout: 10 * time.Second,
-	ReadyTimeout:   10 * time.Second,
-	Process:        settings.ProcessOwn,
-	MountCheck:     true,
-}
+var defaults = settingstest.Defaults(rulesIn(noWorkspace))
 
 // tuned is defaults with the keys most tests set given.
 func tuned(rulesFile string, startupTimeout, grace time.Duration, reread bool) settings.Settings {
@@ -147,7 +137,7 @@ func TestResolveReadsEveryVariable(t *testing.T) {
 		AskTimeout:     20 * time.Minute,
 		RequestTimeout: 30 * time.Second,
 		ReadyTimeout:   time.Minute,
-		Process:        settings.ProcessOwn,
+		Process:        settings.ProcessShared,
 	}
 	if err != nil || got.Settings != want {
 		t.Fatalf("got %+v, %v; want %+v", got, err, want)
@@ -194,13 +184,14 @@ const givenRules = "/given/hostrun.yaml"
 
 // daemonFlags gives every setting but the rules file and reread that
 // serve takes as a flag; givenTimings is what they give.
-var daemonFlags = []string{"--startup-timeout", "1h", "--grace", "1m", "--poll-interval", "5s", "--ask-timeout", "20m", "--request-timeout", "30s", "--mount-check", "--process", "own"}
+var daemonFlags = []string{"--startup-timeout", "1h", "--grace", "1m", "--poll-interval", "5s", "--ask-timeout", "20m", "--request-timeout", "30s", "--mount-check", "--process", string(settingstest.GivenProcess)}
 
 // givenTimings is defaults with what daemonFlags gives, the rules file
 // given and reread off.
 func givenTimings(rulesFile string) settings.Settings {
 	s := tuned(rulesFile, time.Hour, time.Minute, false)
 	s.PollInterval, s.AskTimeout, s.RequestTimeout = 5*time.Second, 20*time.Minute, 30*time.Second
+	s.Process = settingstest.GivenProcess
 	return s
 }
 
@@ -363,19 +354,19 @@ func TestRulesFileUsageNamesTheFlagsThatChooseTheRulesFile(t *testing.T) {
 	}
 }
 
-// The process of up is its own, unless a source says shared.
-func TestProcessDefaultsToOwn(t *testing.T) {
+// The process of up is the shared one, unless a source says own.
+func TestProcessDefaultsToShared(t *testing.T) {
 	got, err := parseUp(t).Resolve(env(nil), noWorkspace)
-	if err != nil || got.Process != settings.ProcessOwn {
-		t.Fatalf("got %q, %v; want %q", got.Process, err, settings.ProcessOwn)
+	if err != nil || got.Process != settings.ProcessShared {
+		t.Fatalf("got %q, %v; want %q", got.Process, err, settings.ProcessShared)
 	}
 }
 
 // A variable sets the process of up.
 func TestProcessIsSetByAVariable(t *testing.T) {
-	got, err := parseUp(t).Resolve(env(map[string]string{"HOSTRUNNER_PROCESS": "shared"}), noWorkspace)
-	if err != nil || got.Process != settings.ProcessShared {
-		t.Fatalf("got %q, %v; want %q", got.Process, err, settings.ProcessShared)
+	got, err := parseUp(t).Resolve(env(map[string]string{"HOSTRUNNER_PROCESS": "own"}), noWorkspace)
+	if err != nil || got.Process != settings.ProcessOwn {
+		t.Fatalf("got %q, %v; want %q", got.Process, err, settings.ProcessOwn)
 	}
 }
 
@@ -415,9 +406,9 @@ func TestProcessRefusesAnInvalidValue(t *testing.T) {
 // compares it.
 func TestArmSettingsNameTheProcess(t *testing.T) {
 	s := defaults
-	s.Process = settings.ProcessShared
-	if got := s.ArmSettings()["process"]; got != string(settings.ProcessShared) {
-		t.Errorf("ArmSettings: got process %q in %v, want %q", got, s.ArmSettings(), settings.ProcessShared)
+	s.Process = settings.ProcessOwn
+	if got := s.ArmSettings()["process"]; got != string(settings.ProcessOwn) {
+		t.Errorf("ArmSettings: got process %q in %v, want %q", got, s.ArmSettings(), settings.ProcessOwn)
 	}
 }
 
@@ -426,7 +417,7 @@ func TestArmSettingsNameTheProcess(t *testing.T) {
 // ArmSettings has it.
 func TestAllowedSettingsAreTheArmSettingsWithoutTheProcess(t *testing.T) {
 	s := defaults
-	s.Process = settings.ProcessShared
+	s.Process = settings.ProcessOwn
 	want := s.ArmSettings()
 	delete(want, "process")
 	if got := s.AllowedSettings(); !maps.Equal(got, want) {
@@ -436,17 +427,17 @@ func TestAllowedSettingsAreTheArmSettingsWithoutTheProcess(t *testing.T) {
 
 // serve takes the process from the variable.
 func TestServeTakesTheProcessFromAVariable(t *testing.T) {
-	got, err := parse(t).Resolve(env(map[string]string{"HOSTRUNNER_PROCESS": "shared"}), noWorkspace)
-	if err != nil || got.Process != settings.ProcessShared {
-		t.Fatalf("got %q, %v; want %q", got.Process, err, settings.ProcessShared)
+	got, err := parse(t).Resolve(env(map[string]string{"HOSTRUNNER_PROCESS": "own"}), noWorkspace)
+	if err != nil || got.Process != settings.ProcessOwn {
+		t.Fatalf("got %q, %v; want %q", got.Process, err, settings.ProcessOwn)
 	}
 }
 
 // serve takes the process from its flag.
 func TestServeTakesTheProcessFromAFlag(t *testing.T) {
-	got, err := parse(t, "--process", "shared").Resolve(env(nil), noWorkspace)
-	if err != nil || got.Process != settings.ProcessShared {
-		t.Fatalf("got %q, %v; want %q", got.Process, err, settings.ProcessShared)
+	got, err := parse(t, "--process", "own").Resolve(env(nil), noWorkspace)
+	if err != nil || got.Process != settings.ProcessOwn {
+		t.Fatalf("got %q, %v; want %q", got.Process, err, settings.ProcessOwn)
 	}
 }
 

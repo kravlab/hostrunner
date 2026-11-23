@@ -6,7 +6,10 @@
 // through its lifecycle (re-up, rebuild with a slow image build, stop,
 // restart). It also brings up a variant of the example without the read-only
 // .devcontainer mount and checks that the daemon refuses every command, and
-// that it runs them once the host turns the mount check off.
+// that it runs them once the host turns the mount check off. The daemons
+// live in the shared process, the default, but for that last scenario's,
+// which starts in a process of its own (process: own) and moves to the
+// shared process when the process setting is dropped, with no new allow.
 package e2e
 
 import (
@@ -26,6 +29,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/kravlab/hostrunner/internal/transport"
 )
 
 const (
@@ -360,6 +365,40 @@ func (e env) runtimeDirOf(t *testing.T, container string) string {
 	return dir
 }
 
+const (
+	// sharedSubcommand is the subcommand of the process that serves a
+	// daemon of the shared process.
+	sharedSubcommand = "shared"
+	// serveSubcommand is the subcommand of the process that serves a daemon
+	// in a process of its own.
+	serveSubcommand = "serve"
+)
+
+// expectServedBy fails the test unless the process listening on socket,
+// found by the peer pid of a connection to it, is the user's `hostrunner
+// <subcommand>`: sharedSubcommand for a daemon of the shared process,
+// serveSubcommand for one in a process of its own. It reads /proc, so it
+// runs on Linux only, like the rest of e2e.
+func expectServedBy(t *testing.T, socket, subcommand string) {
+	t.Helper()
+	c, err := transport.Unix{Path: socket}.Dial(context.Background())
+	if err != nil {
+		t.Fatalf("dial %s: %v", socket, err)
+	}
+	defer c.Close()
+	_, pid, err := transport.PeerCred(c)
+	if err != nil {
+		t.Fatalf("peer of %s: %v", socket, err)
+	}
+	cmdline, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/cmdline")
+	if err != nil {
+		t.Fatalf("command line of the process %d serving %s: %v", pid, socket, err)
+	}
+	if args := strings.Split(string(cmdline), "\x00"); len(args) < 2 || filepath.Base(args[0]) != "hostrunner" || args[1] != subcommand {
+		t.Fatalf("%s is served by %q, want hostrunner %s", socket, args, subcommand)
+	}
+}
+
 // daemonLog returns the runtime dir's daemon log, which every daemon
 // started there appends to.
 func daemonLog(t *testing.T, runtimeDir string) string {
@@ -489,19 +528,26 @@ func volumeName(ws string) string {
 // with the mount check turned off on the host (HOSTRUNNER_MOUNT_CHECK=false
 // for the `hostrunner up` the devcontainer CLI runs, which records the
 // setting in its request, and `hostrunner allow` allows that request): the
-// daemon runs the commands its rules allow.
+// daemon runs the commands its rules allow. Its daemon first runs in a
+// process of its own (HOSTRUNNER_PROCESS=own), the one scenario that does;
+// the test then runs `devcontainer up` again without the process setting
+// and without a new allow, and the daemon moves to the shared process.
 func TestDevcontainerWritableMountWithTheCheckOff(t *testing.T) {
 	eachRuntime(t, func(t *testing.T) string { return newWorkspace(t, true) }, func(t *testing.T, e env) {
-		e.extra = []string{"HOSTRUNNER_MOUNT_CHECK=false"}
+		e.extra = []string{"HOSTRUNNER_MOUNT_CHECK=false", "HOSTRUNNER_PROCESS=own"}
 		testWritableMountWithTheCheckOff(t, e)
 	})
 }
 
 // cleanUp removes everything a run left behind for the workspace, whether
 // or not `devcontainer up` succeeded: its containers (found by label), its
-// daemons (found by their --workspace argument; one armed by the last up
-// would otherwise wait up to 30 min for a container that never returns),
-// and its runtime directories (found by their daemon.log).
+// daemons (one armed by the last up would otherwise wait up to 30 min for a
+// container that never returns), and its runtime directories (found by
+// their daemon.log). The daemons need two ways: the /proc loop finds only
+// the `hostrunner serve` processes, by their --workspace argument, while a
+// daemon of the shared process has no process of its own to find, so
+// `hostrunner stop --dir <runtime dir> --kill` stops it (the shared process
+// ends with its last daemon).
 func (e env) cleanUp(t *testing.T) {
 	out, _ := run(t, os.Environ(), e.runtime, "ps", "-aq", "--filter", "label=devcontainer.local_folder="+e.ws)
 	for _, id := range strings.Fields(out) {
@@ -523,6 +569,7 @@ func (e env) cleanUp(t *testing.T) {
 	logs, _ := filepath.Glob(filepath.Join(os.Getenv("XDG_RUNTIME_DIR"), "hostrunner", "*", "daemon.log"))
 	for _, log := range logs {
 		if data, err := os.ReadFile(log); err == nil && bytes.Contains(data, []byte(`workspace="`+e.ws+`"`)) {
+			_, _ = run(t, e.vars(), filepath.Join(e.bin, "hostrunner"), "stop", "--dir", filepath.Dir(log), "--kill")
 			os.RemoveAll(filepath.Dir(log))
 		}
 	}
@@ -537,6 +584,10 @@ func testLifecycle(t *testing.T, e env) {
 
 	t.Run("hostrun runs in the host workspace", func(t *testing.T) {
 		e.expectHostrunWorks(t)
+	})
+
+	t.Run("the daemon lives in the shared process", func(t *testing.T) {
+		expectServedBy(t, socket, sharedSubcommand)
 	})
 
 	t.Run("example rules allow git in the host workspace", func(t *testing.T) {
@@ -746,7 +797,7 @@ func testLifecycle(t *testing.T, e env) {
 func testWritableMount(t *testing.T, e env) {
 	t.Cleanup(func() { e.cleanUp(t) })
 	e.allowAfterRefusedUp(t)
-	e.up(t)
+	container := e.up(t)
 
 	// devcontainer's default workspace mount puts the workspace at
 	// /workspaces/<its directory name>.
@@ -771,13 +822,30 @@ func testWritableMount(t *testing.T, e env) {
 			t.Fatalf("hostrun %v = %v, want a refusal saying how to turn the check off", args, err)
 		}
 	}
+	expectServedBy(t, filepath.Join(e.runtimeDirOf(t, container), "hostrunner.sock"), sharedSubcommand)
 }
 
+// testWritableMountWithTheCheckOff brings the container up with the mount
+// check off and the daemon in a process of its own (e.extra holds
+// HOSTRUNNER_MOUNT_CHECK=false and HOSTRUNNER_PROCESS=own), and checks that
+// hostrun works. It then models the upgrade to the shared default: the
+// process setting is dropped from e.extra, and `devcontainer up` runs again
+// without a new `hostrunner allow`, as the allow recorded under process:
+// own must still cover the daemon (the process is not among the allowed
+// settings). The daemon steps aside, and up starts it in the shared
+// process on the same socket, where hostrun works again.
 func testWritableMountWithTheCheckOff(t *testing.T, e env) {
 	t.Cleanup(func() { e.cleanUp(t) })
 	e.allowAfterRefusedUp(t)
+	container := e.up(t)
+	e.expectHostrunWorks(t)
+	socket := filepath.Join(e.runtimeDirOf(t, container), "hostrunner.sock")
+	expectServedBy(t, socket, serveSubcommand)
+
+	e.extra = []string{"HOSTRUNNER_MOUNT_CHECK=false"}
 	e.up(t)
 	e.expectHostrunWorks(t)
+	expectServedBy(t, socket, sharedSubcommand)
 }
 
 // stopAndExpectDaemonExit stops the container and waits for the daemon

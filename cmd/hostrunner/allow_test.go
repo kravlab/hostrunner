@@ -13,6 +13,7 @@ import (
 
 	"github.com/kravlab/hostrunner/internal/allow"
 	"github.com/kravlab/hostrunner/internal/launch"
+	"github.com/kravlab/hostrunner/internal/settings"
 )
 
 // allowRules is a valid rules file; allowRulesDigest is its digest.
@@ -202,6 +203,26 @@ func TestAllowDoesNotShowTheProcessOfARefusedUp(t *testing.T) {
 	}
 	if !storeAllows(t, ws, allowRulesDigest, upSettings(t, ws, "--process", "own")) {
 		t.Error("the allow of an up with process: shared does not cover the same up with process: own")
+	}
+}
+
+// An allow recorded for an up in a process of its own, the default of
+// older builds, covers the up that gives no process and so adds its daemon
+// to the shared process: upgrading to the shared default makes no allow
+// out of date.
+func TestAnAllowOfAnUpInItsOwnProcessCoversTheUpWithTheDefaultProcess(t *testing.T) {
+	isolate(t)
+	t.Setenv("HOSTRUNNER_PROCESS", "")
+	ws, _ := devcontainerWith(t, allowRules, "hostrunner-rules.yaml")
+	refuseUp(t, ws, "--process", "own")
+	if _, _, err := runAllowCmd(t, "allow", ws); err != nil {
+		t.Fatal(err)
+	}
+	if got := parseUpOf(t, ws).Settings.Process; got != settings.ProcessShared {
+		t.Fatalf("the up with no process setting resolves process %q, want %q", got, settings.ProcessShared)
+	}
+	if err := upAllowCheck(t, ws); err != nil {
+		t.Fatalf("the up with the default process: %v, want it allowed", err)
 	}
 }
 

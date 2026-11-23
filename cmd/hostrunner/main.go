@@ -20,17 +20,17 @@
 //	hostrunner version
 //
 // `up` is meant for devcontainer's initializeCommand: it installs the client
-// into the runtime directory and starts a detached `serve --watch` there,
-// which exits by itself once its armed container stops; with --restart it
-// replaces a daemon already serving it. With process: shared, `up`
-// adds the daemon to the shared process of its build instead, starting
-// a detached `shared` in the runtime root first when none listens on
-// its control socket there or the one listening is ending, under a lock
-// there, so that concurrent ups of one build start one process (see
-// internal/launch); the process runs each daemon it is asked
-// for as serve would, and ends with the last, or when its first is not
-// added within --ready-timeout, what remains of up's ready_timeout as up
-// starts it (see internal/shared).
+// into the runtime directory and adds the daemon to the shared process of
+// its build (process: shared, the default), starting a detached `shared` in
+// the runtime root first when none listens on its control socket there or
+// the one listening is ending, under a lock there, so that concurrent ups
+// of one build start one process (see internal/launch); the process runs
+// each daemon it is asked for as serve would, and ends with the last, or
+// when its first is not added within --ready-timeout, what remains of up's
+// ready_timeout as up starts it (see internal/shared). With process: own it
+// starts a detached `serve --watch` there instead, which exits by itself
+// once its armed container stops. With --restart it replaces a daemon
+// already serving it.
 // `stop` stops a daemon from the
 // host, the one serving the current directory by default, asking what
 // becomes of the commands it runs unless --kill or --wait says; `restart`

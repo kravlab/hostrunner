@@ -58,6 +58,9 @@ Synchronous, fast, idempotent (it runs on every `devcontainer up`):
 5. Start `hostrunner serve --watch …` detached (`setsid`, cwd `<dir>`,
    stdin from `/dev/null`, stdout/stderr appended to `<dir>/daemon.log`,
    which must be a regular file: opened with `O_NOFOLLOW`).
+   (Since the shared process became the default, `up` adds the daemon to
+   the shared process of its build unless `process` is `own`; see README,
+   Shared process.)
 6. Wait up to 10 s until the daemon answers `FrameArm` on its approval
    socket; exit 0. If the
    daemon exits or the wait times out (the daemon is then killed), exit

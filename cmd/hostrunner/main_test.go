@@ -29,6 +29,7 @@ import (
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
 	"github.com/kravlab/hostrunner/internal/settings"
+	"github.com/kravlab/hostrunner/internal/settings/settingstest"
 	"github.com/kravlab/hostrunner/internal/stop"
 	"github.com/kravlab/hostrunner/internal/transport"
 	"github.com/kravlab/hostrunner/internal/update"
@@ -292,21 +293,12 @@ func TestParseNoReread(t *testing.T) {
 	}
 }
 
-// tuned is the built-in settings with the rules file, the startup
-// timeout, the grace and reread given.
+// tuned is the built-in settings (settingstest.Defaults) with the rules
+// file, the startup timeout, the grace and reread given.
 func tuned(rulesFile string, startupTimeout, grace time.Duration, reread bool) settings.Settings {
-	return settings.Settings{
-		RulesFile:      rulesFile,
-		StartupTimeout: startupTimeout,
-		Grace:          grace,
-		Reread:         reread,
-		PollInterval:   2 * time.Second,
-		AskTimeout:     10 * time.Minute,
-		RequestTimeout: 10 * time.Second,
-		ReadyTimeout:   10 * time.Second,
-		MountCheck:     true,
-		Process:        settings.ProcessOwn,
-	}
+	s := settingstest.Defaults(rulesFile)
+	s.StartupTimeout, s.Grace, s.Reread = startupTimeout, grace, reread
+	return s
 }
 
 // noEnv is a getenv for an empty environment: no HOSTRUNNER_* variable,
@@ -473,10 +465,11 @@ func TestServeGivenEverySettingReadsNoOtherSource(t *testing.T) {
 		t.Errorf("read %s", name)
 		return ""
 	}
-	flags := []string{"--settings", settingsFile(t, "grase: [\n"), "--workspace-settings", settingsFile(t, "grase: [\n"), "--rules-file", "/r.yaml", "--startup-timeout", "1h", "--grace", "1m", "--reread", "--poll-interval", "1s", "--ask-timeout", "1m", "--request-timeout", "1s", "--mount-check", "--process", "own"}
+	flags := []string{"--settings", settingsFile(t, "grase: [\n"), "--workspace-settings", settingsFile(t, "grase: [\n"), "--rules-file", "/r.yaml", "--startup-timeout", "1h", "--grace", "1m", "--reread", "--poll-interval", "1s", "--ask-timeout", "1m", "--request-timeout", "1s", "--mount-check", "--process", string(settingstest.GivenProcess)}
 	got, err := resolveServe(flags, getenv)
 	want := tuned("/r.yaml", time.Hour, time.Minute, true)
 	want.PollInterval, want.AskTimeout, want.RequestTimeout = time.Second, time.Minute, time.Second
+	want.Process = settingstest.GivenProcess
 	if err != nil || got != want {
 		t.Fatalf("got %+v, %v; want %+v", got, err, want)
 	}

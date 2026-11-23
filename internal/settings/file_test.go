@@ -101,7 +101,7 @@ mount_check: false
 		AskTimeout:     20 * time.Minute,
 		RequestTimeout: 30 * time.Second,
 		ReadyTimeout:   time.Minute,
-		Process:        settings.ProcessOwn,
+		Process:        settings.ProcessShared,
 	}
 	if err != nil || got.Settings != want {
 		t.Fatalf("got %+v, %v; want %+v", got, err, want)

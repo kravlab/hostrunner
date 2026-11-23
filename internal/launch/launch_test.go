@@ -1666,15 +1666,38 @@ func restartCommand(ctx context.Context, t *testing.T, daemon string, cfg Config
 	t.Helper()
 	copyExecutable(t, mustStatic(t), filepath.Join(filepath.Dir(daemon), ClientName))
 	s := cfg.Settings
-	return hostCommand(ctx, t, daemon, []string{
+	return hostCommand(ctx, t, daemon, timingsEnv(s), "restart", "--dir", cfg.Dir, answer,
+		"--rules-file", s.RulesFile, "--process", string(s.Process), boolFlag("mount-check", s.MountCheck))
+}
+
+// upCommand returns the command `hostrunner up` of the hostrunner
+// executable daemon for cfg, as a devcontainer's initializeCommand runs
+// it, with the flags and variables that give the daemon the settings of
+// cfg but the process, which no source sets, so that its default applies
+// (an empty HOSTRUNNER_PROCESS is unset, whatever the test's environment
+// holds). up installs the hostrun beside daemon, so the static helper is
+// put there under that name. It ends with ctx.
+func upCommand(ctx context.Context, t *testing.T, daemon string, cfg Config) *exec.Cmd {
+	t.Helper()
+	copyExecutable(t, mustStatic(t), filepath.Join(filepath.Dir(daemon), ClientName))
+	s := cfg.Settings
+	env := append(timingsEnv(s), "HOSTRUNNER_READY_TIMEOUT="+s.ReadyTimeout.String(), "HOSTRUNNER_PROCESS=")
+	return hostCommand(ctx, t, daemon, env, "up", "--dir", cfg.Dir, "--workspace", cfg.Workspace,
+		"--container-workspace", cfg.ContainerWorkspace, "--rules-file", s.RulesFile, boolFlag("mount-check", s.MountCheck))
+}
+
+// timingsEnv returns the variables that set the timings (startup timeout,
+// grace, poll interval, ask timeout, request timeout) and the rereading of
+// s for the daemon that a real hostrunner command starts.
+func timingsEnv(s settings.Settings) []string {
+	return []string{
 		"HOSTRUNNER_STARTUP_TIMEOUT=" + s.StartupTimeout.String(),
 		"HOSTRUNNER_GRACE=" + s.Grace.String(),
 		"HOSTRUNNER_POLL_INTERVAL=" + s.PollInterval.String(),
 		"HOSTRUNNER_ASK_TIMEOUT=" + s.AskTimeout.String(),
 		"HOSTRUNNER_REQUEST_TIMEOUT=" + s.RequestTimeout.String(),
 		"HOSTRUNNER_REREAD=" + strconv.FormatBool(s.Reread),
-	}, "restart", "--dir", cfg.Dir, answer,
-		"--rules-file", s.RulesFile, "--process", string(s.Process), boolFlag("mount-check", s.MountCheck))
+	}
 }
 
 // hostCommand returns the command `daemon <args>` of a real hostrunner
@@ -1745,6 +1768,17 @@ func parentPid(pid int) int {
 	return ppid
 }
 
+// expectOneProcess fails the test unless the daemons of a and b are served
+// by one process, and returns its pid.
+func expectOneProcess(t *testing.T, a, b Config) int {
+	t.Helper()
+	pid := servingPid(t, a)
+	if other := servingPid(t, b); other != pid {
+		t.Fatalf("A is served by process %d, B by %d; want one process", pid, other)
+	}
+	return pid
+}
+
 // servingPid is the pid of the process listening on the socket of cfg.
 func servingPid(t *testing.T, cfg Config) int {
 	t.Helper()
@@ -1787,10 +1821,7 @@ func TestUpOfTwoRuntimeDirsWithProcessSharedServesBothInOneProcess(t *testing.T)
 		t.Fatalf("Up of B: %v", err)
 	}
 
-	sharedPid := servingPid(t, a)
-	if pid := servingPid(t, b); pid != sharedPid {
-		t.Fatalf("A is served by process %d, B by %d; want one process", sharedPid, pid)
-	}
+	sharedPid := expectOneProcess(t, a, b)
 	cmdline, err := os.ReadFile("/proc/" + strconv.Itoa(sharedPid) + "/cmdline")
 	if err != nil {
 		t.Fatal(err)
@@ -1815,6 +1846,26 @@ func TestUpOfTwoRuntimeDirsWithProcessSharedServesBothInOneProcess(t *testing.T)
 	}
 	if _, code := runIn(t, a, "true"); code != protocol.ExitRejected {
 		t.Errorf("true, not in the rules of A, exits %d there, want %d", code, protocol.ExitRejected)
+	}
+}
+
+// With no process setting from any source, the real `hostrunner up` of two
+// runtime directories adds both daemons to one shared process: shared is
+// the default.
+func TestUpWithNoProcessSettingAddsTwoDaemonsToOneSharedProcess(t *testing.T) {
+	daemon := mustHostrunner(t)
+	a, b := sharedPair(t, daemon)
+	for _, cfg := range []Config{a, b} {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		out, err := upCommand(ctx, t, daemon, cfg).CombinedOutput()
+		cancel()
+		if err != nil {
+			t.Fatalf("hostrunner up of %s: %v: %s", cfg.Dir, err, out)
+		}
+	}
+	pid := expectOneProcess(t, a, b)
+	if pids := sharedPids(t, filepath.Dir(a.Dir)); !slices.Equal(pids, []int{pid}) {
+		t.Fatalf("the shared processes of the runtime root are %v; want %d alone, serving both", pids, pid)
 	}
 }
 

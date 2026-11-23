@@ -62,8 +62,8 @@ type Settings struct {
 	ReadyTimeout time.Duration
 	// Process (process) is whether up starts the daemon in a process of its
 	// own (ProcessOwn) or adds it to the shared process of its build
-	// (ProcessShared); the daemon takes it too, to compare it with the one
-	// the arm carries.
+	// (ProcessShared, the default); the daemon takes it too, to compare it
+	// with the one the arm carries.
 	Process Process
 	// RuntimeRoot (runtime_root) is where stop, restart and approve look
 	// for daemons' runtime directories; empty when no source gives one
@@ -131,7 +131,7 @@ func defaults(workspace string) Settings {
 		AskTimeout:     10 * time.Minute, // time for a human to come to the host and answer
 		RequestTimeout: 10 * time.Second, // so idle connections cannot pile up
 		ReadyTimeout:   DefaultReadyTimeout,
-		Process:        ProcessOwn,
+		Process:        ProcessShared, // fewer host processes; own is the opt-out
 		MountCheck:     true,
 	}
 }
