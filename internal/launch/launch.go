@@ -33,6 +33,7 @@ import (
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
 	"github.com/kravlab/hostrunner/internal/settings"
+	"github.com/kravlab/hostrunner/internal/shared"
 	"github.com/kravlab/hostrunner/internal/transport"
 )
 
@@ -61,6 +62,11 @@ func RuntimeDir(approvalSocket string) string {
 
 // armTimeout bounds one arm request, including connecting.
 const armTimeout = 5 * time.Second
+
+// stopTimeout bounds the stop of a daemon up added to a shared process
+// and gave up waiting for, from reaching its approval socket until it
+// stopped (see stopAdded).
+const stopTimeout = 5 * time.Second
 
 // errNotListening means nothing accepts connections on the socket, so a
 // daemon has to be started.
@@ -351,6 +357,9 @@ func (p *Prepared) UpLocked(ctx context.Context) error {
 	if err := installClient(cfg.Client, cfg.Dir); err != nil {
 		return err
 	}
+	if cfg.Process == settings.ProcessShared {
+		return addShared(ctx, cfg, socket, a)
+	}
 	return startDaemon(ctx, cfg, socket, a)
 }
 
@@ -528,55 +537,204 @@ func checkStatic(path string) error {
 	return nil
 }
 
-// startDaemon spawns the daemon in its own session with output going to the
-// log, so it outlives `hostrunner up` and never holds the caller's stdio
-// (which would make devcontainer wait for it), then waits until it
-// follows the arm a, sent to its approval socket.
+// startDaemon spawns the daemon (see spawn), then waits until it follows
+// the arm a, sent to its approval socket.
 func startDaemon(ctx context.Context, cfg Config, socket string, a protocol.Arm) error {
 	logPath := filepath.Join(cfg.Dir, LogName)
-	logFile, err := openLog(logPath)
+	s, err := spawn("daemon", cfg.Daemon, serveArgs(cfg, socket), cfg.Dir, logPath) // cfg.Dir: do not keep the workspace busy
 	if err != nil {
 		return err
 	}
+	return waitReady(ctx, cfg.ReadyTimeout, s, armReady(ctx, cfg, a))
+}
+
+// addShared is UpLocked's start of the daemon with process: shared. It
+// asks the shared process of cfg.Daemon, in the runtime root (the
+// directory of cfg.Dir), to add the daemon serveArgs describes, with the
+// environment of this up, starting that process first when none listens
+// (see startShared); then it waits, for cfg.ReadyTimeout, until the daemon
+// follows the arm a, sent to its approval socket, failing with the tail
+// of its log and stopping the daemon when the wait fails (see waitReady).
+func addShared(ctx context.Context, cfg Config, socket string, a protocol.Arm) error {
+	root := filepath.Dir(cfg.Dir)
+	control, processLog, err := shared.Files(root, cfg.Daemon)
+	if err != nil {
+		return err
+	}
+	logPath := filepath.Join(cfg.Dir, LogName)
+	var logStart int64
+	if info, err := os.Lstat(logPath); err == nil {
+		logStart = info.Size()
+	}
+	req := protocol.AddDaemon{Args: serveArgs(cfg, socket)[1:], Env: os.Environ()}
+	err = shared.Add(ctx, control, req)
+	if errors.Is(err, shared.ErrNotListening) {
+		if err := startShared(ctx, cfg, root, control, processLog); err != nil {
+			return err
+		}
+		err = shared.Add(ctx, control, req)
+	}
+	if err != nil {
+		return err
+	}
+	// The daemon runs in the shared process, which ends with it alone no
+	// more: up watches no end of its own, and stops the daemon rather
+	// than kill the process.
+	s := spawned{what: "daemon", logPath: logPath, kill: func() { stopAdded(cfg.Dir) }, logStart: logStart}
+	return waitReady(ctx, cfg.ReadyTimeout, s, armReady(ctx, cfg, a))
+}
+
+// stopAdded stops the daemon of the runtime directory dir that up added
+// to a shared process and gave up waiting for, as `hostrunner stop --kill`
+// stops a daemon: it kills what the daemon runs and returns once the
+// daemon stopped. Added means started, not listening yet, so it tries
+// again until its approval socket answers, for stopTimeout at most; a
+// daemon it cannot stop is left to end by itself, as one never armed does
+// once its startup timeout passes.
+func stopAdded(dir string) {
+	ctx, cancel := context.WithTimeout(context.Background(), stopTimeout)
+	defer cancel()
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for requestStop(ctx, ApprovalSocket(dir)) != nil {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// requestStop asks the daemon on the approval socket socket to stop,
+// killing what it runs, with FrameStop after the hello as `hostrunner
+// stop` does, and waits until the daemon closes the connection as it
+// stops, until ctx ends at most.
+func requestStop(ctx context.Context, socket string) error {
+	c, err := transport.Unix{Path: socket}.Dial(ctx)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = c.SetDeadline(deadline)
+	}
+	if _, err := daemonlist.Hello(c); err != nil {
+		return err
+	}
+	if err := protocol.WriteJSON(c, protocol.FrameStop, protocol.Stop{}); err != nil {
+		return err
+	}
+	f, err := protocol.ReadFrame(c)
+	if err != nil {
+		return err
+	}
+	if f.Type != protocol.FrameStopping {
+		return daemonlist.ErrorOf(f)
+	}
+	_, err = io.Copy(io.Discard, c)
+	return err
+}
+
+// startShared spawns `hostrunner shared` of cfg.Daemon (see spawn) in the
+// runtime root root, listening on its control socket, control, and
+// logging to processLog, then waits, for cfg.ReadyTimeout, until the
+// control socket accepts connections.
+func startShared(ctx context.Context, cfg Config, root, control, processLog string) error {
+	s, err := spawn("shared process", cfg.Daemon, []string{"shared", "--socket", control}, root, processLog)
+	if err != nil {
+		return err
+	}
+	return waitReady(ctx, cfg.ReadyTimeout, s, func() (bool, error) {
+		return listening(ctx, control), nil
+	})
+}
+
+// spawned is a process spawn started, as waitReady watches it.
+type spawned struct {
+	what     string        // names the process in errors
+	exited   <-chan string // yields how the process ended, once it did; nil for one that cannot be watched
+	kill     func()        // kills it; for a daemon of a shared process, stops it (see stopAdded)
+	logPath  string        // its log
+	logStart int64         // where its output starts in its log
+}
+
+// spawn starts exe with args, the process what names in errors, in its
+// own session, in the directory dir, with output going to the log at
+// logPath (see OpenLog), so it outlives `hostrunner up` and never holds
+// the caller's stdio (which would make devcontainer wait for it). A log
+// that cannot be opened is OpenLog's error.
+func spawn(what, exe string, args []string, dir, logPath string) (spawned, error) {
+	logFile, err := OpenLog(logPath)
+	if err != nil {
+		return spawned{}, err
+	}
 	logStart, _ := logFile.Seek(0, io.SeekEnd)
 
-	cmd := exec.Command(cfg.Daemon, serveArgs(cfg, socket)...)
-	cmd.Dir = cfg.Dir // do not keep the workspace busy
+	cmd := exec.Command(exe, args...)
+	cmd.Dir = dir
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	err = cmd.Start()
 	logFile.Close()
 	if err != nil {
-		return fmt.Errorf("start daemon: %w", err)
+		return spawned{}, fmt.Errorf("start %s: %w", what, err)
 	}
-	exited := make(chan error, 1)
-	go func() { exited <- cmd.Wait() }()
+	exited := make(chan string, 1)
+	go func() {
+		_ = cmd.Wait()
+		exited <- cmd.ProcessState.String()
+	}()
+	return spawned{what: what, exited: exited, kill: func() { _ = cmd.Process.Kill() }, logPath: logPath, logStart: logStart}, nil
+}
 
+// armReady is the ready check of waitReady for a daemon that must follow
+// the arm a, sent to the approval socket of cfg.Dir: done once it does,
+// not yet while nothing listens there, and an error when it steps aside
+// or the arm fails otherwise.
+func armReady(ctx context.Context, cfg Config, a protocol.Arm) func() (bool, error) {
+	return func() (bool, error) {
+		stepAside, err := arm(ctx, ApprovalSocket(cfg.Dir), a)
+		switch {
+		case err == nil && !stepAside:
+			return true, nil
+		case err == nil: // e.g. the rules changed again while it started
+			return false, errors.New("the new daemon stepped aside; retry")
+		case errors.Is(err, errNotListening):
+			return false, nil
+		}
+		return false, err
+	}
+}
+
+// waitReady calls ready every 50 ms until it reports done, for timeout at
+// most. It fails when the process s ends first, when the timeout passes,
+// when ready returns an error or when ctx ends; it kills s in each case
+// but the first, and but for ctx the error carries the tail of the log of
+// s since s started. An s whose exited is nil is not watched for its end:
+// only the timeout, ready and ctx end the wait.
+func waitReady(ctx context.Context, timeout time.Duration, s spawned, ready func() (bool, error)) error {
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
-	deadline := time.After(cfg.ReadyTimeout)
+	deadline := time.After(timeout)
 	for {
 		select {
-		case <-exited:
-			return fmt.Errorf("daemon exited during startup (%s): %s", cmd.ProcessState, logTail(logPath, logStart))
+		case state := <-s.exited:
+			return fmt.Errorf("%s exited during startup (%s): %s", s.what, state, logTail(s.logPath, s.logStart))
 		case <-deadline:
-			_ = cmd.Process.Kill()
-			return fmt.Errorf("daemon did not listen within %v: %s", cfg.ReadyTimeout, logTail(logPath, logStart))
+			s.kill()
+			return fmt.Errorf("%s did not listen within %v: %s", s.what, timeout, logTail(s.logPath, s.logStart))
 		case <-ctx.Done():
-			_ = cmd.Process.Kill()
+			s.kill()
 			return ctx.Err()
 		case <-ticker.C:
-			stepAside, err := arm(ctx, ApprovalSocket(cfg.Dir), a)
-			if err == nil && !stepAside {
+			done, err := ready()
+			if done {
 				return nil
 			}
-			if err == nil { // e.g. the rules changed again while it started
-				err = errors.New("the new daemon stepped aside; retry")
-			}
-			if !errors.Is(err, errNotListening) {
-				_ = cmd.Process.Kill()
-				return fmt.Errorf("%w: %s", err, logTail(logPath, logStart))
+			if err != nil {
+				s.kill()
+				return fmt.Errorf("%w: %s", err, logTail(s.logPath, s.logStart))
 			}
 		}
 	}
@@ -618,17 +776,18 @@ func boolFlag(name string, on bool) string {
 	return "--no-" + name
 }
 
-// openLog opens the daemon log for appending. It refuses anything but a
-// regular file: the log lives in a directory mounted into the container,
-// and a planted symlink or FIFO must not redirect or block the daemon.
-func openLog(path string) (*os.File, error) {
+// OpenLog opens the daemon log, or the log of a shared process, for
+// appending. It refuses anything but a regular file: the daemon log lives
+// in a directory mounted into the container, and a planted symlink or FIFO
+// must not redirect or block the daemon.
+func OpenLog(path string) (*os.File, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0o600)
 	if err != nil {
-		return nil, fmt.Errorf("open daemon log: %w", err)
+		return nil, fmt.Errorf("open log %s: %w", hostterm.Display(path), err)
 	}
 	if info, err := f.Stat(); err != nil || !info.Mode().IsRegular() {
 		f.Close()
-		return nil, fmt.Errorf("daemon log %s is not a regular file", hostterm.Display(path))
+		return nil, fmt.Errorf("log %s is not a regular file", hostterm.Display(path))
 	}
 	return f, nil
 }

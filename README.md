@@ -396,6 +396,7 @@ Besides its rules, a daemon has settings:
 | `request_timeout` | `HOSTRUNNER_REQUEST_TIMEOUT` | `--request-timeout` | `10s` | how long a new connection may take to send its request |
 | `mount_check` | `HOSTRUNNER_MOUNT_CHECK` | `--mount-check`, `--no-mount-check` | `true` | whether it checks that its container cannot write its configuration (see [Mount check](#mount-check)); not in the workspace settings file |
 | `ready_timeout` | `HOSTRUNNER_READY_TIMEOUT` | `--ready-timeout` (`up` only) | `10s` | how long `up` waits for the daemon it starts to listen |
+| `process` | `HOSTRUNNER_PROCESS` | `--process` (`up` only) | `own` | whether `up` starts the daemon in a process of its own (`own`) or adds it to the shared process of its build (`shared`) |
 
 `hostrunner stop`, `restart` and `approve` have settings of their own:
 

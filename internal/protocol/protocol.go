@@ -56,6 +56,10 @@
 // of FrameHello carries that one arm, answered by FrameArmed or
 // FrameError. The container's socket refuses FrameArm, so only the host
 // arms the daemon.
+//
+// The control socket of a shared process speaks its own frames, with its
+// own version (SharedVersion): a connection carries one FrameAddDaemon,
+// answered by FrameDaemonAdded or FrameError.
 package protocol
 
 import (
@@ -134,7 +138,12 @@ const (
 	FrameMountCheckFailed // daemon → session, JSON MountCheckFailed: the check of the armed container's mounts failed, to a session that said it reads this (Serve.MountCheck)
 	FrameRulesNotAllowed  // daemon → session, JSON RulesNotAllowed: the rules or the daemon settings changed to ones not allowed, to a session that said it reads this (Serve.RulesNotAllowed)
 
-	lastFrameType = FrameRulesNotAllowed
+	// Frames of the control socket of a shared process, between
+	// `hostrunner up` and the process; it refuses every other frame.
+	FrameAddDaemon   // `hostrunner up` → shared process, JSON AddDaemon
+	FrameDaemonAdded // shared process → `hostrunner up`, no payload: the daemon was added and started, not that it listens yet: up waits for its arm
+
+	lastFrameType = FrameDaemonAdded
 )
 
 // Exit codes for failures of hostrun itself rather than of the command,
@@ -645,6 +654,24 @@ const (
 	WithdrawnStopping   EndReason = "ended: the daemon is stopping" // the daemon drains; a session that predates it shows the text as is
 	WithdrawnMountCheck EndReason = "ended: the mount check failed" // the check of the armed container's mounts failed; likewise
 )
+
+// SharedVersion is the version of the control socket's protocol, which
+// `hostrunner up` sends in AddDaemon. The shared process refuses a request
+// of any other version.
+const SharedVersion = 1
+
+// AddDaemon asks a shared process to add a daemon. Args are the arguments
+// of `hostrunner serve` for that daemon, without the word serve; Env is the
+// environment, in os.Environ's form, of the `hostrunner up` that sends it,
+// which the daemon resolves its settings with and runs its commands with,
+// not the process's. The process answers FrameDaemonAdded once it started
+// the daemon, maybe before the daemon listens: up then waits until it
+// follows its arm.
+type AddDaemon struct {
+	Version int      `json:"version"`
+	Args    []string `json:"args"`
+	Env     []string `json:"env"`
+}
 
 // Exit reports the exit code of a command that ran.
 type Exit struct {

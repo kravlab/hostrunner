@@ -587,7 +587,7 @@ func (s *Server) serveApprovals(ctx context.Context, wg *sync.WaitGroup) {
 			if ctx.Err() != nil || s.isDraining() {
 				return
 			}
-			if isTemporary(err) {
+			if transport.IsTemporary(err) {
 				time.Sleep(50 * time.Millisecond)
 				continue
 			}

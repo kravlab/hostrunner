@@ -22,10 +22,13 @@ import (
 
 	"github.com/kravlab/hostrunner/internal/allow"
 	"github.com/kravlab/hostrunner/internal/allow/allowtest"
+	"github.com/kravlab/hostrunner/internal/client"
 	"github.com/kravlab/hostrunner/internal/daemonlist"
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
 	"github.com/kravlab/hostrunner/internal/settings"
+	"github.com/kravlab/hostrunner/internal/shared"
+	"github.com/kravlab/hostrunner/internal/transport"
 )
 
 // fakeDaemonEnv makes the test binary act as the daemon when Up spawns it.
@@ -38,8 +41,19 @@ const fakeDaemonEnv = "HOSTRUNNER_LAUNCH_FAKE_DAEMON"
 // with the runtime dir and client given in the variable ("dir:client").
 const runUpEnv = "HOSTRUNNER_LAUNCH_RUN_UP"
 
+// addSharedEnv makes the test binary ask the shared process on the control
+// socket the variable names to add a daemon, exiting 0 once it answered
+// that it added it and 1 otherwise.
+const addSharedEnv = "HOSTRUNNER_LAUNCH_ADD_SHARED"
+
 func TestMain(m *testing.M) {
 	switch {
+	case os.Getenv(addSharedEnv) != "":
+		if err := shared.Add(context.Background(), os.Getenv(addSharedEnv), protocol.AddDaemon{}); err != nil {
+			os.Stderr.WriteString(err.Error() + "\n")
+			os.Exit(1)
+		}
+		os.Exit(0)
 	case os.Getenv(runUpEnv) != "":
 		dir, client, _ := strings.Cut(os.Getenv(runUpEnv), ":")
 		os.Unsetenv(runUpEnv) // the daemon Up spawns must not run Up again
@@ -1444,6 +1458,571 @@ func TestUpOfTwoRuntimeDirsStartsTheRealDaemonOfEachOnceAllowed(t *testing.T) {
 	}
 	if got := served(b); got != "1m0s" {
 		t.Errorf("the daemon of B serves grace %s, want 1m0s", got)
+	}
+}
+
+// sharedPair returns the allowed Configs of two runtime directories, A and
+// B, under one runtime root, each of its own workspace, whose ups add
+// their daemons to the shared process of the real hostrunner daemon, with
+// a fake container runtime. Both rules allow printenv and pwd; those of B
+// also allow true. When the test ends it stops both daemons and fails if
+// a shared process in the root outlives them, killing it.
+func sharedPair(t *testing.T, daemon string) (a, b Config) {
+	t.Helper()
+	fakeContainerRuntime(t)
+	t.Setenv("XDG_DATA_HOME", t.TempDir()) // the store the daemons open too
+	store, err := allow.Open(os.Getenv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := shortDir(t)
+	config := func(name, rulesText string) Config {
+		ws := filepath.Join(base, "ws-"+name)
+		if err := os.Mkdir(ws, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		rulesFile := filepath.Join(ws, "hostrun.yaml")
+		if err := os.WriteFile(rulesFile, []byte(rulesText), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return Config{
+			Dir: filepath.Join(base, "rt", name), Workspace: ws, ContainerWorkspace: "/workspaces/app",
+			Daemon: daemon, Client: mustStatic(t), Allows: store,
+			Settings: settings.Settings{
+				RulesFile: rulesFile, StartupTimeout: 10 * time.Minute, Grace: time.Minute,
+				PollInterval: time.Second, AskTimeout: 10 * time.Minute, RequestTimeout: 10 * time.Second,
+				Reread: true, ReadyTimeout: 10 * time.Second, Process: settings.ProcessShared,
+			},
+		}
+	}
+	common := "rules:\n  - command: printenv\n    args: any\n  - command: pwd\n    args: none\n"
+	a = config("a", common)
+	b = config("b", common+"  - command: true\n    args: none\n")
+	t.Cleanup(func() {
+		pids := sharedPids(t, filepath.Dir(a.Dir))
+		for _, cfg := range []Config{a, b} {
+			stopDaemon(t, daemon, cfg)
+		}
+		for _, pid := range pids {
+			deadline := time.Now().Add(5 * time.Second)
+			for alivePid(pid) && time.Now().Before(deadline) {
+				time.Sleep(20 * time.Millisecond)
+			}
+			if alivePid(pid) {
+				syscall.Kill(pid, syscall.SIGKILL)
+				t.Errorf("the shared process %d outlived its last daemon", pid)
+			}
+		}
+	})
+	for _, cfg := range []Config{a, b} {
+		allowCurrent(t, cfg)
+	}
+	return a, b
+}
+
+// stopDaemon stops the daemon of cfg as `hostrunner stop --dir <dir>
+// --kill` does, with the hostrunner executable daemon; a stop that fails,
+// for a daemon already gone, is only logged.
+func stopDaemon(t *testing.T, daemon string, cfg Config) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if out, err := exec.CommandContext(ctx, daemon, "stop", "--dir", cfg.Dir, "--kill").CombinedOutput(); err != nil {
+		t.Logf("stop %s: %v: %s", cfg.Dir, err, out)
+	}
+}
+
+// sharedPids returns the pids of the running `hostrunner shared` processes
+// whose control socket is in the runtime root root, as /proc shows them.
+func sharedPids(t *testing.T, root string) []int {
+	t.Helper()
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pids []int
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+		cmdline, err := os.ReadFile("/proc/" + e.Name() + "/cmdline")
+		if err != nil {
+			continue
+		}
+		args := strings.Split(string(cmdline), "\x00")
+		if len(args) >= 4 && args[1] == "shared" && args[2] == "--socket" && filepath.Dir(args[3]) == root {
+			pids = append(pids, pid)
+		}
+	}
+	return pids
+}
+
+// servingPid is the pid of the process listening on the socket of cfg.
+func servingPid(t *testing.T, cfg Config) int {
+	t.Helper()
+	c, err := transport.Unix{Path: Socket(cfg.Dir)}.Dial(context.Background())
+	if err != nil {
+		t.Fatalf("dial the socket of %s: %v", cfg.Dir, err)
+	}
+	defer c.Close()
+	_, pid, err := transport.PeerCred(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pid
+}
+
+// runIn runs argv through the daemon of cfg from the container workspace,
+// returning its stdout and exit code.
+func runIn(t *testing.T, cfg Config, argv ...string) (string, int) {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	code := client.Run(context.Background(), transport.Unix{Path: Socket(cfg.Dir)}, argv, cfg.ContainerWorkspace, strings.NewReader(""), &stdout, &stderr)
+	if code != 0 {
+		t.Logf("%v in %s: exit %d: %s", argv, cfg.Dir, code, stderr.String())
+	}
+	return stdout.String(), code
+}
+
+// With process: shared, the ups of two runtime directories, of two
+// workspaces, start one host process that serves both daemons, each with
+// its own rules, workspace and the environment of the up that added it.
+func TestUpOfTwoRuntimeDirsWithProcessSharedServesBothInOneProcess(t *testing.T) {
+	ctx := context.Background()
+	a, b := sharedPair(t, mustHostrunner(t))
+	t.Setenv("HR_UP_MARK", "a")
+	if err := Up(ctx, a); err != nil {
+		t.Fatalf("Up of A: %v", err)
+	}
+	t.Setenv("HR_UP_MARK", "b")
+	if err := Up(ctx, b); err != nil {
+		t.Fatalf("Up of B: %v", err)
+	}
+
+	sharedPid := servingPid(t, a)
+	if pid := servingPid(t, b); pid != sharedPid {
+		t.Fatalf("A is served by process %d, B by %d; want one process", sharedPid, pid)
+	}
+	cmdline, err := os.ReadFile("/proc/" + strconv.Itoa(sharedPid) + "/cmdline")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if args := strings.Split(string(cmdline), "\x00"); len(args) < 2 || args[1] != "shared" {
+		t.Fatalf("the process serving both runs %q, want hostrunner shared", args)
+	}
+
+	for _, c := range []struct {
+		cfg  Config
+		mark string
+	}{{a, "a"}, {b, "b"}} {
+		if got, code := runIn(t, c.cfg, "printenv", "HR_UP_MARK"); got != c.mark+"\n" || code != 0 {
+			t.Errorf("printenv HR_UP_MARK in %s: got %q, exit %d; want %q, exit 0", c.cfg.Dir, got, code, c.mark+"\n")
+		}
+		if got, code := runIn(t, c.cfg, "pwd"); got != c.cfg.Workspace+"\n" || code != 0 {
+			t.Errorf("pwd in %s: got %q, exit %d; want %q, exit 0", c.cfg.Dir, got, code, c.cfg.Workspace+"\n")
+		}
+	}
+	if _, code := runIn(t, b, "true"); code != 0 {
+		t.Errorf("true, allowed by the rules of B, exits %d there, want 0", code)
+	}
+	if _, code := runIn(t, a, "true"); code != protocol.ExitRejected {
+		t.Errorf("true, not in the rules of A, exits %d there, want %d", code, protocol.ExitRejected)
+	}
+}
+
+// hasLine reports whether a line of log contains every one of parts.
+func hasLine(log string, parts ...string) bool {
+	for line := range strings.Lines(log) {
+		if !slices.ContainsFunc(parts, func(p string) bool { return !strings.Contains(line, p) }) {
+			return true
+		}
+	}
+	return false
+}
+
+// With process: shared, each daemon logs to the daemon.log of its own
+// runtime directory, and the process logs to its own log in the runtime
+// root its start, each daemon added and ended, and its exit.
+func TestUpWithProcessSharedKeepsTheLogOfEachDaemonAndOfTheProcessApart(t *testing.T) {
+	ctx := context.Background()
+	daemon := mustHostrunner(t)
+	a, b := sharedPair(t, daemon)
+	for _, cfg := range []Config{a, b} {
+		if err := Up(ctx, cfg); err != nil {
+			t.Fatalf("Up of %s: %v", cfg.Dir, err)
+		}
+	}
+	pids := sharedPids(t, filepath.Dir(a.Dir))
+	if len(pids) != 1 {
+		t.Fatalf("shared processes %v, want one", pids)
+	}
+	for _, cfg := range []Config{a, b} {
+		stopDaemon(t, daemon, cfg)
+	}
+	waitGone(t, pids[0])
+
+	for _, c := range []struct{ own, other Config }{{a, b}, {b, a}} {
+		data, err := os.ReadFile(filepath.Join(c.own.Dir, LogName))
+		if err != nil {
+			t.Fatal(err)
+		}
+		log := string(data)
+		for _, want := range []string{"socket=" + Socket(c.own.Dir), "workspace=" + c.own.Workspace} {
+			if !strings.Contains(log, want) {
+				t.Errorf("the log of %s lacks %q:\n%s", c.own.Dir, want, log)
+			}
+		}
+		for _, other := range []string{c.other.Dir, c.other.Workspace} {
+			if strings.Contains(log, other) {
+				t.Errorf("the log of %s mentions %s of the other daemon:\n%s", c.own.Dir, other, log)
+			}
+		}
+	}
+
+	_, processLog, err := shared.Files(filepath.Dir(a.Dir), daemon)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(processLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := string(data)
+	for _, want := range [][]string{
+		{`msg="shared process started"`},
+		{`msg="daemon added"`, "socket=" + Socket(a.Dir) + " "},
+		{`msg="daemon added"`, "socket=" + Socket(b.Dir) + " "},
+		{`msg="daemon ended"`, "socket=" + Socket(a.Dir) + " "},
+		{`msg="daemon ended"`, "socket=" + Socket(b.Dir) + " "},
+		{`msg="shared process exiting"`},
+	} {
+		if !hasLine(log, want...) {
+			t.Errorf("the process log has no line with %q:\n%s", want, log)
+		}
+	}
+	if strings.Contains(log, "msg=listening") {
+		t.Errorf("the process log holds the events of a daemon:\n%s", log)
+	}
+}
+
+// copyExecutable copies the executable src to dst, mode 0755, and returns
+// dst.
+func copyExecutable(t *testing.T, src, dst string) string {
+	t.Helper()
+	data, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dst, data, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return dst
+}
+
+// The control socket of the shared process takes no add from another
+// user, even one the file system lets connect: the process closes the
+// connection unanswered and logs the refusal.
+func TestUpWithProcessSharedRefusesAnAddFromAnotherUser(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("needs root to run a process as another user")
+	}
+	const nobody = 65534
+	ctx := context.Background()
+	daemon := mustHostrunner(t)
+	a, _ := sharedPair(t, daemon)
+	if err := Up(ctx, a); err != nil {
+		t.Fatalf("Up of A: %v", err)
+	}
+	root := filepath.Dir(a.Dir)
+	control, processLog, err := shared.Files(root, daemon)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Let the other user reach the control socket and run the test binary.
+	base := filepath.Dir(root)
+	for _, path := range []string{base, root} {
+		if err := os.Chmod(path, 0o711); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Chmod(control, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.CommandContext(ctx, copyExecutable(t, os.Args[0], filepath.Join(base, "add")))
+	cmd.Env = append(os.Environ(), addSharedEnv+"="+control)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: nobody, Gid: nobody}}
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("the add of uid %d was accepted: %s", nobody, out)
+	}
+	if _, ok := errors.AsType[*exec.ExitError](err); !ok {
+		t.Fatalf("run the add as uid %d: %v", nobody, err)
+	}
+	data, err := os.ReadFile(processLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid := "pid=" + strconv.Itoa(cmd.Process.Pid) + " "
+	if log := string(data); !hasLine(log, `msg="control socket connection refused"`, "uid="+strconv.Itoa(nobody), pid) || hasLine(log, `msg="add refused"`, pid) {
+		t.Errorf("the process log does not show the connection of uid %d refused unanswered (add: %s):\n%s", nobody, out, log)
+	}
+}
+
+// The daemons of a shared process are listed under the runtime root, as
+// approve, stop and restart list them, on their approval sockets; its
+// control socket, in the same root, is not taken for a daemon's.
+func TestUpWithProcessSharedListsTheDaemonsAndNotTheControlSocket(t *testing.T) {
+	ctx := context.Background()
+	a, b := sharedPair(t, mustHostrunner(t))
+	for _, cfg := range []Config{a, b} {
+		if err := Up(ctx, cfg); err != nil {
+			t.Fatalf("Up of %s: %v", cfg.Dir, err)
+		}
+	}
+	var got []string
+	for _, d := range daemonlist.List(ctx, filepath.Dir(a.Dir)) {
+		got = append(got, d.Socket)
+	}
+	if want := []string{ApprovalSocket(a.Dir), ApprovalSocket(b.Dir)}; !slices.Equal(got, want) {
+		t.Errorf("listed %v, want %v", got, want)
+	}
+}
+
+// Each build of hostrunner has its shared process: the ups of two runtime
+// directories whose daemon executables differ in content add their
+// daemons to two processes, each on its control socket in the root.
+func TestUpWithProcessSharedOfAnotherExecutableStartsAnotherProcess(t *testing.T) {
+	ctx := context.Background()
+	daemon := mustHostrunner(t)
+	a, b := sharedPair(t, daemon)
+	b.Daemon = copyExecutable(t, daemon, filepath.Join(t.TempDir(), "hostrunner"))
+	f, err := os.OpenFile(b.Daemon, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("another build"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.CommandContext(ctx, b.Daemon, "version").CombinedOutput(); err != nil {
+		t.Fatalf("the changed copy does not run: %v: %s", err, out)
+	}
+	for _, cfg := range []Config{a, b} {
+		if err := Up(ctx, cfg); err != nil {
+			t.Fatalf("Up of %s: %v", cfg.Dir, err)
+		}
+	}
+	if pa, pb := servingPid(t, a), servingPid(t, b); pa == pb {
+		t.Errorf("A and B are both served by process %d, want one process each", pa)
+	}
+	controls, err := filepath.Glob(filepath.Join(filepath.Dir(a.Dir), "shared-*.sock"))
+	if err != nil || len(controls) != 2 {
+		t.Errorf("control sockets %v, %v; want two", controls, err)
+	}
+}
+
+// The shared process outlives a daemon that ends while another runs, and
+// exits once its last daemon ended, removing its control socket.
+func TestUpWithProcessSharedExitsAfterTheLastDaemonEnds(t *testing.T) {
+	ctx := context.Background()
+	daemon := mustHostrunner(t)
+	a, b := sharedPair(t, daemon)
+	for _, cfg := range []Config{a, b} {
+		if err := Up(ctx, cfg); err != nil {
+			t.Fatalf("Up of %s: %v", cfg.Dir, err)
+		}
+	}
+	pid := servingPid(t, a)
+	control, _, err := shared.Files(filepath.Dir(a.Dir), daemon)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stopDaemon(t, daemon, a)
+	if err := WaitStopped(ctx, Socket(a.Dir), 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if !alivePid(pid) {
+		t.Fatalf("the shared process %d exited with the daemon of B still running", pid)
+	}
+	if got, code := runIn(t, b, "pwd"); got != b.Workspace+"\n" || code != 0 {
+		t.Errorf("pwd in %s after A stopped: got %q, exit %d; want %q, exit 0", b.Dir, got, code, b.Workspace+"\n")
+	}
+
+	stopDaemon(t, daemon, b)
+	waitGone(t, pid)
+	if _, err := os.Lstat(control); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the control socket %s after the process exited: %v, want it removed", control, err)
+	}
+}
+
+// SIGTERM or SIGINT to the shared process ends every daemon it runs, then
+// the process itself.
+func TestUpWithProcessSharedEndsItsDaemonsOnASignal(t *testing.T) {
+	for _, sig := range []syscall.Signal{syscall.SIGTERM, syscall.SIGINT} {
+		t.Run(sig.String(), func(t *testing.T) {
+			ctx := context.Background()
+			a, b := sharedPair(t, mustHostrunner(t))
+			for _, cfg := range []Config{a, b} {
+				if err := Up(ctx, cfg); err != nil {
+					t.Fatalf("Up of %s: %v", cfg.Dir, err)
+				}
+			}
+			pid := servingPid(t, a)
+			if err := syscall.Kill(pid, sig); err != nil {
+				t.Fatal(err)
+			}
+			for _, cfg := range []Config{a, b} {
+				if err := WaitStopped(ctx, Socket(cfg.Dir), 5*time.Second); err != nil {
+					t.Error(err)
+				}
+			}
+			waitGone(t, pid)
+		})
+	}
+}
+
+// startSharedProcess starts `hostrunner shared` of the executable daemon
+// in the runtime root root, as up starts it, and waits until its control
+// socket accepts connections. It returns the control socket, the process
+// log and a channel closed once the process exited; the process is killed
+// when the test ends.
+func startSharedProcess(t *testing.T, daemon, root string) (control, processLog string, exited <-chan struct{}) {
+	t.Helper()
+	control, processLog, err := shared.Files(root, daemon)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logFile, err := OpenLog(processLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(daemon, "shared", "--socket", control)
+	cmd.Stdout, cmd.Stderr = logFile, logFile
+	err = cmd.Start()
+	logFile.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(done)
+	}()
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		<-done
+	})
+	deadline := time.Now().Add(5 * time.Second)
+	for !listening(context.Background(), control) {
+		if time.Now().After(deadline) {
+			t.Fatalf("the shared process did not listen on %s", control)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return control, processLog, done
+}
+
+// A shared process whose add is refused while it runs no daemon, as for
+// the first add after it started, ends: nothing would end it otherwise.
+func TestSharedProcessEndsWhenAnAddIsRefusedAndNoDaemonRuns(t *testing.T) {
+	root := shortDir(t)
+	control, _, exited := startSharedProcess(t, mustHostrunner(t), root)
+	if err := shared.Add(context.Background(), control, protocol.AddDaemon{Args: []string{"--socket", filepath.Join(root, "a", "hostrunner.sock")}}); err == nil {
+		t.Fatal("the add of a daemon without its flags was accepted")
+	}
+	select {
+	case <-exited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the shared process runs on with no daemon after the refused add")
+	}
+}
+
+// A refused add of a shared process is in the process log by the socket
+// of the daemon it asked for.
+func TestSharedProcessLogsTheSocketOfARefusedAdd(t *testing.T) {
+	root := shortDir(t)
+	control, processLog, exited := startSharedProcess(t, mustHostrunner(t), root)
+	socket := filepath.Join(root, "a", "hostrunner.sock")
+	if err := shared.Add(context.Background(), control, protocol.AddDaemon{Args: []string{"--socket", socket}}); err == nil {
+		t.Fatal("the add of a daemon without its flags was accepted")
+	}
+	<-exited
+	data, err := os.ReadFile(processLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if log := string(data); !hasLine(log, `msg="add refused"`, "socket="+socket+" ") {
+		t.Errorf("the process log has no refused add naming %s:\n%s", socket, log)
+	}
+}
+
+// An up whose wait for the daemon it added to the shared process fails
+// stops that daemon, as an up of a daemon of its own process kills it;
+// the other daemons of the process keep running.
+func TestUpWithProcessSharedStopsTheDaemonItAddedWhenItsWaitFails(t *testing.T) {
+	ctx := context.Background()
+	a, b := sharedPair(t, mustHostrunner(t))
+	if err := Up(ctx, b); err != nil {
+		t.Fatalf("Up of B: %v", err)
+	}
+	a.ReadyTimeout = time.Millisecond
+	if err := Up(ctx, a); err == nil || !strings.Contains(err.Error(), "did not listen within") {
+		t.Fatalf("Up of A with a timeout of 1 ms: %v, want a timeout", err)
+	}
+	if err := WaitStopped(ctx, Socket(a.Dir), 5*time.Second); err != nil {
+		t.Error(err)
+	}
+	if got, code := runIn(t, b, "pwd"); got != b.Workspace+"\n" || code != 0 {
+		t.Errorf("pwd in %s: got %q, exit %d; want %q, exit 0", b.Dir, got, code, b.Workspace+"\n")
+	}
+}
+
+// addFailingDaemon starts the shared process of a with the up of a, then
+// asks it to add the daemon of another runtime directory of the workspace
+// of a, whose serve fails at once: the directory lies inside the
+// workspace, so its approval socket would too. It returns the Config of
+// that daemon.
+func addFailingDaemon(t *testing.T, a Config) Config {
+	t.Helper()
+	ctx := context.Background()
+	if err := Up(ctx, a); err != nil {
+		t.Fatalf("Up of A: %v", err)
+	}
+	c := a
+	c.Dir = filepath.Join(a.Workspace, "rt", "c")
+	if err := os.MkdirAll(c.Dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	control, _, err := shared.Files(filepath.Dir(a.Dir), a.Daemon)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := shared.Add(ctx, control, protocol.AddDaemon{Args: serveArgs(c, Socket(c.Dir))[1:], Env: os.Environ()}); err != nil {
+		t.Fatalf("add the daemon of %s: %v", c.Dir, err)
+	}
+	return c
+}
+
+// The error a daemon of the shared process ends with is in its own log,
+// as `hostrunner: <error>`, as the error of a daemon of its own process.
+func TestSharedProcessWritesTheErrorADaemonEndsWithToItsLog(t *testing.T) {
+	a, _ := sharedPair(t, mustHostrunner(t))
+	c := addFailingDaemon(t, a)
+	logPath := filepath.Join(c.Dir, LogName)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		data, err := os.ReadFile(logPath)
+		if err == nil && hasLine(string(data), "hostrunner: ", ApprovalSocket(c.Dir)) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the log of %s has no line with its error: %v:\n%s", c.Dir, err, data)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

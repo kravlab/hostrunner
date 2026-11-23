@@ -7,6 +7,7 @@
 //	    --workspace <host-path> --container-workspace <path> [settings]
 //	hostrunner serve --socket <path> --workspace <host-path> --container-workspace <path>
 //	    [--watch] [settings]
+//	hostrunner shared --socket <path>
 //	hostrunner test [--settings <path>] [--workspace-settings <path>] [--rules-file <path>]
 //	    [--] <command> [args...]
 //	hostrunner allow [<workspace>]
@@ -21,7 +22,12 @@
 // `up` is meant for devcontainer's initializeCommand: it installs the client
 // into the runtime directory and starts a detached `serve --watch` there,
 // which exits by itself once its armed container stops; with --restart it
-// replaces a daemon already serving it. `stop` stops a daemon from the
+// replaces a daemon already serving it. With process: shared, `up`
+// adds the daemon to the shared process of its build instead, starting
+// a detached `shared` in the runtime root first when none listens on
+// its control socket there; the process runs each daemon it is asked
+// for as serve would, and ends with the last (see internal/shared).
+// `stop` stops a daemon from the
 // host, the one serving the current directory by default, asking what
 // becomes of the commands it runs unless --kill or --wait says; `restart`
 // then starts a new one for it (see internal/stop). `test` runs the Rules
@@ -98,6 +104,7 @@ import (
 	"github.com/kravlab/hostrunner/internal/rules"
 	"github.com/kravlab/hostrunner/internal/rulesfile"
 	"github.com/kravlab/hostrunner/internal/settings"
+	"github.com/kravlab/hostrunner/internal/shared"
 	"github.com/kravlab/hostrunner/internal/stop"
 	"github.com/kravlab/hostrunner/internal/transport"
 	"github.com/kravlab/hostrunner/internal/update"
@@ -106,7 +113,8 @@ import (
 )
 
 const (
-	usage             = "usage: hostrunner up|serve|test|allow|deny|approve|stop|restart|update|instructions|version [flags]; see `hostrunner <command> -h`"
+	usage             = "usage: hostrunner up|serve|shared|test|allow|deny|approve|stop|restart|update|instructions|version [flags]; see `hostrunner <command> -h`"
+	sharedUsage       = "usage: hostrunner shared --socket <path>"
 	allowUsage        = "usage: hostrunner allow [<workspace>]"
 	denyUsage         = "usage: hostrunner deny [<workspace>]"
 	updateUsage       = "usage: hostrunner update [--check]"
@@ -168,8 +176,9 @@ func exitCode(err error) int {
 // run dispatches the subcommand in args; stdout receives `version`'s,
 // `update`'s, `instructions`', `allow`'s and `deny`'s output and the
 // approval session, which reads the human's answers from stdin; stderr
-// flag help, the daemon's log, the Rules test's verdict, the warning of
-// `allow` and the questions of `instructions --append`, answered on stdin.
+// flag help, the daemon's log or the shared process's, the Rules test's
+// verdict, the warning of `allow` and the questions of `instructions
+// --append`, answered on stdin.
 // The caller prints a returned error; see exitCode for the exit code.
 func run(args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
@@ -213,19 +222,23 @@ func run(args []string, stdout, stderr io.Writer) error {
 		cfg.Commands = commands
 		return stop.Run(sctx, cfg, os.Stdin, stderr)
 	case "serve":
-		cfg, err := parseServe(args[1:], os.Getenv, stderr)
+		cfg, runtimes, err := prepareServe(args[1:], os.Getenv, daemon.NewEnvironment(os.Environ()), stderr, version)
 		if err != nil {
 			return err
 		}
-		cfg.environment = daemon.NewEnvironment(os.Environ())
-		var runtimes []watch.Runtime
-		if cfg.watch {
-			if runtimes = watch.DetectIn(cfg.environment); len(runtimes) == 0 {
-				return errors.New("--watch needs docker or podman in PATH")
-			}
-		}
-		cfg.version = version
 		return serve(ctx, cfg, slog.New(slog.NewTextHandler(stderr, nil)), runtimes)
+	case "shared":
+		socket, err := parseShared(args[1:], stderr)
+		if err != nil {
+			return err
+		}
+		l, err := transport.Unix{Path: socket}.Listen()
+		if err != nil {
+			return err
+		}
+		return shared.Serve(ctx, l, func(args, env []string) (shared.Daemon, error) {
+			return sharedDaemon(args, env, version)
+		}, slog.New(slog.NewTextHandler(stderr, nil)))
 	case "test":
 		cfg, err := parseTest(args[1:], os.Getenv, stderr)
 		if err != nil {
@@ -580,6 +593,78 @@ func parseServe(args []string, getenv func(string) string, output io.Writer) (se
 		return cfg, err
 	}
 	return cfg, nil
+}
+
+// prepareServe prepares the daemon of build version that args, the flags
+// of `hostrunner serve`, describe: it parses them, resolving the settings
+// with getenv and writing flag help to output, sets environment as the
+// one the daemon runs its commands with, and finds the container runtimes
+// its watch polls in it (see serveRuntimes). Both `serve` and a daemon of
+// the shared process (see sharedDaemon) are prepared so.
+func prepareServe(args []string, getenv func(string) string, environment *daemon.Environment, output io.Writer, version string) (serveConfig, []watch.Runtime, error) {
+	cfg, err := parseServe(args, getenv, output)
+	if err != nil {
+		return serveConfig{}, nil, err
+	}
+	cfg.environment = environment
+	runtimes, err := serveRuntimes(cfg)
+	if err != nil {
+		return serveConfig{}, nil, err
+	}
+	cfg.version = version
+	return cfg, runtimes, nil
+}
+
+// serveRuntimes returns the container runtimes the watch of the daemon cfg
+// describes polls, found in the PATH of its environment: none without
+// watch, and an error with watch when there is neither docker nor podman.
+func serveRuntimes(cfg serveConfig) ([]watch.Runtime, error) {
+	if !cfg.watch {
+		return nil, nil
+	}
+	runtimes := watch.DetectIn(cfg.environment)
+	if len(runtimes) == 0 {
+		return nil, errors.New("--watch needs docker or podman in PATH")
+	}
+	return runtimes, nil
+}
+
+// parseShared parses the flags of `hostrunner shared`: --socket, the
+// control socket, is required.
+func parseShared(args []string, output io.Writer) (socket string, err error) {
+	fs := flag.NewFlagSet("shared", flag.ContinueOnError)
+	fs.SetOutput(output)
+	fs.StringVar(&socket, "socket", "", "control socket to listen on")
+	if err := parseFlags(fs, args, sharedUsage); err != nil {
+		return "", err
+	}
+	if socket == "" {
+		return "", errors.New(sharedUsage)
+	}
+	return socket, nil
+}
+
+// sharedDaemon is the daemon a shared process of build version adds for
+// an AddDaemon request: args, the arguments of `hostrunner serve`, parsed
+// as serve parses them but with the settings resolved in env, the
+// environment of the `up` that sent it, which the daemon also runs its
+// commands with and finds the container runtimes in. It logs to daemon.log
+// in its runtime directory, the directory of its socket, opened here as
+// up opens it (see launch.OpenLog) and closed by the process once it
+// ends (see shared.Daemon).
+func sharedDaemon(args, env []string, version string) (shared.Daemon, error) {
+	environment := daemon.NewEnvironment(env)
+	cfg, runtimes, err := prepareServe(args, environment.Getenv, environment, io.Discard, version)
+	if err != nil {
+		return shared.Daemon{}, err
+	}
+	logFile, err := launch.OpenLog(filepath.Join(filepath.Dir(cfg.socket), launch.LogName))
+	if err != nil {
+		return shared.Daemon{}, err
+	}
+	return shared.Daemon{Socket: cfg.socket, Log: logFile, Serve: func(ctx context.Context) error {
+		return serve(ctx, cfg, slog.New(slog.NewTextHandler(logFile, nil)), runtimes)
+	}}, nil
 }
 
 // parseApprove parses the flags of `hostrunner approve`: --dir, the runtime

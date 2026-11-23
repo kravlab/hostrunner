@@ -55,6 +55,14 @@ func (e *Environment) lookup(name string) (string, bool) {
 	return "", false
 }
 
+// Getenv returns the value of the variable name in e, empty when e does
+// not set it, as os.Getenv does in the process's environment: the getenv
+// a daemon resolves its settings with.
+func (e *Environment) Getenv(name string) string {
+	value, _ := e.lookup(name)
+	return value
+}
+
 // LookPath returns the path of the executable file the program name stands
 // for, as exec.LookPath does but in the PATH of e, not of the process: the
 // first executable file of that name in the directories of PATH. Like

@@ -57,6 +57,10 @@ type Settings struct {
 	// ReadyTimeout (ready_timeout) is how long up waits for the daemon it
 	// starts to listen; up's own, not passed to the daemon.
 	ReadyTimeout time.Duration
+	// Process (process) is whether up starts the daemon in a process of its
+	// own (ProcessOwn) or adds it to the shared process of its build
+	// (ProcessShared); up's own, not passed to the daemon.
+	Process string
 	// RuntimeRoot (runtime_root) is where stop, restart and approve look
 	// for daemons' runtime directories; empty when no source gives one
 	// and XDG_RUNTIME_DIR is unset.
@@ -73,6 +77,14 @@ type Settings struct {
 	// check); only a human on the host may turn it off.
 	MountCheck bool
 }
+
+// The values of the setting process: ProcessOwn starts a daemon in a
+// process of its own, ProcessShared adds it to the shared process of its
+// build.
+const (
+	ProcessOwn    = "own"
+	ProcessShared = "shared"
+)
 
 // Resolved is what resolving settings found: the Settings and, besides
 // them, what no key holds, which a daemon is not passed and an arm does
@@ -108,6 +120,7 @@ func defaults(workspace string) Settings {
 		AskTimeout:     10 * time.Minute, // time for a human to come to the host and answer
 		RequestTimeout: 10 * time.Second, // so idle connections cannot pile up
 		ReadyTimeout:   10 * time.Second, // a daemon listens at once, unless something is wrong
+		Process:        ProcessOwn,
 		MountCheck:     true,
 	}
 }
@@ -184,6 +197,7 @@ const (
 	kindPath                 // a file path, not empty; a relative one is read against the workspace
 	kindAbsPath              // a directory path, not empty; a relative one is an error
 	kindCount                // a non-negative int, written in decimal
+	kindChoice               // one of the strings its key lists (values)
 )
 
 // String names the kind in errors ("invalid duration") and usages.
@@ -195,6 +209,8 @@ func (k kind) String() string {
 		return "path"
 	case kindCount:
 		return "integer"
+	case kindChoice:
+		return "value"
 	}
 	return "duration"
 }
@@ -230,9 +246,12 @@ type key struct {
 	// container could write: only the host settings file, its common part
 	// or a workspace section, may set it, besides the flags and variables.
 	hostOnly bool
-	usage    string                // the flag's help
-	field    func(s *Settings) any // a *string, *time.Duration, *bool or *int into s
-	def      any                   // the value no source sets, of the kind; nil when defaults or hostDefaults give it
+	// values are the strings a kindChoice key takes, in the order errors and
+	// usages list them; nil for the other kinds.
+	values []string
+	usage  string                // the flag's help
+	field  func(s *Settings) any // a *string, *time.Duration, *bool or *int into s
+	def    any                   // the value no source sets, of the kind; nil when defaults or hostDefaults give it
 }
 
 // get returns the value of k in s: a string, a time.Duration, a bool or
@@ -314,6 +333,12 @@ var keys = []key{
 		name: "ready_timeout", kind: kindDuration, scope: scopeUp,
 		usage: "how long to wait for the daemon to listen",
 		field: func(s *Settings) any { return &s.ReadyTimeout },
+	},
+	{
+		name: "process", kind: kindChoice, scope: scopeUp,
+		values: []string{ProcessOwn, ProcessShared},
+		usage:  "whether up starts the daemon in a process of its own or adds it to the shared process of its build",
+		field:  func(s *Settings) any { return &s.Process },
 	},
 	{
 		name: "runtime_root", kind: kindAbsPath, scope: scopeRuntimeRoot,
@@ -424,7 +449,8 @@ func mustLookup(name string) key {
 func Usage() string { return usageOf(keysOf(scopeDaemon)) }
 
 // UpUsage is Usage for the flags RegisterUp adds, as up's usage line
-// shows them: Usage and [--ready-timeout <duration>].
+// shows them: Usage, [--ready-timeout <duration>] and [--process
+// <own|shared>].
 func UpUsage() string { return usageOf(keysOf(scopeDaemon, scopeUp)) }
 
 // StopUsage is the usage of the flags RegisterStop adds: [--settings
@@ -466,10 +492,14 @@ const (
 	workspaceFlagUsage = "[--workspace-settings <path>]"
 )
 
-// usageOf is k's flag as a usage line shows it: [--grace <duration>].
+// usageOf is k's flag as a usage line shows it: [--grace <duration>]; a
+// choice lists its values: [--process <own|shared>].
 func (k key) usageOf() string {
 	if k.kind == kindBool {
 		return fmt.Sprintf("[--%s | --no-%[1]s]", k.flagName())
+	}
+	if k.kind == kindChoice {
+		return fmt.Sprintf("[--%s <%s>]", k.flagName(), strings.Join(k.values, "|"))
 	}
 	return fmt.Sprintf("[--%s <%s>]", k.flagName(), k.kind)
 }
@@ -484,6 +514,24 @@ var errEmptyPath = errors.New("empty path")
 // errNegative is the problem with an integer below zero, which no
 // setting can mean.
 var errNegative = errors.New("must not be negative")
+
+// wantValues lists the values of k, a kindChoice key, as errors name
+// them: `own or shared`.
+func (k key) wantValues() string { return strings.Join(k.values, " or ") }
+
+// parse reads raw, the text a variable or a file gives, as a value of
+// k's kind; the error describes the problem without naming the source. A
+// kindChoice value must be one of k's values: `invalid value "x" (want own
+// or shared)`.
+func (k key) parse(raw string) (any, error) {
+	if k.kind == kindChoice {
+		if !slices.Contains(k.values, raw) {
+			return nil, fmt.Errorf("invalid %s %q (want %s)", k.kind, raw, k.wantValues())
+		}
+		return raw, nil
+	}
+	return k.kind.parse(raw)
+}
 
 // check returns the problem with v, a value of kind k, that no setting
 // can mean whatever its source: errNotPositive for a duration at or
@@ -503,9 +551,12 @@ func (k kind) check(v any) error {
 }
 
 // parse reads raw, the text a variable or a file gives, as a value of
-// kind k; the error describes the problem without naming the source.
+// kind k, any but kindChoice, which its key parses (see key.parse); the
+// error describes the problem without naming the source.
 func (k kind) parse(raw string) (any, error) {
 	switch k {
+	case kindChoice:
+		panic("settings: a choice is parsed by its key")
 	case kindPath, kindAbsPath:
 		if raw == "" {
 			return nil, errEmptyPath
@@ -673,7 +724,7 @@ func env(in scopes, getenv func(string) string) (layer, error) {
 		if raw == "" {
 			continue
 		}
-		v, err := k.kind.parse(raw)
+		v, err := k.parse(raw)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", k.variable(), err)
 		}

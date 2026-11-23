@@ -42,6 +42,7 @@ import (
 	"github.com/kravlab/hostrunner/internal/allow"
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
+	"github.com/kravlab/hostrunner/internal/transport"
 	"github.com/kravlab/hostrunner/internal/workspace"
 )
 
@@ -316,7 +317,7 @@ func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 	for {
 		conn, err := l.Accept()
 		if err != nil {
-			if isTemporary(err) && ctx.Err() == nil {
+			if transport.IsTemporary(err) && ctx.Err() == nil {
 				backoff = min(max(2*backoff, 5*time.Millisecond), time.Second)
 				s.log.Warn("accept failed, retrying", "error", err, "backoff", backoff)
 				select {
@@ -340,17 +341,6 @@ func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 		backoff = 0
 		wg.Go(func() { s.handle(ctx, conn) })
 	}
-}
-
-// isTemporary reports accept errors caused by momentary resource shortage,
-// after which accepting can succeed again.
-func isTemporary(err error) bool {
-	for _, errno := range []syscall.Errno{syscall.EMFILE, syscall.ENFILE, syscall.ENOBUFS, syscall.ENOMEM, syscall.ECONNABORTED} {
-		if errors.Is(err, errno) {
-			return true
-		}
-	}
-	return false
 }
 
 // handle serves one connection to the container's socket: a dry run or

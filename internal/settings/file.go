@@ -183,7 +183,7 @@ func readSettings(in scopes, m *yaml.Node, where string, p part) (layer, map[str
 		if !in.takes(k) {
 			continue
 		}
-		v, err := nodeValue(k.kind, value)
+		v, err := nodeValue(k, value)
 		if err != nil {
 			return nil, nil, fmt.Errorf("%s%s: %w", where, name, err)
 		}
@@ -214,12 +214,13 @@ func readSections(in scopes, m *yaml.Node, where string) (map[string]layer, erro
 	return sections, nil
 }
 
-// nodeValue reads n as a value of kind k. YAML would read a bare number
-// into a time.Duration as nanoseconds and `yes` into a bool, so the node's
-// tag must match: a string for a duration, a bool for a bool, an integer
-// for an integer.
-func nodeValue(k kind, n *yaml.Node) (any, error) {
-	want := "!!str" // a duration or a path
+// nodeValue reads n as a value of the key setting. YAML would read a bare
+// number into a time.Duration as nanoseconds and `yes` into a bool, so the
+// node's tag must match: a string for a duration, a bool for a bool, an
+// integer for an integer.
+func nodeValue(setting key, n *yaml.Node) (any, error) {
+	k := setting.kind
+	want := "!!str" // a duration, a path or a choice
 	switch k {
 	case kindBool:
 		want = "!!bool"
@@ -230,7 +231,7 @@ func nodeValue(k kind, n *yaml.Node) (any, error) {
 	case n.Kind != yaml.ScalarNode:
 		return nil, fmt.Errorf("invalid %s: not a single value (line %d)", k, n.Line)
 	case n.Tag == want:
-		return k.parse(n.Value)
+		return setting.parse(n.Value)
 	case n.Tag == "!!null":
 		return nil, fmt.Errorf("invalid %s: no value (line %d)", k, n.Line)
 	case k == kindDuration && (n.Tag == "!!int" || n.Tag == "!!float"):

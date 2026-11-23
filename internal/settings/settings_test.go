@@ -24,6 +24,7 @@ var defaults = settings.Settings{
 	AskTimeout:     10 * time.Minute,
 	RequestTimeout: 10 * time.Second,
 	ReadyTimeout:   10 * time.Second,
+	Process:        settings.ProcessOwn,
 	MountCheck:     true,
 }
 
@@ -146,6 +147,7 @@ func TestResolveReadsEveryVariable(t *testing.T) {
 		AskTimeout:     20 * time.Minute,
 		RequestTimeout: 30 * time.Second,
 		ReadyTimeout:   time.Minute,
+		Process:        settings.ProcessOwn,
 	}
 	if err != nil || got.Settings != want {
 		t.Fatalf("got %+v, %v; want %+v", got, err, want)
@@ -348,7 +350,7 @@ func TestMountCheckOffHint(t *testing.T) {
 }
 
 func TestUpUsageAlsoNamesTheReadyTimeout(t *testing.T) {
-	want := settings.Usage() + " [--ready-timeout <duration>]"
+	want := settings.Usage() + " [--ready-timeout <duration>] [--process <own|shared>]"
 	if got := settings.UpUsage(); got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}
@@ -358,5 +360,77 @@ func TestRulesFileUsageNamesTheFlagsThatChooseTheRulesFile(t *testing.T) {
 	want := "[--settings <path>] [--workspace-settings <path>] [--rules-file <path>]"
 	if got := settings.RulesFileUsage(); got != want {
 		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+// The process of up is its own, unless a source says shared.
+func TestProcessDefaultsToOwn(t *testing.T) {
+	got, err := parseUp(t).Resolve(env(nil), noWorkspace)
+	if err != nil || got.Process != settings.ProcessOwn {
+		t.Fatalf("got %q, %v; want %q", got.Process, err, settings.ProcessOwn)
+	}
+}
+
+// A variable sets the process of up.
+func TestProcessIsSetByAVariable(t *testing.T) {
+	got, err := parseUp(t).Resolve(env(map[string]string{"HOSTRUNNER_PROCESS": "shared"}), noWorkspace)
+	if err != nil || got.Process != settings.ProcessShared {
+		t.Fatalf("got %q, %v; want %q", got.Process, err, settings.ProcessShared)
+	}
+}
+
+// A flag sets the process of up over a variable.
+func TestProcessIsSetByAFlagOverAVariable(t *testing.T) {
+	got, err := parseUp(t, "--process", "shared").Resolve(env(map[string]string{"HOSTRUNNER_PROCESS": "own"}), noWorkspace)
+	if err != nil || got.Process != settings.ProcessShared {
+		t.Fatalf("got %q, %v; want %q", got.Process, err, settings.ProcessShared)
+	}
+}
+
+// A value that is neither own nor shared is an error naming its source and
+// key and the values it may take, in a variable, a flag and a file.
+func TestProcessRefusesAnInvalidValue(t *testing.T) {
+	const want = `invalid value "x" (want own or shared)`
+	_, err := parseUp(t).Resolve(env(map[string]string{"HOSTRUNNER_PROCESS": "x"}), noWorkspace)
+	if err == nil || err.Error() != "HOSTRUNNER_PROCESS: "+want {
+		t.Errorf("variable: got %v, want HOSTRUNNER_PROCESS: %s", err, want)
+	}
+	_, err = parseUp(t, "--process", "x").Resolve(env(nil), noWorkspace)
+	if _, ok := errors.AsType[*settings.FlagError](err); !ok || err.Error() != "--process: "+want {
+		t.Errorf("flag: got %v, want a flag error --process: %s", err, want)
+	}
+	path := writeFile(t, "process: x\n")
+	_, err = parseUp(t, "--settings", path).Resolve(env(nil), noWorkspace)
+	if err == nil || err.Error() != "settings file "+path+": process: "+want {
+		t.Errorf("file: got %v, want settings file %s: process: %s", err, path, want)
+	}
+	path = writeFile(t, "process: 1\n")
+	_, err = parseUp(t, "--settings", path).Resolve(env(nil), noWorkspace)
+	if err == nil || !strings.Contains(err.Error(), "process: invalid value 1") {
+		t.Errorf("file, a number: got %v, want process: invalid value 1", err)
+	}
+}
+
+// The process is up's own: serve does not take it, and the daemon is not
+// passed it.
+func TestProcessIsNotADaemonSetting(t *testing.T) {
+	s := defaults
+	s.Process = settings.ProcessShared
+	if _, ok := s.Daemon()["process"]; ok {
+		t.Errorf("Daemon: got process in %v", s.Daemon())
+	}
+	if _, ok := settings.DaemonDefaults(noWorkspace)["process"]; ok {
+		t.Error("DaemonDefaults: got process")
+	}
+	got, err := parse(t).Resolve(env(map[string]string{"HOSTRUNNER_PROCESS": "x"}), noWorkspace)
+	if err != nil || got.Process != settings.ProcessOwn {
+		t.Errorf("serve: got %q, %v; want the default, the variable unread", got.Process, err)
+	}
+}
+
+// up's usage names --process with the values it takes.
+func TestUpUsageNamesTheProcess(t *testing.T) {
+	if got := settings.UpUsage(); !strings.Contains(got, "[--process <own|shared>]") {
+		t.Errorf("UpUsage: got %q, want [--process <own|shared>] in it", got)
 	}
 }

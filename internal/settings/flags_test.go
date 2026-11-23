@@ -146,7 +146,7 @@ func TestRegisterRulesFileAddsTheFlagsThatChooseTheRulesFile(t *testing.T) {
 }
 
 // Register adds the flags of the keys serve takes; RegisterUp adds
-// --ready-timeout too, up's own.
+// --ready-timeout and --process too, up's own.
 func TestRegisterUpAddsTheReadyTimeout(t *testing.T) {
 	names := func(register func(*settings.Flags, *flag.FlagSet)) map[string]bool {
 		var f settings.Flags
@@ -165,8 +165,8 @@ func TestRegisterUpAddsTheReadyTimeout(t *testing.T) {
 	if serve["ready-timeout"] {
 		t.Error("Register: got --ready-timeout, which serve does not take")
 	}
-	if up := names((*settings.Flags).RegisterUp); !up["ready-timeout"] || len(up) != len(serve)+1 {
-		t.Errorf("RegisterUp: got %v, want the flags of Register and --ready-timeout", up)
+	if up := names((*settings.Flags).RegisterUp); !up["ready-timeout"] || !up["process"] || len(up) != len(serve)+2 {
+		t.Errorf("RegisterUp: got %v, want the flags of Register, --ready-timeout and --process", up)
 	}
 
 	var f settings.Flags

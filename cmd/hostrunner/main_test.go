@@ -305,6 +305,7 @@ func tuned(rulesFile string, startupTimeout, grace time.Duration, reread bool) s
 		RequestTimeout: 10 * time.Second,
 		ReadyTimeout:   10 * time.Second,
 		MountCheck:     true,
+		Process:        settings.ProcessOwn,
 	}
 }
 
@@ -1235,7 +1236,7 @@ func TestRunDispatchesUpdate(t *testing.T) {
 // TestUsageListsTheSubcommands checks that the top-level usage names
 // every subcommand.
 func TestUsageListsTheSubcommands(t *testing.T) {
-	if err := run(nil, io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "up|serve|test|allow|deny|approve|stop|restart|update|instructions|version") {
+	if err := run(nil, io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "up|serve|shared|test|allow|deny|approve|stop|restart|update|instructions|version") {
 		t.Fatalf("got %v, want the usage listing every subcommand", err)
 	}
 }
