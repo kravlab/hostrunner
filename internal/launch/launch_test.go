@@ -1871,6 +1871,149 @@ func TestUpWithProcessSharedThatMeetsAnEndingProcessAddsTheDaemonToANewOne(t *te
 	}
 }
 
+// socketFds returns the sockets the process pid holds open, as the targets
+// of its descriptors in /proc show them ("socket:[<inode>]").
+func socketFds(t *testing.T, pid int) map[string]bool {
+	t.Helper()
+	dir := "/proc/" + strconv.Itoa(pid) + "/fd"
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sockets := map[string]bool{}
+	for _, e := range entries {
+		if target, err := os.Readlink(filepath.Join(dir, e.Name())); err == nil && strings.HasPrefix(target, "socket:") {
+			sockets[target] = true
+		}
+	}
+	return sockets
+}
+
+// An up racing the end of a real shared process, whose add the process
+// refuses as ending, succeeds in a new shared process.
+func TestUpWithProcessSharedRacingTheEndOfTheProcessAddsTheDaemonToANewOne(t *testing.T) {
+	daemon := mustHostrunner(t)
+	a, b := sharedPair(t, daemon)
+	a.ReadyTimeout = 15 * time.Second
+	if err := Up(context.Background(), b); err != nil {
+		t.Fatalf("Up of B: %v", err)
+	}
+	ending := servingPid(t, b)
+	control, processLog, err := shared.Files(filepath.Dir(b.Dir), daemon)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The process stays reachable on held, a second link to its socket,
+	// while the test listens on the control socket's name, so that it
+	// holds the add of A there until the end of the process is decided.
+	held := control + ".held"
+	if err := os.Link(control, held); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Remove(held) })
+	if err := os.Remove(control); err != nil {
+		t.Fatal(err)
+	}
+	l, err := net.ListenUnix("unix", &net.UnixAddr{Name: control, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The process removes the socket at control as it ends; the test
+	// never does, so that it removes no socket of a new process.
+	l.SetUnlinkOnClose(false)
+	upErr := make(chan error, 1)
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		upErr <- Up(context.Background(), a)
+	}()
+	var fromUp net.Conn
+	defer func() {
+		// Whatever failed, the up is let go and waited for before the
+		// cleanup of sharedConfigs stops the daemons.
+		l.Close()
+		if fromUp != nil {
+			fromUp.Close()
+		}
+		<-finished
+	}()
+	_ = l.SetDeadline(time.Now().Add(10 * time.Second))
+	if fromUp, err = l.Accept(); err != nil {
+		t.Fatalf("the add of A: %v", err)
+	}
+	_ = fromUp.SetDeadline(time.Now().Add(10 * time.Second))
+	f, err := protocol.ReadFrame(fromUp)
+	if err != nil {
+		t.Fatalf("the add request of A: %v", err)
+	}
+	var request bytes.Buffer
+	if err := protocol.WriteFrame(&request, f); err != nil {
+		t.Fatal(err)
+	}
+	before := socketFds(t, ending)
+	toProcess, err := net.Dial("unix", held)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer toProcess.Close()
+	_ = toProcess.SetDeadline(time.Now().Add(10 * time.Second))
+	// All of the request but its last byte: the process reads it until
+	// its end is decided, then refuses it as ending.
+	if _, err := toProcess.Write(request.Bytes()[:request.Len()-1]); err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		after := socketFds(t, ending)
+		if slices.ContainsFunc(slices.Collect(maps.Keys(after)), func(s string) bool { return !before[s] }) {
+			break // the process accepted the connection
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the shared process does not accept the add of A")
+		}
+	}
+	stopDaemon(t, daemon, b)
+	answer, err := protocol.ReadFrame(toProcess)
+	if err != nil {
+		t.Fatalf("the answer of the shared process to the add of A: %v, want FrameEnding", err)
+	}
+	if answer.Type != protocol.FrameEnding {
+		t.Fatalf("the answer of the shared process to the add of A: frame type %d, want FrameEnding (%d)", answer.Type, protocol.FrameEnding)
+	}
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		if _, err := os.Lstat(control); errors.Is(err, os.ErrNotExist) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the ending shared process does not remove its control socket")
+		}
+	}
+	if err := protocol.WriteFrame(fromUp, answer); err != nil {
+		t.Fatal(err)
+	}
+	fromUp.Close()
+	if err := <-upErr; err != nil {
+		t.Fatalf("Up of A: %v", err)
+	}
+	pid := servingPid(t, a)
+	if pid == ending {
+		t.Fatal("the daemon of A is served by the ending shared process")
+	}
+	if kind := processKind(t, pid); kind != "shared" {
+		t.Errorf("the daemon of A is served by a process that runs %s, want shared", kind)
+	}
+	waitGone(t, ending)
+	if _, code := runIn(t, a, "pwd"); code != 0 {
+		t.Errorf("pwd through the daemon of A: exit %d, want 0", code)
+	}
+	data, err := os.ReadFile(processLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if log := string(data); !hasLine(log, `msg="add refused"`, "the shared process is ending") {
+		t.Errorf("the process log records no add refused as the process is ending:\n%s", log)
+	}
+}
+
 // timingSlack is how much longer than its ready timeout an up of the
 // shared path may take in the tests that bound it: room for a loaded
 // machine, yet clearly less than the 5 s that one exchange on the control
