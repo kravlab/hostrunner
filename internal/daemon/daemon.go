@@ -43,6 +43,7 @@ import (
 	"github.com/kravlab/hostrunner/internal/contain"
 	"github.com/kravlab/hostrunner/internal/protocol"
 	"github.com/kravlab/hostrunner/internal/rules"
+	"github.com/kravlab/hostrunner/internal/settings"
 	"github.com/kravlab/hostrunner/internal/transport"
 	"github.com/kravlab/hostrunner/internal/workspace"
 )
@@ -155,13 +156,12 @@ func WithSettings(daemonSettings map[string]string) Option {
 	return func(s *Server) { s.settings = daemonSettings }
 }
 
-// WithProcess sets the kind of process the Server actually runs in, "own"
-// or "shared" (the values of settings.Process; not the process setting,
-// which may name another), which it tells approval sessions and
-// `hostrunner restart` (protocol.DaemonInfo.Process); without it the
-// Server reports none, as a daemon older than the field does.
-func WithProcess(process string) Option {
-	return func(s *Server) { s.process = process }
+// WithProcess sets the kind of process the Server actually runs in, own or
+// shared (not the process setting, which may name another), which it tells
+// approval sessions and `hostrunner restart` (protocol.DaemonInfo.Process);
+// without it the Server reports none, as a daemon older than the field does.
+func WithProcess(process settings.Process) Option {
+	return func(s *Server) { s.process = string(process) }
 }
 
 // WithReread lets an approval session make the Server reread its rules
@@ -269,7 +269,7 @@ func New(mapper *workspace.Mapper, policy Policy, log *slog.Logger, opts ...Opti
 		mapper: mapper, policy: policy, log: log,
 		requestTimeout: defaultRequestTimeout, askTimeout: defaultAskTimeout,
 		running: map[uint64]protocol.RunningCommand{}, draining: make(chan struct{}),
-		mount: noMountCheck{}, environment: processEnvironment,
+		mount: noMountCheck{}, environment: ProcessEnvironment(),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -979,14 +979,6 @@ func decodeRequest(f protocol.Frame) (protocol.Request, error) {
 // the path valid only until exec, as it inherits the descriptor until then.
 func fdPath(dir *os.File) string {
 	return fmt.Sprintf("/proc/self/fd/%d", dir.Fd())
-}
-
-// newCommand prepares argv to run in the environment of the process, the
-// way a Server without WithEnvironment starts a command (see
-// Server.command): in the open directory dir, whose real path is hostPath,
-// with the environment env (see inDirectory), its output streamed to out.
-func newCommand(ctx context.Context, argv []string, dir *os.File, hostPath string, env []string, out *frameWriter) *exec.Cmd {
-	return streamTo(inDirectory(processEnvironment.command(ctx, argv), dir, hostPath, env), out)
 }
 
 // command prepares p's argv to run in the daemon's environment, which

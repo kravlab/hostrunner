@@ -554,22 +554,12 @@ var errEmptyPath = errors.New("empty path")
 // setting can mean.
 var errNegative = errors.New("must not be negative")
 
-// wantValues lists the values of k, a kindChoice key, as errors name
-// them: `own or shared`.
-func (k key) wantValues() string { return strings.Join(k.values, " or ") }
-
 // parse reads raw, the text a variable or a file gives, as a value of
 // k's kind; the error describes the problem without naming the source. A
 // kindChoice value must be one of k's values: `invalid value "x" (want own
 // or shared)`.
 func (k key) parse(raw string) (any, error) {
-	if k.kind == kindChoice {
-		if !slices.Contains(k.values, raw) {
-			return nil, fmt.Errorf("invalid %s %q (want %s)", k.kind, raw, k.wantValues())
-		}
-		return raw, nil
-	}
-	return k.kind.parse(raw)
+	return k.kind.parse(raw, k.values)
 }
 
 // check returns the problem with v, a value of kind k, that no setting
@@ -590,12 +580,15 @@ func (k kind) check(v any) error {
 }
 
 // parse reads raw, the text a variable or a file gives, as a value of
-// kind k, any but kindChoice, which its key parses (see key.parse); the
-// error describes the problem without naming the source.
-func (k kind) parse(raw string) (any, error) {
+// kind k; the error describes the problem without naming the source.
+// values are the strings a kindChoice takes, which no other kind reads.
+func (k kind) parse(raw string, values []string) (any, error) {
 	switch k {
 	case kindChoice:
-		panic("settings: a choice is parsed by its key")
+		if !slices.Contains(values, raw) {
+			return nil, fmt.Errorf("invalid %s %q (want %s)", k, raw, strings.Join(values, " or "))
+		}
+		return raw, nil
 	case kindPath, kindAbsPath:
 		if raw == "" {
 			return nil, errEmptyPath

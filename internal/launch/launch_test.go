@@ -2620,6 +2620,8 @@ func TestUpWithProcessSharedRefusesAnAddFromAnotherUser(t *testing.T) {
 	pid := "pid=" + strconv.Itoa(cmd.Process.Pid) + " "
 	if log := string(data); !hasLine(log, `msg="control socket connection refused"`, "uid="+strconv.Itoa(nobody), pid) || hasLine(log, `msg="add refused"`, pid) {
 		t.Errorf("the process log does not show the connection of uid %d refused (add: %s):\n%s", nobody, out, log)
+	} else if !hasLine(log, `msg="control socket connection refused"`, `reason="the peer's uid is not this user's"`) || strings.Contains(log, "error=<nil>") {
+		t.Errorf("the process log does not give the reason, or has a nil error (add: %s):\n%s", out, log)
 	}
 }
 
@@ -3552,9 +3554,10 @@ func TestUpWithProcessSharedStopsTheDaemonItAddedWhenItsWaitFails(t *testing.T) 
 	upCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	go func() {
-		// The process logs the daemon added before it answers the add, and
-		// the wait for the arm tries first 50 ms after it began: the cancel
-		// ends that wait, before the daemon is armed.
+		// The process logs the daemon added as the daemon starts to run,
+		// about when it answers the add, and the wait for the arm tries
+		// first 50 ms after it began: the cancel ends that wait, before
+		// the daemon is armed.
 		for upCtx.Err() == nil {
 			if data, _ := os.ReadFile(processLog); hasLine(string(data), `msg="daemon added"`, "socket="+Socket(a.Dir)+" ") {
 				cancel()
@@ -3634,7 +3637,7 @@ func TestUpWithProcessSharedStopsTheDaemonItAddedWhenItsReadyTimeoutPasses(t *te
 
 	gaveUp := make(chan struct{}) // closed once the approval socket of the test is gone
 	go func() {
-		// The process logs the daemon added before it answers the add.
+		// The process logs the daemon added as the daemon starts to run.
 		added := func() bool {
 			data, _ := os.ReadFile(processLog)
 			return hasLine(string(data), `msg="daemon added"`, "socket="+Socket(a.Dir)+" ")

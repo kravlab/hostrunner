@@ -140,6 +140,63 @@ func testServeEndsOnlyTheDaemonThatPanics(t *testing.T, panicking func(ctx conte
 	}
 }
 
+// A panic while the shared process prepares the daemon of an add request
+// refuses that add alone: its peer gets a refusal that does not carry the
+// stack, the panic with its stack is in the process log, and the process
+// goes on, with the daemon it runs and with later adds.
+func TestServeRefusesAnAddWhosePreparationPanics(t *testing.T) {
+	control := filepath.Join(t.TempDir(), "control.sock")
+	l, err := transport.Unix{Path: control}.Listen()
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs := map[string]*logBuffer{"first": newLogBuffer(), "later": newLogBuffer()}
+	prepare := func(args, _ []string) (shared.Daemon, error) {
+		name := args[0]
+		if name == "panics" {
+			panic("the preparation broke")
+		}
+		return shared.Daemon{Socket: name, Log: logs[name], Serve: func(ctx context.Context) error {
+			<-ctx.Done()
+			return nil
+		}}, nil
+	}
+	processLog := newLogBuffer()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	served := make(chan error, 1)
+	go func() {
+		served <- shared.Serve(ctx, l, prepare, time.Minute, slog.New(slog.NewTextHandler(processLog, nil)))
+	}()
+
+	if err := shared.Add(ctx, control, protocol.AddDaemon{Args: []string{"first"}}); err != nil {
+		t.Fatalf("add first: %v", err)
+	}
+	err = shared.Add(ctx, control, protocol.AddDaemon{Args: []string{"panics"}})
+	if err == nil || errors.Is(err, shared.ErrEnding) {
+		t.Errorf("the add whose preparation panicked: got %v, want a refusal that is not ErrEnding", err)
+	} else if strings.Contains(err.Error(), "shared_test.go") {
+		t.Errorf("the refusal carries the stack:\n%v", err)
+	}
+	if err := shared.Add(ctx, control, protocol.AddDaemon{Args: []string{"later"}}); err != nil {
+		t.Errorf("add later, after the panic: %v", err)
+	}
+	select {
+	case err := <-served:
+		t.Fatalf("the process ended with the add that panicked: %v", err)
+	case <-logs["first"].closed:
+		t.Fatal("the daemon already running ended with the add that panicked")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if log := processLog.String(); !strings.Contains(log, "the preparation broke") || !strings.Contains(log, "shared_test.go") {
+		t.Errorf("the process log lacks the panic and its stack:\n%s", log)
+	}
+	cancel()
+	if err := <-served; err != nil {
+		t.Errorf("Serve: %v", err)
+	}
+}
+
 // A shared process that gets no daemon within its first-add timeout
 // ends on its own: Serve returns, its control socket is removed and the
 // process log says why.

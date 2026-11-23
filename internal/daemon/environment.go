@@ -19,10 +19,16 @@ type Environment struct {
 	process bool // the process's, read whenever it is used; vars is unused
 }
 
-// processEnvironment is what a Server runs with unless WithEnvironment
-// gives it another: the environment of its process, as it is when a command
-// starts, which is the daemon's own where it is alone in its process.
+// processEnvironment is the one Environment of the process, see
+// ProcessEnvironment.
 var processEnvironment = &Environment{process: true}
+
+// ProcessEnvironment returns the environment of the process, as it is
+// whenever it is used, which is the daemon's own where it is alone in its
+// process. It is what a Server runs with unless WithEnvironment gives it
+// another. It returns one shared value, safe to share because it is only
+// read.
+func ProcessEnvironment() *Environment { return processEnvironment }
 
 // NewEnvironment returns an Environment of vars, which it copies.
 func NewEnvironment(vars []string) *Environment {

@@ -586,7 +586,7 @@ type spawned struct {
 	logStart int64         // where its output starts in its log
 	// host is, for a daemon added to a shared process this up started,
 	// that process: waitReady fails at once when it exits, and the errors
-	// of the wait quote its log too (see waitReadyLogs). nil otherwise.
+	// of the wait quote its log too (see startFailureLogs). nil otherwise.
 	host *spawned
 }
 
@@ -600,30 +600,26 @@ func (s spawned) ownLogSinceStart() string {
 	return logTail(s.logPath, s.logStart)
 }
 
-// ownAndHostLogsSinceStart is what s wrote to its own log since it
-// started (see ownLogSinceStart) and, when s has a host that wrote to its
-// log since it started, "; <host's what> log: " and what the host wrote;
-// "" when neither wrote anything.
-func (s spawned) ownAndHostLogsSinceStart() string {
-	out := s.ownLogSinceStart()
-	if s.host == nil {
-		return out
-	}
-	if host := s.host.ownLogSinceStart(); host != "" {
-		out = strings.TrimPrefix(out+"; "+s.host.what+" log: "+host, "; ")
-	}
-	return out
-}
-
-// waitReadyLogs is what waitReady quotes for s when its wait fails: the
-// tail of the own log of s since it started (see logTail), a placeholder
-// when that log is missing or unreadable, and for an s with a host, the
-// logs of both since they started instead (see ownAndHostLogsSinceStart).
-func (s spawned) waitReadyLogs() string {
+// startFailureLogs is what up's errors quote for s when its start fails:
+// the tail of the log of s since it started (see logTail), a placeholder
+// when that log is missing or unreadable. For an s with a host, it is
+// instead what s wrote to its own log since it started (see
+// ownLogSinceStart) followed by "; <host's what> log: " and what the host
+// wrote to its log since it started, each part left out when its log got
+// nothing; "" when neither wrote anything.
+func (s spawned) startFailureLogs() string {
 	if s.host == nil {
 		return logTail(s.logPath, s.logStart)
 	}
-	return s.ownAndHostLogsSinceStart()
+	own := s.ownLogSinceStart()
+	host := s.host.ownLogSinceStart()
+	switch {
+	case host == "":
+		return own
+	case own == "":
+		return s.host.what + " log: " + host
+	}
+	return own + "; " + s.host.what + " log: " + host
 }
 
 // spawn starts exe with args, the process what names in errors, in its
@@ -682,7 +678,7 @@ func armReady(ctx context.Context, cfg Config, a protocol.Arm) func() (bool, err
 // ends; it kills s in each case but the first two (an s whose host ended
 // ended with it), and but for ctx the error carries the tail of the log of
 // s since s started, and that of its host's log when it has one (see
-// spawned.waitReadyLogs). An s whose exited is nil is not watched for its
+// spawned.startFailureLogs). An s whose exited is nil is not watched for its
 // end: only its host, d, ready and ctx end the wait.
 func waitReady(ctx context.Context, d readyDeadline, s spawned, ready func() (bool, error)) error {
 	ticker := time.NewTicker(50 * time.Millisecond)
@@ -695,12 +691,12 @@ func waitReady(ctx context.Context, d readyDeadline, s spawned, ready func() (bo
 	for {
 		select {
 		case state := <-s.exited:
-			return fmt.Errorf("%s exited during startup (%s): %s", s.what, state, s.waitReadyLogs())
+			return fmt.Errorf("%s exited during startup (%s): %s", s.what, state, s.startFailureLogs())
 		case state := <-hostExited:
-			return fmt.Errorf("%s exited (%s) while up waited for its %s to listen: %s", s.host.what, state, s.what, s.waitReadyLogs())
+			return fmt.Errorf("%s exited (%s) while up waited for its %s to listen: %s", s.host.what, state, s.what, s.startFailureLogs())
 		case <-deadline:
 			s.kill()
-			return fmt.Errorf("%s did not listen within %v: %s", s.what, d.timeout, s.waitReadyLogs())
+			return fmt.Errorf("%s did not listen within %v: %s", s.what, d.timeout, s.startFailureLogs())
 		case <-ctx.Done():
 			s.kill()
 			return ctx.Err()
@@ -711,7 +707,7 @@ func waitReady(ctx context.Context, d readyDeadline, s spawned, ready func() (bo
 			}
 			if err != nil {
 				s.kill()
-				return fmt.Errorf("%w: %s", err, s.waitReadyLogs())
+				return fmt.Errorf("%w: %s", err, s.startFailureLogs())
 			}
 		}
 	}

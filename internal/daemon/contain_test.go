@@ -43,6 +43,69 @@ func TestServeContainsAPanicOfItsGoroutines(t *testing.T) {
 	}
 }
 
+// A panic in the goroutine rereading the rules file ends the daemon whose
+// goroutine it is alone, as the shared process runs each daemon under a
+// containment of its own (see shared.serveDaemon): Serve ends with the
+// panic as its error, with its stack, and the containment of a sibling
+// daemon stays uncancelled and keeps serving.
+func TestRereadPanicEndsItsDaemonAlone(t *testing.T) {
+	rulesFile := filepath.Join(t.TempDir(), "hostrunner-rules.yaml")
+	if err := os.WriteFile(rulesFile, []byte("rules:\n  - command: echo\n    args: any\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	panicking := newPolicyServer(t, policyOf{},
+		daemon.WithApprovals(newChanListener(), rulesFile),
+		daemon.WithReread("old", func() (daemon.Policy, string, error) { panic("reread broke") }),
+		daemon.WithRereadEvery(time.Millisecond))
+	sibling := newPolicyServer(t, allowAll{})
+	siblingListener := newChanListener()
+
+	parent, stopAll := context.WithTimeout(context.Background(), 30*time.Second)
+	defer stopAll()
+	// Each daemon is served as shared.serveDaemon serves one: under a
+	// containment of its own, and with the panic it kept as its error.
+	serveContained := func(srv *daemon.Server, l net.Listener) (context.Context, <-chan error) {
+		ctx, cancel := contain.Within(parent, nil)
+		done := make(chan error, 1)
+		go func() {
+			defer cancel()
+			done <- contain.Call(ctx, func() error { return srv.Serve(ctx, l) })
+		}()
+		return ctx, done
+	}
+	panickingCtx, panickingDone := serveContained(panicking, newChanListener())
+	siblingCtx, siblingDone := serveContained(sibling, siblingListener)
+
+	var err error
+	select {
+	case err = <-panickingDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the daemon whose reread panicked did not end")
+	}
+	var pe *contain.PanicError
+	if !errors.As(err, &pe) {
+		t.Fatalf("Serve ended with %v, want a *contain.PanicError", err)
+	}
+	if pe.Value != "reread broke" || len(pe.Stack) == 0 {
+		t.Fatalf("the panic is %v with a %d-byte stack, want reread broke with a stack", pe.Value, len(pe.Stack))
+	}
+	if !errors.Is(context.Cause(panickingCtx), pe) {
+		t.Fatalf("the containment's context ended with %v, want the panic", context.Cause(panickingCtx))
+	}
+
+	if err := siblingCtx.Err(); err != nil {
+		t.Fatalf("the sibling's containment ended with %v, want it running", err)
+	}
+	if got := ask(t, siblingListener, protocol.FrameRequest, "printf", "alive"); got.end.Type != protocol.FrameExit || got.stdout != "alive" {
+		t.Fatalf("the sibling answered %q ending with frame %d %s, want alive and an Exit", got.stdout, got.end.Type, got.end.Payload)
+	}
+	select {
+	case err := <-siblingDone:
+		t.Fatalf("the sibling's Serve returned %v, want it serving", err)
+	default:
+	}
+}
+
 // A panic in a Write of a command's output, which exec.Cmd makes in a
 // goroutine of its own, is contained under the containment of Serve's
 // context: it ends that context, and Serve returns.

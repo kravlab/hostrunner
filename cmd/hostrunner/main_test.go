@@ -23,6 +23,7 @@ import (
 	"github.com/kravlab/hostrunner/internal/allow"
 	"github.com/kravlab/hostrunner/internal/allow/allowtest"
 	"github.com/kravlab/hostrunner/internal/client"
+	"github.com/kravlab/hostrunner/internal/daemon"
 	"github.com/kravlab/hostrunner/internal/fakedaemon"
 	"github.com/kravlab/hostrunner/internal/instructions"
 	"github.com/kravlab/hostrunner/internal/launch"
@@ -152,6 +153,8 @@ func TestParseServeAcceptsAllFlags(t *testing.T) {
 		workspaceFlags:    workspaceFlags{workspace: "/home/u/app", containerWorkspace: "/workspaces/app"},
 		workspaceSettings: "/home/u/app/.devcontainer/hostrunner.yaml",
 		allows:            allow.Store{Dir: "/data/hostrunner/allow"},
+		runsIn:            settings.ProcessOwn,
+		environment:       daemon.ProcessEnvironment(),
 		Settings:          tuned("/home/u/app/.devcontainer/hostrunner-rules.yaml", 30*time.Minute, 15*time.Second, true),
 	}
 	if got != want {
@@ -738,6 +741,8 @@ func watchConfig(t *testing.T) serveConfig {
 	t.Cleanup(func() { os.RemoveAll(base) })
 	return serveConfig{
 		socket:         filepath.Join(base, "h.sock"),
+		runsIn:         settings.ProcessOwn,
+		environment:    daemon.ProcessEnvironment(),
 		workspaceFlags: workspaceFlags{workspace: base, containerWorkspace: "/workspaces/app"},
 		watch:          true,
 		Settings: settings.Settings{

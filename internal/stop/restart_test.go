@@ -544,7 +544,7 @@ func TestRestartSaysWhatTheSettingsChange(t *testing.T) {
 // daemon there: added to the shared process of the installed hostrunner,
 // with --process shared.
 func TestRestartSaysAndStartsAProcessChange(t *testing.T) {
-	d := startCurrentDaemon(t, validRules, false, append([]daemon.Option{daemon.WithProcess("own")}, rereading...)...)
+	d := startCurrentDaemon(t, validRules, false, append([]daemon.Option{daemon.WithProcess(settings.ProcessOwn)}, rereading...)...)
 	r := restartConfig(t)
 	r.Settings = resolving(t, besideRules, "--process", "shared")
 	allowRestart(t, r, d.workspace, d.dir)

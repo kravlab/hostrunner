@@ -79,12 +79,12 @@ func (l List) Pick(text string) (int, bool) {
 // Print prints the daemons, of which there is at least one, to w and
 // returns the prompt that asks to choose one, for the caller to print.
 func (l List) Print(w io.Writer) (prompt string) {
-	wsWidth, versionWidth, processWidth, containerWidth := 0, 0, 0, 0
+	width, vwidth, pwidth, cwidth := 0, 0, 0, 0
 	for _, d := range l.Daemons {
-		wsWidth = max(wsWidth, len([]rune(Display(d.Info.Workspace))))
-		versionWidth = max(versionWidth, len([]rune(l.version(d))))
-		processWidth = max(processWidth, len([]rune(l.processKind(d))))
-		containerWidth = max(containerWidth, len([]rune(Display(d.Info.ContainerWorkspace))))
+		width = max(width, len([]rune(Display(d.Info.Workspace))))
+		vwidth = max(vwidth, len([]rune(l.version(d))))
+		pwidth = max(pwidth, len([]rune(l.processKind(d))))
+		cwidth = max(cwidth, len([]rune(Display(d.Info.ContainerWorkspace))))
 	}
 	def := l.Default()
 	fmt.Fprintln(w, "daemons:")
@@ -93,16 +93,16 @@ func (l List) Print(w io.Writer) (prompt string) {
 		if i == def {
 			mark = "*"
 		}
-		ws := padRight(Display(d.Info.Workspace), wsWidth)
-		v := padRight(l.version(d), versionWidth)
-		p := padRight(l.processKind(d), processWidth)
+		ws := padRight(Display(d.Info.Workspace), width)
+		v := padRight(l.version(d), vwidth)
+		p := padRight(l.processKind(d), pwidth)
 		var note string
 		switch {
 		case !l.choosable(d):
 			note = "another version: restart its container"
 		default:
 			c := Display(d.Info.ContainerWorkspace)
-			note = "(container " + c + ")" + strings.Repeat(" ", containerWidth-len([]rune(c)))
+			note = "(container " + c + ")" + strings.Repeat(" ", cwidth-len([]rune(c)))
 			var marks []string
 			if i == def {
 				marks = append(marks, "← current directory")

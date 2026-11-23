@@ -205,7 +205,7 @@ func (p *process) handle(ctx context.Context, c net.Conn) {
 	stop := context.AfterFunc(ctx, func() { _ = c.SetReadDeadline(time.Now()) })
 	defer stop()
 	if uid != os.Getuid() {
-		p.log.Warn("control socket connection refused", "uid", uid, "pid", pid, "error", err)
+		p.log.Warn("control socket connection refused", "uid", uid, "pid", pid, "reason", "the peer's uid is not this user's")
 		// The request is read, unlooked at, before the answer, so that
 		// the peer's write of it does not fail on a connection already
 		// closed, which Add would take for ErrEnding.
@@ -239,7 +239,7 @@ func (p *process) handle(ctx context.Context, c net.Conn) {
 	}
 	req, err := decodeAdd(f)
 	if err == nil {
-		err = p.add(ctx, req, pid)
+		err = p.addContained(ctx, req, pid)
 	}
 	if err != nil {
 		p.refuse(c, pid, err, requestSocket(req.Args)...)
@@ -273,10 +273,16 @@ func requestSocket(args []string) []any {
 			socket, ok = args[i+1], true
 		}
 		if ok {
-			return []any{"socket", socket, "runtime_dir", filepath.Dir(socket)}
+			return socketAttrs(socket)
 		}
 	}
 	return nil
+}
+
+// socketAttrs returns the log attributes of the daemon socket socket and of
+// its runtime directory.
+func socketAttrs(socket string) []any {
+	return []any{"socket", socket, "runtime_dir", filepath.Dir(socket)}
 }
 
 // endIfIdle ends the process when it runs no daemon, as after a refused
@@ -285,9 +291,15 @@ func (p *process) endIfIdle() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.daemons == 0 {
-		p.ending = true
-		p.cancel()
+		p.endLocked()
 	}
+}
+
+// endLocked decides the end of the process: no daemon starts any more, and
+// its context is cancelled. It requires p.mu held.
+func (p *process) endLocked() {
+	p.ending = true
+	p.cancel()
 }
 
 // endIfNoneAdded ends the process, logging so, when no daemon started
@@ -302,8 +314,7 @@ func (p *process) endIfNoneAdded(ctx context.Context, firstAdd time.Duration) {
 		return
 	}
 	p.log.Info("no daemon added", "timeout", firstAdd)
-	p.ending = true
-	p.cancel()
+	p.endLocked()
 }
 
 // decodeAdd returns the AddDaemon request f carries, an error when f is
@@ -332,8 +343,28 @@ func (p *process) add(ctx context.Context, req protocol.AddDaemon, pid int) erro
 	return p.start(ctx, d, pid)
 }
 
+// addContained is add within a containment of its own (see package
+// contain), so that a panic of the preparation of the daemon, as of its
+// arguments or its log, refuses req alone, not the process and its
+// daemons: the panic is logged, with its stack, to the process log, and
+// the error returned, the reason req is refused with, says only that the
+// add failed.
+func (p *process) addContained(ctx context.Context, req protocol.AddDaemon, pid int) error {
+	// The daemon runs under ctx, not under the containment's context,
+	// which ends with this call.
+	cctx, cancel := contain.Within(ctx, nil)
+	defer cancel()
+	err := contain.Call(cctx, func() error { return p.add(ctx, req, pid) })
+	var pe *contain.PanicError
+	if errors.As(err, &pe) {
+		p.log.Error("add panicked", "pid", pid, "error", pe)
+		return errors.New("the shared process failed to add the daemon: internal error")
+	}
+	return err
+}
+
 // start runs d, asked for by the process pid, in a goroutine under ctx,
-// counted among the daemons, and logs it added before it runs; when its
+// counted among the daemons, and logs it added as it starts to run; when its
 // Serve returns, it logs that it ended and, for the last daemon, ends the
 // process. A panic of d other than the one it ends with (see serveDaemon),
 // a later one or one after its end, is logged, with its stack, to the
@@ -349,13 +380,13 @@ func (p *process) start(ctx context.Context, d Daemon, pid int) error {
 	}
 	p.daemons++
 	p.mu.Unlock()
-	p.log.Info("daemon added", "socket", d.Socket, "runtime_dir", filepath.Dir(d.Socket), "pid", pid)
 	log := &daemonLog{w: d.Log}
 	others := func(pe *contain.PanicError) {
 		p.log.Error("daemon panicked again", "socket", d.Socket, "error", pe)
 		fmt.Fprintf(log, "hostrunner: %v\n", pe)
 	}
 	p.wg.Go(func() {
+		p.log.Info("daemon added", append(socketAttrs(d.Socket), "pid", pid)...)
 		err := serveDaemon(ctx, d, others)
 		if err != nil {
 			fmt.Fprintf(log, "hostrunner: %v\n", err)
@@ -365,8 +396,7 @@ func (p *process) start(ctx context.Context, d Daemon, pid int) error {
 		p.mu.Lock()
 		defer p.mu.Unlock()
 		if p.daemons--; p.daemons == 0 {
-			p.ending = true
-			p.cancel()
+			p.endLocked()
 		}
 	})
 	return nil

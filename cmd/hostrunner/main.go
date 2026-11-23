@@ -30,19 +30,17 @@
 // ready_timeout as up starts it (see internal/shared). With process: own it
 // starts a detached `serve --watch` there instead, which exits by itself
 // once its armed container stops. With --restart it replaces a daemon
-// already serving it.
-// `stop` stops a daemon from the
-// host, the one serving the current directory by default, asking what
-// becomes of the commands it runs unless --kill or --wait says; `restart`
-// then starts a new one for it (see internal/stop). `test` runs the Rules
-// test: whether the rules file `up` would use with the current directory
-// as the workspace (default .devcontainer/hostrunner-rules.yaml) allows
-// a command; it exits 0 when it does, 126 when it does not, and 1 on any
-// error. `allow` is what a human on the host runs to trust a workspace's
-// rules: `up` starts a daemon only for rules and settings so allowed,
-// and an `up` refused records what it asked for (the rules file, its
-// digest and the daemon settings the allow covers) in
-// $XDG_DATA_HOME/hostrunner/allow; `allow` allows exactly that request
+// already serving it. `stop` stops a daemon from the host, the one serving
+// the current directory by default, asking what becomes of the commands it
+// runs unless --kill or --wait says; `restart` then starts a new one for it
+// (see internal/stop). `test` runs the Rules test: whether the rules file
+// `up` would use with the current directory as the workspace (default
+// .devcontainer/hostrunner-rules.yaml) allows a command; it exits 0 when it
+// does, 126 when it does not, and 1 on any error. `allow` is what a human on
+// the host runs to trust a workspace's rules: `up` starts a daemon only for
+// rules and settings so allowed, and an `up` refused records what it asked
+// for (the rules file, its digest and the daemon settings the allow covers)
+// in $XDG_DATA_HOME/hostrunner/allow; `allow` allows exactly that request
 // once the rules file still has that digest and prints what it allowed;
 // without a request it allows nothing and fails, telling to start the
 // container first.
@@ -554,8 +552,8 @@ type serveConfig struct {
 	workspaceSettings string              // the workspace settings file, absolute (see settings.Flags.WorkspaceFile)
 	version           string              // the build version the daemon reports (see buildVersion)
 	allows            allow.Store         // where a hand edit of the rules file is checked as allowed
-	environment       *daemon.Environment // what its commands and secret sources run with; nil: the process's (see daemon.WithEnvironment)
-	inSharedProcess   bool                // the daemon runs in the shared process (see newSharedDaemon), not in a process of its own; its hello reports it, whatever the process setting says
+	environment       *daemon.Environment // what its commands and secret sources run with; never nil: the process's as parseServe sets it (see daemon.WithEnvironment)
+	runsIn            settings.Process    // the process it runs in: ProcessOwn, or ProcessShared once newSharedDaemon made it; its hello reports it, not the process setting (which the arm compares)
 	settings.Settings                     // the daemon's settings
 }
 
@@ -594,6 +592,8 @@ func parseServe(args []string, getenv func(string) string, output io.Writer) (se
 		return cfg, err
 	}
 	cfg.Settings = s
+	cfg.runsIn = settings.ProcessOwn
+	cfg.environment = daemon.ProcessEnvironment()
 	if cfg.workspaceSettings, err = sf.WorkspaceFile(getenv, cfg.workspace); err != nil {
 		return cfg, err
 	}
@@ -677,7 +677,7 @@ func sharedDaemon(args, env []string, version string) (shared.Daemon, error) {
 // launch.OpenLog) and closed by the process once it ends (see
 // shared.Daemon).
 func newSharedDaemon(cfg serveConfig, runtimes []watch.Runtime) (shared.Daemon, error) {
-	cfg.inSharedProcess = true
+	cfg.runsIn = settings.ProcessShared
 	logFile, err := launch.OpenLog(filepath.Join(filepath.Dir(cfg.socket), launch.LogName))
 	if err != nil {
 		return shared.Daemon{}, err
@@ -976,12 +976,10 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 		daemon.WithRequestTimeout(cfg.RequestTimeout),
 		daemon.WithBuildVersion(cfg.version),
 		daemon.WithSettings(cfg.Settings.AllowedSettings()),
-		daemon.WithProcess(string(runsIn(cfg))),
+		daemon.WithProcess(cfg.runsIn),
+		daemon.WithEnvironment(cfg.environment),
 	}
 	opts = append(opts, allowOptions(cfg)...)
-	if cfg.environment != nil {
-		opts = append(opts, daemon.WithEnvironment(cfg.environment))
-	}
 	if cfg.Reread {
 		opts = append(opts, daemon.WithRereadEvery(cfg.PollInterval))
 	}
@@ -999,17 +997,6 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 		})
 	}
 	return srv.Serve(ctx, l)
-}
-
-// runsIn returns the process the daemon of cfg runs in: the shared
-// process when newSharedDaemon made it, else a process of its own, as
-// `hostrunner serve` runs it, whatever the process setting says (it is
-// what the arm compares, not where the daemon is).
-func runsIn(cfg serveConfig) settings.Process {
-	if cfg.inSharedProcess {
-		return settings.ProcessShared
-	}
-	return settings.ProcessOwn
 }
 
 // wireMountCheck sets up the mount check of a `serve --watch` of cfg, the
