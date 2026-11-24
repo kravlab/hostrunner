@@ -2215,6 +2215,121 @@ func TestUpWithProcessSharedFailsWithinTheReadyTimeoutWhenTheProcessDoesNotAnswe
 	}
 }
 
+// An up whose add reaches a shared process that is ending, and whose next
+// add reaches one that never answers until the ready timeout cuts it
+// short, fails saying both: that the process is ending, the real reason,
+// and that the last one did not answer.
+func TestUpWithProcessSharedFailsSayingTheProcessIsEndingWhenTheReadyTimeoutCutsTheNextAddShort(t *testing.T) {
+	a, _ := sharedPair(t, mustHostrunner(t))
+	a.ReadyTimeout = 500 * time.Millisecond
+	adds := 0
+	fakeEndingProcess(t, a, 2, func(c net.Conn) {
+		adds++
+		if adds == 1 {
+			answerEnding(c)
+			return
+		}
+		answerNever(c)
+	})
+	err := Up(context.Background(), a)
+	if !errors.Is(err, shared.ErrEnding) {
+		t.Errorf("Up of A: %v, want an error saying the shared process is ending", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "did not answer the add request") {
+		t.Fatalf("Up of A: %v, want an error saying the shared process did not answer", err)
+	}
+	if ending, unanswered := strings.Index(err.Error(), shared.ErrEnding.Error()), strings.Index(err.Error(), "did not answer the add request"); ending < 0 || ending > unanswered {
+		t.Errorf("Up of A: %v, want the error saying the process is ending before the one saying it did not answer", err)
+	}
+}
+
+// fakeSharedDaemon returns an executable that stands in for the hostrunner
+// executable, whose `shared` it runs as a process that records its pid in
+// the file started, which it creates at once, and idles until killed; any
+// other command it runs, as stopDaemon does, exits 0. The process is
+// killed when the test ends.
+func fakeSharedDaemon(t *testing.T) (exe, started string) {
+	t.Helper()
+	dir := shortDir(t)
+	exe, started = filepath.Join(dir, "daemon"), filepath.Join(dir, "started")
+	script := "#!/bin/sh\n[ \"$1\" = shared ] || exit 0\necho $$ > " + started + ".tmp && mv " + started + ".tmp " + started + "\nexec sleep 60\n"
+	if err := os.WriteFile(exe, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if pids := lines(t, started); len(pids) == 1 {
+			if pid, err := strconv.Atoi(pids[0]); err == nil {
+				syscall.Kill(pid, syscall.SIGKILL)
+			}
+		}
+	})
+	return exe, started
+}
+
+// fakeStartedProcess listens on the control socket of the shared process
+// of cfg once the file started exists, as the process an up started
+// (see fakeSharedDaemon) does when it listens, and hands each connection,
+// that of the probe with which an up sees it listen first, to answer,
+// closing it after. It stops when the test ends.
+func fakeStartedProcess(t *testing.T, cfg Config, started string, answer func(c net.Conn)) {
+	t.Helper()
+	control, _, err := shared.Files(filepath.Dir(cfg.Dir), cfg.Daemon)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finished := make(chan struct{})
+	t.Cleanup(func() { <-finished })
+	go func() {
+		defer close(finished)
+		for {
+			if _, err := os.Stat(started); err == nil {
+				break
+			}
+			select {
+			case <-t.Context().Done():
+				return
+			case <-time.After(5 * time.Millisecond):
+			}
+		}
+		l, err := transport.Unix{Path: control}.Listen()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer l.Close()
+		context.AfterFunc(t.Context(), func() { l.Close() })
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			stop := context.AfterFunc(t.Context(), func() { c.Close() })
+			answer(c)
+			stop()
+			c.Close()
+		}
+	}()
+}
+
+// An up whose add reaches a shared process that is ending, and which then
+// starts a new process whose add the ready timeout cuts short, fails
+// saying that the new process did not answer, not that the process it
+// replaced is ending.
+func TestUpWithProcessSharedDoesNotBlameTheEndingProcessItReplacedWhenTheReadyTimeoutCutsTheNextAddShort(t *testing.T) {
+	daemon, started := fakeSharedDaemon(t)
+	a, _ := sharedPair(t, daemon)
+	a.ReadyTimeout = 2 * time.Second
+	fakeEndingProcess(t, a, 1, answerEnding)
+	fakeStartedProcess(t, a, started, answerNever)
+	err := Up(context.Background(), a)
+	if err == nil || !strings.Contains(err.Error(), "did not answer the add request") {
+		t.Fatalf("Up of A: %v, want an error saying the shared process did not answer", err)
+	}
+	if errors.Is(err, shared.ErrEnding) {
+		t.Errorf("Up of A: %v, want no error saying the shared process is ending, as a new one replaced it", err)
+	}
+}
+
 // An up that finds the lock of the shared process held by another, which
 // keeps it, fails within about its ready timeout, saying it waited for
 // that lock.

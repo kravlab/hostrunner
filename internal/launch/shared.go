@@ -157,11 +157,14 @@ const endingRetry = 50 * time.Millisecond
 // deadline d, of addShared, and ctx bound it all: the wait for the lock
 // (see lockShared), each start, and each add, whose exchange d cuts short
 // when it comes before the add's own timeout (see shared.Add). Once d
-// passed, an add that would be retried, or one d cut short, fails with
-// the error of that add, saying the daemon was not added within the ready
-// timeout. host is the process this up started and found listening, the
-// last one when it started several, nil when it started none; a start
-// that fails returns nil, its error quoting the log of the process.
+// passed, an add that would be retried, or one d cut short, fails saying
+// the daemon was not added within the ready timeout (see notAdded),
+// naming first the error of the last add that reached an ending
+// process, the likely cause, then that of the add that failed; a start
+// of a new process forgets that error. host is the process this up
+// started and found listening, the last one when it started several,
+// nil when it started none; a start that fails returns nil, its error
+// quoting the log of the process.
 func addLocked(ctx context.Context, cfg Config, d readyDeadline, files sharedFiles, req protocol.AddDaemon) (host *spawned, err error) {
 	unlock, err := lockShared(ctx, d, files.control)
 	if err != nil {
@@ -170,19 +173,20 @@ func addLocked(ctx context.Context, cfg Config, d readyDeadline, files sharedFil
 	defer unlock()
 	addCtx, cancel := context.WithDeadline(ctx, d.at)
 	defer cancel()
-	notAdded := func(err error) error {
-		return fmt.Errorf("the daemon was not added to a shared process within the ready timeout of %v: %w", d.timeout, err)
-	}
+	var ending error // the last error of an add that reached an ending process
 	for {
 		err := shared.Add(addCtx, files.control, req)
+		if errors.Is(err, shared.ErrEnding) {
+			ending = err
+		}
 		retry := errors.Is(err, shared.ErrNotListening) || errors.Is(err, shared.ErrEnding)
 		switch {
 		case !retry && errors.Is(err, os.ErrDeadlineExceeded) && d.passed():
-			return host, notAdded(err)
+			return host, notAdded(d, ending, err)
 		case !retry:
 			return host, err
 		case d.passed():
-			return host, notAdded(err)
+			return host, notAdded(d, ending, err)
 		}
 		if errors.Is(err, shared.ErrNotListening) {
 			started, err := startShared(ctx, cfg, d, files)
@@ -190,6 +194,7 @@ func addLocked(ctx context.Context, cfg Config, d readyDeadline, files sharedFil
 				return nil, err
 			}
 			host = &started
+			ending = nil
 			continue
 		}
 		select {
@@ -200,9 +205,21 @@ func addLocked(ctx context.Context, cfg Config, d readyDeadline, files sharedFil
 		// Checked after the wait too, so that the error is that of this
 		// add, not that of a next one that d cuts short as it connects.
 		if d.passed() {
-			return host, notAdded(err)
+			return host, notAdded(d, ending, err)
 		}
 	}
+}
+
+// notAdded is the error of an add that failed with err, past the ready
+// deadline d or cut short by it: it says the daemon was not added within
+// the ready timeout, naming first ending, the error of the last add that
+// reached an ending process, when there was one and err is not that
+// error again, then err as the error of the next add.
+func notAdded(d readyDeadline, ending, err error) error {
+	if ending != nil && !errors.Is(err, shared.ErrEnding) {
+		return fmt.Errorf("the daemon was not added to a shared process within the ready timeout of %v: %w; the next add failed: %w", d.timeout, ending, err)
+	}
+	return fmt.Errorf("the daemon was not added to a shared process within the ready timeout of %v: %w", d.timeout, err)
 }
 
 // lockPoll is how often lockShared tries again to take the lock of a
