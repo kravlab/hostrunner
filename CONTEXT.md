@@ -44,6 +44,12 @@ sequence of characters, `/` included.
 A pattern that is a regular expression, matched anywhere
 in the value unless it anchors itself.
 
+**Workspace**:
+The host directory of one devcontainer's project, which
+the container mounts; named by its real path, with
+symlinks resolved.
+_Avoid_: project, repo, checkout
+
 **Mirrored directory**:
 The host directory that matches the container's current
 directory inside the workspace.
