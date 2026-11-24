@@ -12,6 +12,7 @@ import (
 
 	"github.com/kravlab/hostrunner/internal/daemon"
 	"github.com/kravlab/hostrunner/internal/protocol"
+	"github.com/kravlab/hostrunner/internal/rules"
 	"github.com/kravlab/hostrunner/internal/transport"
 )
 
@@ -23,19 +24,28 @@ type requestCheck struct {
 	results []error // the result of each call in turn; the last one repeats; none passes
 }
 
-// check returns the result set for this call, and counts it.
-func (c *requestCheck) check(context.Context) error {
+// requirementsPass is the requirements stage of a per-request mount check
+// (see daemon.MountCheck) that every rule's mount requirements pass.
+func requirementsPass([]rules.MountRequirement) error { return nil }
+
+// check returns the result set for this call as that of its protected-path
+// stage, and counts it; its requirements stage passes (see
+// requirementsPass).
+func (c *requestCheck) check(context.Context) (daemon.MountRequirementsCheck, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.calls++
 	if len(c.results) == 0 {
-		return nil
+		return requirementsPass, nil
 	}
 	err := c.results[0]
 	if len(c.results) > 1 {
 		c.results = c.results[1:]
 	}
-	return err
+	if err != nil {
+		return nil, err
+	}
+	return requirementsPass, nil
 }
 
 // set makes the next calls return results in turn, the last one repeating.

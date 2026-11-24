@@ -911,7 +911,9 @@ func isTerminal(f *os.File) bool {
 // one finds that the container can write its configuration. It checks
 // them again for every request, on the live mount tables of the armed
 // containers (see watch.Watcher.Live), and refuses the request while that
-// check finds the same. Without watch there is no container to check, and
+// check finds the same, or finds that the container does not meet the mount
+// requirements of the rule that selects the request, which refuses only
+// that rule's commands. Without watch there is no container to check, and
 // no check; with MountCheck off, which only a human on the host can set,
 // none either.
 func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []watch.Runtime) error {
@@ -1007,8 +1009,11 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 // watcher runs, each arm and the check of each attach, and returns the
 // option that has the Server refuse commands by the check's results and
 // check the live mount tables of the watcher *watcher points to before
-// the Server serves, before every request; with it off, it leaves wc as it
-// is and returns none, so nothing is checked.
+// the Server serves, before every request: the protected paths first, the
+// protected-path stage of daemon.MountCheck, then, on the same tables, the
+// mount requirements of the request's rule, relative to the host workspace
+// root, its requirements stage; with it off, it leaves wc as it is
+// and returns none, so nothing is checked, mount requirements included.
 func wireMountCheck(cfg serveConfig, wc *watch.Config, srv **daemon.Server, watcher **watch.Watcher) []daemon.Option {
 	if !cfg.MountCheck {
 		return nil
@@ -1018,15 +1023,20 @@ func wireMountCheck(cfg serveConfig, wc *watch.Config, srv **daemon.Server, watc
 	}
 	// Before `up` gets its reply, so before its container starts.
 	wc.Armed = func(armedAt time.Time) { (*srv).MountRearmed(armedAt) }
-	liveCheck := func(ctx context.Context) error {
+	liveCheck := func(ctx context.Context) (daemon.MountRequirementsCheck, error) {
 		live, err := (*watcher).Live(ctx)
 		if errors.Is(err, watch.ErrNotAttached) {
-			return daemon.ErrMountCheckPending
+			return nil, daemon.ErrMountCheckPending
 		}
 		if err != nil {
-			return err
+			return nil, err
 		}
-		return mountcheck.Check(live, protectedPaths(cfg))
+		if err := mountcheck.Check(live, protectedPaths(cfg)); err != nil {
+			return nil, err
+		}
+		return func(reqs []rules.MountRequirement) error {
+			return mountcheck.CheckRequirements(live, cfg.workspace, reqs)
+		}, nil
 	}
 	return []daemon.Option{daemon.WithMountCheck(settings.MountCheckOffHint(), liveCheck)}
 }

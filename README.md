@@ -176,8 +176,10 @@ rules, the working directory and the path checks, then looks the program
 up as starting it would (127 when the host lacks it, 126 when it cannot
 execute it) and answers. It exits 0
 with the allowing rule, the rule's `dir` when it has one
-(`allowed by rule "tix issues", runs in /`) and the names of the secrets
-it would inject (`, injects secrets: token`), or with the code and
+(`allowed by rule "tix issues", runs in /`), the names of the secrets
+it would inject (`, injects secrets: token`) and the mounts the rule
+requires, sorted by path (`, requires mounts: .git mounted, .git/config
+read-only`), or with the code and
 message the run would get. It checks a secret's source without obtaining
 the value: a `command` source's program is looked up but not run, an
 `env` variable must be set, a `file` must open.
@@ -270,6 +272,18 @@ check as unreadable mounts do.
   approved run starts; a standing or session approval is granted only
   once that check has passed. A repeat under a standing or session
   approval is checked like any run.
+- A rule may require mounts of the workspace (`mounts:`, see
+  [Rules](#rules)), such as `.git` for git. The check before a request
+  adds the requirements of that request's rule, in every armed container,
+  at the same two points as the rest of it, not at attach. `mounted`
+  holds when the live mount table has a mount point at exactly that path,
+  read-only or not. `read-only` is judged as a protected path is: any
+  writable mount reaching the path fails it, a writable mount of an
+  ancestor of the workspace included, and a container that does not
+  mount the workspace root can still fail it that way. A failed
+  requirement refuses only the commands of that rule, with 126 and no
+  approval to get past it; the refusal names the container path and the
+  rule. The approval session's notice names the rule too.
 - A request checked as the daemon stops is refused with 125 `the
   hostrunner daemon is stopping`, not as a failed check.
 - The next check that passes serves requests again.
@@ -279,7 +293,8 @@ the check turned off by a human on the host: `mount_check: false` in
 the host settings file (its common part or the workspace's section),
 `HOSTRUNNER_MOUNT_CHECK=false` or `--no-mount-check` for `up`,
 `restart` and `serve` (see [Settings](#settings)). The refusals of a
-failed check say so. The container cannot turn it off: the workspace
+failed check say so; it turns the requirements of rules off too. The
+container cannot turn it off: the workspace
 settings file refuses `mount_check`. Like the other daemon settings it
 is part of what an allow covers and what an arm compares, so turning it
 off needs a new `hostrunner allow` and applies on the next `up`. With
@@ -885,6 +900,12 @@ rules:
   - command: tix issues
     dir: /                     # run in / on the host, not where the container stands
     args: any
+  - command: git commit
+    args: any
+    mounts:                    # the container must have these mounted
+      .git: mounted            # a mount point of its own
+      .git/config: read-only   # not writable
+      .git/hooks: read-only
 ```
 
 - A command no rule matches is denied, and so is everything when the file
@@ -940,6 +961,21 @@ rules:
   shorter rule whose command starts the same way (`tix issues` for
   `tix issues list`), following further `inherit`s; it is an error when
   there is no such rule or it has no `dir`.
+- `mounts:` makes a rule require mounts of the container: a map from a
+  path relative to the workspace root to `mounted` (a mount point of its
+  own) or `read-only` (not writable), checked before each request (see
+  [Mount check](#mount-check)). Only the rule that matches the request
+  contributes, whether it allows or refuses the argv, and a longer rule
+  does not inherit those of a shorter one (a `git commit amend` rule
+  would need its own `mounts:`), and an argv no rule matches is held to
+  the protected paths alone. A path
+  that is absolute, has a `..` component, is not clean (`.`, `.git/`,
+  `./.git`), is given twice, or a mode other than the two, makes the
+  file invalid, with the line, and so does `mounts:` with no value
+  (null); `mounts: {}` means none. `hostrunner
+  test` and the dry run report them (`, requires mounts: …`) without
+  checking them. They are part of the rules file: its digest, allow and
+  reread cover them.
 - Arguments are parsed like getopt, unless the rule says `flag_style: go`
   (below): `--flag=value`, `--flag value`, `-abc` (= `-a -b -c`),
   `-ovalue`, and `--` ending the flags. Only flags

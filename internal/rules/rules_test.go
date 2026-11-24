@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -616,5 +617,150 @@ func TestPathCheckDoesNotWidenTheList(t *testing.T) {
 	}
 	if allowed.Paths != nil {
 		t.Fatalf("denied command reported path arguments %+v", allowed.Paths)
+	}
+}
+
+func TestCheckReportsTheMountsOfTheMatchedRule(t *testing.T) {
+	p := mustParse(t, "rules:\n  - command: git\n    args: any\n    mounts:\n      .git: mounted\n      .git/hooks: read-only\n")
+	allowed, err := p.Check([]string{"git", "status"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []MountRequirement{{Path: ".git", Mode: MountMounted}, {Path: ".git/hooks", Mode: MountReadOnly}}
+	if !slices.Equal(allowed.Mounts, want) {
+		t.Fatalf("got %v, want %v", allowed.Mounts, want)
+	}
+}
+
+func TestMountsAreSortedByPath(t *testing.T) {
+	p := mustParse(t, "rules:\n  - command: git\n    args: any\n    mounts:\n      .git/hooks: read-only\n      .git: mounted\n      .git/config: read-only\n")
+	allowed, err := p.Check([]string{"git"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []MountRequirement{
+		{Path: ".git", Mode: MountMounted},
+		{Path: ".git/config", Mode: MountReadOnly},
+		{Path: ".git/hooks", Mode: MountReadOnly},
+	}
+	if !slices.Equal(allowed.Mounts, want) {
+		t.Fatalf("got %v, want %v", allowed.Mounts, want)
+	}
+}
+
+func TestMountModeStringIsTheYAMLSpelling(t *testing.T) {
+	if got := MountMounted.String(); got != "mounted" {
+		t.Errorf("MountMounted: got %q", got)
+	}
+	if got := MountReadOnly.String(); got != "read-only" {
+		t.Errorf("MountReadOnly: got %q", got)
+	}
+}
+
+// TestParseRejectsInvalidMounts checks each refusal of a mounts entry and
+// that it names the line of the entry. The entries start at line 5.
+func TestParseRejectsInvalidMounts(t *testing.T) {
+	const head = "rules:\n  - command: git\n    args: any\n    mounts:\n"
+	cases := map[string]struct{ entries, want string }{
+		"unknown mode": {
+			"      .git: mounted\n      .git/config: rw\n",
+			`rule 1: "git": mounts: path ".git/config": mode must be mounted or read-only, not "rw" (line 6)`,
+		},
+		"non-string mode": {
+			"      .git: mounted\n      .git/config: true\n      .git/hooks: [read-only]\n",
+			`rule 1: "git": mounts: path ".git/config": mode must be the string mounted or read-only (line 6)`,
+		},
+		"absolute path": {
+			"      .git: mounted\n      /etc: read-only\n",
+			`rule 1: "git": mounts: path "/etc" must be relative to the workspace root (line 6)`,
+		},
+		"parent component first": {
+			"      ../etc: read-only\n",
+			`rule 1: "git": mounts: path "../etc" must not contain a .. component (line 5)`,
+		},
+		"parent component inside": {
+			"      .git: mounted\n      a/../b: mounted\n",
+			`rule 1: "git": mounts: path "a/../b" must not contain a .. component (line 6)`,
+		},
+		"parent only": {
+			"      ..: mounted\n",
+			`rule 1: "git": mounts: path ".." must not contain a .. component (line 5)`,
+		},
+		"leading dot component": {
+			"      ./.git: mounted\n",
+			`rule 1: "git": mounts: path "./.git" is not clean, use ".git" (line 5)`,
+		},
+		"trailing slash": {
+			"      .git/: mounted\n",
+			`rule 1: "git": mounts: path ".git/" is not clean, use ".git" (line 5)`,
+		},
+		"double slash": {
+			"      .git: mounted\n      a//b: mounted\n",
+			`rule 1: "git": mounts: path "a//b" is not clean, use "a/b" (line 6)`,
+		},
+		"dot inside": {
+			"      a/./b: mounted\n",
+			`rule 1: "git": mounts: path "a/./b" is not clean, use "a/b" (line 5)`,
+		},
+		"workspace root": {
+			"      .: mounted\n",
+			`rule 1: "git": mounts: path "." is not a path below the workspace root (line 5)`,
+		},
+		"empty path": {
+			"      \"\": mounted\n",
+			`rule 1: "git": mounts: path "" is not a path below the workspace root (line 5)`,
+		},
+		"duplicate path": {
+			"      .git: mounted\n      .git/config: read-only\n      .git: read-only\n",
+			`rule 1: "git": mounts: duplicate path ".git" (line 7)`,
+		},
+		"non-string path": {
+			"      .git: mounted\n      5: read-only\n",
+			`rule 1: "git": mounts: path must be a string (line 6)`,
+		},
+		"list instead of a mapping": {
+			"      - .git\n",
+			`rule 1: "git": mounts: not a mapping of workspace paths to modes (line 5)`,
+		},
+		"scalar instead of a mapping": {
+			"      mounted\n",
+			`rule 1: "git": mounts: not a mapping of workspace paths to modes (line 5)`,
+		},
+		"null instead of a mapping": {
+			"",
+			`rule 1: "git": mounts: not a mapping of workspace paths to modes (line 4)`,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := Parse([]byte(head + tc.entries))
+			if err == nil || err.Error() != tc.want {
+				t.Fatalf("got %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestDenialApprovedCarriesTheMountsOfTheMatchedRule(t *testing.T) {
+	p := mustParse(t, "rules:\n  - command: git push\n    flags:\n      allow: [-v]\n    mounts:\n      .git: mounted\n")
+	_, err := p.Check([]string{"git", "push", "--force"})
+	d, ok := ApprovableDenial(err)
+	if !ok {
+		t.Fatalf("got %v, want an approvable denial", err)
+	}
+	want := []MountRequirement{{Path: ".git", Mode: MountMounted}}
+	if !slices.Equal(d.Approved.Mounts, want) {
+		t.Fatalf("got %v, want %v", d.Approved.Mounts, want)
+	}
+}
+
+func TestALongerRuleDoesNotInheritMounts(t *testing.T) {
+	p := mustParse(t, "rules:\n  - command: git\n    args: any\n    mounts:\n      .git: mounted\n  - command: git push\n    args: any\n")
+	allowed, err := p.Check([]string{"git", "push"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(allowed.Mounts) != 0 {
+		t.Fatalf("got %v, want no mounts", allowed.Mounts)
 	}
 }

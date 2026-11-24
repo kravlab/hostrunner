@@ -12,6 +12,7 @@ import (
 
 	"github.com/kravlab/hostrunner/internal/mountcheck"
 	"github.com/kravlab/hostrunner/internal/protocol"
+	"github.com/kravlab/hostrunner/internal/rules"
 )
 
 // Messages of the refusals of the mount check, for the client: they name
@@ -21,6 +22,11 @@ const (
 	mountUnreadableMessage   = "the daemon cannot read the container's mounts to check them: every command is refused"
 	mountUncheckableMessage  = "the daemon cannot check the container's mounts: every command is refused"
 	mountWritableMessageForm = "the container can write %s, so it could change the daemon's configuration: every command is refused until it is mounted read-only"
+	// Of a failed mount requirement: the container path, then the rule.
+	mountNotMountedMessageForm  = "the container does not have %s as a mount point of its own, which rule %q requires: the command is refused until it is mounted"
+	mountNotReadOnlyMessageForm = "the container can write %s, which rule %q requires to be read-only: the command is refused until it is mounted read-only"
+	// Of any other failure of the requirements stage: the rule.
+	mountRequirementUncheckableMessageForm = "the daemon cannot check the mounts rule %q requires: the command is refused"
 )
 
 // mountOffForm ends the refusals of a failed mount check with how a human
@@ -33,6 +39,34 @@ const mountOffForm = "; a human on the host can turn the mount check off: %s"
 // check of the latest arm; the per-request check of WithMountCheck returns
 // it when it cannot run yet, before the latest arm has attached.
 var ErrMountCheckPending = errors.New("mount check pending: the daemon has not attached to the container yet")
+
+// MountCheck is the per-request mount check of WithMountCheck, made in two
+// stages on one reading of the live mount tables of the armed containers,
+// so that the daemon knows which stage failed. The protected-path stage is
+// the call itself: it reads the tables and checks the protected paths on
+// them, and its error refuses every command. When it passes it returns the
+// requirements stage, which checks the mount requirements of the
+// request's rule on the same tables, and whose error refuses only the
+// commands of that rule.
+type MountCheck func(ctx context.Context) (MountRequirementsCheck, error)
+
+// MountRequirementsCheck is the requirements stage of a MountCheck: it
+// returns nil when the containers meet every one of reqs, the mount
+// requirements of the request's rule (rules.Allowed.Mounts), or why they
+// do not. The daemon calls it only for a rule with requirements.
+type MountRequirementsCheck func(reqs []rules.MountRequirement) error
+
+// ruleRequirements are what the per-request mount check checks for a
+// request besides the protected paths: reqs, the mount requirements of
+// rule, the command of the rule that selects the request, for the
+// refusals and notices that name it. They come from one policy, the
+// rules.Allowed that names the rule (see Server.ruleMountRequirements and
+// prepared.ruleRequirements). The zero value, for an argv no rule
+// matches, requires nothing beyond the protected paths.
+type ruleRequirements struct {
+	rule string
+	reqs []rules.MountRequirement
+}
 
 // mountChecker is what the Server does about the mount check: mountState
 // when WithMountCheck turned the check on, noMountCheck, which does
@@ -54,9 +88,9 @@ type mountChecker interface {
 	refusal() *refusal
 	// requestRefusal returns the refusal of a run, dry run or --ask by the
 	// per-request check: that of the attach-time state, then that of the
-	// live check made for the request now, or nil (see
-	// mountState.requestRefusal).
-	requestRefusal(ctx context.Context) *refusal
+	// live check made for the request now, with rr, the requirements of
+	// its rule, or nil (see mountState.requestRefusal).
+	requestRefusal(ctx context.Context, rr ruleRequirements) *refusal
 	// recheck ends the request id, r, just enqueued, for a failed check of
 	// the attach-time state (see mountState.recheck).
 	recheck(id uint64, r *approvalRequest) (outcome, bool)
@@ -84,8 +118,9 @@ func (noMountCheck) recheck(uint64, *approvalRequest) (outcome, bool) {
 	return outcome{}, false
 }
 
-// requestRefusal checks nothing before a request: none is refused.
-func (noMountCheck) requestRefusal(context.Context) *refusal { return nil }
+// requestRefusal checks nothing before a request, its rule's mount
+// requirements included: none is refused.
+func (noMountCheck) requestRefusal(context.Context, ruleRequirements) *refusal { return nil }
 
 // mountState is the result of the latest check of the armed container's
 // mounts (see WithMountCheck), the mountChecker of a Server that checks
@@ -95,8 +130,9 @@ type mountState struct {
 	approvals *approvals   // the Server's approval sessions; nil without WithApprovals
 	offHint   string       // how a human on the host turns the check off; see WithMountCheck
 	// liveCheck is the check made for every request, on the live mount
-	// tables (see WithMountCheck and requestRefusal).
-	liveCheck func(ctx context.Context) error
+	// tables, its requirements stage with the mount requirements of its
+	// rule (see WithMountCheck and requestRefusal).
+	liveCheck MountCheck
 	// requestsStarted counts the live checks started: each takes the next
 	// number as it starts, which orders their results (see
 	// requestChecked).
@@ -117,12 +153,24 @@ type mountState struct {
 	// reports of the per-request checks one at a time (see requestChecked).
 	reporting sync.Mutex
 	// requestFailure is the path and reason of the latest per-request
-	// check that failed; the zero key once one passed, or before any
+	// check whose protected-path stage failed, which refuses every
+	// command; the zero key once one passed that stage, or before any
 	// failed. Guarded by reporting.
-	requestFailure mountFailureKey
-	// requestRecorded is the number of the live check whose result
-	// requestFailure holds (see requestsStarted). Guarded by reporting.
-	requestRecorded uint64
+	requestFailure recordedFailure
+	// ruleFailures are, by rule, the path and reason of the latest failed
+	// check of the mount requirements of the rule, which refuses only its
+	// commands; the zero key once a check of a request of that rule passed
+	// them, none before any was checked. Guarded by reporting.
+	ruleFailures map[string]recordedFailure
+}
+
+// recordedFailure is the latest result of one stage of the per-request
+// check, for the protected paths or for the requirements of one rule (see
+// requestChecked): key, the zero key for a pass, and seq, the number of
+// the live check it is of (see requestsStarted).
+type recordedFailure struct {
+	key mountFailureKey
+	seq uint64
 }
 
 // mountFailureKind is the reason a mount check failed, as its refusal
@@ -131,25 +179,69 @@ type mountFailureKind string
 
 // Reasons a mount check fails.
 const (
-	mountWritable    mountFailureKind = "writable"    // a container can write a protected path (mountcheck.WritableError)
-	mountUnreadable  mountFailureKind = "unreadable"  // a container's mounts cannot be read (mountcheck.UnreadableError)
-	mountUncheckable mountFailureKind = "uncheckable" // any other failure
+	mountWritable    mountFailureKind = "writable"      // a container can write a protected path (mountcheck.WritableError)
+	mountUnreadable  mountFailureKind = "unreadable"    // a container's mounts cannot be read (mountcheck.UnreadableError)
+	mountNotMounted  mountFailureKind = "not mounted"   // a required path is not a mount of its own (mountcheck.NotMountedError)
+	mountNotReadOnly mountFailureKind = "not read-only" // a container can write a path required read-only (mountcheck.ReadOnlyRequirementError)
+	mountUncheckable mountFailureKind = "uncheckable"   // any other failure of the protected-path stage
+	// mountRequirementUncheckable is any other failure of the requirements
+	// stage (see MountCheck), e.g. a *mountcheck.UnresolvableError for a
+	// required path.
+	mountRequirementUncheckable mountFailureKind = "requirement uncheckable"
 )
+
+// mountFailureMessages build the message of the refusal of each kind of
+// failed mount check from its key (see failureRefusal).
+var mountFailureMessages = map[mountFailureKind]func(key mountFailureKey) string{
+	mountWritable: func(key mountFailureKey) string {
+		return fmt.Sprintf(mountWritableMessageForm, key.containerPath)
+	},
+	mountUnreadable:  func(mountFailureKey) string { return mountUnreadableMessage },
+	mountUncheckable: func(mountFailureKey) string { return mountUncheckableMessage },
+	mountNotMounted: func(key mountFailureKey) string {
+		return fmt.Sprintf(mountNotMountedMessageForm, key.containerPath, key.rule)
+	},
+	mountNotReadOnly: func(key mountFailureKey) string {
+		return fmt.Sprintf(mountNotReadOnlyMessageForm, key.containerPath, key.rule)
+	},
+	mountRequirementUncheckable: func(key mountFailureKey) string {
+		return fmt.Sprintf(mountRequirementUncheckableMessageForm, key.rule)
+	},
+}
 
 // mountFailureKey is the path and reason of a failed mount check: two
 // failures with the same key are the same failure, whatever else their
 // error text says. Its zero value is no failure.
 type mountFailureKey struct {
 	kind          mountFailureKind
-	container     string // the container ID, of a writable or unreadable container
-	containerPath string // where in the container a protected path is writable
+	container     string // the container ID, of a writable or unreadable container or one failing a mount requirement
+	containerPath string // where in the container a protected path is writable, or a mount requirement fails
+	// rule is the rule whose mount requirements failed, for a failure of
+	// the requirements stage (see ofRequirements); "" otherwise.
+	rule string
 }
 
+// ofRequirements reports whether k is a failure of the requirements stage
+// (see MountCheck), which refuses only the commands of k.rule, rather than
+// one that refuses every command.
+func (k mountFailureKey) ofRequirements() bool { return k.rule != "" }
+
 // failureKey returns the key of failure, the error of a failed mount
-// check, or the zero key for nil.
-func failureKey(failure error) mountFailureKey {
-	if failure == nil {
+// check, or the zero key for nil: of the requirements stage when rule, the
+// rule whose requirements were checked, is not "", of the protected-path
+// stage or the attach-time check otherwise.
+func failureKey(failure error, rule string) mountFailureKey {
+	switch {
+	case failure == nil:
 		return mountFailureKey{}
+	case rule != "":
+		if n, ok := errors.AsType[*mountcheck.NotMountedError](failure); ok {
+			return mountFailureKey{kind: mountNotMounted, container: n.Container, containerPath: n.ContainerPath, rule: rule}
+		}
+		if r, ok := errors.AsType[*mountcheck.ReadOnlyRequirementError](failure); ok {
+			return mountFailureKey{kind: mountNotReadOnly, container: r.Container, containerPath: r.ContainerPath, rule: rule}
+		}
+		return mountFailureKey{kind: mountRequirementUncheckable, rule: rule}
 	}
 	if w, ok := errors.AsType[*mountcheck.WritableError](failure); ok {
 		return mountFailureKey{kind: mountWritable, container: w.Container, containerPath: w.ContainerPath}
@@ -194,12 +286,24 @@ func (m *mountState) snapshot() mountSnapshot {
 // before its command would start; for a dry run once, as its last check;
 // for an --ask as it arrives, before it is queued, and once after the
 // human's answer, right before the approved run starts, a standing or
-// session approval granted only once it passed. Its nil passes; ErrMountCheckPending, when it
+// session approval granted only once it passed; for a repeat of a
+// standing or session approval as for a run. Its protected-path stage
+// checks the protected paths; its requirements stage (see MountCheck), the
+// mount requirements of the request's rule: as the request arrives, those
+// of the rule the rules served at that moment select for its argv, an
+// argv no rule matches having none; after the other checks, those of the
+// rule that allowed or approved the command as they were prepared, so the
+// rule and its requirements always come from one policy. A nil error of
+// both passes; ErrMountCheckPending from the protected-path stage, when it
 // cannot run yet, refuses the request as before the first check; any
 // other error refuses it as a failed check does, without withdrawing the
 // requests waiting for an answer or changing the result MountChecked
-// recorded. It is called concurrently, under the daemon's context.
-func WithMountCheck(offHint string, check func(ctx context.Context) error) Option {
+// recorded. Any error of the requirements stage names the rule in the
+// refusal and the session's notice: a *mountcheck.NotMountedError or
+// *mountcheck.ReadOnlyRequirementError the requirement that failed, any
+// other that the rule's requirements cannot be checked. It is called
+// concurrently, under the daemon's context.
+func WithMountCheck(offHint string, check MountCheck) Option {
 	return func(s *Server) { s.mountOffHint, s.mountLiveCheck = &offHint, check }
 }
 
@@ -269,7 +373,7 @@ func (m *mountState) checked(armedAt time.Time, err error) {
 		m.log.Info("mount check passed")
 	default:
 		m.log.Warn("mount check failed: every command is refused", "error", err)
-		m.approvals.mountCheckFailed(err, m.failureRefusal(err))
+		m.approvals.mountCheckFailed(err, m.failureRefusal(err, ""))
 	}
 }
 
@@ -298,7 +402,7 @@ func (m *mountState) refusal() *refusal {
 	case r.failure == nil:
 		return nil
 	}
-	return m.failureRefusal(r.failure)
+	return m.failureRefusal(r.failure, "")
 }
 
 // pendingRefusal returns the refusal of every run, dry run and --ask
@@ -310,70 +414,103 @@ func pendingRefusal() *refusal {
 // requestRefusal returns the refusal of a run, dry run or --ask by the
 // per-request mount check, or nil: that of the attach-time state while it
 // has not passed (see refusal), otherwise that of the live check made for
-// the request now (WithMountCheck), pending while it cannot run yet and
-// failed while it fails, the session serving the daemon told of each new
-// failure (see requestChecked). A live check that ends with ctx done, the
-// daemon stopping, refuses the request as a stopping daemon does, its
-// result neither recorded nor told. Its message names container paths
-// only; its error, for the log, the host's.
-func (m *mountState) requestRefusal(ctx context.Context) *refusal {
+// the request now with rr, the requirements of its rule
+// (WithMountCheck), pending while it cannot run yet and failed while it
+// fails, the session serving the daemon told of each new failure (see
+// requestChecked). A live check that ends with ctx done, the daemon
+// stopping, refuses the request as a stopping daemon does, its result
+// neither recorded nor told. Its message names container paths only; its
+// error, for the log, the host's.
+func (m *mountState) requestRefusal(ctx context.Context, rr ruleRequirements) *refusal {
 	if r := m.refusal(); r != nil {
 		return r
 	}
 	seq := m.requestsStarted.Add(1)
-	err := m.liveCheck(ctx)
+	requirements, protected := m.liveCheck(ctx)
+	var required error // the result of the requirements stage, run only once the protected paths passed
+	if protected == nil && len(rr.reqs) > 0 {
+		required = requirements(rr.reqs)
+	}
 	if ctx.Err() != nil {
 		// What the check found, cut short, is not the container's state.
 		return drainingRefusal()
 	}
-	if errors.Is(err, ErrMountCheckPending) {
+	if errors.Is(protected, ErrMountCheckPending) || errors.Is(required, ErrMountCheckPending) {
 		return pendingRefusal()
 	}
-	m.requestChecked(seq, err)
-	if err == nil {
-		return nil
+	m.requestChecked(seq, rr.rule, protected, required)
+	switch {
+	case protected != nil:
+		return m.failureRefusal(protected, "")
+	case required != nil:
+		return m.failureRefusal(required, rr.rule)
 	}
-	return m.failureRefusal(err)
+	return nil
 }
 
-// requestChecked records err, the result of the live check numbered seq
-// (see requestsStarted), and tells the session serving the daemon of a
-// failure unlike the latest one (see requestFailure): once per path and
-// reason (failureKey), again after a check passed. A result of a check
+// requestChecked records the result of the live check numbered seq (see
+// requestsStarted), made for a request of rule: protected, that of its
+// protected-path stage, and, once that passed, required, that of its
+// requirements stage. It tells the session serving the daemon of a
+// failure unlike the latest one of its stage: a failed protected path once
+// per path and reason (failureKey), again after any check passed the
+// protected paths (see requestFailure); a failure of the requirements of
+// a rule once per path and reason for that rule, again after a check of a
+// request of that same rule passed them (see ruleFailures), whatever the
+// requests of other rules found meanwhile. In each, a result of a check
 // that started before the one recorded last is stale and dropped, so
 // concurrent checks are recorded in the order they started. Unlike
 // MountChecked, it ends no request waiting for an answer.
-func (m *mountState) requestChecked(seq uint64, err error) {
-	key := failureKey(err)
+func (m *mountState) requestChecked(seq uint64, rule string, protected, required error) {
 	m.reporting.Lock()
 	defer m.reporting.Unlock()
-	if seq < m.requestRecorded {
+	m.record(&m.requestFailure, seq, protected, "")
+	if protected != nil || rule == "" {
 		return
 	}
-	m.requestRecorded = seq
-	if key == m.requestFailure {
+	if m.ruleFailures == nil {
+		m.ruleFailures = make(map[string]recordedFailure)
+	}
+	// Kept once it passes, so that its seq still drops stale results.
+	f := m.ruleFailures[rule]
+	m.record(&f, seq, required, rule)
+	m.ruleFailures[rule] = f
+}
+
+// record records in f the result of the live check numbered seq, failure,
+// of the requirements of rule, or of the protected paths when rule is "",
+// unless it is stale, and tells the session serving the daemon of a
+// failure unlike the one f holds (see requestChecked). The caller holds
+// reporting.
+func (m *mountState) record(f *recordedFailure, seq uint64, failure error, rule string) {
+	if seq < f.seq {
 		return
 	}
-	m.requestFailure = key
-	if err != nil {
-		m.approvals.tellMountCheckFailed(err)
+	f.seq = seq
+	key := failureKey(failure, rule)
+	if key == f.key {
+		return
+	}
+	f.key = key
+	if failure != nil {
+		m.approvals.tellMountCheckFailed(failure, rule)
 	}
 }
 
-// failureRefusal returns the refusal of every run, dry run and --ask for
-// failure, the error of a failed mount check (see refusal); its message
-// ends with how to turn the check off (see WithMountCheck).
-func (m *mountState) failureRefusal(failure error) *refusal {
-	key := failureKey(failure)
-	message := mountUncheckableMessage
-	switch key.kind {
-	case mountWritable:
-		message = fmt.Sprintf(mountWritableMessageForm, key.containerPath)
-	case mountUnreadable:
-		message = mountUnreadableMessage
+// failureRefusal returns the refusal of a run, dry run or --ask for
+// failure, the error of a failed mount check (see refusal): of every one
+// when rule is "", of those of rule for a failure of the requirements
+// stage checking rule's mount requirements (see failureKey). Its message
+// ends with how to turn the check off (see WithMountCheck); its error, for
+// the log, names the rule of a failure of the requirements stage.
+func (m *mountState) failureRefusal(failure error, rule string) *refusal {
+	key := failureKey(failure, rule)
+	message := mountFailureMessages[key.kind](key) + fmt.Sprintf(mountOffForm, m.offHint)
+	err := fmt.Errorf("mount check failed: %w", failure)
+	if key.ofRequirements() {
+		err = fmt.Errorf("mount check failed: rule %q: %w", key.rule, failure)
 	}
-	message += fmt.Sprintf(mountOffForm, m.offHint)
-	return &refusal{protocol.ExitRejected, message, fmt.Errorf("mount check failed: %w", failure)}
+	return &refusal{protocol.ExitRejected, message, err}
 }
 
 // recheck ends request id, r, just enqueued, for the failed mount check
@@ -399,9 +536,11 @@ func (m *mountState) holdReports() (release func()) {
 
 // tellMountCheckFailed tells the session serving the daemon, if it reads
 // the frame (protocol.Serve.MountCheck), that a per-request mount check
-// failed with failure; unlike mountCheckFailed, it ends no request. A
-// session that does not take the frame is gone, as in enqueue.
-func (a *approvals) tellMountCheckFailed(failure error) {
+// failed with failure, a failure of the mount requirements of rule when
+// rule is not "", which the frame names in Rule, not in Error; unlike
+// mountCheckFailed, it ends no request. A session that does not take the
+// frame is gone, as in enqueue.
+func (a *approvals) tellMountCheckFailed(failure error, rule string) {
 	if a == nil {
 		return
 	}
@@ -411,7 +550,7 @@ func (a *approvals) tellMountCheckFailed(failure error) {
 	if c == nil || !c.readsMountCheck.Load() {
 		return
 	}
-	if err := c.out.writeJSON(protocol.FrameMountCheckFailed, protocol.MountCheckFailed{Error: failure.Error()}); err != nil {
+	if err := c.out.writeJSON(protocol.FrameMountCheckFailed, protocol.MountCheckFailed{Error: failure.Error(), Rule: rule}); err != nil {
 		c.conn.Close()
 	}
 }

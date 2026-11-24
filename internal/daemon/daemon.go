@@ -74,7 +74,7 @@ type Server struct {
 	process          string                                               // "": none reported; see WithProcess
 	mount            mountChecker                                         // the mount check: noMountCheck unless WithMountCheck; see MountChecked
 	mountOffHint     *string                                              // nil: the mount check is off; see WithMountCheck
-	mountLiveCheck   func(ctx context.Context) error                      // the mount check made before every request; see WithMountCheck
+	mountLiveCheck   MountCheck                                           // the mount check made before every request; see WithMountCheck
 	environment      *Environment                                         // what commands and secret sources run with; never nil, see WithEnvironment
 
 	// The order of the locks: a goroutine takes one only while it holds
@@ -420,9 +420,10 @@ var dryRunLogArgs = []any{"dry_run", true}
 // checks opened, never starting the command or reading stdin. The
 // attach-time state of the mount check refuses it as it arrives, before
 // the rules are consulted; its one live check is its last check, once the
-// others passed, where a run would check right before its start (see
-// mountChecker.requestRefusal). The answer carries the warning of the
-// daemon (see pendingAllowWarning).
+// others passed, where a run would check right before its start, with the
+// mount requirements of the rule it was prepared as (see
+// mountChecker.requestRefusal and prepared.ruleRequirements). The answer
+// carries the warning of the daemon (see pendingAllowWarning).
 func (s *Server) dryRun(ctx context.Context, out *frameWriter, req protocol.Request) {
 	if r := s.mount.refusal(); r != nil {
 		s.reject(out, r.code, r.message, r.err, dryRunLogArgs...)
@@ -438,11 +439,11 @@ func (s *Server) dryRun(ctx context.Context, out *frameWriter, req protocol.Requ
 		return
 	}
 	p.close()
-	if s.mountRefused(ctx, s.rejecter(out, dryRunLogArgs...)) {
+	if s.mountRefused(ctx, p.ruleRequirements(), s.rejecter(out, dryRunLogArgs...)) {
 		return
 	}
 	s.log.Info("dry run allowed", append(append(p.logArgs(req), "rule", p.rule), dryRunLogArgs...)...)
-	_ = out.writeJSON(protocol.FrameAllowed, protocol.Allowed{Rule: p.rule, Dir: p.fixedDir, Secrets: p.secrets, Approval: p.approval, Warning: s.pendingAllowWarning()})
+	_ = out.writeJSON(protocol.FrameAllowed, protocol.Allowed{Rule: p.rule, Dir: p.fixedDir, Secrets: p.secrets, Mounts: p.mountReport, Approval: p.approval, Warning: s.pendingAllowWarning()})
 }
 
 // arm handles FrameArm from `hostrunner up`, which reaches the daemon on
@@ -499,6 +500,11 @@ type prepared struct {
 	env      []string   // injected NAME=value variables over the daemon's
 	secrets  []string   // names of the secrets injected, for the log
 	masked   []string   // their values, masked in the command's output
+	// mountRequirements are the rule's mount requirements, which the check
+	// right before the start, or a dry run's last check, checks (see
+	// ruleRequirements); mountReport are the same, for a dry run's answer.
+	mountRequirements []rules.MountRequirement
+	mountReport       []protocol.MountRequirement
 	// pathFailures are the arguments that failed their path checks and are
 	// passed as given, as the passes allowed (see prepareAllowed).
 	pathFailures []pathFailure
@@ -512,6 +518,14 @@ type prepared struct {
 func (p *prepared) close() {
 	p.dir.Close()
 	closeAll(p.files)
+}
+
+// ruleRequirements returns the mount requirements of the rule that allowed
+// or approved p, with that rule, both from the rules.Allowed p was
+// prepared from: a reread since cannot pair the rule with requirements of
+// another policy.
+func (p *prepared) ruleRequirements() ruleRequirements {
+	return ruleRequirements{rule: p.rule, reqs: p.mountRequirements}
 }
 
 // logArgs describe the command p prepared for req in the daemon log: the
@@ -582,7 +596,8 @@ func (s *Server) prepare(ctx context.Context, req protocol.Request, dryRun bool)
 // argument is passed as given, and the failure is in pathFailures.
 func (s *Server) prepareAllowed(ctx context.Context, req protocol.Request, allowed rules.Allowed, dryRun bool, passes pathPasses) (*prepared, *refusal) {
 	var err error
-	p := &prepared{rule: allowed.Rule, fixedDir: allowed.Dir, secrets: allowed.SecretNames()}
+	p := &prepared{rule: allowed.Rule, fixedDir: allowed.Dir, secrets: allowed.SecretNames(),
+		mountRequirements: allowed.Mounts, mountReport: allowed.MountRequirementsReport()}
 	if p.dir, p.hostPath, err = s.mapper.Open(req.Cwd); err != nil {
 		return nil, &refusal{protocol.ExitRejected, cwdMessage(req.Cwd, err), err}
 	}
@@ -644,7 +659,7 @@ type exchange struct {
 // initial credit it sends once the command started carries the warning of
 // the daemon (see pendingAllowWarning).
 func (s *Server) run(ctx context.Context, x exchange, req protocol.Request) {
-	if s.mountRefused(x.daemon, s.rejecter(x.out)) {
+	if s.mountRefused(x.daemon, s.ruleMountRequirements(req.Argv), s.rejecter(x.out)) {
 		return
 	}
 	p, r := s.prepare(x.daemon, req, false)
@@ -671,8 +686,9 @@ type frameSource func() (protocol.Frame, error)
 // start runs p, the prepared command of req, on x: it streams stdio,
 // reading the client's frames from next, and reports the exit code;
 // x.cancel stops it early. Right before the command starts, after every
-// other check, it makes the request's per-request mount check (see
-// mountChecker.requestRefusal), refusing it on failure. For run, the
+// other check, it makes the request's per-request mount check with p's
+// mount requirements (see mountChecker.requestRefusal and
+// prepared.ruleRequirements), refusing it on failure. For run, the
 // approved run it is, it tells the session serving the daemon the output
 // and how the run ended, also when it does not start; run is nil for a
 // command the rules allowed. passed, when not nil, is called once every
@@ -695,8 +711,9 @@ func (s *Server) start(ctx context.Context, x exchange, req protocol.Request, p 
 
 	// The mounts are checked again right before the start, after every
 	// other check and the secrets, so that what the container could write
-	// meanwhile is not missed.
-	refused := s.mountRefused(x.daemon, func(r *refusal) {
+	// meanwhile is not missed; with the requirements of the rule p was
+	// prepared as, whatever a reread since serves.
+	refused := s.mountRefused(x.daemon, p.ruleRequirements(), func(r *refusal) {
 		if run != nil && run.start.Request != 0 {
 			// A run a human just approved is refused as a new request
 			// would be.
@@ -772,15 +789,33 @@ func (s *Server) start(ctx context.Context, x exchange, req protocol.Request, p 
 	streams.Wait()
 }
 
-// mountRefused makes the per-request mount check of a request under ctx
-// (see mountChecker.requestRefusal) and, when it refuses the request,
-// refuses it through refuse. It reports whether it refused.
-func (s *Server) mountRefused(ctx context.Context, refuse func(r *refusal)) bool {
-	r := s.mount.requestRefusal(ctx)
+// mountRefused makes the per-request mount check of a request under ctx,
+// with rr, the mount requirements of its rule (see
+// mountChecker.requestRefusal) and, when it refuses the request, refuses
+// it through refuse. It reports whether it refused.
+func (s *Server) mountRefused(ctx context.Context, rr ruleRequirements, refuse func(r *refusal)) bool {
+	r := s.mount.requestRefusal(ctx, rr)
 	if r != nil {
 		refuse(r)
 	}
 	return r != nil
+}
+
+// ruleMountRequirements returns the mount requirements of the rule the
+// rules served now select for argv, for the check of a request as it
+// arrives: that of their Allowed when they allow it, or of the Denial's
+// Approved when they refuse it, none when no rule matches it. A shorter
+// rule's requirements never add to those of the rule selected.
+func (s *Server) ruleMountRequirements(argv []string) ruleRequirements {
+	allowed, err := s.rules().Check(argv)
+	if err != nil {
+		d, ok := errors.AsType[*rules.Denial](err)
+		if !ok {
+			return ruleRequirements{}
+		}
+		allowed = d.Approved
+	}
+	return ruleRequirements{rule: allowed.Rule, reqs: allowed.Mounts}
 }
 
 // rejecter returns the function that rejects a request on out as the

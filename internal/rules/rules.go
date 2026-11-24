@@ -42,6 +42,12 @@
 // values is the caller's. A rule with secrets takes allow lists only (see
 // checkStrictLists).
 //
+// A rule may require paths of the workspace to be mounted in the container
+// (`mounts:`), a map from a path relative to the workspace root to
+// `mounted` or `read-only`. Check reports the requirements of the matching
+// rule, sorted by path, and a longer rule does not inherit them; checking
+// them against the container is the caller's.
+//
 // A refusal carries every reason the matching rule finds, each with its
 // kind (see Denial): a plain refusal reports the first, while an approval
 // request and the Rules test show them all and tell from their kinds
@@ -319,6 +325,7 @@ type rule struct {
 	positional *list // nil: positional arguments are unrestricted
 	secrets    []Secret
 	inject     Injection
+	mounts     []MountRequirement
 }
 
 // flagFilter restricts a rule's flags. Its names and the keys of values are
@@ -426,6 +433,7 @@ type (
 		Positional *rawList             `yaml:"positional"`
 		Secrets    map[string]rawSecret `yaml:"secrets"`
 		Inject     *rawInject           `yaml:"inject"`
+		Mounts     yaml.Node            `yaml:"mounts"` // a Node: Parse reports the line of a bad entry
 		// SecretsWithAnyArgs allows args: any in a rule with secrets.
 		SecretsWithAnyArgs bool `yaml:"secrets_with_any_args"`
 	}
@@ -537,6 +545,9 @@ func newRule(rr rawRule) (*rule, error) {
 		return nil, fmt.Errorf("%q: %w", r.name, err)
 	}
 	if r.inject, err = newInjection(rr.Inject, r.secrets); err != nil {
+		return nil, fmt.Errorf("%q: %w", r.name, err)
+	}
+	if r.mounts, err = newMounts(rr.Mounts); err != nil {
 		return nil, fmt.Errorf("%q: %w", r.name, err)
 	}
 	if rr.FlagStyle != "" {
@@ -774,6 +785,10 @@ type Allowed struct {
 	Secrets []Secret
 	// Inject is what the rule adds to the command; Assemble places it.
 	Inject Injection
+	// Mounts are the allowing rule's mount requirements, sorted by path; the
+	// caller has to check them against the container. A rule does not
+	// inherit them from a shorter rule.
+	Mounts []MountRequirement
 	// commandLen is the number of argv tokens the rule's command spans.
 	commandLen int
 }
@@ -806,7 +821,7 @@ func (p *Policy) Check(argv []string) (Allowed, error) {
 	for i := range paths {
 		paths[i].Index += len(best.command)
 	}
-	allowed := Allowed{Rule: best.name, Paths: paths, Dir: best.dir, Secrets: best.secrets, Inject: best.inject, commandLen: len(best.command)}
+	allowed := Allowed{Rule: best.name, Paths: paths, Dir: best.dir, Secrets: best.secrets, Inject: best.inject, Mounts: best.mounts, commandLen: len(best.command)}
 	if len(found) > 0 {
 		return Allowed{}, denial(best.name, allowed, found)
 	}

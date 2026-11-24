@@ -37,6 +37,12 @@ rules:
         --only: {}                 # any value
     positional:
       deny: ["+*"]             # or allow: [...], never both
+  - command: git commit
+    args: any
+    mounts:                    # paths below the workspace root the
+      .git: mounted            # container has to mount: a mount point of
+      .git/config: read-only   # its own, or not writable
+      .git/hooks: read-only
 ```
 
 Validation errors: empty or duplicate `command`; `args` other than
@@ -44,6 +50,27 @@ Validation errors: empty or duplicate `command`; `args` other than
 with `deny` (in `flags`, `positional`, or a value filter); a flag name in
 `allow`/`deny`/`values` that does not start with `-`; empty rule
 (`command` only) ★ — it must say `args: any` explicitly.
+
+`mounts` is a map from a path relative to the workspace root to a mode,
+`mounted` or `read-only`; it combines with any `args`, `flags` and
+`positional` (it restricts no argument), and `mounts: {}` means none.
+Further validation errors, each with the YAML line of the entry: `mounts`
+not a mapping, null (`mounts:` with no value) included; a path that is not a string, is absolute, has a `..`
+component, is not clean (`.git/`, `./.git`, `a//b`, `.` and the empty
+path included) or is given twice; a mode that is not the string `mounted`
+or `read-only`.
+
+The mounts are the requirements of the rule that matches the request
+(the longest `command`), whether it allows or refuses the argv; a longer
+rule does not inherit those of a shorter one, and an argv no rule matches
+has only the protected paths of the mount check. `Allowed.Mounts` holds
+them sorted by path. Checking them against the armed containers, the
+refusal (126, not approvable), the approval session notice and the
+`, requires mounts: …` part of the dry run and `hostrunner test` answer
+belong to the daemon: see the README (Mount check) and
+[ADR 0011](../adr/0011-mount-requirements-on-the-live-mount-table.md).
+`mounts` is part of the rules file, so its digest, allow and reread
+cover it.
 
 ## Matching
 
@@ -202,6 +229,8 @@ name container paths anyway, so only relative symlinks are followed.
 
 ## Out of scope
 
-Raw-command input, mount-check profiles.
+Raw-command input. A separate file of mount-check profiles: mount
+requirements live in the rules file (`mounts`, see
+[ADR 0011](../adr/0011-mount-requirements-on-the-live-mount-table.md)).
 
 Rereading the rules file once it changes: [rules-reread.md](rules-reread.md).

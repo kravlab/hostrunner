@@ -323,7 +323,7 @@ func (t *term) serveDaemon(ctx context.Context, socket string, takeOver, canList
 		fmt.Fprintln(t.out, noRunOutput)
 	}
 	if info.MountCheckFailed != "" {
-		fmt.Fprintln(t.out, mountCheckFailedText(info.MountCheckFailed))
+		fmt.Fprintln(t.out, mountCheckFailedText(info.MountCheckFailed, ""))
 	}
 	fmt.Fprintf(t.out, "waiting for requests · %s\n", idleCommands)
 
@@ -659,7 +659,7 @@ func (s *session) daemonFrame(f protocol.Frame) error {
 		if err := protocol.DecodeJSON(f, &m); err != nil {
 			return err
 		}
-		s.notify(mountCheckFailedText(m.Error))
+		s.notify(mountCheckFailedText(m.Error, m.Rule))
 	case protocol.FrameRunStarted:
 		var m protocol.RunStarted
 		if err := protocol.DecodeJSON(f, &m); err != nil {
@@ -944,9 +944,15 @@ func (s *session) rulesReread(r protocol.RulesReread) {
 }
 
 // mountCheckFailedText says that the daemon's check of its container's
-// mounts failed for why, the daemon's error: it refuses every command.
-func mountCheckFailedText(why string) string {
-	return "the mount check failed, so the daemon refuses every command: " + hostterm.Display(why)
+// mounts failed for why, the daemon's error: it refuses the commands of
+// rule, the rule whose mount requirements failed or cannot be checked, or
+// every command when rule is empty.
+func mountCheckFailedText(why, rule string) string {
+	refused := "every command"
+	if rule != "" {
+		refused = "the commands of rule \"" + hostterm.Display(rule) + "\""
+	}
+	return "the mount check failed, so the daemon refuses " + refused + ": " + hostterm.Display(why)
 }
 
 // notify prints text, a notice, on lines of its own, adding the newline

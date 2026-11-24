@@ -956,7 +956,7 @@ func (s *Server) ask(ctx context.Context, x exchange, f protocol.Frame) {
 			return
 		}
 	}
-	if s.mountRefused(x.daemon, s.rejecter(x.out)) {
+	if s.mountRefused(x.daemon, s.ruleMountRequirements(req.Argv), s.rejecter(x.out)) {
 		return
 	}
 	need, r := s.assessApproval(x.daemon, req)

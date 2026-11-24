@@ -370,6 +370,22 @@ func TestRulesTestReportsTheFixedDirectory(t *testing.T) {
 	}
 }
 
+// The Rules test names the mounts the allowing rule requires, sorted by
+// path, and checks none of them: no container is involved.
+func TestRulesTestListsTheRequiredMounts(t *testing.T) {
+	rules := `rules:
+  - command: git
+    args: any
+    mounts:
+      .git/config: read-only
+      .git: mounted
+`
+	code, _, stderr := runTest(t, "--config", writeRules(t, rules), "git", "status")
+	if want := "hostrunner: allowed by rule \"git\", requires mounts: .git mounted, .git/config read-only\n"; code != 0 || stderr != want {
+		t.Fatalf("exit code %d, stderr %q; want 0, %q", code, stderr, want)
+	}
+}
+
 // The Rules test names a rule's secrets and touches none of them.
 func TestRulesTestListsTheSecrets(t *testing.T) {
 	rules := `rules:

@@ -34,7 +34,7 @@ const (
 // to log.
 func startMountCheckingDaemon(t *testing.T, log *lockedBuffer) harness {
 	t.Helper()
-	return startDaemonWith(t, slog.New(slog.NewTextHandler(log, nil)), policy(t, echoOnly), daemon.WithMountCheck(mountCheckOffHint, func(context.Context) error { return nil }))
+	return startDaemonWith(t, slog.New(slog.NewTextHandler(log, nil)), policy(t, echoOnly), daemon.WithMountCheck(mountCheckOffHint, func(context.Context) (daemon.MountRequirementsCheck, error) { return requirementsPass, nil }))
 }
 
 // writableConfig is the failed check of a container that can write the
