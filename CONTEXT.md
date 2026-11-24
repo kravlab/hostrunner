@@ -241,6 +241,13 @@ devcontainer and daemon, through a bind mount or a volume that binds a
 host directory, and that it meets the mount requirements of the
 request's rule. A human on the host may turn it off for a workspace
 (`mount_check`); the container cannot.
+
+**Live mount table**:
+The mount table of an armed container's init process as the kernel shows
+it now (`/proc/<pid>/mountinfo` on the host): which of the mounts
+`inspect` reports are still mounted in the container, and whether each is
+read-only.
+_Avoid_: mount snapshot, inspected mounts
 _Avoid_: read-only check, writable warning
 
 **Mount requirement**:

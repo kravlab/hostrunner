@@ -26,6 +26,12 @@ const drainingMessage = "the hostrunner daemon is stopping"
 // errDraining is why a command is refused while the daemon drains.
 var errDraining = errors.New("draining: no new commands start")
 
+// drainingRefusal returns the refusal of a command that would start while
+// the daemon drains or stops.
+func drainingRefusal() *refusal {
+	return &refusal{protocol.ExitHostrunError, drainingMessage, errDraining}
+}
+
 // track records req's command as running and returns its key for
 // untrack; it refuses (ok false) once the daemon drains.
 func (s *Server) track(req protocol.Request) (key uint64, ok bool) {

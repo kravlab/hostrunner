@@ -15,19 +15,27 @@ import (
 )
 
 // Runtime is a watch.Runtime whose containers a test starts, stops and
-// removes, as docker would, and whose volumes it sets. Its zero value has
-// no containers and no volumes.
+// removes, as docker would, and whose volumes it sets. Each start gives a
+// container a new pid, that of its init process, whose live mount table a
+// test sets (see MountTable). Its zero value has no containers and no
+// volumes.
 type Runtime struct {
 	mu         sync.Mutex
 	containers []watch.Container
-	mounts     map[string][]watch.Mount // by container ID; outlives Remove
-	mountsErr  map[string]bool          // IDs whose mounts fail to read
-	volumes    map[string]watch.Volume  // by name
-	volumesErr map[string]bool          // names of the volumes that fail to inspect
+	mounts     map[string][]watch.Mount      // by container ID; outlives Remove
+	mountsErr  map[string]bool               // IDs whose mounts fail to read
+	tables     map[string][]watch.MountPoint // by container ID; outlives Remove
+	tablesErr  map[string]bool               // IDs whose mount tables fail to read
+	volumes    map[string]watch.Volume       // by name
+	volumesErr map[string]bool               // names of the volumes that fail to inspect
 	failing    bool
+	lastPid    int   // the pid Start gave last; 0 before any
 	hold       *hold // the next Containers call waits on it; nil: none
 	panicValue any   // the next Containers call panics with it; nil: none
 }
+
+// pidBase is what the pids Start gives count up from.
+const pidBase = 1000
 
 type hold struct {
 	entered, released chan struct{}
@@ -71,6 +79,47 @@ func (r *Runtime) Containers(context.Context, string) ([]watch.Container, error)
 		}
 	}
 	return out, nil
+}
+
+// MountTable returns a copy of the live mount table of the running
+// container whose pid is pid. Any other pid, as the old one of a restarted
+// container, one of a stopped or removed container, or 0, is a process that
+// is gone: the error wraps watch.ErrProcessGone. Until SetMountTable is
+// called for the container, its table has one point per mount SetMounts set
+// for it, at the cleaned destination and with the ReadOnly flag, in that
+// order, as a container just made has.
+func (r *Runtime) MountTable(_ context.Context, pid int) ([]watch.MountPoint, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	i := slices.IndexFunc(r.containers, func(c watch.Container) bool { return c.Running && c.Pid == pid })
+	if i < 0 {
+		return nil, fmt.Errorf("mount table of process %d: %w", pid, watch.ErrProcessGone)
+	}
+	id := r.containers[i].ID
+	if r.tablesErr[id] {
+		return nil, fmt.Errorf("mount table of process %d: unreadable", pid)
+	}
+	if table, ok := r.tables[id]; ok {
+		return slices.Clone(table), nil
+	}
+	var table []watch.MountPoint
+	for _, m := range r.mounts[id] {
+		table = append(table, watch.MountPoint{Path: m.Point(), ReadOnly: m.ReadOnly})
+	}
+	return table, nil
+}
+
+// SetMountTable sets the live mount table of the init process of the
+// container id, which MountTable reports. It is kept across Start and Stop;
+// for an id that does not exist yet it is remembered and applies once it
+// starts. A test can change it between requests.
+func (r *Runtime) SetMountTable(id string, points ...watch.MountPoint) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.tables == nil {
+		r.tables = make(map[string][]watch.MountPoint)
+	}
+	r.tables[id] = slices.Clone(points)
 }
 
 // volume returns a copy of the volume name as Containers reports it, or
@@ -141,15 +190,31 @@ func (r *Runtime) FailMounts(id string, failing bool) {
 	r.mountsErr[id] = failing
 }
 
-// Start starts the container id, creating it if needed: it runs and its
-// start time is now.
-func (r *Runtime) Start(id string) {
-	r.update(id, func(c *watch.Container) { c.Running, c.StartedAt = true, time.Now() })
+// FailMountTable makes MountTable fail, with an error that does not say the
+// process is gone, for the process of the container id, or read its table
+// again.
+func (r *Runtime) FailMountTable(id string, failing bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.tablesErr == nil {
+		r.tablesErr = make(map[string]bool)
+	}
+	r.tablesErr[id] = failing
 }
 
-// Stop stops the container id; it keeps its start time.
+// Start starts the container id, creating it if needed: it runs with a new
+// pid, distinct from every pid given before, and its start time is now.
+func (r *Runtime) Start(id string) {
+	r.update(id, func(c *watch.Container) {
+		r.lastPid++
+		c.Running, c.StartedAt, c.Pid = true, time.Now(), pidBase+r.lastPid
+	})
+}
+
+// Stop stops the container id; it keeps its start time and no longer has a
+// pid.
 func (r *Runtime) Stop(id string) {
-	r.update(id, func(c *watch.Container) { c.Running = false })
+	r.update(id, func(c *watch.Container) { c.Running, c.Pid = false, 0 })
 }
 
 // Remove removes the container id.

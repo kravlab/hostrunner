@@ -1,6 +1,7 @@
 // Package mountcheck tells whether a devcontainer can write host paths the
 // daemon protects, judging from the container's mounts as its runtime
-// reports them.
+// reports them and, where the container's live mount table was read, from
+// that table, which decides what the mounts are now.
 package mountcheck
 
 import (
@@ -10,6 +11,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 
@@ -72,10 +74,21 @@ type mount struct {
 
 // Check returns nil when none of containers can write any of paths (host
 // paths), else the first failure found, containers in order then paths in
-// order: an *UnreadableError for a container whose mounts could not be read,
-// else a *WritableError. An *UnresolvableError for a protected path comes before
+// order: an *UnreadableError for a container whose mounts, or live mount
+// table, could not be read, else a *WritableError. An *UnresolvableError for a protected path comes before
 // all of them, one for a mount source right after its container's mounts
 // are read.
+//
+// A container with a live mount table (watch.Container.Live) is not judged
+// by its inspection alone, which can be stale: a mount that inspection
+// reports counts only when the table has a point at its cleaned
+// destination, and it is read-only when the topmost such point, the last
+// in the table, is. A mount without a point there vanished from the
+// container and is dropped, so it shadows nothing; points that inspection
+// does not report hold no host source and are ignored. This holds for
+// every kind of mount, volumes included: a volume is still judged by its
+// device, and only its presence and read-only flag come from the table. A
+// container without a table is judged by its inspection alone.
 //
 // Protected paths and mount sources are compared after resolving symlinks,
 // dangling ones included; a path that does not exist is resolved through
@@ -110,7 +123,10 @@ func Check(containers []watch.Container, paths []string) error {
 		if c.MountsErr != nil {
 			return &UnreadableError{Container: c.ID, Err: c.MountsErr}
 		}
-		mounts, err := hostMounts(c.ID, c.Mounts)
+		if c.Live != nil && c.Live.Err != nil {
+			return &UnreadableError{Container: c.ID, Err: c.Live.Err}
+		}
+		mounts, err := hostMounts(c.ID, liveMounts(c.Mounts, c.Live))
 		if err != nil {
 			return err
 		}
@@ -121,6 +137,27 @@ func Check(containers []watch.Container, paths []string) error {
 		}
 	}
 	return nil
+}
+
+// liveMounts returns the mounts of ms that the live mount table l holds,
+// those with a point at their cleaned destination, each with the read-only
+// flag of the topmost such point, the last in the table: it is mounted over
+// the others. Without a table (l is nil), it returns ms.
+func liveMounts(ms []watch.Mount, l *watch.LiveMounts) []watch.Mount {
+	if l == nil {
+		return ms
+	}
+	var out []watch.Mount
+	for _, m := range ms {
+		for _, p := range slices.Backward(l.Points) {
+			if p.Path == m.Point() {
+				m.ReadOnly = p.ReadOnly
+				out = append(out, m)
+				break
+			}
+		}
+	}
+	return out
 }
 
 // hostMounts resolves the mounts that have an absolute host source, a

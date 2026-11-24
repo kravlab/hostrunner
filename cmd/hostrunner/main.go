@@ -900,18 +900,20 @@ func isTerminal(f *os.File) bool {
 // in cfg's allow store for the workspace and the daemon's settings, as
 // `up` checks it: an edit not allowed keeps the rules served, and records
 // the allow request, until a `hostrunner allow` (see allowOptions).
-// Without Reread they take
-// effect only in a new daemon, except that an approval session which adds
-// a rule makes the daemon reread the file, and one that found the file
-// edited by hand has it reread once allowed. The digest of the rules
-// reread is the one arms compare.
+// Without Reread they take effect only in a new daemon, except that an
+// approval session which adds a rule makes the daemon reread the file,
+// and one that found the file edited by hand has it reread once allowed.
+// The digest of the rules reread is the one arms compare.
 //
 // With watch, the daemon also checks the mounts of the armed container on
 // every attach (see protectedPaths and daemon.WithMountCheck): it refuses
-// every command until the first check of each arm, and while the latest one finds
-// that the container can write its configuration. Without watch there is
-// no container to check, and no check; with MountCheck off, which only a
-// human on the host can set, none either.
+// every command until the first check of each arm, and while the latest
+// one finds that the container can write its configuration. It checks
+// them again for every request, on the live mount tables of the armed
+// containers (see watch.Watcher.Live), and refuses the request while that
+// check finds the same. Without watch there is no container to check, and
+// no check; with MountCheck off, which only a human on the host can set,
+// none either.
 func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []watch.Runtime) error {
 	policy, err := rules.Load(cfg.RulesFile)
 	if err != nil {
@@ -946,7 +948,7 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var (
-		watcher   *watch.Watcher
+		watcher   *watch.Watcher  // set before the Server serves, which checks the mounts before every request
 		srv       *daemon.Server  // set before the watcher runs, which calls Attached
 		mountOpts []daemon.Option // the mount check's, see wireMountCheck
 	)
@@ -958,7 +960,7 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 			StartupTimeout: cfg.StartupTimeout,
 			Grace:          cfg.Grace,
 		}
-		mountOpts = wireMountCheck(cfg, &wc, &srv)
+		mountOpts = wireMountCheck(cfg, &wc, &srv, &watcher)
 		watcher = watch.New(runtimes, wc, log)
 	}
 	reread := func() (daemon.Policy, string, error) {
@@ -1003,9 +1005,11 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 // one place that looks at cfg.MountCheck: with it on, it sets in wc the
 // callbacks that bring the Server, which *srv points to before the
 // watcher runs, each arm and the check of each attach, and returns the
-// option that has the Server refuse commands by the check's results; with
-// it off, it leaves wc as it is and returns none.
-func wireMountCheck(cfg serveConfig, wc *watch.Config, srv **daemon.Server) []daemon.Option {
+// option that has the Server refuse commands by the check's results and
+// check the live mount tables of the watcher *watcher points to before
+// the Server serves, before every request; with it off, it leaves wc as it
+// is and returns none, so nothing is checked.
+func wireMountCheck(cfg serveConfig, wc *watch.Config, srv **daemon.Server, watcher **watch.Watcher) []daemon.Option {
 	if !cfg.MountCheck {
 		return nil
 	}
@@ -1014,7 +1018,17 @@ func wireMountCheck(cfg serveConfig, wc *watch.Config, srv **daemon.Server) []da
 	}
 	// Before `up` gets its reply, so before its container starts.
 	wc.Armed = func(armedAt time.Time) { (*srv).MountRearmed(armedAt) }
-	return []daemon.Option{daemon.WithMountCheck(settings.MountCheckOffHint())}
+	liveCheck := func(ctx context.Context) error {
+		live, err := (*watcher).Live(ctx)
+		if errors.Is(err, watch.ErrNotAttached) {
+			return daemon.ErrMountCheckPending
+		}
+		if err != nil {
+			return err
+		}
+		return mountcheck.Check(live, protectedPaths(cfg))
+	}
+	return []daemon.Option{daemon.WithMountCheck(settings.MountCheckOffHint(), liveCheck)}
 }
 
 // protectedPaths are the host paths of cfg's daemon configuration that the

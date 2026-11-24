@@ -956,8 +956,7 @@ func (s *Server) ask(ctx context.Context, x exchange, f protocol.Frame) {
 			return
 		}
 	}
-	if r := s.mount.refusal(); r != nil {
-		s.reject(x.out, r.code, r.message, r.err)
+	if s.mountRefused(x.daemon, s.rejecter(x.out)) {
 		return
 	}
 	need, r := s.assessApproval(x.daemon, req)
@@ -1077,16 +1076,6 @@ func (s *Server) ask(ctx context.Context, x exchange, f protocol.Frame) {
 		s.rejectRun(x.out, run, *endedDraining.refusal(), drainingMessage)
 		return
 	}
-	if r := s.mount.refusal(); r != nil {
-		// The mount check failed after the answer: the command is refused
-		// as a new one would be, and nothing is granted.
-		if p != nil {
-			p.close()
-		}
-		s.log.Info("approval not run", "approval_id", id, "reason", string(endedMountCheck))
-		s.rejectRun(x.out, run, *r, r.message)
-		return
-	}
 	_ = x.out.writeJSON(protocol.FrameApproved, protocol.Approved{Scope: scope})
 	// Only the path failures the human saw are passed as given, for the
 	// reason they saw: one that fails its check only now, or otherwise (a
@@ -1099,23 +1088,27 @@ func (s *Server) ask(ctx context.Context, x exchange, f protocol.Frame) {
 			return
 		}
 	}
+	var grant func()
 	if scope == protocol.ScopeStanding || scope == protocol.ScopeSession {
-		// Granted once the approved command has passed its checks, so a
-		// request refused at its start leaves nothing standing. A session
-		// approval belongs to the session that gave the answer.
+		// Granted by start once the approved command has passed every
+		// check, the mount check right before its start included, so a
+		// request refused before it starts leaves nothing standing. A
+		// session approval belongs to the session that gave the answer.
 		var by *sessionConn
 		if scope == protocol.ScopeSession {
 			by = o.by
 		}
-		if n, ok := s.approvals.grant(req, guarded, seen, by); ok {
-			s.log.Info(string(scope)+" approval granted", "approval", n, "argv", req.Argv, "dir", need.hostDir, "approval_id", id)
-		} else {
-			// The session left while the command was checked: it runs as
-			// approved, but nothing is held for it.
-			s.log.Info("session approval not granted", "approval_id", id, "reason", approvalsEndedLeft)
+		grant = func() {
+			if n, ok := s.approvals.grant(req, guarded, seen, by); ok {
+				s.log.Info(string(scope)+" approval granted", "approval", n, "argv", req.Argv, "dir", need.hostDir, "approval_id", id)
+			} else {
+				// The session left while the command was checked: it runs
+				// as approved, but nothing is held for it.
+				s.log.Info("session approval not granted", "approval_id", id, "reason", approvalsEndedLeft)
+			}
 		}
 	}
-	s.start(ctx, x, req, p, frames.next, run, "approved", scope, "approval_id", id)
+	s.start(ctx, x, req, p, frames.next, run, grant, "approved", scope, "approval_id", id)
 }
 
 // approvalNeed is what --ask would ask a human about a request: what the

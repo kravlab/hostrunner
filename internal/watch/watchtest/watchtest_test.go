@@ -2,6 +2,7 @@ package watchtest_test
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"testing"
 
@@ -122,4 +123,167 @@ func TestPanicMakesTheNextContainersCallPanic(t *testing.T) {
 		t.Fatal("Containers returned; want a panic")
 	}()
 	containers(t, r)
+}
+
+// Every Start gives the container a new pid, distinct from every pid given
+// before, also to the container it restarts.
+func TestStartGivesEveryContainerANewPid(t *testing.T) {
+	r := &watchtest.Runtime{}
+	r.Start("a")
+	r.Start("b")
+	first := containers(t, r)
+	r.Stop("a")
+	r.Start("a")
+	again := containers(t, r)
+	pids := []int{first[0].Pid, first[1].Pid, again[0].Pid}
+	for _, pid := range pids {
+		if pid <= 0 {
+			t.Fatalf("got pids %v; want every one positive", pids)
+		}
+	}
+	if len(slices.Compact(slices.Sorted(slices.Values(pids)))) != len(pids) {
+		t.Fatalf("got pids %v; want them distinct", pids)
+	}
+}
+
+// A stopped container has no process: its pid is 0.
+func TestStopClearsThePid(t *testing.T) {
+	r := &watchtest.Runtime{}
+	r.Start("c")
+	r.Stop("c")
+	if got := containers(t, r); got[0].Running || got[0].Pid != 0 {
+		t.Fatalf("got %+v; want a stopped container without a pid", got[0])
+	}
+}
+
+func mountTable(t *testing.T, r *watchtest.Runtime, pid int) []watch.MountPoint {
+	t.Helper()
+	got, err := r.MountTable(context.Background(), pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
+// MountTable of the pid of a running container returns the table
+// SetMountTable set for it, and a later SetMountTable changes the next
+// answer.
+func TestMountTableOfTheCurrentPidReturnsTheSetTable(t *testing.T) {
+	r := &watchtest.Runtime{}
+	r.Start("c")
+	pid := containers(t, r)[0].Pid
+	want := []watch.MountPoint{{Path: "/"}, {Path: "/workspace", ReadOnly: true}}
+	r.SetMountTable("c", want...)
+	if got := mountTable(t, r, pid); !slices.Equal(got, want) {
+		t.Fatalf("got %v; want %v", got, want)
+	}
+	next := []watch.MountPoint{{Path: "/"}}
+	r.SetMountTable("c", next...)
+	if got := mountTable(t, r, pid); !slices.Equal(got, next) {
+		t.Fatalf("got %v after the change; want %v", got, next)
+	}
+}
+
+// A process that does not run any more, or never did, is gone: the old pid
+// of a restarted container, the pid of a stopped or removed container, and
+// pid 0.
+func TestMountTableOfAProcessThatDoesNotRunIsGone(t *testing.T) {
+	r := &watchtest.Runtime{}
+	r.Start("restarted")
+	r.Start("stopped")
+	r.Start("removed")
+	first := containers(t, r)
+	r.Stop("restarted")
+	r.Start("restarted")
+	r.Stop("stopped")
+	r.Remove("removed")
+	for name, pid := range map[string]int{
+		"old pid after a restart": first[0].Pid,
+		"stopped":                 first[1].Pid,
+		"removed":                 first[2].Pid,
+		"pid 0":                   0,
+	} {
+		if _, err := r.MountTable(context.Background(), pid); !errors.Is(err, watch.ErrProcessGone) {
+			t.Errorf("%s: got error %v; want ErrProcessGone", name, err)
+		}
+	}
+}
+
+// Without a SetMountTable, the live table has one point per mount SetMounts
+// set, as a container just made has; SetMountTable then replaces it.
+func TestMountTableDefaultsToTheMounts(t *testing.T) {
+	r := &watchtest.Runtime{}
+	r.Start("c")
+	r.SetMounts("c",
+		watch.Mount{Source: "/home/u/app", Destination: "/workspace/"},
+		watch.Mount{Destination: "/tmp", ReadOnly: true})
+	pid := containers(t, r)[0].Pid
+	want := []watch.MountPoint{{Path: "/workspace"}, {Path: "/tmp", ReadOnly: true}}
+	if got := mountTable(t, r, pid); !slices.Equal(got, want) {
+		t.Fatalf("got %v; want %v", got, want)
+	}
+	r.SetMountTable("c")
+	if got := mountTable(t, r, pid); len(got) != 0 {
+		t.Fatalf("got %v after SetMountTable with no points; want an empty table", got)
+	}
+}
+
+// FailMountTable makes the table of that container's process unreadable,
+// with an error that does not say the process is gone, and readable again.
+func TestFailMountTableReportsAnErrorForThatContainerOnly(t *testing.T) {
+	r := &watchtest.Runtime{}
+	r.Start("a")
+	r.Start("b")
+	r.SetMountTable("a", watch.MountPoint{Path: "/workspace"})
+	got := containers(t, r)
+	r.FailMountTable("a", true)
+	_, err := r.MountTable(context.Background(), got[0].Pid)
+	if err == nil || errors.Is(err, watch.ErrProcessGone) {
+		t.Fatalf("got error %v; want one that is not ErrProcessGone", err)
+	}
+	if _, err := r.MountTable(context.Background(), got[1].Pid); err != nil {
+		t.Fatalf("b: got error %v; want none", err)
+	}
+	r.FailMountTable("a", false)
+	if table := mountTable(t, r, got[0].Pid); len(table) != 1 {
+		t.Fatalf("got %v; want a's table back", table)
+	}
+}
+
+func TestMountTableReturnsCopies(t *testing.T) {
+	r := &watchtest.Runtime{}
+	r.Start("c")
+	pid := containers(t, r)[0].Pid
+	in := []watch.MountPoint{{Path: "/workspace"}}
+	r.SetMountTable("c", in...)
+	in[0].Path = "/changed by the caller of SetMountTable"
+	mountTable(t, r, pid)[0].Path = "/changed by the caller of MountTable"
+	if got := mountTable(t, r, pid); got[0].Path != "/workspace" {
+		t.Fatalf("got %v; want the table unchanged", got)
+	}
+}
+
+func TestDefaultMountTableReturnsCopies(t *testing.T) {
+	r := &watchtest.Runtime{}
+	r.Start("c")
+	r.SetMounts("c", watch.Mount{Destination: "/workspace"})
+	pid := containers(t, r)[0].Pid
+	mountTable(t, r, pid)[0].Path = "/changed by the caller of MountTable"
+	if got := mountTable(t, r, pid); got[0].Path != "/workspace" {
+		t.Fatalf("got %v; want the table unchanged", got)
+	}
+}
+
+// SetMountTable of an id that does not exist yet applies once it starts, and
+// is kept across Stop and Start.
+func TestSetMountTableOfUnknownContainerAppliesWhenItStarts(t *testing.T) {
+	r := &watchtest.Runtime{}
+	want := []watch.MountPoint{{Path: "/workspace", ReadOnly: true}}
+	r.SetMountTable("c", want...)
+	r.Start("c")
+	r.Stop("c")
+	r.Start("c")
+	if got := mountTable(t, r, containers(t, r)[0].Pid); !slices.Equal(got, want) {
+		t.Fatalf("got %v; want %v", got, want)
+	}
 }

@@ -29,6 +29,11 @@ func (hangingRuntime) Containers(ctx context.Context, _ string) ([]watch.Contain
 	return nil, ctx.Err()
 }
 
+func (hangingRuntime) MountTable(ctx context.Context, _ int) ([]watch.MountPoint, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
 var testConfig = watch.Config{
 	Workspace:      "/home/u/app",
 	PollInterval:   5 * time.Millisecond,
@@ -585,7 +590,7 @@ func fakeCLIMounts(t *testing.T, workspace, bErr, mountsA, mountsB string) strin
 func fakeCLIVolumes(t *testing.T, workspace, bErr, mountsA, mountsB, volume string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "fakert")
-	inspectB := `echo 'b false "2026-10-09T12:00:05.5+02:00" ` + mountsB + `'`
+	inspectB := `echo 'b false 0 "2026-10-09T12:00:05.5+02:00" ` + mountsB + `'`
 	if bErr != "" {
 		inspectB = `echo '` + bErr + `' >&2; status=1`
 	}
@@ -595,8 +600,8 @@ case "$*" in
 "ps -aq --filter label=devcontainer.local_folder=` + workspace + `")
 	echo a; echo b ;;
 "ps -aq --filter label=devcontainer.local_folder="*) ;;
-"inspect --type container --format {{.Id}} {{.State.Running}} {{json .State.StartedAt}} {{json .Mounts}} a b")
-	echo 'a true "2026-10-09T10:00:00.123456789Z" ` + mountsA + `'
+"inspect --type container --format {{.Id}} {{.State.Running}} {{.State.Pid}} {{json .State.StartedAt}} {{json .Mounts}} a b")
+	echo 'a true 4242 "2026-10-09T10:00:00.123456789Z" ` + mountsA + `'
 	` + inspectB + ` ;;
 "volume inspect --format {{json .}} data")
 	` + volume + ` ;;
@@ -619,6 +624,17 @@ func TestCLIRuntimeListsWorkspaceContainersInEveryState(t *testing.T) {
 	}
 	if err != nil || !slices.EqualFunc(got, want, sameContainer) {
 		t.Fatalf("got %v, %v; want %v, nil", got, err, want)
+	}
+}
+
+func TestCLIRuntimeReportsTheInitProcessOfEachContainer(t *testing.T) {
+	rt := watch.CLI{Binary: fakeCLI(t, "/home/u/app", "")}
+	got, err := rt.Containers(context.Background(), "/home/u/app")
+	if err != nil || len(got) != 2 {
+		t.Fatalf("got %v, %v; want two containers, nil", got, err)
+	}
+	if got[0].Pid != 4242 || got[1].Pid != 0 {
+		t.Fatalf("got pids %d (running a), %d (stopped b); want 4242, 0", got[0].Pid, got[1].Pid)
 	}
 }
 
@@ -666,7 +682,7 @@ func TestCLIRuntimeReportsMissingMountsField(t *testing.T) {
 	script := `#!/bin/sh
 case "$1" in
 ps) echo a ;;
-inspect) echo 'a true "2026-10-09T10:00:00Z"' ;;
+inspect) echo 'a true 4242 "2026-10-09T10:00:00Z"' ;;
 esac
 `
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
@@ -675,6 +691,22 @@ esac
 	got, err := (watch.CLI{Binary: path}).Containers(context.Background(), "/home/u/app")
 	if err != nil || len(got) != 1 || got[0].MountsErr == nil || !got[0].Running {
 		t.Fatalf("got %+v, %v; want container a with a MountsErr, nil", got, err)
+	}
+}
+
+func TestCLIRuntimeReportsUnparsablePidAsInspectionError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fakert")
+	script := `#!/bin/sh
+case "$1" in
+ps) echo a ;;
+inspect) echo 'a true not-a-pid "2026-10-09T10:00:00Z" null' ;;
+esac
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := (watch.CLI{Binary: path}).Containers(context.Background(), "/home/u/app"); err == nil {
+		t.Fatalf("got %v, nil; want an error for the unparsable pid", got)
 	}
 }
 
@@ -1100,6 +1132,10 @@ func (r *sharedRuntime) Containers(context.Context, string) ([]watch.Container, 
 	return []watch.Container{r.c}, nil
 }
 
+func (r *sharedRuntime) MountTable(context.Context, int) ([]watch.MountPoint, error) {
+	return nil, nil
+}
+
 func (r *sharedRuntime) set(running bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -1112,9 +1148,12 @@ func (r *sharedRuntime) set(running bool) {
 func TestAttachedContainersAreCopiesTheCallbackMayChange(t *testing.T) {
 	want := []watch.Mount{{Source: "/home/u/app", Destination: "/workspace"}, {Destination: "/tmp"},
 		{Type: "volume", Name: "v", Destination: "/v", Volume: &watch.Volume{Driver: "local", Options: map[string]string{"device": "/home/u/v"}}}}
-	rt := &sharedRuntime{c: watch.Container{ID: "c", Mounts: slices.Clone(want)}}
+	wantLive := []watch.MountPoint{{Path: "/workspace"}, {Path: "/tmp", ReadOnly: true}}
+	rt := &sharedRuntime{c: watch.Container{ID: "c", Mounts: slices.Clone(want),
+		Live: &watch.LiveMounts{Points: slices.Clone(wantLive)}}}
 	var mu sync.Mutex
 	var seen [][]watch.Mount
+	var seenLive [][]watch.MountPoint
 	cfg := testConfig
 	cfg.Attached = func(_ time.Time, armed []watch.Container) {
 		mu.Lock()
@@ -1124,6 +1163,9 @@ func TestAttachedContainersAreCopiesTheCallbackMayChange(t *testing.T) {
 		v.Options = maps.Clone(v.Options)
 		mounts[2].Volume = &v
 		seen = append(seen, mounts)
+		seenLive = append(seenLive, slices.Clone(armed[0].Live.Points))
+		armed[0].Live.Points[0].Path = "/changed by the callback"
+		armed[0].Live.Points = append(armed[0].Live.Points, watch.MountPoint{Path: "/added by the callback"})
 		armed[0].Mounts[0].Destination = "/changed by the callback"
 		armed[0].Mounts[2].Volume.Options["device"] = "/changed by the callback"
 		armed[0].Mounts[2].Volume.Driver = "changed by the callback"
@@ -1145,6 +1187,537 @@ func TestAttachedContainersAreCopiesTheCallbackMayChange(t *testing.T) {
 	if !slices.EqualFunc(got, want, sameMount) {
 		t.Fatalf("second attach got mounts %v; want %v unchanged by the first callback", got, want)
 	}
+	mu.Lock()
+	gotLive := seenLive[1]
+	mu.Unlock()
+	if !slices.Equal(gotLive, wantLive) {
+		t.Fatalf("second attach got live mount points %v; want %v unchanged by the first callback", gotLive, wantLive)
+	}
 	rt.set(false)
 	expectResult(t, done, nil)
+}
+
+// Attached gets the live mount table of each armed container that runs,
+// read through the runtime that reported it; one that does not run gets
+// none, and is checked from its inspection alone.
+func TestAttachedGetsTheLiveTablesOfRunningArmedContainers(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		rt := &watchtest.Runtime{}
+		rec := &attachRecorder{}
+		cfg := testConfig
+		cfg.Attached = rec.attached
+		_, done := startWatcherWith(context.Background(), cfg, nil, rt)
+		time.Sleep(cfg.PollInterval / 2)
+		table := []watch.MountPoint{{Path: "/workspace"}, {Path: "/workspace/.devcontainer", ReadOnly: true}}
+		rt.SetMountTable("running", table...)
+		rt.Start("stopped")
+		rt.Stop("stopped")
+		rt.Start("running") // both start between two polls
+		time.Sleep(cfg.PollInterval)
+		calls := rec.snapshot()
+		if len(calls) != 1 || !slices.Equal(ids(calls[0]), []string{"stopped", "running"}) {
+			t.Fatalf("got %+v; want one call with stopped and running", calls)
+		}
+		if l := calls[0][0].Live; l != nil {
+			t.Fatalf("the stopped container got live mounts %+v; want none", l)
+		}
+		if l := calls[0][1].Live; l == nil || l.Err != nil || !slices.Equal(l.Points, table) {
+			t.Fatalf("the running container got live mounts %+v; want %v", l, table)
+		}
+		rt.Stop("running")
+		expectResult(t, done, nil)
+	})
+}
+
+func TestLiveBeforeTheAttachIsNotAttached(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rt := &watchtest.Runtime{}
+	w, _ := startWatcher(ctx, nil, rt)
+	time.Sleep(3 * testConfig.PollInterval) // polls find no armed container
+	if got, err := w.Live(ctx); !errors.Is(err, watch.ErrNotAttached) {
+		t.Fatalf("Live before the attach got %+v, %v; want %v", got, err, watch.ErrNotAttached)
+	}
+}
+
+// expectLive waits for Live to answer for an attach, and returns its
+// containers.
+func expectLive(t *testing.T, w *watch.Watcher) []watch.Container {
+	t.Helper()
+	var (
+		got []watch.Container
+		err error
+	)
+	eventually(t, func() bool {
+		got, err = w.Live(context.Background())
+		return !errors.Is(err, watch.ErrNotAttached)
+	}, "Live did not attach")
+	if err != nil {
+		t.Fatalf("Live: %v", err)
+	}
+	return got
+}
+
+// livePoints returns the live mount points of the container id among
+// containers, failing if it is not there or its table was not read.
+func livePoints(t *testing.T, containers []watch.Container, id string) []watch.MountPoint {
+	t.Helper()
+	i := slices.IndexFunc(containers, func(c watch.Container) bool { return c.ID == id })
+	if i < 0 {
+		t.Fatalf("got %+v; want container %s", containers, id)
+	}
+	l := containers[i].Live
+	if l == nil || l.Err != nil {
+		t.Fatalf("container %s got live mounts %+v; want a table", id, l)
+	}
+	return l.Points
+}
+
+func TestLiveReadsTheCurrentMountTable(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rt := &watchtest.Runtime{}
+	before := []watch.MountPoint{{Path: "/workspace"}, {Path: "/workspace/.devcontainer", ReadOnly: true}}
+	rt.SetMountTable("c", before...)
+	w, _ := startWatcher(ctx, nil, rt)
+	rt.Start("c")
+	if got := livePoints(t, expectLive(t, w), "c"); !slices.Equal(got, before) {
+		t.Fatalf("first Live got %v; want %v", got, before)
+	}
+
+	after := []watch.MountPoint{{Path: "/workspace"}, {Path: "/workspace/.devcontainer"}} // remounted writable
+	rt.SetMountTable("c", after...)
+	got, err := w.Live(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if points := livePoints(t, got, "c"); !slices.Equal(points, after) {
+		t.Fatalf("second Live got %v; want the changed table %v", points, after)
+	}
+}
+
+func TestLiveAfterARearmIsNotAttachedUntilTheNextAttach(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rt := &watchtest.Runtime{}
+	w, _ := startWatcher(ctx, nil, rt)
+	rt.Start("old")
+	expectLive(t, w)
+
+	rt.Stop("old")
+	expectArmAccepted(t, w)
+	if got, err := w.Live(ctx); !errors.Is(err, watch.ErrNotAttached) {
+		t.Fatalf("Live right after a re-arm got %+v, %v; want %v", got, err, watch.ErrNotAttached)
+	}
+	time.Sleep(3 * testConfig.PollInterval) // polls find no container started since the arm
+	if got, err := w.Live(ctx); !errors.Is(err, watch.ErrNotAttached) {
+		t.Fatalf("Live before the re-arm attached got %+v, %v; want %v", got, err, watch.ErrNotAttached)
+	}
+	rt.Start("new")
+	if got := expectLive(t, w); !slices.Equal(ids(got), []string{"new"}) {
+		t.Fatalf("Live after the re-arm attached got %v; want only the new container", ids(got))
+	}
+}
+
+// countingRuntime is a watchtest.Runtime that counts its Containers calls.
+type countingRuntime struct {
+	*watchtest.Runtime
+	calls atomic.Int32
+}
+
+func (r *countingRuntime) Containers(ctx context.Context, workspace string) ([]watch.Container, error) {
+	r.calls.Add(1)
+	return r.Runtime.Containers(ctx, workspace)
+}
+
+// A restart gives the armed container a new process: Live finds the old
+// one gone, inspects again and reads the table of the new one, whose pid
+// the next call reads directly.
+func TestLiveAfterARestartReadsTheNewProcess(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		cfg := raceConfig() // the test acts between two polls
+		rt := &countingRuntime{Runtime: &watchtest.Runtime{}}
+		w, _ := startWatcherWith(ctx, cfg, nil, rt)
+		time.Sleep(cfg.PollInterval / 10)
+		rt.Start("c")
+		time.Sleep(cfg.PollInterval) // the poll at 150 ms attaches
+		attached, err := w.Live(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		rt.Stop("c") // docker restart
+		rt.Start("c")
+		table := []watch.MountPoint{{Path: "/workspace"}, {Path: "/after-the-restart", ReadOnly: true}}
+		rt.SetMountTable("c", table...)
+		before := rt.calls.Load()
+		got, err := w.Live(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if points := livePoints(t, got, "c"); !slices.Equal(points, table) {
+			t.Fatalf("Live after the restart got %v; want the new process's table %v", points, table)
+		}
+		if got[0].Pid == attached[0].Pid {
+			t.Fatalf("Live after the restart reports pid %d; want the new process's, not the attach's", got[0].Pid)
+		}
+		if n := rt.calls.Load() - before; n != 1 {
+			t.Fatalf("Live after the restart inspected %d times; want once", n)
+		}
+
+		before = rt.calls.Load()
+		again, err := w.Live(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if points := livePoints(t, again, "c"); !slices.Equal(points, table) || again[0].Pid != got[0].Pid {
+			t.Fatalf("the next Live got pid %d, %v; want pid %d, %v", again[0].Pid, points, got[0].Pid, table)
+		}
+		if n := rt.calls.Load() - before; n != 0 {
+			t.Fatalf("the next Live inspected %d times; want none: it reads the new pid", n)
+		}
+	})
+}
+
+// A container that does not run cannot write: Live leaves out an armed
+// container that stopped. Live inspects it again only once its last
+// inspection is a poll interval old, and then takes it in again if it runs:
+// until then, it is left out without a query.
+func TestLiveInspectsAStoppedArmedContainerAgainAfterAPollInterval(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		cfg := raceConfig()
+		rt := &countingRuntime{Runtime: &watchtest.Runtime{}}
+		w, _ := startWatcherWith(ctx, cfg, nil, rt)
+		time.Sleep(cfg.PollInterval / 10)
+		rt.Start("a")
+		rt.Start("b")
+		time.Sleep(cfg.PollInterval) // the poll at 150 ms attaches to both
+
+		rt.Stop("b")
+		got, err := w.Live(ctx) // at 165 ms: b's process is gone, b is inspected again
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(ids(got), []string{"a"}) {
+			t.Fatalf("Live with b stopped got %v; want only a", ids(got))
+		}
+		livePoints(t, got, "a")
+
+		rt.Start("b")
+		release := holdNextQuery(t, rt.Runtime) // the poll at 300 ms waits: only Live inspects
+		defer release()
+		before := rt.calls.Load()
+		got, err = w.Live(ctx) // b's inspection is 135 ms old
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(ids(got), []string{"a"}) {
+			t.Fatalf("Live within a poll interval of b's inspection got %v; want only a", ids(got))
+		}
+		if n := rt.calls.Load() - before; n != 0 {
+			t.Fatalf("Live within a poll interval of b's inspection inspected %d times; want none", n)
+		}
+
+		time.Sleep(cfg.PollInterval / 10) // b's inspection is 150 ms old
+		before = rt.calls.Load()
+		got, err = w.Live(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(ids(got), []string{"a", "b"}) {
+			t.Fatalf("Live a poll interval after b's inspection got %v; want a and b", ids(got))
+		}
+		livePoints(t, got, "b")
+		if n := rt.calls.Load() - before; n != 1 {
+			t.Fatalf("Live a poll interval after b's inspection inspected %d times; want once", n)
+		}
+	})
+}
+
+// Run's polls keep what Live reads current: an armed container that
+// started again is seen through the poll's inspection, its new process's
+// table read, without Live inspecting it.
+func TestLiveReadsAContainerStartedAgainThroughThePollsInspection(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		cfg := raceConfig()
+		rt := &countingRuntime{Runtime: &watchtest.Runtime{}}
+		w, _ := startWatcherWith(ctx, cfg, nil, rt)
+		time.Sleep(cfg.PollInterval / 10)
+		rt.Start("a")
+		rt.Start("b")
+		time.Sleep(cfg.PollInterval) // the poll at 150 ms attaches to both
+
+		rt.Stop("b")
+		if got, err := w.Live(ctx); err != nil || !slices.Equal(ids(got), []string{"a"}) {
+			t.Fatalf("Live with b stopped got %v, %v; want only a", ids(got), err)
+		}
+		rt.Start("b")
+		table := []watch.MountPoint{{Path: "/workspace"}, {Path: "/started-again", ReadOnly: true}}
+		rt.SetMountTable("b", table...)
+		time.Sleep(cfg.PollInterval) // the poll at 300 ms sees b running
+
+		before := rt.calls.Load()
+		got, err := w.Live(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if points := livePoints(t, got, "b"); !slices.Equal(points, table) {
+			t.Fatalf("Live after the poll got %v for b; want its new process's table %v", points, table)
+		}
+		if n := rt.calls.Load() - before; n != 0 {
+			t.Fatalf("Live after the poll inspected %d times; want none: the poll's inspection names b's new process", n)
+		}
+	})
+}
+
+func TestLiveReportsAnUnreadableTableOnItsContainerOnly(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rt := &watchtest.Runtime{}
+	w, _ := startWatcher(ctx, nil, rt)
+	rt.Start("readable")
+	rt.Start("unreadable")
+	// The two may attach in two polls.
+	eventually(t, func() bool { return len(expectLive(t, w)) == 2 }, "Live did not get both containers")
+
+	rt.FailMountTable("unreadable", true)
+	got, err := w.Live(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	livePoints(t, got, "readable")
+	i := slices.IndexFunc(got, func(c watch.Container) bool { return c.ID == "unreadable" })
+	if i < 0 || got[i].Live == nil || got[i].Live.Err == nil || errors.Is(got[i].Live.Err, watch.ErrProcessGone) {
+		t.Fatalf("got %+v; want unreadable with a Live.Err that is not ErrProcessGone", got)
+	}
+}
+
+// A container whose process is gone cannot be inspected again while no
+// runtime answers: it carries why, for the caller to refuse.
+func TestLiveReportsAGoneProcessWhileNoRuntimeAnswers(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		cfg := raceConfig()
+		rt := &watchtest.Runtime{}
+		w, _ := startWatcherWith(ctx, cfg, nil, rt)
+		time.Sleep(cfg.PollInterval / 10)
+		rt.Start("c")
+		time.Sleep(cfg.PollInterval) // the poll at 150 ms attaches
+
+		rt.Stop("c") // docker restart
+		rt.Start("c")
+		rt.Fail(true)
+		got, err := w.Live(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 1 || got[0].ID != "c" || got[0].Live == nil || got[0].Live.Err == nil ||
+			errors.Is(got[0].Live.Err, watch.ErrProcessGone) {
+			t.Fatalf("got %+v; want c with why it could not be inspected again as its Live.Err", got)
+		}
+	})
+}
+
+// racingRuntime is a watchtest.Runtime whose container id restarts, or
+// stops, when its first mount table is asked for: between the inspection
+// that reported it and the read of its table.
+type racingRuntime struct {
+	*watchtest.Runtime
+	id      string
+	restart bool // start it again after stopping it
+	once    sync.Once
+}
+
+func (r *racingRuntime) MountTable(ctx context.Context, pid int) ([]watch.MountPoint, error) {
+	r.once.Do(func() {
+		r.Stop(r.id)
+		if r.restart {
+			r.Start(r.id)
+		}
+	})
+	return r.Runtime.MountTable(ctx, pid)
+}
+
+func TestAttachedInspectsAgainAContainerWhoseProcessIsGone(t *testing.T) {
+	table := []watch.MountPoint{{Path: "/workspace"}}
+	for _, tt := range []struct {
+		name    string
+		restart bool
+		check   func(c watch.Container) bool
+	}{
+		{"restarted: the new process's table", true, func(c watch.Container) bool {
+			return c.Running && c.Live != nil && c.Live.Err == nil && slices.Equal(c.Live.Points, table)
+		}},
+		{"stopped: no table", false, func(c watch.Container) bool { return !c.Running && c.Live == nil }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				rt := &racingRuntime{Runtime: &watchtest.Runtime{}, id: "c", restart: tt.restart}
+				rt.SetMountTable("c", table...)
+				rec := &attachRecorder{}
+				cfg := raceConfig()
+				cfg.Attached = rec.attached
+				_, done := startWatcherWith(context.Background(), cfg, nil, rt)
+				time.Sleep(cfg.PollInterval / 10)
+				rt.Start("c")
+				time.Sleep(cfg.PollInterval) // the poll at 150 ms attaches
+				calls := rec.snapshot()
+				if len(calls) != 1 || len(calls[0]) != 1 || !tt.check(calls[0][0]) {
+					t.Fatalf("got %+v", calls)
+				}
+				rt.Stop("c")
+				expectResult(t, done, nil)
+			})
+		})
+	}
+}
+
+// lateRuntime is a watchtest.Runtime that counts its Containers calls and
+// can make one answer late: it answers with the state at its call, once
+// released, as a slow runtime CLI does after the containers changed.
+type lateRuntime struct {
+	*watchtest.Runtime
+	calls atomic.Int32
+	mu    sync.Mutex
+	late  *hold // the next Containers call answers late; nil: none
+}
+
+type hold struct {
+	entered, released chan struct{}
+}
+
+// Late makes the next Containers call read the state, close entered, and
+// answer with that state once release is called.
+func (r *lateRuntime) Late() (entered <-chan struct{}, release func()) {
+	h := &hold{entered: make(chan struct{}), released: make(chan struct{})}
+	r.mu.Lock()
+	r.late = h
+	r.mu.Unlock()
+	return h.entered, sync.OnceFunc(func() { close(h.released) })
+}
+
+func (r *lateRuntime) Containers(ctx context.Context, workspace string) ([]watch.Container, error) {
+	r.calls.Add(1)
+	r.mu.Lock()
+	h := r.late
+	r.late = nil
+	r.mu.Unlock()
+	found, err := r.Runtime.Containers(ctx, workspace)
+	if h != nil {
+		close(h.entered)
+		<-h.released
+	}
+	return found, err
+}
+
+// Two Live calls that both inspect the armed container again may finish
+// out of order: the one whose inspection is older must not replace what
+// the newer one found, or the next Live would read a process that is gone
+// and inspect again.
+func TestLiveKeepsTheNewerOfTwoConcurrentInspections(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		cfg := raceConfig() // the test acts between two polls
+		rt := &lateRuntime{Runtime: &watchtest.Runtime{}}
+		w, _ := startWatcherWith(ctx, cfg, nil, rt)
+		time.Sleep(cfg.PollInterval / 10)
+		rt.Start("c")
+		time.Sleep(cfg.PollInterval) // the poll at 150 ms attaches
+
+		rt.Stop("c") // docker restart: the attach's process is gone
+		rt.Start("c")
+		entered, release := rt.Late()
+		older := make(chan error, 1)
+		go func() {
+			_, err := w.Live(ctx)
+			older <- err
+		}()
+		<-entered // the older Live has inspected, and answers late
+
+		time.Sleep(time.Millisecond)
+		rt.Stop("c") // restarted again: the older inspection's process is gone too
+		rt.Start("c")
+		newer, err := w.Live(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		release()
+		if err := <-older; err != nil {
+			t.Fatal(err)
+		}
+
+		before := rt.calls.Load()
+		got, err := w.Live(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 1 || got[0].Pid != newer[0].Pid {
+			t.Fatalf("the next Live got %+v; want pid %d, the newer inspection's", got, newer[0].Pid)
+		}
+		if n := rt.calls.Load() - before; n != 0 {
+			t.Fatalf("the next Live inspected %d times; want none: it reads the newer pid", n)
+		}
+	})
+}
+
+// Live calls run alongside Run's polls, arms, restarts and each other; run
+// under -race, the test checks they share no state unguarded.
+func TestLiveIsSafeForConcurrentUseWithRun(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cfg := testConfig
+	cfg.Attached = func(time.Time, []watch.Container) {}
+	rt := &watchtest.Runtime{}
+	w, done := startWatcherWith(ctx, cfg, nil, rt)
+	rt.Start("c")
+	expectLive(t, w)
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	for range 4 {
+		wg.Go(func() {
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				got, err := w.Live(ctx)
+				if err != nil && !errors.Is(err, watch.ErrNotAttached) {
+					t.Errorf("Live: %v", err)
+					return
+				}
+				for _, c := range got {
+					if c.Live != nil && c.Live.Err == nil {
+						c.Live.Points = append(c.Live.Points, watch.MountPoint{Path: "/added by the caller"})
+					}
+				}
+			}
+		})
+	}
+	for i := range 20 {
+		rt.Stop("c") // docker restart
+		rt.Start("c")
+		if i%5 == 0 {
+			expectArmAccepted(t, w)
+			rt.Stop("c")
+			rt.Start("c")
+		}
+		time.Sleep(testConfig.PollInterval)
+	}
+	close(stop)
+	wg.Wait()
+	select {
+	case err := <-done:
+		t.Fatalf("the watcher ended (%v) while its armed container ran", err)
+	default:
+	}
 }

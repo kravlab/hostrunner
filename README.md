@@ -210,11 +210,24 @@ pointing to it.
 A daemon that watches its container (`hostrunner up`, that is
 `serve --watch`) checks the container's mounts, so that the container
 cannot rewrite the configuration it is served by. Once the daemon attaches
-to the armed container, and again whenever a new container joins the armed
-ones (a Compose recreate, say), it checks that the container cannot write
-`.devcontainer/`, the rules file or the workspace settings file. These are
-host paths with symlinks followed, and a deeper mount shadows a shallower
-one, so the read-only `.devcontainer` mount in the example above passes.
+to the armed container, again whenever a new container joins the armed
+ones (a Compose recreate, say), and before every request, it checks that
+the container cannot write `.devcontainer/`, the rules file or the
+workspace settings file. These are host paths with symlinks followed, and
+a deeper mount shadows a shallower one, so the read-only `.devcontainer`
+mount in the example above passes.
+
+The mounts come from `docker inspect` (`podman inspect`), which can be
+stale: a mount can be unmounted, mounted over or remounted after the
+container started. So for a running container the daemon also reads the
+live mount table of its init process (`/proc/<pid>/mountinfo` on the
+host). A mount from the inspection counts only when the live table has a
+mount at its destination, and its read-only flag is that of the topmost
+live entry there. Host sources are still compared from the inspection, so
+a second read-write mount of a protected directory elsewhere is refused
+too. A container that is stopped when the daemon attaches is judged by
+the inspection alone.
+
 A named volume is judged by what `docker volume inspect` (`podman volume
 inspect`) reports of it: a `local` volume whose `device` option is an
 absolute path (one created with `--opt type=none --opt o=bind --opt
@@ -239,6 +252,26 @@ check as unreadable mounts do.
   only, never a host path. Waiting `--ask` requests are withdrawn. The
   daemon log and the approval session report the failure, the log with the
   host path.
+- The check before a request makes the same refusal, but does not
+  withdraw waiting `--ask` requests, and the approval session is told of
+  a failure once, again only when the failure changes or after a check
+  passed. A live mount table that cannot be read refuses every command. A
+  table whose process is gone is read again after one more inspection, at
+  once. An armed container that did not run at its last inspection cannot
+  write and is skipped; it is inspected again at most once per poll
+  interval, and the daemon's own polls refresh what the check sees. Each
+  armed container is checked against its own table.
+- A run is checked when it arrives and again right before the process
+  starts, after the other checks and the secrets. A dry run starts
+  nothing and makes one live check, the last, after the rules' checks,
+  right before it answers; the attach-time state (pending or failed)
+  still refuses it first. An `--ask` is checked when it arrives, before it
+  is queued, and once more after the human's answer, right before the
+  approved run starts; a standing or session approval is granted only
+  once that check has passed. A repeat under a standing or session
+  approval is checked like any run.
+- A request checked as the daemon stops is refused with 125 `the
+  hostrunner daemon is stopping`, not as a failed check.
 - The next check that passes serves requests again.
 
 A devcontainer that cannot mount `.devcontainer/` read-only can have

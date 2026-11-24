@@ -327,6 +327,10 @@ func (r fakeRuntime) Containers(context.Context, string) ([]watch.Container, err
 	return []watch.Container{{ID: "c", Running: r.running, StartedAt: time.Now()}}, nil
 }
 
+func (r fakeRuntime) MountTable(context.Context, int) ([]watch.MountPoint, error) {
+	return nil, nil
+}
+
 const validRules = "rules:\n  - command: echo\n    args: any\n"
 
 // rereading makes a current daemon one that rereads its rules file by

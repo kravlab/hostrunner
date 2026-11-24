@@ -74,6 +74,7 @@ type Server struct {
 	process          string                                               // "": none reported; see WithProcess
 	mount            mountChecker                                         // the mount check: noMountCheck unless WithMountCheck; see MountChecked
 	mountOffHint     *string                                              // nil: the mount check is off; see WithMountCheck
+	mountLiveCheck   func(ctx context.Context) error                      // the mount check made before every request; see WithMountCheck
 	environment      *Environment                                         // what commands and secret sources run with; never nil, see WithEnvironment
 
 	// The order of the locks: a goroutine takes one only while it holds
@@ -273,7 +274,7 @@ func New(mapper *workspace.Mapper, policy Policy, log *slog.Logger, opts ...Opti
 	// After the options, so that WithMountCheck and WithApprovals work in
 	// any order.
 	if s.mountOffHint != nil {
-		s.mount = &mountState{log: s.log, approvals: s.approvals, offHint: *s.mountOffHint}
+		s.mount = &mountState{log: s.log, approvals: s.approvals, offHint: *s.mountOffHint, liveCheck: s.mountLiveCheck}
 	}
 	return s
 }
@@ -416,8 +417,12 @@ var dryRunLogArgs = []any{"dry_run", true}
 
 // dryRun answers whether req would start: it runs the same checks as run,
 // then looks the program up as starting it would, and releases what the
-// checks opened, never starting the command or reading stdin. The answer
-// carries the warning of the daemon (see pendingAllowWarning).
+// checks opened, never starting the command or reading stdin. The
+// attach-time state of the mount check refuses it as it arrives, before
+// the rules are consulted; its one live check is its last check, once the
+// others passed, where a run would check right before its start (see
+// mountChecker.requestRefusal). The answer carries the warning of the
+// daemon (see pendingAllowWarning).
 func (s *Server) dryRun(ctx context.Context, out *frameWriter, req protocol.Request) {
 	if r := s.mount.refusal(); r != nil {
 		s.reject(out, r.code, r.message, r.err, dryRunLogArgs...)
@@ -433,6 +438,9 @@ func (s *Server) dryRun(ctx context.Context, out *frameWriter, req protocol.Requ
 		return
 	}
 	p.close()
+	if s.mountRefused(ctx, s.rejecter(out, dryRunLogArgs...)) {
+		return
+	}
 	s.log.Info("dry run allowed", append(append(p.logArgs(req), "rule", p.rule), dryRunLogArgs...)...)
 	_ = out.writeJSON(protocol.FrameAllowed, protocol.Allowed{Rule: p.rule, Dir: p.fixedDir, Secrets: p.secrets, Approval: p.approval, Warning: s.pendingAllowWarning()})
 }
@@ -636,8 +644,7 @@ type exchange struct {
 // initial credit it sends once the command started carries the warning of
 // the daemon (see pendingAllowWarning).
 func (s *Server) run(ctx context.Context, x exchange, req protocol.Request) {
-	if r := s.mount.refusal(); r != nil {
-		s.reject(x.out, r.code, r.message, r.err)
+	if s.mountRefused(x.daemon, s.rejecter(x.out)) {
 		return
 	}
 	p, r := s.prepare(x.daemon, req, false)
@@ -654,7 +661,7 @@ func (s *Server) run(ctx context.Context, x exchange, req protocol.Request) {
 // the rules allow it, or a standing or session approval lets it through,
 // a repeat, which is an approved run (see approvals.startRepeat).
 func (s *Server) startUnasked(ctx context.Context, x exchange, req protocol.Request, p *prepared) {
-	s.start(ctx, x, req, p, func() (protocol.Frame, error) { return protocol.ReadFrame(x.conn) }, s.approvals.startRepeat(req, p))
+	s.start(ctx, x, req, p, func() (protocol.Frame, error) { return protocol.ReadFrame(x.conn) }, s.approvals.startRepeat(req, p), nil)
 }
 
 // frameSource returns the client's next frame, or an error once the
@@ -663,11 +670,16 @@ type frameSource func() (protocol.Frame, error)
 
 // start runs p, the prepared command of req, on x: it streams stdio,
 // reading the client's frames from next, and reports the exit code;
-// x.cancel stops it early. For run, the approved run it is, it tells the
-// session serving the daemon the output and how the run ended, also when
-// it does not start; run is nil for a command the rules allowed. logArgs
-// (slog key-value pairs) go to its log lines.
-func (s *Server) start(ctx context.Context, x exchange, req protocol.Request, p *prepared, next frameSource, run *approvedRun, logArgs ...any) {
+// x.cancel stops it early. Right before the command starts, after every
+// other check, it makes the request's per-request mount check (see
+// mountChecker.requestRefusal), refusing it on failure. For run, the
+// approved run it is, it tells the session serving the daemon the output
+// and how the run ended, also when it does not start; run is nil for a
+// command the rules allowed. passed, when not nil, is called once every
+// check has passed, right before the command starts, so that nothing it
+// grants outlives a request refused before then. logArgs (slog key-value
+// pairs) go to its log lines.
+func (s *Server) start(ctx context.Context, x exchange, req protocol.Request, p *prepared, next frameSource, run *approvedRun, passed func(), logArgs ...any) {
 	// The command inherits the files; the daemon's copies go once it has
 	// started (p.files is cleared then), or with the request on failure.
 	defer p.close()
@@ -676,10 +688,25 @@ func (s *Server) start(ctx context.Context, x exchange, req protocol.Request, p 
 	// starts nothing new.
 	key, ok := s.track(req)
 	if !ok {
-		s.rejectRun(x.out, run, refusal{protocol.ExitHostrunError, drainingMessage, errDraining}, drainingMessage)
+		s.rejectRun(x.out, run, *drainingRefusal(), drainingMessage)
 		return
 	}
 	defer s.untrack(key)
+
+	// The mounts are checked again right before the start, after every
+	// other check and the secrets, so that what the container could write
+	// meanwhile is not missed.
+	refused := s.mountRefused(x.daemon, func(r *refusal) {
+		if run != nil && run.start.Request != 0 {
+			// A run a human just approved is refused as a new request
+			// would be.
+			s.log.Info("approval not run", "approval_id", run.start.Request, "reason", string(endedMountCheck))
+		}
+		s.rejectRun(x.out, run, *r, r.message)
+	})
+	if refused {
+		return
+	}
 
 	cmd := s.command(ctx, p, x.out)
 	if run != nil {
@@ -694,6 +721,9 @@ func (s *Server) start(ctx context.Context, x exchange, req protocol.Request, p 
 		r := refusal{protocol.ExitHostrunError, "cannot start the command", err}
 		s.rejectRun(x.out, run, r, r.message)
 		return
+	}
+	if passed != nil {
+		passed()
 	}
 	if err := cmd.Start(); err != nil {
 		code, message := startFailure(req.Argv[0], err)
@@ -740,6 +770,23 @@ func (s *Server) start(ctx context.Context, x exchange, req protocol.Request, p 
 	}
 	x.conn.Close()
 	streams.Wait()
+}
+
+// mountRefused makes the per-request mount check of a request under ctx
+// (see mountChecker.requestRefusal) and, when it refuses the request,
+// refuses it through refuse. It reports whether it refused.
+func (s *Server) mountRefused(ctx context.Context, refuse func(r *refusal)) bool {
+	r := s.mount.requestRefusal(ctx)
+	if r != nil {
+		refuse(r)
+	}
+	return r != nil
+}
+
+// rejecter returns the function that rejects a request on out as the
+// refusal it is given says, logArgs going to the log (see reject).
+func (s *Server) rejecter(out *frameWriter, logArgs ...any) func(r *refusal) {
+	return func(r *refusal) { s.reject(out, r.code, r.message, r.err, logArgs...) }
 }
 
 // rejectRun rejects the command of run, an approved run (nil for one the
