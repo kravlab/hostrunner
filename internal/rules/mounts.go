@@ -1,6 +1,7 @@
 package rules
 
 import (
+	"cmp"
 	"fmt"
 	"path"
 	"slices"
@@ -48,32 +49,41 @@ func parseMountMode(name string) (MountMode, bool) {
 }
 
 // MountRequirement is what a rule requires of one path in the container:
-// Path is relative to the workspace root, in forward-slash form, and Mode
-// says how it has to be mounted.
+// Path is relative to the workspace root, in forward-slash form, Mode says
+// how it has to be mounted, and Rule is the command of the rule that
+// declares it, which is not always the rule that selects a request (see
+// Allowed.Mounts).
 type MountRequirement struct {
 	Path string
 	Mode MountMode
+	Rule string
 }
 
-// MountRequirementsReport returns the allowing rule's mount requirements
-// as an Allowed answer reports them, in the order Mounts has them, or nil
-// when it has none. The dry run and the Rules test (`hostrunner test`)
-// both report them through it, as they report the secrets through
-// SecretNames.
+// MountRequirementsReport returns Mounts, the mount requirements of every
+// rule that starts the command, as an Allowed answer reports them, in the
+// order Mounts has them, or nil when there are none. Each names its rule
+// unless it is a, the rule that allows the command. The dry run and the
+// Rules test (`hostrunner test`) both report them through it, as they
+// report the secrets through SecretNames.
 func (a Allowed) MountRequirementsReport() []protocol.MountRequirement {
 	var report []protocol.MountRequirement
 	for _, r := range a.Mounts {
-		report = append(report, protocol.MountRequirement{Path: r.Path, Mode: r.Mode.String()})
+		req := protocol.MountRequirement{Path: r.Path, Mode: r.Mode.String()}
+		if r.Rule != a.Rule {
+			req.Rule = r.Rule
+		}
+		report = append(report, req)
 	}
 	return report
 }
 
-// newMounts validates the `mounts` value of a rule.
+// newMounts validates the `mounts` value of the rule whose command is
+// rule, and returns its requirements, each declared by rule.
 //
 // A failure names the line of the entry, as the yaml package counts it.
 // `mounts: *name` stands for the anchored map it refers to, so rules can
 // share one block; a value that is not a map names the line of the alias.
-func newMounts(n yaml.Node) ([]MountRequirement, error) {
+func newMounts(n yaml.Node, rule string) ([]MountRequirement, error) {
 	if n.Kind == 0 {
 		return nil, nil // no mounts key
 	}
@@ -112,8 +122,15 @@ func newMounts(n yaml.Node) ([]MountRequirement, error) {
 		if slices.ContainsFunc(reqs, func(r MountRequirement) bool { return r.Path == key.Value }) {
 			return nil, fmt.Errorf("mounts: duplicate path %q (line %d)", key.Value, key.Line)
 		}
-		reqs = append(reqs, MountRequirement{Path: key.Value, Mode: mode})
+		reqs = append(reqs, MountRequirement{Path: key.Value, Mode: mode, Rule: rule})
 	}
-	slices.SortFunc(reqs, func(a, b MountRequirement) int { return strings.Compare(a.Path, b.Path) })
 	return reqs, nil
+}
+
+// sortMounts sorts reqs by path, then mode, then rule: the order
+// Allowed.Mounts has them in.
+func sortMounts(reqs []MountRequirement) {
+	slices.SortFunc(reqs, func(a, b MountRequirement) int {
+		return cmp.Or(strings.Compare(a.Path, b.Path), cmp.Compare(a.Mode, b.Mode), strings.Compare(a.Rule, b.Rule))
+	})
 }

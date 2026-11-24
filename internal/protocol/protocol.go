@@ -226,7 +226,8 @@ type Armed struct {
 // client that predates them ignores the field. Approval is ScopeStanding
 // or ScopeSession when a standing or session approval lets the command
 // through, which runs it as the rule that refused it would (Dir,
-// Secrets). Mounts are the mount requirements of the rule, in the order
+// Secrets). Mounts are the mount requirements of every rule that starts
+// the command, the allowing rule's and those of shorter rules, in the order
 // the daemon reports them, omitted when there are none; a client that
 // predates them ignores the field. Warning is described on Credit.
 type Allowed struct {
@@ -241,9 +242,14 @@ type Allowed struct {
 // MountRequirement is one mount a rule requires of the container. Path is
 // relative to the workspace root, in forward-slash form; Mode is how it has
 // to be mounted, as the rules file spells it: "mounted" or "read-only".
+// Rule is the command of the rule that declares it, omitted when that is
+// the rule that allows the command (Allowed.Rule): the requirements of a
+// shorter rule that also start the command name their rule. A client that
+// predates Rule ignores it.
 type MountRequirement struct {
 	Path string `json:"path"`
 	Mode string `json:"mode"`
+	Rule string `json:"rule,omitempty"`
 }
 
 // String describes a, as the dry run and the Rules test report it.
@@ -262,6 +268,9 @@ func (a Allowed) String() string {
 		reqs := make([]string, len(a.Mounts))
 		for i, m := range a.Mounts {
 			reqs[i] = m.Path + " " + m.Mode
+			if m.Rule != "" {
+				reqs[i] += fmt.Sprintf(" (rule %q)", m.Rule)
+			}
 		}
 		s += ", requires mounts: " + strings.Join(reqs, ", ")
 	}
@@ -479,8 +488,7 @@ func (n RulesNotAllowed) Text() string {
 // for a failed mount requirement of a rule, or mount requirements the
 // daemon cannot check, it is that rule's command, and the daemon refuses
 // only the commands of that rule until a later check of them passes, Error
-// then not naming the rule. A session that predates
-// Rule ignores it.
+// then not naming the rule. A session that predates Rule ignores it.
 type MountCheckFailed struct {
 	Error string `json:"error"`
 	Rule  string `json:"rule,omitempty"`

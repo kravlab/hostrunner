@@ -64,15 +64,23 @@ daemon now follows its armed container, recognised by start time.
   runs (`Running`, `Pid` > 0) gets `Live`, its table read through the
   runtime that reported it. A process gone meanwhile: one fresh query of
   every runtime, then the fresh data, read once more if it runs.
+  One that runs without a process id gets no `Live` there, as one that
+  does not run; the first `Live` call judges it.
 - `Live(ctx)`: copies of the latest attach's armed containers, each as
   the newest inspection of it reported (the attach's, a later poll's or a
   `Live` call's); `ErrNotAttached` from an arm until its attach. Each that
   runs has its table read now. A gone process is inspected again at once.
-  One that did not run is left out: it is inspected again only when its
-  inspection is at least `PollInterval` old (reported as it runs now, or
-  left out if it does not; one no runtime could inspect carries the
-  error), otherwise left out without a query. The fresh data is kept for
-  the next call, unless an entry holds a newer inspection.
+  One that runs without a process id (`Running`, `Pid` 0: restarting) is
+  not taken as stopped: it is inspected again once, whatever the age of its
+  inspection, and when it still has no process id its `Live.Err` is
+  `ErrNoProcessID` (`container runs but reports no process id`), so the
+  check refuses until a later inspection finds its process. One that did
+  not run is left out: it is inspected again only when its inspection is
+  at least `StoppedInspectionMaxAge` old (zero: `PollInterval`; reported
+  as it runs now, or left out if it does not; one no runtime could
+  inspect carries the error), otherwise left out without a query. The
+  fresh data is kept for the next call, unless an entry holds a newer
+  inspection.
 - `Run`'s polls that change no armed set refresh the cache (`takePoll`):
   each armed container of the latest attach takes what the poll reported,
   so `Live` follows the runtimes without inspecting a container that

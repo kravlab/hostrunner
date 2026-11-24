@@ -82,7 +82,15 @@ func gitMounts(cfg serveConfig) []watch.Mount {
 // off.
 func requireRefusedByRequirement(t *testing.T, cfg serveConfig, code int, stderr, suffix, reason string) {
 	t.Helper()
-	want := cfg.containerWorkspace + suffix
+	requireRefusedAt(t, cfg, code, stderr, cfg.containerWorkspace+suffix, reason)
+}
+
+// requireRefusedAt fails the test unless code and stderr are the refusal of
+// a command by a mount requirement of the git rule: 126, naming the
+// container path want and reason, not the host workspace, and how to turn
+// the check off.
+func requireRefusedAt(t *testing.T, cfg serveConfig, code int, stderr, want, reason string) {
+	t.Helper()
 	if code != protocol.ExitRejected || !strings.Contains(stderr, want+reason) {
 		t.Errorf("got %d, %q; want %d naming %s and %q", code, stderr, protocol.ExitRejected, want, reason)
 	}
@@ -142,6 +150,50 @@ func TestServeWatchRunsACommandOfAnotherRuleWithoutTheGitMounts(t *testing.T) {
 	requireMarker(t, cfg, "marker", true)
 	code, stderr := runServedOutput(cfg, "git", "init", "-q", "repo")
 	requireRefusedByRequirement(t, cfg, code, stderr, "/.git", notMountedReason)
+}
+
+// gitAmendRule is a longer rule than gitRule, with no mounts of its own,
+// that allows `git commit amend` whatever follows.
+const gitAmendRule = "  - command: git commit amend\n    args: any\n"
+
+// gitAmendConfig is gitMountConfig whose rules also hold gitAmendRule.
+func gitAmendConfig(t *testing.T) serveConfig {
+	t.Helper()
+	cfg := gitMountConfig(t)
+	if err := os.WriteFile(cfg.RulesFile, []byte(touchRules+gitRule+gitAmendRule), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return cfg
+}
+
+// `git commit amend`, which its own rule allows, is refused with 126 when
+// the requirements of the shorter `git` rule fail, the refusal naming that
+// rule and not the one that selects the command: a longer rule inherits
+// the requirements of the shorter ones. A dry run is refused the same.
+func TestServeWatchRefusesALongerRulesCommandWhenAShorterRulesMountRequirementFails(t *testing.T) {
+	for _, argv := range [][]string{
+		{"git", "commit", "amend"},
+		{"--dry-run", "git", "commit", "amend"},
+	} {
+		t.Run(strings.Join(argv, " "), func(t *testing.T) {
+			cfg := gitAmendConfig(t)
+			rt := &watchtest.Runtime{}
+			armedContainer(t, cfg, rt, workspaceMount(cfg), readOnlyDevcontainer(cfg), readOnlyGit(cfg, "config"), readOnlyGit(cfg, "hooks"))
+			code, stderr := runServedOutput(cfg, argv...)
+			requireRefusedByRequirement(t, cfg, code, stderr, "/.git", notMountedReason)
+		})
+	}
+}
+
+// A dry run of `git commit amend` passes in a container that meets the
+// requirements of the `git` rule, which the longer rule inherits.
+func TestServeWatchDryRunOfALongerRulesCommandPassesWhenTheShorterRulesMountsAreThere(t *testing.T) {
+	cfg := gitAmendConfig(t)
+	rt := &watchtest.Runtime{}
+	armedContainer(t, cfg, rt, gitMounts(cfg)...)
+	if code, stderr := runServedOutput(cfg, "--dry-run", "git", "commit", "amend"); code != 0 {
+		t.Fatalf("got %d, %q; want 0", code, stderr)
+	}
 }
 
 // A dry run of `git` reports the refusal a run would get, for either
@@ -433,4 +485,44 @@ func TestServeWatchRefusesAGitCommandOnceTheGitConfigMountVanished(t *testing.T)
 	code, stderr := runServedOutput(cfg, "git", "init", "-q", "marker")
 	requireRefusedByRequirement(t, cfg, code, stderr, "/.git/config", notReadOnlyReason)
 	requireMarker(t, cfg, "marker", false)
+}
+
+// parentMounts are the mounts of a container that mounts the parent of
+// cfg's workspace writable at /p instead of the workspace itself, with the
+// workspace's .devcontainer read-only over it, and the container path of
+// the workspace's .git below it.
+func parentMounts(cfg serveConfig) (mounts []watch.Mount, gitPath string) {
+	ws := "/p/" + filepath.Base(cfg.workspace)
+	return []watch.Mount{
+		{Source: filepath.Dir(cfg.workspace), Destination: "/p"},
+		{Source: filepath.Join(cfg.workspace, ".devcontainer"), Destination: ws + "/.devcontainer", ReadOnly: true},
+	}, ws + "/.git"
+}
+
+// A container that mounts the parent of the workspace writable, with no
+// mount of .git onto itself, is refused `git` with 126, naming the
+// container path under the parent mount, and git does not run: the
+// container could move .git away.
+func TestServeWatchRefusesAGitCommandWhenTheWorkspaceParentIsMountedWithoutGit(t *testing.T) {
+	cfg := gitMountConfig(t)
+	mounts, gitPath := parentMounts(cfg)
+	rt := &watchtest.Runtime{}
+	armedContainer(t, cfg, rt, mounts...)
+	code, stderr := runServedOutput(cfg, "git", "init", "-q", "marker")
+	requireRefusedAt(t, cfg, code, stderr, gitPath, notMountedReason)
+	requireMarker(t, cfg, "marker", false)
+}
+
+// A container that mounts the parent of the workspace writable runs `git`
+// when .git is a mount point of its own under the parent mount.
+func TestServeWatchRunsAGitCommandWhenGitIsMountedUnderTheWorkspaceParent(t *testing.T) {
+	cfg := gitMountConfig(t)
+	mounts, gitPath := parentMounts(cfg)
+	git := watch.Mount{Source: filepath.Join(cfg.workspace, ".git"), Destination: gitPath, ReadOnly: true}
+	rt := &watchtest.Runtime{}
+	armedContainer(t, cfg, rt, append(mounts, git)...)
+	if code, stderr := runServedOutput(cfg, "git", "init", "-q", "marker"); code != 0 {
+		t.Fatalf("got %d, %q; want 0", code, stderr)
+	}
+	requireMarker(t, cfg, "marker", true)
 }

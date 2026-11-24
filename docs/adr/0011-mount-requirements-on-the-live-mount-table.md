@@ -17,8 +17,9 @@ those mounts are still there and read-only. A rule may name mount
 requirements, paths from the workspace root that must be a mount
 point of their own (`mounted`) or not writable (`read-only`), such
 as `.git`, `.git/config` and `.git/hooks` for git; they are checked
-for the requests of that rule's command only. A failure refuses the
-request (126), and no approval lets it through.
+for every request whose command starts with that rule's command, so a
+longer rule inherits them. A failure refuses the request (126), and no
+approval lets it through.
 
 ## Considered Options
 

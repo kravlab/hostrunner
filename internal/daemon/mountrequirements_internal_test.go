@@ -22,13 +22,13 @@ import (
 // echoRequirements are the mount requirements of the echo rule of
 // mountCheckServer.
 var echoRequirements = []rules.MountRequirement{
-	{Path: ".git", Mode: rules.MountMounted},
-	{Path: ".git/config", Mode: rules.MountReadOnly},
+	{Path: ".git", Mode: rules.MountMounted, Rule: "echo"},
+	{Path: ".git/config", Mode: rules.MountReadOnly, Rule: "echo"},
 }
 
 // echoRule is the echo rule of mountCheckServer with its requirements, as
-// the per-request check is given them.
-var echoRule = ruleRequirements{rule: "echo", reqs: echoRequirements}
+// the per-request check is given them for a request of that rule.
+var echoRule = []ruleRequirements{{rule: "echo", reqs: echoRequirements}}
 
 // requirementsSeen is a live mount check (see MountCheck) that counts the
 // calls of its protected-path stage, which returns protected, and records
@@ -113,8 +113,8 @@ func TestARunsMountChecksGetItsRulesRequirements(t *testing.T) {
 	wantRequirementsSeen(t, &check, echoRequirements, echoRequirements)
 }
 
-// A dry run's one live check is given the mount requirements of the rule
-// that allows it.
+// Both live checks of a dry run, as it arrives and its last, are given
+// the mount requirements of the rule that allows it.
 func TestADryRunsMountCheckGetsItsRulesRequirements(t *testing.T) {
 	var check requirementsSeen
 	s, _ := mountCheckServer(t, check.check)
@@ -124,7 +124,7 @@ func TestADryRunsMountCheckGetsItsRulesRequirements(t *testing.T) {
 	if len(got) != 1 || got[0].Type != protocol.FrameAllowed {
 		t.Fatalf("the client got frames %v, want Allowed alone", frameTypes(got))
 	}
-	wantRequirementsSeen(t, &check, echoRequirements)
+	wantRequirementsSeen(t, &check, echoRequirements, echoRequirements)
 }
 
 // An --ask for an argv its rule refuses (echo takes no arguments) is
@@ -228,29 +228,59 @@ func TestARepeatsMountChecksGetItsRulesRequirements(t *testing.T) {
 	wantRequirementsSeen(t, &check, echoRequirements, echoRequirements)
 }
 
-// A request is checked with the mount requirements of its own rule alone:
-// an argv no rule matches has none, and one of a longer rule without
-// mounts (`echo plain`) has none either, whatever the shorter rule (echo)
-// requires, so only its protected paths are checked.
-func TestARequestWithoutARuleRequiringMountsGetsNone(t *testing.T) {
-	for name, argv := range map[string][]string{
-		"no rule":     {"true"},
-		"longer rule": {"echo", "plain", "x"},
-	} {
-		t.Run(name, func(t *testing.T) {
-			var check requirementsSeen
-			s, _ := mountCheckServer(t, check.check)
+// A request no rule starts is checked without mount requirements: only its
+// protected paths are checked.
+func TestARequestNoRuleStartsGetsNoRequirements(t *testing.T) {
+	var check requirementsSeen
+	s, _ := mountCheckServer(t, check.check)
 
-			<-served(t, s, protocol.FrameRequest, echoRequest(argv...))
+	<-served(t, s, protocol.FrameRequest, echoRequest("true"))
 
-			checks, seen := check.calls()
-			if checks == 0 {
-				t.Fatal("the request was not checked")
-			}
-			if len(seen) != 0 {
-				t.Fatalf("the requirements stage got %+v, want no call", seen)
-			}
-		})
+	checks, seen := check.calls()
+	if checks == 0 {
+		t.Fatal("the request was not checked")
+	}
+	if len(seen) != 0 {
+		t.Fatalf("the requirements stage got %+v, want no call", seen)
+	}
+}
+
+// A request of a longer rule without mounts of its own (`echo plain`) is
+// checked with the requirements of the shorter rule that starts it (echo),
+// the rule of each named: the longer rule inherits them.
+func TestARequestOfALongerRuleGetsTheRequirementsOfTheShorterRule(t *testing.T) {
+	var check requirementsSeen
+	s, _ := mountCheckServer(t, check.check)
+
+	got := <-served(t, s, protocol.FrameRequest, echoRequest("echo", "plain", "x"))
+
+	if len(got) == 0 || got[len(got)-1].Type != protocol.FrameExit {
+		t.Fatalf("the client got frames %v, want them to end with its exit", frameTypes(got))
+	}
+	wantRequirementsSeen(t, &check, echoRequirements, echoRequirements)
+}
+
+// A requirement of the shorter rule that fails refuses the request of the
+// longer rule naming the shorter rule that declares it, not the longer one
+// that selects the request, in the refusal, the daemon's log and the
+// notice.
+func TestAFailedRequirementOfAShorterRuleNamesThatRule(t *testing.T) {
+	check := requirementsSeen{result: requirementFailures["not mounted"].failure}
+	s, peer := mountCheckServer(t, check.check)
+	frames := collectFrames(peer)
+
+	got := <-served(t, s, protocol.FrameRequest, echoRequest("echo", "plain", "x"))
+
+	if len(got) != 1 {
+		t.Fatalf("the client got frames %v, want its refusal alone", frameTypes(got))
+	}
+	e := decoded[protocol.Error](t, got[0], protocol.FrameError)
+	if e.Code != protocol.ExitRejected || e.Message != requirementFailures["not mounted"].message {
+		t.Fatalf("the client got %+v, want code %d, %q", e, protocol.ExitRejected, requirementFailures["not mounted"].message)
+	}
+	want := []protocol.MountCheckFailed{{Error: requirementFailures["not mounted"].failure.Error(), Rule: "echo"}}
+	if got := noticedFailures(t, s, frames); !reflect.DeepEqual(got, want) {
+		t.Fatalf("the session was told of %+v, want %+v", got, want)
 	}
 }
 
@@ -391,16 +421,85 @@ func failingRequirements(failure error) MountCheck {
 func TestAFailedMountRequirementIsNoticedOnceAcrossOtherRulesPassing(t *testing.T) {
 	s, peer := mountCheckServer(t, failingRequirements(requirementFailures["not mounted"].failure))
 	frames := collectFrames(peer)
-	git, other := ruleRequirements{rule: "git", reqs: echoRequirements}, ruleRequirements{rule: "other"}
+	git := []ruleRequirements{{rule: "git", reqs: echoRequirements}}
 
 	for range 3 {
 		s.mount.requestRefusal(context.Background(), git)
-		s.mount.requestRefusal(context.Background(), other)
+		s.mount.requestRefusal(context.Background(), nil)
 	}
 
 	got := noticedFailures(t, s, frames)
 	if len(got) != 1 || got[0].Rule != "git" {
 		t.Fatalf("the session was told of %+v, want of the failure of git once", got)
+	}
+}
+
+// requirementsFailingFor returns the per-request mount check whose
+// protected-path stage passes and whose requirements stage fails with
+// failure for the requirements that rule declares, and passes the others.
+func requirementsFailingFor(rule string, failure error) MountCheck {
+	return func(context.Context) (MountRequirementsCheck, error) {
+		return func(reqs []rules.MountRequirement) error {
+			if reqs[0].Rule == rule {
+				return failure
+			}
+			return nil
+		}, nil
+	}
+}
+
+// A request that a longer rule selects is refused for the requirement of
+// the shorter rule that fails, the rule that declares it named, while the
+// longer rule's own requirement passes: the session is told of the failure
+// of the shorter rule once, however often the request repeats.
+func TestAFailedRequirementOfOneOfTwoRulesNamesThatRuleOnly(t *testing.T) {
+	failure := requirementFailures["not mounted"].failure
+	s, peer := mountCheckServer(t, requirementsFailingFor("git", failure))
+	frames := collectFrames(peer)
+	rrs := []ruleRequirements{
+		{rule: "git", reqs: []rules.MountRequirement{{Path: ".git", Mode: rules.MountMounted, Rule: "git"}}},
+		{
+			rule: "git commit",
+			reqs: []rules.MountRequirement{{Path: ".git/hooks", Mode: rules.MountReadOnly, Rule: "git commit"}},
+		},
+	}
+
+	var r *refusal
+	for range 2 {
+		r = s.mount.requestRefusal(context.Background(), rrs)
+	}
+
+	if r == nil || !strings.Contains(r.message, `rule "git" requires`) {
+		t.Fatalf("got %+v, want a refusal naming rule git", r)
+	}
+	want := []protocol.MountCheckFailed{{Error: failure.Error(), Rule: "git"}}
+	if got := noticedFailures(t, s, frames); !reflect.DeepEqual(got, want) {
+		t.Fatalf("the session was told of %+v, want %+v", got, want)
+	}
+}
+
+// When the requirements of both rules fail, the request is refused for the
+// first, and the session is told of the failure of each rule.
+func TestFailedRequirementsOfTwoRulesAreEachNoticed(t *testing.T) {
+	failure := requirementFailures["not mounted"].failure
+	s, peer := mountCheckServer(t, failingRequirements(failure))
+	frames := collectFrames(peer)
+	rrs := []ruleRequirements{
+		{rule: "git", reqs: []rules.MountRequirement{{Path: ".git", Mode: rules.MountMounted, Rule: "git"}}},
+		{rule: "git commit", reqs: []rules.MountRequirement{{Path: ".git", Mode: rules.MountMounted, Rule: "git commit"}}},
+	}
+
+	r := s.mount.requestRefusal(context.Background(), rrs)
+
+	if r == nil || !strings.Contains(r.message, `rule "git" requires`) {
+		t.Fatalf("got %+v, want a refusal naming rule git", r)
+	}
+	want := []protocol.MountCheckFailed{
+		{Error: failure.Error(), Rule: "git"},
+		{Error: failure.Error(), Rule: "git commit"},
+	}
+	if got := noticedFailures(t, s, frames); !reflect.DeepEqual(got, want) {
+		t.Fatalf("the session was told of %+v, want %+v", got, want)
 	}
 }
 
@@ -429,8 +528,8 @@ func TestTwoRulesFailingOnOnePathAreEachNoticed(t *testing.T) {
 	s, peer := mountCheckServer(t, failingRequirements(failure))
 	frames := collectFrames(peer)
 
-	s.mount.requestRefusal(context.Background(), ruleRequirements{rule: "git", reqs: echoRequirements})
-	s.mount.requestRefusal(context.Background(), ruleRequirements{rule: "git status", reqs: echoRequirements})
+	s.mount.requestRefusal(context.Background(), []ruleRequirements{{rule: "git", reqs: echoRequirements}})
+	s.mount.requestRefusal(context.Background(), []ruleRequirements{{rule: "git status", reqs: echoRequirements}})
 
 	want := []protocol.MountCheckFailed{{Error: failure.Error(), Rule: "git"}, {Error: failure.Error(), Rule: "git status"}}
 	if got := noticedFailures(t, s, frames); !reflect.DeepEqual(got, want) {

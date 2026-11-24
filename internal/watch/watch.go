@@ -40,9 +40,11 @@ var ErrNotAttached = errors.New("not attached to the armed container since the l
 // Container is what a runtime reports about one container of the
 // workspace.
 type Container struct {
-	ID        string
-	Running   bool
-	Pid       int       // host process ID of the container's init process as the runtime reports it; 0 when it does not run
+	ID      string
+	Running bool
+	// Pid is the host process ID of the container's init process as the
+	// runtime reports it; 0 when it does not run, and while it restarts.
+	Pid       int
 	StartedAt time.Time // last start; zero if never started
 	Mounts    []Mount   // meaningful only if MountsErr is nil
 	MountsErr error     // why the mounts could not be read; nil when they were
@@ -53,7 +55,9 @@ type Container struct {
 }
 
 // Runs reports whether c runs, as the inspection that reported it found it,
-// with an init process the daemon can read: Running, and Pid > 0.
+// with an init process the daemon can read: Running, and Pid > 0. A
+// container the runtime reports Running with Pid 0 is restarting: it does
+// not run in this sense, yet it is not stopped (see Live).
 func (c Container) Runs() bool { return c.Running && c.Pid > 0 }
 
 // LiveMounts is the live mount table of a container's init process, as the
@@ -96,9 +100,9 @@ type Mount struct {
 	VolumeErr error
 }
 
-// Point returns the mount point in the container a live mount table lists
+// PointPath returns the mount point in the container a live mount table lists
 // the mount at: its cleaned Destination.
-func (m Mount) Point() string { return path.Clean(m.Destination) }
+func (m Mount) PointPath() string { return path.Clean(m.Destination) }
 
 // Volume is a volume as its runtime's inspection reports it: its driver
 // (DriverLocal for the runtime's own) and the options it was created with,
@@ -123,23 +127,27 @@ type Runtime interface {
 
 // Config tunes a Watcher.
 type Config struct {
-	Workspace      string        // host workspace folder (the label value)
-	PollInterval   time.Duration // how often runtimes are queried; also how old an inspection that found an armed container stopped must be for Live to inspect it again
-	QueryTimeout   time.Duration // how long one runtime query may take
-	StartupTimeout time.Duration // how long to wait for the armed container (covers image builds)
-	Grace          time.Duration // how long the armed container must be seen absent
+	Workspace    string        // host workspace folder (the label value)
+	PollInterval time.Duration // how often runtimes are queried
+	// StoppedInspectionMaxAge is how old an inspection that found an armed
+	// container stopped may be before Live inspects it again; zero means
+	// PollInterval.
+	StoppedInspectionMaxAge time.Duration
+	QueryTimeout            time.Duration // how long one runtime query may take
+	StartupTimeout          time.Duration // how long to wait for the armed container (covers image builds)
+	Grace                   time.Duration // how long the armed container must be seen absent
 
 	// Attached, when set, is called on each attach to an armed container,
 	// and again whenever a container that started after the arm joins an
-	// attached arm (e.g. one a Compose devcontainer recreated), so its
-	// mounts are seen too. It gets all armed containers, the new one
-	// included, as the runtimes reported them in the poll that changed the
-	// armed set, mounts included, each that runs with its live mount table
-	// (Live) read then; Run calls it before it polls again.
-	// Polls that bring no new armed container do not call it; they update
-	// the armed containers Live reads instead. The containers are copies the callback may keep. armedAt is the time of
-	// the arm it attached for (see Armed): a call may come after a later
-	// arm, from a poll that was under way when it came.
+	// attached arm (e.g. one a Compose devcontainer recreated), so its mounts
+	// are seen too. It gets all armed containers, the new one included, as
+	// the runtimes reported them in the poll that changed the armed set,
+	// mounts included, each that runs with its live mount table (Live) read
+	// then; Run calls it before it polls again. Polls that bring no new armed
+	// container do not call it; they update the armed containers Live reads
+	// instead. The containers are copies the callback may keep. armedAt is
+	// the time of the arm it attached for (see Armed): a call may come after
+	// a later arm, from a poll that was under way when it came.
 	Attached func(armedAt time.Time, armed []Container)
 
 	// Armed, when set, is called by each Arm that the watcher follows, with
@@ -322,23 +330,23 @@ func (w *Watcher) Run(ctx context.Context) error {
 	)
 	for {
 		now := time.Now()
-		ins := w.query(ctx)
-		if ins.answered {
+		inspected := w.query(ctx)
+		if inspected.answered {
 			lastAnswer = now
-			if justAttached, changed := arm.observe(ins.containers, now, w.cfg.Grace); changed {
+			if justAttached, changed := arm.observe(inspected.containers, now, w.cfg.Grace); changed {
 				if justAttached {
 					w.log.Info("attached to the armed container", "workspace", w.cfg.Workspace)
 				} else {
 					w.log.Info("a container joined the armed containers", "workspace", w.cfg.Workspace)
 				}
-				armed := arm.armed(ins)
+				armed := arm.armed(inspected)
 				w.readAttached(ctx, armed)
 				w.setAttachment(arm.at, armed)
 				if w.cfg.Attached != nil {
 					w.cfg.Attached(arm.at, containersOf(armed))
 				}
 			} else if arm.attached() {
-				w.takePoll(arm.at, ins)
+				w.takePoll(arm.at, inspected)
 			}
 			w.setStopped(arm.at, arm.attached() && !arm.absentSince.IsZero())
 		} else {
@@ -388,14 +396,15 @@ func (w *Watcher) setAttachment(armedAt time.Time, armed []tracked) {
 	}
 }
 
-// takePoll makes what ins, a poll for the arm at armedAt that changed no
-// armed set, reports of the armed containers of the latest attach what Live
-// reads, so that Live follows the runtimes without inspecting them itself
-// (see readRequested). One ins does not report any more keeps its data,
-// inspected at ins.at. An entry that holds a newer inspection, a Live
-// call's that started after the poll, is kept as it is; a poll for an arm
-// before the latest, in flight during an arm, changes nothing.
-func (w *Watcher) takePoll(armedAt time.Time, ins inspection) {
+// takePoll makes the reports in inspected, a poll for the arm at armedAt
+// that changed no armed set, about the armed containers of the latest attach
+// what Live reads, so that Live follows the runtimes without inspecting them
+// itself (see readRequested). A container that inspected does not report
+// any more keeps its data, as inspected at inspected.at. An entry that
+// holds a newer inspection, a Live call's that started after the poll, is
+// kept as it is; a poll for an arm before the latest, in flight during an
+// arm, changes nothing.
+func (w *Watcher) takePoll(armedAt time.Time, inspected inspection) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if !armedAt.Equal(w.armedAt) || w.latest == nil {
@@ -403,13 +412,13 @@ func (w *Watcher) takePoll(armedAt time.Time, ins inspection) {
 	}
 	for i := range w.latest.armed {
 		t := &w.latest.armed[i]
-		if t.inspectedAt.After(ins.at) {
+		if t.inspectedAt.After(inspected.at) {
 			continue
 		}
-		if j := ins.index(t.ID); j >= 0 {
-			*t = ins.tracked(j)
+		if j := inspected.index(t.ID); j >= 0 {
+			*t = inspected.tracked(j)
 		} else {
-			t.inspectedAt = ins.at
+			t.inspectedAt = inspected.at
 		}
 	}
 }
@@ -422,38 +431,6 @@ func copyTracked(ts []tracked) []tracked {
 		out = append(out, t.copy())
 	}
 	return out
-}
-
-// Live returns copies of the armed containers of the latest attach (those
-// Attached was last called with for the latest arm, containers that joined
-// it included), as the newest inspection of each reported it (the attach's,
-// a later poll's or a Live call's), each that runs with its live mount
-// table read now, or ErrNotAttached before the latest arm has attached:
-// from an arm until its attach there are none. A container that does not
-// run cannot write, so it is left out. One whose process is gone is
-// inspected again at once, and one that did not run at an inspection at
-// least PollInterval old is inspected again too: it is reported as it runs
-// now, or left out if it does not run; if no runtime answers, it carries
-// why as its Live.Err. One that did not run at a newer inspection is left
-// out without a query: Run's polls inspect it every PollInterval. It is
-// safe for concurrent use with Run and other Live calls.
-func (w *Watcher) Live(ctx context.Context) ([]Container, error) {
-	w.mu.Lock()
-	latest := w.latest
-	var armed []tracked
-	if latest != nil {
-		armed = copyTracked(latest.armed)
-	}
-	w.mu.Unlock()
-	if latest == nil {
-		return nil, ErrNotAttached
-	}
-	if w.readRequested(ctx, armed) {
-		w.updateAttachment(latest, armed)
-	}
-	// After readRequested, a container without Live does not run: it cannot
-	// write, so it is left out.
-	return containersOf(slices.DeleteFunc(armed, func(t tracked) bool { return t.Live == nil })), nil
 }
 
 // updateAttachment makes copies of armed, read again since Live copied them
@@ -523,13 +500,13 @@ func (a *arming) observe(containers []Container, now time.Time, grace time.Durat
 	return justAttached, changed
 }
 
-// armed returns copies of the armed containers among those ins found, in
-// their order, each with the runtime that reported it.
-func (a *arming) armed(ins inspection) []tracked {
+// armed returns copies of the armed containers among those in inspected,
+// in their order, each with the runtime that reported it.
+func (a *arming) armed(inspected inspection) []tracked {
 	var out []tracked
-	for i, c := range ins.containers {
+	for i, c := range inspected.containers {
 		if a.ids[c.ID] {
-			out = append(out, ins.tracked(i))
+			out = append(out, inspected.tracked(i))
 		}
 	}
 	return out
@@ -578,87 +555,35 @@ func containersOf(ts []tracked) []Container {
 	return out
 }
 
-// readAttached sets the Live of each of armed, the armed containers of an
-// attach, that runs to its live mount table, read through the runtime that
-// reported it within QueryTimeout, or to why it could not be read; the
-// others keep the Live their runtime reported. A table whose process is gone
-// (the container restarted or stopped since its inspection) is read again
-// after one fresh inspection of every runtime (see refresh).
-func (w *Watcher) readAttached(ctx context.Context, armed []tracked) {
-	var gone []int
-	for i := range armed {
-		if armed[i].Runs() && w.readTable(ctx, &armed[i]) {
-			gone = append(gone, i)
-		}
-	}
-	if len(gone) > 0 {
-		w.refresh(ctx, armed, gone)
-	}
-}
-
-// readRequested is readAttached for Live: it also inspects again, in the
-// same fresh inspection, the containers that did not run at an inspection
-// at least PollInterval old. Those that did not run at a later one are left
-// without a Live and not inspected: Run's polls, which come every
-// PollInterval, inspect them too (see takePoll). It reports whether any
-// container was inspected again.
-func (w *Watcher) readRequested(ctx context.Context, armed []tracked) (refreshed bool) {
-	now := time.Now()
-	var stale []int
-	for i := range armed {
-		switch {
-		case armed[i].Runs():
-			if w.readTable(ctx, &armed[i]) {
-				stale = append(stale, i)
-			}
-		case now.Sub(armed[i].inspectedAt) >= w.cfg.PollInterval:
-			stale = append(stale, i)
-		default:
-			armed[i].Live = nil // left out: it did not run, and cannot write
-		}
-	}
-	if len(stale) == 0 {
-		return false
-	}
-	w.refresh(ctx, armed, stale)
-	return true
-}
-
-// readTable sets t's Live to its live mount table (see mountTable) and
-// reports whether its process is gone, so that t must be inspected again.
-func (w *Watcher) readTable(ctx context.Context, t *tracked) (gone bool) {
-	t.Live = w.mountTable(ctx, *t)
-	if !errors.Is(t.Live.Err, ErrProcessGone) {
-		return false
-	}
-	w.log.Info("armed container's process is gone: inspecting again", "container", t.ID)
-	return true
-}
-
 // refresh inspects every runtime once more and, for each of armed at the
 // indexes stale, takes the container as its runtime reports it now, with
 // that runtime and the inspection's time, and its live mount table read
 // once more if it runs (any failure is its Live.Err, a process gone again
-// included). One that does not run gets no Live; one no runtime reports any
+// included). One that runs without a process ID (Running, Pid 0) gets
+// ErrNoProcessID as its Live.Err if noProcessID is set, and no Live
+// otherwise. One that does not run gets no Live; one no runtime reports any
 // more keeps its data, inspected at the inspection's time, and gets no Live
 // either. If no runtime answers, each keeps its data and gets why as its
 // Live.Err.
-func (w *Watcher) refresh(ctx context.Context, armed []tracked, stale []int) {
-	ins := merge(time.Now(), w.pollRuntimes(ctx))
+func (w *Watcher) refresh(ctx context.Context, armed []tracked, stale []int, noProcessID bool) {
+	inspected := merge(time.Now(), w.pollRuntimes(ctx))
 	for _, i := range stale {
-		if !ins.answered {
-			armed[i].Live = &LiveMounts{Err: ins.err}
+		if !inspected.answered {
+			armed[i].Live = &LiveMounts{Err: inspected.err}
 			continue
 		}
 		armed[i].Live = nil
-		j := ins.index(armed[i].ID)
+		j := inspected.index(armed[i].ID)
 		if j < 0 {
-			armed[i].inspectedAt = ins.at
+			armed[i].inspectedAt = inspected.at
 			continue
 		}
-		armed[i] = ins.tracked(j)
-		if armed[i].Runs() {
+		armed[i] = inspected.tracked(j)
+		switch {
+		case armed[i].Runs():
 			armed[i].Live = w.mountTable(ctx, armed[i])
+		case noProcessID && armed[i].Running:
+			armed[i].Live = &LiveMounts{Err: ErrNoProcessID}
 		}
 	}
 }
@@ -713,16 +638,16 @@ type inspection struct {
 	at         time.Time // when the query started
 }
 
-// index returns the index of the container id among those ins found, or -1
-// if it found none.
-func (ins inspection) index(id string) int {
-	return slices.IndexFunc(ins.containers, func(c Container) bool { return c.ID == id })
+// index returns the index of the container id among the containers of in,
+// or -1 if in holds none with that id.
+func (in inspection) index(id string) int {
+	return slices.IndexFunc(in.containers, func(c Container) bool { return c.ID == id })
 }
 
-// tracked returns a copy of the container ins found at i, with the runtime
-// that reported it and when ins started.
-func (ins inspection) tracked(i int) tracked {
-	return tracked{Container: copyContainer(ins.containers[i]), rt: ins.runtimes[i], inspectedAt: ins.at}
+// tracked returns a copy of the container of in at i, with the runtime
+// that reported it and the time the query of in started.
+func (in inspection) tracked(i int) tracked {
+	return tracked{Container: copyContainer(in.containers[i]), rt: in.runtimes[i], inspectedAt: in.at}
 }
 
 // runtimeAnswer is one runtime's answer to a query: its containers, or why
@@ -751,28 +676,28 @@ func (w *Watcher) pollRuntimes(ctx context.Context) []runtimeAnswer {
 // runtime that reported it, of a query that started at at.
 func merge(at time.Time, answers []runtimeAnswer) inspection {
 	var (
-		ins  = inspection{at: at}
-		errs []error
+		inspected = inspection{at: at}
+		errs      []error
 	)
 	for _, a := range answers {
 		if a.err != nil {
 			errs = append(errs, a.err)
 			continue
 		}
-		ins.containers = append(ins.containers, a.containers...)
+		inspected.containers = append(inspected.containers, a.containers...)
 		for range a.containers {
-			ins.runtimes = append(ins.runtimes, a.rt)
+			inspected.runtimes = append(inspected.runtimes, a.rt)
 		}
-		ins.answered = true
+		inspected.answered = true
 	}
 	switch {
-	case ins.answered:
+	case inspected.answered:
 	case len(errs) == 0:
-		ins.err = errors.New("no container runtime to ask")
+		inspected.err = errors.New("no container runtime to ask")
 	default:
-		ins.err = fmt.Errorf("no container runtime answered: %w", errors.Join(errs...))
+		inspected.err = fmt.Errorf("no container runtime answered: %w", errors.Join(errs...))
 	}
-	return ins
+	return inspected
 }
 
 // query is pollRuntimes and merge for Run's polls. A failing runtime is

@@ -382,16 +382,16 @@ func TestExampleConfigProtectsGit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []MountRequirement{
-		{Path: ".git", Mode: MountMounted},
-		{Path: ".git/config", Mode: MountReadOnly},
-		{Path: ".git/hooks", Mode: MountReadOnly},
-	}
 	for _, argv := range exampleAllowedGit {
 		allowed, err := p.Check(strings.Fields(argv))
 		if err != nil {
 			t.Errorf("%s: denied: %v", argv, err)
 			continue
+		}
+		want := []MountRequirement{
+			{Path: ".git", Mode: MountMounted, Rule: allowed.Rule},
+			{Path: ".git/config", Mode: MountReadOnly, Rule: allowed.Rule},
+			{Path: ".git/hooks", Mode: MountReadOnly, Rule: allowed.Rule},
 		}
 		if !slices.Equal(allowed.Mounts, want) {
 			t.Errorf("%s: mounts = %v, want %v", argv, allowed.Mounts, want)
@@ -676,7 +676,7 @@ func TestCheckReportsTheMountsOfTheMatchedRule(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []MountRequirement{{Path: ".git", Mode: MountMounted}, {Path: ".git/hooks", Mode: MountReadOnly}}
+	want := []MountRequirement{{Path: ".git", Mode: MountMounted, Rule: "git"}, {Path: ".git/hooks", Mode: MountReadOnly, Rule: "git"}}
 	if !slices.Equal(allowed.Mounts, want) {
 		t.Fatalf("got %v, want %v", allowed.Mounts, want)
 	}
@@ -689,9 +689,30 @@ func TestMountsAreSortedByPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []MountRequirement{
-		{Path: ".git", Mode: MountMounted},
-		{Path: ".git/config", Mode: MountReadOnly},
-		{Path: ".git/hooks", Mode: MountReadOnly},
+		{Path: ".git", Mode: MountMounted, Rule: "git"},
+		{Path: ".git/config", Mode: MountReadOnly, Rule: "git"},
+		{Path: ".git/hooks", Mode: MountReadOnly, Rule: "git"},
+	}
+	if !slices.Equal(allowed.Mounts, want) {
+		t.Fatalf("got %v, want %v", allowed.Mounts, want)
+	}
+}
+
+// A path two rules name with different modes is required with both, and
+// the union is sorted by path, then mode.
+func TestMountsOfSeveralRulesKeepBothModesOfAPathSortedByPathThenMode(t *testing.T) {
+	p := mustParse(t, "rules:\n"+
+		"  - command: git\n    args: any\n    mounts:\n      .git/hooks: read-only\n      .git/config: read-only\n"+
+		"  - command: git commit\n    args: any\n    mounts:\n      .git/hooks: mounted\n      .git: mounted\n")
+	allowed, err := p.Check([]string{"git", "commit"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []MountRequirement{
+		{Path: ".git", Mode: MountMounted, Rule: "git commit"},
+		{Path: ".git/config", Mode: MountReadOnly, Rule: "git"},
+		{Path: ".git/hooks", Mode: MountMounted, Rule: "git commit"},
+		{Path: ".git/hooks", Mode: MountReadOnly, Rule: "git"},
 	}
 	if !slices.Equal(allowed.Mounts, want) {
 		t.Fatalf("got %v, want %v", allowed.Mounts, want)
@@ -801,8 +822,8 @@ func TestParseResolvesAMountsAlias(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []MountRequirement{
-		{Path: ".git", Mode: MountMounted},
-		{Path: ".git/hooks", Mode: MountReadOnly},
+		{Path: ".git", Mode: MountMounted, Rule: "git fetch"},
+		{Path: ".git/hooks", Mode: MountReadOnly, Rule: "git fetch"},
 	}
 	if !slices.Equal(allowed.Mounts, want) {
 		t.Fatalf("got %v, want %v", allowed.Mounts, want)
@@ -843,7 +864,7 @@ func TestNewMountsRejectsAnInvalidAlias(t *testing.T) {
 			if alias.Kind != yaml.AliasNode {
 				t.Fatalf("test document: got node kind %v, want an alias", alias.Kind)
 			}
-			_, err := newMounts(*alias)
+			_, err := newMounts(*alias, "use")
 			if err == nil || err.Error() != tc.want {
 				t.Fatalf("got %v, want %q", err, tc.want)
 			}
@@ -858,19 +879,82 @@ func TestDenialApprovedCarriesTheMountsOfTheMatchedRule(t *testing.T) {
 	if !ok {
 		t.Fatalf("got %v, want an approvable denial", err)
 	}
-	want := []MountRequirement{{Path: ".git", Mode: MountMounted}}
+	want := []MountRequirement{{Path: ".git", Mode: MountMounted, Rule: "git push"}}
 	if !slices.Equal(d.Approved.Mounts, want) {
 		t.Fatalf("got %v, want %v", d.Approved.Mounts, want)
 	}
 }
 
-func TestALongerRuleDoesNotInheritMounts(t *testing.T) {
+// A command the longer rule denies still carries the requirements of the
+// shorter rules, in Approved, as the daemon checks them for it.
+func TestDenialApprovedCarriesTheMountsOfShorterRulesToo(t *testing.T) {
+	p := mustParse(t, "rules:\n"+
+		"  - command: git\n    args: any\n    mounts:\n      .git: mounted\n"+
+		"  - command: git push\n    flags:\n      allow: [-v]\n    mounts:\n      .git/hooks: read-only\n")
+	_, err := p.Check([]string{"git", "push", "--force"})
+	d, ok := ApprovableDenial(err)
+	if !ok {
+		t.Fatalf("got %v, want an approvable denial", err)
+	}
+	want := []MountRequirement{
+		{Path: ".git", Mode: MountMounted, Rule: "git"},
+		{Path: ".git/hooks", Mode: MountReadOnly, Rule: "git push"},
+	}
+	if !slices.Equal(d.Approved.Mounts, want) {
+		t.Fatalf("got %v, want %v", d.Approved.Mounts, want)
+	}
+}
+
+// A rule whose command does not start the argv contributes nothing: not a
+// longer rule, not a sibling, not a rule that only shares a first word with
+// a longer command.
+func TestMountsOfARuleThatDoesNotStartTheArgvAreNotRequired(t *testing.T) {
+	p := mustParse(t, "rules:\n"+
+		"  - command: git\n    args: any\n    mounts:\n      .git: mounted\n"+
+		"  - command: git push\n    args: any\n    mounts:\n      .git/hooks: read-only\n"+
+		"  - command: git fetch\n    args: any\n    mounts:\n      .git/config: read-only\n"+
+		"  - command: gitk\n    args: any\n    mounts:\n      other: mounted\n")
+	allowed, err := p.Check([]string{"git", "fetch"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []MountRequirement{
+		{Path: ".git", Mode: MountMounted, Rule: "git"},
+		{Path: ".git/config", Mode: MountReadOnly, Rule: "git fetch"},
+	}
+	if !slices.Equal(allowed.Mounts, want) {
+		t.Fatalf("got %v, want %v", allowed.Mounts, want)
+	}
+}
+
+// Two rules that name the same path and mode each declare it: both
+// requirements are kept, the shorter rule's first, so that either rule's
+// failure can be told.
+func TestTheSameMountOfTwoRulesIsRequiredOfEach(t *testing.T) {
+	p := mustParse(t, "rules:\n"+
+		"  - command: git commit\n    args: any\n    mounts:\n      .git: mounted\n"+
+		"  - command: git\n    args: any\n    mounts:\n      .git: mounted\n")
+	allowed, err := p.Check([]string{"git", "commit"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []MountRequirement{
+		{Path: ".git", Mode: MountMounted, Rule: "git"},
+		{Path: ".git", Mode: MountMounted, Rule: "git commit"},
+	}
+	if !slices.Equal(allowed.Mounts, want) {
+		t.Fatalf("got %v, want %v", allowed.Mounts, want)
+	}
+}
+
+func TestALongerRuleInheritsTheMountsOfShorterRules(t *testing.T) {
 	p := mustParse(t, "rules:\n  - command: git\n    args: any\n    mounts:\n      .git: mounted\n  - command: git push\n    args: any\n")
 	allowed, err := p.Check([]string{"git", "push"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(allowed.Mounts) != 0 {
-		t.Fatalf("got %v, want no mounts", allowed.Mounts)
+	want := []MountRequirement{{Path: ".git", Mode: MountMounted, Rule: "git"}}
+	if !slices.Equal(allowed.Mounts, want) {
+		t.Fatalf("got %v, want %v", allowed.Mounts, want)
 	}
 }

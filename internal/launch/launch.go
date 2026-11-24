@@ -734,6 +734,7 @@ func serveArgs(cfg Config, socket string) []string {
 		"--startup-timeout", cfg.StartupTimeout.String(),
 		"--grace", cfg.Grace.String(),
 		"--poll-interval", cfg.PollInterval.String(),
+		"--stopped-inspection-max-age", cfg.StoppedInspectionMaxAge.String(),
 		"--ask-timeout", cfg.AskTimeout.String(),
 		"--request-timeout", cfg.RequestTimeout.String(),
 		"--process", string(cfg.Process),

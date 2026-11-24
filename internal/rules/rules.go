@@ -44,9 +44,10 @@
 //
 // A rule may require paths of the workspace to be mounted in the container
 // (`mounts:`), a map from a path relative to the workspace root to
-// `mounted` or `read-only`. Check reports the requirements of the matching
-// rule, sorted by path, and a longer rule does not inherit them; checking
-// them against the container is the caller's.
+// `mounted` or `read-only`. Check reports the requirements of every rule
+// whose command starts the argv, sorted by path, then mode: a longer rule
+// inherits those of the shorter ones. Checking them against the container
+// is the caller's.
 //
 // A refusal carries every reason the matching rule finds, each with its
 // kind (see Denial): a plain refusal reports the first, while an approval
@@ -547,7 +548,7 @@ func newRule(rr rawRule) (*rule, error) {
 	if r.inject, err = newInjection(rr.Inject, r.secrets); err != nil {
 		return nil, fmt.Errorf("%q: %w", r.name, err)
 	}
-	if r.mounts, err = newMounts(rr.Mounts); err != nil {
+	if r.mounts, err = newMounts(rr.Mounts, r.name); err != nil {
 		return nil, fmt.Errorf("%q: %w", r.name, err)
 	}
 	if rr.FlagStyle != "" {
@@ -785,9 +786,12 @@ type Allowed struct {
 	Secrets []Secret
 	// Inject is what the rule adds to the command; Assemble places it.
 	Inject Injection
-	// Mounts are the allowing rule's mount requirements, sorted by path; the
-	// caller has to check them against the container. A rule does not
-	// inherit them from a shorter rule.
+	// Mounts are the mount requirements of every rule whose command starts
+	// the argv, allowing or denying it: the allowing rule's and those of the
+	// shorter rules it inherits, each naming the rule that declares it
+	// (MountRequirement.Rule). A path two rules name is required with both
+	// modes. They are sorted by path, then mode, then rule; the caller has
+	// to check them against the container.
 	Mounts []MountRequirement
 	// commandLen is the number of argv tokens the rule's command spans.
 	commandLen int
@@ -795,7 +799,9 @@ type Allowed struct {
 
 // Check returns what allowed argv, or a *Denial when argv is not allowed.
 // The denial carries every reason the matching rule finds, not only the
-// first one it reports.
+// first one it reports. Either way, the mount requirements it reports
+// (Allowed.Mounts, Denial.Approved) are those of every rule whose command
+// starts argv, not only the matching rule's.
 func (p *Policy) Check(argv []string) (Allowed, error) {
 	if len(argv) == 0 {
 		return Allowed{}, &Denial{Reason: "empty command"}
@@ -804,15 +810,20 @@ func (p *Policy) Check(argv []string) (Allowed, error) {
 		return Allowed{}, denial("", Allowed{}, findings{{Kind: ReasonNoFile, Text: missingReason}})
 	}
 	var best *rule
+	var mounts []MountRequirement
 	for _, r := range p.rules {
-		if len(r.command) <= len(argv) && slices.Equal(r.command, argv[:len(r.command)]) &&
-			(best == nil || len(r.command) > len(best.command)) {
+		if len(r.command) > len(argv) || !slices.Equal(r.command, argv[:len(r.command)]) {
+			continue
+		}
+		mounts = append(mounts, r.mounts...)
+		if best == nil || len(r.command) > len(best.command) {
 			best = r
 		}
 	}
 	if best == nil {
 		return Allowed{}, denial("", Allowed{}, findings{{Kind: ReasonNoRule, Text: fmt.Sprintf("no rule allows %q", strings.Join(argv[:min(2, len(argv))], " "))}})
 	}
+	sortMounts(mounts)
 	var paths []PathArg
 	var found findings
 	best.check(argv[len(best.command):], &paths, &found)
@@ -821,7 +832,7 @@ func (p *Policy) Check(argv []string) (Allowed, error) {
 	for i := range paths {
 		paths[i].Index += len(best.command)
 	}
-	allowed := Allowed{Rule: best.name, Paths: paths, Dir: best.dir, Secrets: best.secrets, Inject: best.inject, Mounts: best.mounts, commandLen: len(best.command)}
+	allowed := Allowed{Rule: best.name, Paths: paths, Dir: best.dir, Secrets: best.secrets, Inject: best.inject, Mounts: mounts, commandLen: len(best.command)}
 	if len(found) > 0 {
 		return Allowed{}, denial(best.name, allowed, found)
 	}

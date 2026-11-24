@@ -900,10 +900,11 @@ func isTerminal(f *os.File) bool {
 // in cfg's allow store for the workspace and the daemon's settings, as
 // `up` checks it: an edit not allowed keeps the rules served, and records
 // the allow request, until a `hostrunner allow` (see allowOptions).
-// Without Reread they take effect only in a new daemon, except that an
-// approval session which adds a rule makes the daemon reread the file,
-// and one that found the file edited by hand has it reread once allowed.
-// The digest of the rules reread is the one arms compare.
+// Without Reread they take
+// effect only in a new daemon, except that an approval session which adds
+// a rule makes the daemon reread the file, and one that found the file
+// edited by hand has it reread once allowed. The digest of the rules
+// reread is the one arms compare.
 //
 // With watch, the daemon also checks the mounts of the armed container on
 // every attach (see protectedPaths and daemon.WithMountCheck): it refuses
@@ -950,19 +951,13 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var (
-		watcher   *watch.Watcher  // set before the Server serves, which checks the mounts before every request
-		srv       *daemon.Server  // set before the watcher runs, which calls Attached
-		mountOpts []daemon.Option // the mount check's, see wireMountCheck
+		watcher        *watch.Watcher
+		mountOpts      []daemon.Option                      // the mount check's, see wireMountCheck
+		bindMountCheck func(*daemon.Server, *watch.Watcher) // see wireMountCheck
 	)
 	if cfg.watch {
-		wc := watch.Config{
-			Workspace:      cfg.workspace,
-			PollInterval:   cfg.PollInterval,
-			QueryTimeout:   queryTimeout,
-			StartupTimeout: cfg.StartupTimeout,
-			Grace:          cfg.Grace,
-		}
-		mountOpts = wireMountCheck(cfg, &wc, &srv, &watcher)
+		wc := watcherConfig(cfg)
+		mountOpts, bindMountCheck = wireMountCheck(cfg, &wc)
 		watcher = watch.New(runtimes, wc, log)
 	}
 	reread := func() (daemon.Policy, string, error) {
@@ -991,8 +986,9 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 		opts = append(opts, daemon.WithContainerStopped(watcher.ContainerStopped))
 		opts = append(opts, mountOpts...)
 	}
-	srv = daemon.New(mapper, policy, log, opts...)
+	srv := daemon.New(mapper, policy, log, opts...)
 	if watcher != nil {
+		bindMountCheck(srv, watcher)
 		contain.GoIn(ctx, &watching, func() {
 			defer cancel()
 			if err := watcher.Run(ctx); err != nil && ctx.Err() == nil {
@@ -1003,46 +999,69 @@ func serve(ctx context.Context, cfg serveConfig, log *slog.Logger, runtimes []wa
 	return srv.Serve(ctx, l)
 }
 
+// watcherConfig returns the configuration of the watcher of a `serve
+// --watch` of cfg: its workspace and the settings that tune it. The
+// callbacks of the mount check are set in it afterwards (see
+// wireMountCheck).
+func watcherConfig(cfg serveConfig) watch.Config {
+	return watch.Config{
+		Workspace:               cfg.workspace,
+		PollInterval:            cfg.PollInterval,
+		StoppedInspectionMaxAge: cfg.StoppedInspectionMaxAge,
+		QueryTimeout:            queryTimeout,
+		StartupTimeout:          cfg.StartupTimeout,
+		Grace:                   cfg.Grace,
+	}
+}
+
 // wireMountCheck sets up the mount check of a `serve --watch` of cfg, the
 // one place that looks at cfg.MountCheck: with it on, it sets in wc the
-// callbacks that bring the Server, which *srv points to before the
-// watcher runs, each arm and the check of each attach, and returns the
-// option that has the Server refuse commands by the check's results and
-// check the live mount tables of the watcher *watcher points to before
-// the Server serves, before every request: the protected paths first, the
-// protected-path stage of daemon.MountCheck, then, on the same tables, the
-// mount requirements of the request's rule, relative to the host workspace
-// root, its requirements stage; with it off, it leaves wc as it is
-// and returns none, so nothing is checked, mount requirements included.
-func wireMountCheck(cfg serveConfig, wc *watch.Config, srv **daemon.Server, watcher **watch.Watcher) []daemon.Option {
+// callbacks that bring the Server each arm and the check of each attach,
+// and returns the option that has the Server refuse commands by the
+// check's results and check the live mount tables of the watcher before
+// every request: it reads the tables once (mountcheck.Read) and judges
+// what it read for the protected paths first, the protected-path stage of
+// daemon.MountCheck, then for the mount requirements of one rule that
+// starts the request, relative to the host workspace root, its
+// requirements stage; with it off, it leaves wc as it is and returns none,
+// so nothing is checked, mount requirements included. The caller calls
+// bind once with the Server made with the options and the watcher made
+// with wc, before the watcher runs and the Server serves.
+func wireMountCheck(cfg serveConfig, wc *watch.Config) (opts []daemon.Option, bind func(*daemon.Server, *watch.Watcher)) {
 	if !cfg.MountCheck {
-		return nil
+		return nil, func(*daemon.Server, *watch.Watcher) {}
 	}
+	var (
+		srv     *daemon.Server
+		watcher *watch.Watcher
+	)
 	wc.Attached = func(armedAt time.Time, armed []watch.Container) {
-		(*srv).MountChecked(armedAt, mountcheck.Check(armed, protectedPaths(cfg)))
+		srv.MountChecked(armedAt, mountcheck.Read(armed).Check(protectedPaths(cfg)))
 	}
 	// Before `up` gets its reply, so before its container starts.
-	wc.Armed = func(armedAt time.Time) { (*srv).MountRearmed(armedAt) }
+	wc.Armed = func(armedAt time.Time) { srv.MountRearmed(armedAt) }
 	liveCheck := func(ctx context.Context) (daemon.MountRequirementsCheck, error) {
-		live, err := (*watcher).Live(ctx)
+		live, err := watcher.Live(ctx)
 		if errors.Is(err, watch.ErrNotAttached) {
 			return nil, daemon.ErrMountCheckPending
 		}
 		if err != nil {
 			return nil, err
 		}
-		if err := mountcheck.Check(live, protectedPaths(cfg)); err != nil {
+		mounts := mountcheck.Read(live)
+		if err := mounts.Check(protectedPaths(cfg)); err != nil {
 			return nil, err
 		}
 		return func(reqs []rules.MountRequirement) error {
-			return mountcheck.CheckRequirements(live, cfg.workspace, reqs)
+			return mounts.CheckRequirements(cfg.workspace, reqs)
 		}, nil
 	}
-	return []daemon.Option{daemon.WithMountCheck(settings.MountCheckOffHint(), liveCheck)}
+	bind = func(s *daemon.Server, w *watch.Watcher) { srv, watcher = s, w }
+	return []daemon.Option{daemon.WithMountCheck(settings.MountCheckOffHint(), liveCheck)}, bind
 }
 
 // protectedPaths are the host paths of cfg's daemon configuration that the
-// armed container must not be able to write (see mountcheck.Check): the
+// armed container must not be able to write (see mountcheck.Mounts.Check): the
 // workspace's .devcontainer directory, the rules file and the workspace
 // settings file, wherever these two lie.
 func protectedPaths(cfg serveConfig) []string {

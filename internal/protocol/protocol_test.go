@@ -275,6 +275,16 @@ func TestAllowedTextNamesTheRequiredMounts(t *testing.T) {
 	}
 }
 
+// A requirement of another rule than the one that allows the command, one
+// that names its rule, is told with it.
+func TestAllowedTextNamesTheRuleOfAMountOfAnotherRule(t *testing.T) {
+	a := Allowed{Rule: "git commit", Mounts: []MountRequirement{{Path: ".git", Mode: "mounted", Rule: "git"}, {Path: ".git/config", Mode: "read-only"}}}
+	want := `allowed by rule "git commit", requires mounts: .git mounted (rule "git"), .git/config read-only`
+	if got := a.String(); got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
 // The mounts come after the directory and the secrets, and a rule without
 // mounts adds nothing to the description.
 func TestAllowedTextOrdersTheMountsAfterTheOtherParts(t *testing.T) {
@@ -318,6 +328,21 @@ func TestAllowedMountsWireFormat(t *testing.T) {
 		t.Fatal(err)
 	}
 	if want := `{"rule":"git"}`; string(f.Payload) != want {
+		t.Errorf("payload %s, want %s", f.Payload, want)
+	}
+}
+
+// A requirement of another rule is written with that rule under "rule".
+func TestAllowedMountRuleWireFormat(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteJSON(&buf, FrameAllowed, Allowed{Rule: "git commit", Mounts: []MountRequirement{{Path: ".git", Mode: "mounted", Rule: "git"}}}); err != nil {
+		t.Fatal(err)
+	}
+	f, err := ReadFrame(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `{"rule":"git commit","mounts":[{"path":".git","mode":"mounted","rule":"git"}]}`; string(f.Payload) != want {
 		t.Errorf("payload %s, want %s", f.Payload, want)
 	}
 }

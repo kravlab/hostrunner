@@ -82,6 +82,33 @@ func TestResolveTakesEachKeyFromTheHighestOfFiveSources(t *testing.T) {
 	}
 }
 
+// stopped_inspection_max_age, like the other timings, is one of the keys
+// that the workspace's section of the host settings file and the
+// workspace settings file may set.
+func TestWorkspaceSourcesSetTheStoppedInspectionMaxAge(t *testing.T) {
+	ws := t.TempDir()
+	host := "stopped_inspection_max_age: 6s\n" + section(ws, "stopped_inspection_max_age: 7s")
+	tests := []struct {
+		name, wsFile string
+		want         time.Duration
+	}{
+		{"section over common part", "", 7 * time.Second},
+		{"workspace file over section", "stopped_inspection_max_age: 8s\n", 8 * time.Second},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vars := map[string]string{"HOSTRUNNER_SETTINGS": writeFile(t, host)}
+			if tt.wsFile != "" {
+				vars["HOSTRUNNER_WORKSPACE_SETTINGS"] = writeFile(t, tt.wsFile)
+			}
+			got, err := parse(t).Resolve(env(vars), ws)
+			if err != nil || got.StoppedInspectionMaxAge != tt.want {
+				t.Fatalf("got %v, %v; want %v", got.StoppedInspectionMaxAge, err, tt.want)
+			}
+		})
+	}
+}
+
 // A section applies to the workspace whose path is its own after ~
 // expansion and symlink resolution, on either side, and to no other.
 func TestSectionAppliesToItsWorkspaceAlone(t *testing.T) {

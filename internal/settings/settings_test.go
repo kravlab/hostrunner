@@ -82,6 +82,102 @@ func TestResolveGivesTheDefaultsWhenNoSourceSetsAKey(t *testing.T) {
 	}
 }
 
+// stopped_inspection_max_age has no default of its own: zero, which the
+// watcher reads as the poll interval.
+func TestResolveLeavesTheStoppedInspectionMaxAgeZeroWhenNoSourceSetsIt(t *testing.T) {
+	got, err := parse(t).Resolve(env(nil), noWorkspace)
+	if err != nil || got.StoppedInspectionMaxAge != 0 {
+		t.Fatalf("got %v, %v; want 0", got.StoppedInspectionMaxAge, err)
+	}
+}
+
+// stopped_inspection_max_age comes from the host settings file, a variable
+// and a flag, the highest source winning, as the other durations do.
+func TestResolveTakesTheStoppedInspectionMaxAgeFromEverySource(t *testing.T) {
+	file := "stopped_inspection_max_age: 7s\n"
+	vars := map[string]string{"HOSTRUNNER_STOPPED_INSPECTION_MAX_AGE": "8s"}
+	tests := []struct {
+		name  string
+		file  string
+		vars  map[string]string
+		flags []string
+		want  time.Duration
+	}{
+		{"file", file, nil, nil, 7 * time.Second},
+		{"variable over file", file, vars, nil, 8 * time.Second},
+		{"flag over variable", file, vars, []string{"--stopped-inspection-max-age", "9s"}, 9 * time.Second},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vars := map[string]string{"HOSTRUNNER_SETTINGS": writeFile(t, tt.file)}
+			maps.Copy(vars, tt.vars)
+			got, err := parse(t, tt.flags...).Resolve(env(vars), noWorkspace)
+			if err != nil || got.StoppedInspectionMaxAge != tt.want {
+				t.Fatalf("got %v, %v; want %v", got.StoppedInspectionMaxAge, err, tt.want)
+			}
+		})
+	}
+}
+
+// A zero stopped_inspection_max_age, the value that means the poll
+// interval, is a value like any other from every source, since `up` gives
+// it to the daemon as a flag whatever it is.
+func TestResolveAcceptsAZeroStoppedInspectionMaxAge(t *testing.T) {
+	file := "stopped_inspection_max_age: 7s\n"
+	tests := []struct {
+		name  string
+		file  string
+		vars  map[string]string
+		flags []string
+	}{
+		{"file", "stopped_inspection_max_age: 0s\n", nil, nil},
+		{"variable over file", file, map[string]string{"HOSTRUNNER_STOPPED_INSPECTION_MAX_AGE": "0s"}, nil},
+		{"flag over file", file, nil, []string{"--stopped-inspection-max-age", "0s"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vars := map[string]string{"HOSTRUNNER_SETTINGS": writeFile(t, tt.file)}
+			maps.Copy(vars, tt.vars)
+			got, err := parse(t, tt.flags...).Resolve(env(vars), noWorkspace)
+			if err != nil || got.StoppedInspectionMaxAge != 0 {
+				t.Fatalf("got %v, %v; want 0", got.StoppedInspectionMaxAge, err)
+			}
+		})
+	}
+}
+
+// A negative stopped_inspection_max_age is refused from every source, the
+// flag as a *FlagError.
+func TestResolveRefusesANegativeStoppedInspectionMaxAge(t *testing.T) {
+	path := writeFile(t, "stopped_inspection_max_age: -1s\n")
+	const (
+		problem  = "must not be negative, got -1s"
+		variable = "HOSTRUNNER_STOPPED_INSPECTION_MAX_AGE"
+	)
+	inFile := "settings file " + path + ": stopped_inspection_max_age: " + problem
+	tests := []struct {
+		name  string
+		vars  map[string]string
+		flags []string
+		want  string
+	}{
+		{"file", map[string]string{"HOSTRUNNER_SETTINGS": path}, nil, inFile},
+		{"variable", map[string]string{variable: "-1s"}, nil, variable + ": " + problem},
+		{"flag", nil, []string{"--stopped-inspection-max-age", "-1s"}, "--stopped-inspection-max-age: must not be negative"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := parse(t, tt.flags...).Resolve(env(tt.vars), noWorkspace)
+			if err == nil || err.Error() != tt.want {
+				t.Fatalf("got %v, want %q", err, tt.want)
+			}
+			if _, isFlag := errors.AsType[*settings.FlagError](err); isFlag != (tt.name == "flag") {
+				t.Fatalf("got %v, flag error: %v", err, isFlag)
+			}
+		})
+	}
+}
+
 // Each key comes from the highest source that sets it: flags, then the
 // variables, then the host settings file, then the default.
 func TestResolveTakesEachKeyFromTheHighestSourceSettingIt(t *testing.T) {
@@ -184,13 +280,13 @@ const givenRules = "/given/hostrun.yaml"
 
 // daemonFlags gives every setting but the rules file and reread that
 // serve takes as a flag; givenTimings is what they give.
-var daemonFlags = []string{"--startup-timeout", "1h", "--grace", "1m", "--poll-interval", "5s", "--ask-timeout", "20m", "--request-timeout", "30s", "--mount-check", "--process", string(settingstest.GivenProcess)}
+var daemonFlags = []string{"--startup-timeout", "1h", "--grace", "1m", "--poll-interval", "5s", "--stopped-inspection-max-age", "7s", "--ask-timeout", "20m", "--request-timeout", "30s", "--mount-check", "--process", string(settingstest.GivenProcess)}
 
 // givenTimings is defaults with what daemonFlags gives, the rules file
 // given and reread off.
 func givenTimings(rulesFile string) settings.Settings {
 	s := tuned(rulesFile, time.Hour, time.Minute, false)
-	s.PollInterval, s.AskTimeout, s.RequestTimeout = 5*time.Second, 20*time.Minute, 30*time.Second
+	s.PollInterval, s.StoppedInspectionMaxAge, s.AskTimeout, s.RequestTimeout = 5*time.Second, 7*time.Second, 20*time.Minute, 30*time.Second
 	s.Process = settingstest.GivenProcess
 	return s
 }
@@ -255,7 +351,7 @@ func TestResolveAsGivenReadsEverySourceWhenAFlagIsMissing(t *testing.T) {
 		t.Fatal("without --rules-file: got no error for an invalid variable")
 	}
 	if _, err := parse(t, "--rules-file", givenRules, "--reread", "--startup-timeout", "1h", "--grace", "1m").ResolveAsGiven(env(map[string]string{"HOSTRUNNER_GRACE": "abc"}), noWorkspace); err == nil {
-		t.Fatal("without --poll-interval, --ask-timeout and --request-timeout: got no error for an invalid variable")
+		t.Fatal("without --poll-interval, --stopped-inspection-max-age, --ask-timeout and --request-timeout: got no error for an invalid variable")
 	}
 }
 
@@ -325,7 +421,7 @@ func TestResolveRefusesATildeWithoutHome(t *testing.T) {
 }
 
 func TestUsageNamesEveryFlagServeTakes(t *testing.T) {
-	want := "[--settings <path>] [--workspace-settings <path>] [--rules-file <path>] [--startup-timeout <duration>] [--grace <duration>] [--reread | --no-reread] [--poll-interval <duration>] [--ask-timeout <duration>] [--request-timeout <duration>] [--mount-check | --no-mount-check] [--process <own|shared>]"
+	want := "[--settings <path>] [--workspace-settings <path>] [--rules-file <path>] [--startup-timeout <duration>] [--grace <duration>] [--reread | --no-reread] [--poll-interval <duration>] [--stopped-inspection-max-age <duration>] [--ask-timeout <duration>] [--request-timeout <duration>] [--mount-check | --no-mount-check] [--process <own|shared>]"
 	if got := settings.Usage(); got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}

@@ -15,6 +15,42 @@ import (
 	"github.com/kravlab/hostrunner/internal/watch/watchtest"
 )
 
+// TestWireMountCheckOffSetsNothing checks that with the mount check off
+// wireMountCheck returns no option, leaves the watcher's callbacks unset,
+// and returns a bind that can be called.
+func TestWireMountCheckOffSetsNothing(t *testing.T) {
+	cfg := mountCheckConfig(t)
+	cfg.MountCheck = false
+	var wc watch.Config
+	opts, bind := wireMountCheck(cfg, &wc)
+	if len(opts) != 0 {
+		t.Fatalf("got %d options, want none", len(opts))
+	}
+	if wc.Attached != nil || wc.Armed != nil {
+		t.Fatal("the watcher's callbacks are set, want them unset")
+	}
+	bind(nil, nil)
+}
+
+// TestWireMountCheckOnSetsTheCallbacksAndItsOption checks that with the
+// mount check on wireMountCheck sets the watcher's callbacks and returns
+// the option of the live check.
+func TestWireMountCheckOnSetsTheCallbacksAndItsOption(t *testing.T) {
+	cfg := mountCheckConfig(t)
+	cfg.MountCheck = true
+	var wc watch.Config
+	opts, bind := wireMountCheck(cfg, &wc)
+	if len(opts) != 1 {
+		t.Fatalf("got %d options, want the live check's", len(opts))
+	}
+	if wc.Attached == nil || wc.Armed == nil {
+		t.Fatal("the watcher's callbacks are unset, want them set")
+	}
+	if bind == nil {
+		t.Fatal("bind is nil")
+	}
+}
+
 // mountCheckConfig is a `serve --watch` over a temporary workspace whose
 // rules file, .devcontainer/hostrunner-rules.yaml, allows `true`, and
 // whose workspace settings file is .devcontainer/hostrunner.yaml, which

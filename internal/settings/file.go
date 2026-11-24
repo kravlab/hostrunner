@@ -234,7 +234,7 @@ func nodeValue(setting key, n *yaml.Node) (any, error) {
 		return setting.parse(n.Value)
 	case n.Tag == "!!null":
 		return nil, fmt.Errorf("invalid %s: no value (line %d)", k, n.Line)
-	case k == kindDuration && (n.Tag == "!!int" || n.Tag == "!!float"):
+	case (k == kindDuration || k == kindOptionalDuration) && (n.Tag == "!!int" || n.Tag == "!!float"):
 		return nil, fmt.Errorf("invalid duration %s: give a unit, e.g. 90s", n.Value)
 	case n.Tag == "!!str":
 		return nil, fmt.Errorf("invalid %s %q", k, n.Value)

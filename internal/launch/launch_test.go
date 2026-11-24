@@ -103,6 +103,7 @@ func runFakeDaemon(mode string) {
 	fs.DurationVar(&own.StartupTimeout, "startup-timeout", 0, "")
 	fs.DurationVar(&own.Grace, "grace", 0, "")
 	fs.DurationVar(&own.PollInterval, "poll-interval", 0, "")
+	fs.DurationVar(&own.StoppedInspectionMaxAge, "stopped-inspection-max-age", 0, "")
 	fs.DurationVar(&own.AskTimeout, "ask-timeout", 0, "")
 	fs.DurationVar(&own.RequestTimeout, "request-timeout", 0, "")
 	process := fs.String("process", "", "")
@@ -789,10 +790,12 @@ func TestUpReplacesDaemonWhoseRereadingDiffers(t *testing.T) {
 func TestServeArgsGiveEverySetting(t *testing.T) {
 	base := Config{Workspace: "/home/u/app", ContainerWorkspace: "/workspaces/app", WorkspaceSettings: "/home/u/app/.devcontainer/hostrunner.yaml", Settings: settings.Settings{
 		RulesFile: "/home/u/app/.devcontainer/hostrun.yaml", StartupTimeout: 30 * time.Minute, Grace: 15 * time.Second,
-		PollInterval: 2 * time.Second, AskTimeout: 10 * time.Minute, RequestTimeout: 10 * time.Second, ReadyTimeout: time.Minute,
+		PollInterval: 2 * time.Second, StoppedInspectionMaxAge: 3 * time.Second,
+		AskTimeout: 10 * time.Minute, RequestTimeout: 10 * time.Second, ReadyTimeout: time.Minute,
 	}}
 	start := []string{"serve", "--socket", "/run/h.sock", "--workspace", "/home/u/app", "--container-workspace", "/workspaces/app", "--workspace-settings", "/home/u/app/.devcontainer/hostrunner.yaml", "--rules-file", "/home/u/app/.devcontainer/hostrun.yaml", "--watch",
-		"--startup-timeout", "30m0s", "--grace", "15s", "--poll-interval", "2s", "--ask-timeout", "10m0s", "--request-timeout", "10s"}
+		"--startup-timeout", "30m0s", "--grace", "15s", "--poll-interval", "2s", "--stopped-inspection-max-age", "3s",
+		"--ask-timeout", "10m0s", "--request-timeout", "10s"}
 	for _, tt := range []struct {
 		reread, mountCheck bool
 		process            settings.Process
@@ -969,12 +972,14 @@ func TestArmCarriesTheDaemonSettings(t *testing.T) {
 			name: "every setting",
 			s: settings.Settings{
 				RulesFile: "/w/rules.yaml", StartupTimeout: time.Hour, Grace: time.Minute, Reread: false,
-				PollInterval: time.Second, AskTimeout: time.Minute, RequestTimeout: time.Second, ReadyTimeout: time.Minute,
+				PollInterval: time.Second, StoppedInspectionMaxAge: 3 * time.Second,
+				AskTimeout: time.Minute, RequestTimeout: time.Second, ReadyTimeout: time.Minute,
 				Process: settings.ProcessShared, MountCheck: true,
 			},
 			want: map[string]string{
 				"rules_file": "/w/rules.yaml", "startup_timeout": "1h0m0s", "grace": "1m0s", "reread": "false",
-				"poll_interval": "1s", "ask_timeout": "1m0s", "request_timeout": "1s", "process": "shared", "mount_check": "true",
+				"poll_interval": "1s", "stopped_inspection_max_age": "3s", "ask_timeout": "1m0s", "request_timeout": "1s",
+				"process": "shared", "mount_check": "true",
 			},
 			wantNoReread: true,
 		},
@@ -1019,7 +1024,8 @@ func TestArmCarriesTheDaemonSettings(t *testing.T) {
 func TestServeArgsResolveToUpsSettings(t *testing.T) {
 	full := settings.Settings{
 		RulesFile: "/home/u/app/.devcontainer/hostrun.yaml", StartupTimeout: 30 * time.Minute, Grace: 15 * time.Second,
-		Reread: true, PollInterval: 2 * time.Second, AskTimeout: 10 * time.Minute, RequestTimeout: 10 * time.Second,
+		Reread: true, PollInterval: 2 * time.Second, StoppedInspectionMaxAge: 3 * time.Second,
+		AskTimeout: 10 * time.Minute, RequestTimeout: 10 * time.Second,
 		ReadyTimeout: 10 * time.Second, Process: settings.ProcessOwn, MountCheck: true,
 	}
 	elsewhere := full

@@ -859,8 +859,8 @@ func (s *Server) serveSession(c *sessionConn, takeOver bool) string {
 		if err := send(protocol.FrameServing, nil); err != nil {
 			return err
 		}
-		if failed, failures := s.mount.failure(); failed != "" && failures != c.helloMountFailures && c.readsMountCheck.Load() {
-			if err := send(protocol.FrameMountCheckFailed, protocol.MountCheckFailed{Error: failed}); err != nil {
+		if failed, failures := s.mount.failure(); failed != "" && failures != c.helloMountFailures {
+			if err := c.sendMountCheckFailed(send, failed, ""); err != nil {
 				return err
 			}
 		}
@@ -956,7 +956,7 @@ func (s *Server) ask(ctx context.Context, x exchange, f protocol.Frame) {
 			return
 		}
 	}
-	if s.mountRefused(x.daemon, s.ruleMountRequirements(req.Argv), s.rejecter(x.out)) {
+	if s.mountRefused(x.daemon, s.arrivalRequirements(req.Argv), s.rejecter(x.out)) {
 		return
 	}
 	need, r := s.assessApproval(x.daemon, req)
@@ -1108,7 +1108,14 @@ func (s *Server) ask(ctx context.Context, x exchange, f protocol.Frame) {
 			}
 		}
 	}
-	s.start(ctx, x, req, p, frames.next, run, grant, "approved", scope, "approval_id", id)
+	s.start(ctx, x, startArgs{
+		req:     req,
+		p:       p,
+		next:    frames.next,
+		run:     run,
+		passed:  grant,
+		logArgs: []any{"approved", scope, "approval_id", id},
+	})
 }
 
 // approvalNeed is what --ask would ask a human about a request: what the

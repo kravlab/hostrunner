@@ -107,7 +107,7 @@ func (f *Flags) register(fs *flag.FlagSet, flagged []key, in ...scope) {
 			if k.flagName() == rulesFileFlag {
 				fs.String(configFlag, "", "synonym of --"+rulesFileFlag)
 			}
-		case kindDuration:
+		case kindDuration, kindOptionalDuration:
 			f.durations[k.name] = fs.Duration(k.flagName(), k.get(&defaults).(time.Duration), k.usage)
 		case kindBool:
 			f.bools[k.name] = fs.Bool(k.flagName(), false, k.usage)

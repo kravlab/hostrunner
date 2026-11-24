@@ -114,8 +114,8 @@ func TestMountPointIsTheCleanedDestination(t *testing.T) {
 		{"/workspace/", "/workspace"},
 		{"/workspace/./.devcontainer/../.devcontainer", "/workspace/.devcontainer"},
 	} {
-		if got := (watch.Mount{Destination: tt.dest}).Point(); got != tt.want {
-			t.Errorf("Mount{Destination: %q}.Point() = %q; want %q", tt.dest, got, tt.want)
+		if got := (watch.Mount{Destination: tt.dest}).PointPath(); got != tt.want {
+			t.Errorf("Mount{Destination: %q}.PointPath() = %q; want %q", tt.dest, got, tt.want)
 		}
 	}
 }

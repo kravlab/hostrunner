@@ -1381,6 +1381,76 @@ func TestLiveAfterARestartReadsTheNewProcess(t *testing.T) {
 	})
 }
 
+// startWithStoppedB runs a watcher whose polls are too far apart to refresh
+// anything while the test runs and whose StoppedInspectionMaxAge is 100 ms,
+// attaches it to the running a and b, stops b and calls Live: b's process is
+// gone, so b is inspected again, found stopped and left out. It then starts b
+// again, which only a later inspection can see.
+func startWithStoppedB(t *testing.T) (context.Context, *watch.Watcher, *countingRuntime) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	cfg := raceConfig()
+	cfg.PollInterval = 10 * time.Second
+	cfg.StoppedInspectionMaxAge = 100 * time.Millisecond
+	rt := &countingRuntime{Runtime: &watchtest.Runtime{}}
+	w, _ := startWatcherWith(ctx, cfg, nil, rt)
+	time.Sleep(cfg.PollInterval / 10)
+	rt.Start("a")
+	rt.Start("b")
+	time.Sleep(cfg.PollInterval) // the poll at 10 s attaches to both
+	rt.Stop("b")
+	got, err := w.Live(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(ids(got), []string{"a"}) {
+		t.Fatalf("Live with b stopped got %v; want only a", ids(got))
+	}
+	rt.Start("b")
+	return ctx, w, rt
+}
+
+// StoppedInspectionMaxAge, not PollInterval, says how old the inspection of
+// a stopped armed container must be for Live to inspect it again: once it
+// has passed, a container that has started since is seen running.
+func TestLiveInspectsAStoppedArmedContainerAgainAfterStoppedInspectionMaxAge(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, w, _ := startWithStoppedB(t)
+
+		time.Sleep(100 * time.Millisecond)
+		got, err := w.Live(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(ids(got), []string{"a", "b"}) {
+			t.Fatalf("Live a StoppedInspectionMaxAge after b's inspection got %v; want a and b", ids(got))
+		}
+		livePoints(t, got, "b")
+	})
+}
+
+// Within StoppedInspectionMaxAge of that inspection, Live leaves the
+// stopped container out without a query.
+func TestLiveLeavesOutAStoppedArmedContainerWithinStoppedInspectionMaxAge(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, w, rt := startWithStoppedB(t)
+
+		time.Sleep(50 * time.Millisecond)
+		before := rt.calls.Load()
+		got, err := w.Live(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(ids(got), []string{"a"}) {
+			t.Fatalf("Live within StoppedInspectionMaxAge of b's inspection got %v; want only a", ids(got))
+		}
+		if n := rt.calls.Load() - before; n != 0 {
+			t.Fatalf("Live within StoppedInspectionMaxAge of b's inspection inspected %d times; want none", n)
+		}
+	})
+}
+
 // A container that does not run cannot write: Live leaves out an armed
 // container that stopped. Live inspects it again only once its last
 // inspection is a poll interval old, and then takes it in again if it runs:
@@ -1525,6 +1595,104 @@ func TestLiveReportsAGoneProcessWhileNoRuntimeAnswers(t *testing.T) {
 	})
 }
 
+// startRestartingC runs a watcher with a runtime counting its inspections,
+// attaches it to the running c, makes c restart (running, without a process)
+// and lets a poll inspect it, so that Live starts from a cached container
+// that runs with pid 0 and whose inspection is younger than
+// StoppedInspectionMaxAge.
+func startRestartingC(t *testing.T) (context.Context, *watch.Watcher, *countingRuntime) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	cfg := raceConfig()
+	rt := &countingRuntime{Runtime: &watchtest.Runtime{}}
+	w, _ := startWatcherWith(ctx, cfg, nil, rt)
+	time.Sleep(cfg.PollInterval / 10)
+	rt.Start("c")
+	time.Sleep(cfg.PollInterval) // the poll at 150 ms attaches
+	rt.Restarting("c")
+	time.Sleep(cfg.PollInterval) // the poll at 300 ms sees c without a process
+	return ctx, w, rt
+}
+
+// A container the runtime reports running without a process (restarting) is
+// not taken as stopped: Live inspects it again once, even though its last
+// inspection is young, and reads the table of the process it has then.
+func TestLiveInspectsAgainAContainerThatRunsWithoutAProcessID(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, w, rt := startRestartingC(t)
+		rt.Start("c")
+		table := []watch.MountPoint{{Path: "/workspace"}, {Path: "/after-the-restart", ReadOnly: true}}
+		rt.SetMountTable("c", table...)
+		before := rt.calls.Load()
+		got, err := w.Live(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if points := livePoints(t, got, "c"); !slices.Equal(points, table) {
+			t.Fatalf("Live got %v; want the new process's table %v", points, table)
+		}
+		if n := rt.calls.Load() - before; n != 1 {
+			t.Fatalf("Live inspected %d times; want once", n)
+		}
+	})
+}
+
+// A container that still has no process at the fresh inspection is not
+// readable: Live returns it with a Live.Err saying why, for the caller to
+// refuse, and inspects it again once at each call until it has a process.
+func TestLiveReportsAContainerThatStillRunsWithoutAProcessID(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, w, rt := startRestartingC(t)
+		for range 2 {
+			before := rt.calls.Load()
+			got, err := w.Live(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got) != 1 || got[0].ID != "c" || got[0].Live == nil || !errors.Is(got[0].Live.Err, watch.ErrNoProcessID) {
+				t.Fatalf("Live got %+v; want c with ErrNoProcessID as its Live.Err", got)
+			}
+			if n := rt.calls.Load() - before; n != 1 {
+				t.Fatalf("Live inspected %d times; want once", n)
+			}
+		}
+		if msg := watch.ErrNoProcessID.Error(); msg != "container runs but reports no process id" {
+			t.Fatalf("ErrNoProcessID says %q", msg)
+		}
+
+		rt.Start("c")
+		got, err := w.Live(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		livePoints(t, got, "c") // a later inspection finds its process
+	})
+}
+
+// A process that is gone and has not come back by the fresh inspection, the
+// container running without a process ID, is reported the same way.
+func TestLiveReportsAGoneProcessOfAContainerThatRunsWithoutAProcessID(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		cfg := raceConfig()
+		rt := &watchtest.Runtime{}
+		w, _ := startWatcherWith(ctx, cfg, nil, rt)
+		time.Sleep(cfg.PollInterval / 10)
+		rt.Start("c")
+		time.Sleep(cfg.PollInterval) // the poll at 150 ms attaches
+		rt.Restarting("c")           // docker restart: the attach's pid is gone
+		got, err := w.Live(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 1 || got[0].Live == nil || !errors.Is(got[0].Live.Err, watch.ErrNoProcessID) {
+			t.Fatalf("Live got %+v; want c with ErrNoProcessID as its Live.Err", got)
+		}
+	})
+}
+
 // racingRuntime is a watchtest.Runtime whose container id restarts, or
 // stops, when its first mount table is asked for: between the inspection
 // that reported it and the read of its table.
@@ -1532,13 +1700,19 @@ type racingRuntime struct {
 	*watchtest.Runtime
 	id      string
 	restart bool // start it again after stopping it
-	once    sync.Once
+	// restarting leaves it running without a process after the stop, as a
+	// container that is restarting; restart is then ignored.
+	restarting bool
+	once       sync.Once
 }
 
 func (r *racingRuntime) MountTable(ctx context.Context, pid int) ([]watch.MountPoint, error) {
 	r.once.Do(func() {
 		r.Stop(r.id)
-		if r.restart {
+		switch {
+		case r.restarting:
+			r.Restarting(r.id)
+		case r.restart:
 			r.Start(r.id)
 		}
 	})
@@ -1573,6 +1747,47 @@ func TestAttachedInspectsAgainAContainerWhoseProcessIsGone(t *testing.T) {
 					t.Fatalf("got %+v", calls)
 				}
 				rt.Stop("c")
+				expectResult(t, done, nil)
+			})
+		})
+	}
+}
+
+// A container that runs without a process ID (restarting) at the attach, or
+// still at the fresh inspection of the attach, is not an error of the
+// attach: it gets no live table, as one that does not run, and the request
+// that follows judges it (see Live).
+func TestAttachedGetsNoLiveTableForAContainerThatRunsWithoutAProcessID(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		gone bool // its process is gone when its table is read, and it restarts without one
+	}{
+		{"restarting at the inspection of the attach", false},
+		{"restarting at the fresh inspection after a gone process", true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				fake := &watchtest.Runtime{}
+				var rt watch.Runtime = fake
+				if tt.gone {
+					rt = &racingRuntime{Runtime: fake, id: "c", restarting: true}
+				}
+				rec := &attachRecorder{}
+				cfg := raceConfig()
+				cfg.Attached = rec.attached
+				_, done := startWatcherWith(context.Background(), cfg, nil, rt)
+				time.Sleep(cfg.PollInterval / 10)
+				fake.Start("c")
+				if !tt.gone {
+					fake.Restarting("c") // between two polls: the attach finds it so
+				}
+				time.Sleep(cfg.PollInterval) // the poll at 150 ms attaches
+				calls := rec.snapshot()
+				if len(calls) != 1 || len(calls[0]) != 1 ||
+					!calls[0][0].Running || calls[0][0].Pid != 0 || calls[0][0].Live != nil {
+					t.Fatalf("got %+v; want one call with c running without a pid and without live mounts", calls)
+				}
+				fake.Stop("c")
 				expectResult(t, done, nil)
 			})
 		})

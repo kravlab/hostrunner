@@ -91,7 +91,7 @@ func (r *Runtime) Containers(context.Context, string) ([]watch.Container, error)
 func (r *Runtime) MountTable(_ context.Context, pid int) ([]watch.MountPoint, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	i := slices.IndexFunc(r.containers, func(c watch.Container) bool { return c.Running && c.Pid == pid })
+	i := slices.IndexFunc(r.containers, func(c watch.Container) bool { return c.Runs() && c.Pid == pid })
 	if i < 0 {
 		return nil, fmt.Errorf("mount table of process %d: %w", pid, watch.ErrProcessGone)
 	}
@@ -104,7 +104,7 @@ func (r *Runtime) MountTable(_ context.Context, pid int) ([]watch.MountPoint, er
 	}
 	var table []watch.MountPoint
 	for _, m := range r.mounts[id] {
-		table = append(table, watch.MountPoint{Path: m.Point(), ReadOnly: m.ReadOnly})
+		table = append(table, watch.MountPoint{Path: m.PointPath(), ReadOnly: m.ReadOnly})
 	}
 	return table, nil
 }
@@ -215,6 +215,13 @@ func (r *Runtime) Start(id string) {
 // pid.
 func (r *Runtime) Stop(id string) {
 	r.update(id, func(c *watch.Container) { c.Running, c.Pid = false, 0 })
+}
+
+// Restarting makes the container id, creating it if needed, run without a
+// process, as a runtime reports a container that is restarting: Running,
+// with pid 0 and the start time it had. The next Start gives it a pid.
+func (r *Runtime) Restarting(id string) {
+	r.update(id, func(c *watch.Container) { c.Running, c.Pid = true, 0 })
 }
 
 // Remove removes the container id.

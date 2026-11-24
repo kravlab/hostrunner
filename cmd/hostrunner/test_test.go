@@ -386,6 +386,28 @@ func TestRulesTestListsTheRequiredMounts(t *testing.T) {
 	}
 }
 
+// The Rules test lists the requirements of every rule that starts the
+// command, naming the rule of those the allowing rule does not declare, a
+// shorter rule's: a longer rule inherits them.
+func TestRulesTestListsTheMountsOfShorterRulesToo(t *testing.T) {
+	rules := `rules:
+  - command: git
+    args: any
+    mounts:
+      .git: mounted
+      .git/config: read-only
+  - command: git commit amend
+    args: any
+    mounts:
+      .git/hooks: read-only
+`
+	code, _, stderr := runTest(t, "--config", writeRules(t, rules), "git", "commit", "amend")
+	want := "hostrunner: allowed by rule \"git commit amend\", requires mounts: .git mounted (rule \"git\"), .git/config read-only (rule \"git\"), .git/hooks read-only\n"
+	if code != 0 || stderr != want {
+		t.Fatalf("exit code %d, stderr %q; want 0, %q", code, stderr, want)
+	}
+}
+
 // The Rules test names a rule's secrets and touches none of them.
 func TestRulesTestListsTheSecrets(t *testing.T) {
 	rules := `rules:

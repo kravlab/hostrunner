@@ -156,6 +156,30 @@ func TestStopClearsThePid(t *testing.T) {
 	}
 }
 
+// A restarting container is running without a process: Containers reports
+// it Running with pid 0, its pid 0 is a process that is gone, and the next
+// Start gives it a new pid.
+func TestRestartingReportsARunningContainerWithoutAPid(t *testing.T) {
+	r := &watchtest.Runtime{}
+	r.Start("c")
+	started := containers(t, r)[0]
+	r.Restarting("c")
+	got := containers(t, r)[0]
+	if !got.Running || got.Pid != 0 || got.Runs() {
+		t.Fatalf("got %+v; want a running container without a pid", got)
+	}
+	if !got.StartedAt.Equal(started.StartedAt) {
+		t.Fatalf("got start time %v; want the unchanged %v", got.StartedAt, started.StartedAt)
+	}
+	if _, err := r.MountTable(context.Background(), got.Pid); !errors.Is(err, watch.ErrProcessGone) {
+		t.Fatalf("got error %v for pid 0; want ErrProcessGone", err)
+	}
+	r.Start("c")
+	if again := containers(t, r)[0]; !again.Runs() || again.Pid == started.Pid {
+		t.Fatalf("got %+v after the start; want a new pid", again)
+	}
+}
+
 func mountTable(t *testing.T, r *watchtest.Runtime, pid int) []watch.MountPoint {
 	t.Helper()
 	got, err := r.MountTable(context.Background(), pid)

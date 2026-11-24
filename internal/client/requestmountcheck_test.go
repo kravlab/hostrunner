@@ -119,26 +119,35 @@ func TestRequestMountCheckFailureBeforeTheStartRefusesTheCommand(t *testing.T) {
 	assertNotRun(t, h, "marker")
 }
 
-// A dry run makes one live check, its last: right before it would answer
-// that the command is allowed, so a failure then refuses it, while a dry
-// run the rules refuse is refused by them, no live check made.
-func TestRequestMountCheckOfADryRunIsItsLastCheck(t *testing.T) {
+// A dry run makes two live checks, as a run does: one as it arrives,
+// before the rules are consulted, and its last, right before it would
+// answer that the command is allowed, so a failure of either refuses it,
+// and a dry run the rules refuse is refused by the first when the mounts
+// fail.
+func TestRequestMountCheckOfADryRunChecksAsItArrivesAndLast(t *testing.T) {
 	var log lockedBuffer
 	var check requestCheck
 	h := startRequestCheckingDaemon(t, &log, &check)
-	check.set(writableConfig(h))
 	want := result{code: protocol.ExitRejected, stderr: mountCheckWritableText}
+	check.set(nil, writableConfig(h))
 	if got := h.run(t, containerRoot, "", "--dry-run", "sh", "-c", "touch marker"); got != want {
-		t.Errorf("got %+v, want %+v", got, want)
+		t.Errorf("last check failing: got %+v, want %+v", got, want)
 	}
-	if calls := check.count(); calls != 1 {
-		t.Errorf("the check ran %d times for an allowed dry run, want 1", calls)
+	if calls := check.count(); calls != 2 {
+		t.Errorf("the check ran %d times for an allowed dry run, want 2", calls)
 	}
-	if got := h.run(t, containerRoot, "", "--dry-run", "touch", "marker"); got.code != protocol.ExitRejected || got.stderr == mountCheckWritableText {
-		t.Errorf("got %+v, want it refused by the rules", got)
+	check.set(writableConfig(h))
+	if got := h.run(t, containerRoot, "", "--dry-run", "sh", "-c", "touch marker"); got != want {
+		t.Errorf("arrival check failing: got %+v, want %+v", got, want)
 	}
-	if calls := check.count(); calls != 1 {
-		t.Errorf("the check ran %d times in all, want 1: none for a dry run the rules refuse", calls)
+	if calls := check.count(); calls != 3 {
+		t.Errorf("the check ran %d times in all, want 3: once more, as the dry run arrived", calls)
+	}
+	if got := h.run(t, containerRoot, "", "--dry-run", "touch", "marker"); got != want {
+		t.Errorf("a dry run the rules refuse: got %+v, want %+v, refused by the check as it arrives", got, want)
+	}
+	if calls := check.count(); calls != 4 {
+		t.Errorf("the check ran %d times in all, want 4", calls)
 	}
 	assertNotRun(t, h, "marker")
 }
