@@ -1029,6 +1029,16 @@ rules:
 `, []string{"touch", "-a", "+marker"}, "+marker", `hostrun: denied by rule "touch": flag -a is not allowed` + guarded},
 		{"path check", guardedRules, []string{"cat", "/etc/passwd"}, "", `hostrun: argument "/etc/passwd" is not a workspace file: it is an absolute path` + guarded},
 		{"rule with secrets", guardedRules, []string{"printf", "other"}, "", `hostrun: denied by rule "printf": argument "other" is not allowed` + guarded},
+		{"rule with only the host workspace", `
+rules:
+  - command: printf
+    inject:
+      env: {WORKSPACE_DIR: "${host.workspace}"}
+    flags:
+      allow: []
+    positional:
+      allow: ["ok"]
+`, []string{"printf", "other"}, "", `hostrun: denied by rule "printf": argument "other" is not allowed` + ask},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

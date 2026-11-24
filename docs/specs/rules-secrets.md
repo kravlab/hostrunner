@@ -42,7 +42,10 @@ rules:
 
 - A secret name is `[a-z][a-z0-9_]*`; secrets are obtained in name order.
 - A template is literal text with `${name}` (a secret), `${file.name}` (an
-  injected file's descriptor path) and `$$` (a literal `$`).
+  injected file's descriptor path), `${host.workspace}` (the workspace's
+  real path on the host, symlinks resolved; plain text, not a secret) and
+  `$$` (a literal `$`). A secret may still be named `workspace`:
+  `${workspace}` is that secret.
 
 ## Validation errors
 
@@ -52,7 +55,8 @@ Each names the rule.
   one; an empty `command`; a `timeout` that is not a positive Go duration,
   or one on a source other than `command`.
 - In a template: a lone `$`, an unterminated `${`, a name outside the
-  grammar, an unknown secret or file. A secret or file no template uses.
+  grammar, an unknown secret or file, a `${host.<name>}` other than
+  `${host.workspace}`. A secret or file no template uses.
 - A rule with `secrets` whose lists are not strict: `args: any` without
   `secrets_with_any_args: true`; no `flags.allow`; a flag under `values`
   without an `allow` or `allow_regex` list; no `positional` with `allow`
@@ -79,7 +83,10 @@ the path checks of [rules-fixed-directory.md](rules-fixed-directory.md):
    directory, symlinks followed. Trailing CR and LF are trimmed.
 6. The injection is rendered and placed: program, `program_args`, rest of
    the rule's command, `command_args`, the container's arguments (with the
-   `path: open` replacements), `trailing_args`.
+   `path: open` replacements), `trailing_args`. `${host.workspace}`
+   renders to the workspace's real path wherever the request's working
+   directory is; it is no secret: it is not masked, makes no rule one
+   with secrets (strict lists), and a dry run does not name it.
 
 The injected files are created after the secrets are obtained: each is a
 memfd holding its rendered content, sealed against writing, growing and

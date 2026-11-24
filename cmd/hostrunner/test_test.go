@@ -58,6 +58,28 @@ func TestRulesTestReportsTheRuleThatAllowsACommand(t *testing.T) {
 	}
 }
 
+// A rule that uses ${host.workspace} is reported as a rule without secrets
+// is: its allowance names the rule only, and its refusal is approvable.
+func TestRulesTestReportsARuleUsingTheHostWorkspaceAsOneWithoutSecrets(t *testing.T) {
+	config := writeRules(t, "rules:\n  - command: sh\n    inject:\n      env: {WORKSPACE_DIR: \"${host.workspace}\"}\n    args: none\n")
+	for _, tc := range []struct {
+		name   string
+		argv   []string
+		code   int
+		stderr string
+	}{
+		{"allowed", []string{"sh"}, 0, "hostrunner: allowed by rule \"sh\"\n"},
+		{"denied", []string{"sh", "-x"}, 126, "hostrunner: denied by rule \"sh\": arguments are not allowed" + approvable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			code, stdout, stderr := runTest(t, append([]string{"--config", config}, tc.argv...)...)
+			if code != tc.code || stdout != "" || stderr != tc.stderr {
+				t.Fatalf("got exit code %d, stdout %q, stderr %q; want %d, nothing, %q", code, stdout, stderr, tc.code, tc.stderr)
+			}
+		})
+	}
+}
+
 func TestRulesTestDeniesACommandAndNamesItsClass(t *testing.T) {
 	code, stdout, stderr := runTest(t, "--config", writeRules(t, testRules), "git", "push", "--force")
 	if code != 126 {

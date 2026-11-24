@@ -36,13 +36,14 @@ type secretSources struct {
 }
 
 // obtain obtains the value of every secret, fresh for this request, with
-// trailing CR and LF trimmed, into the map the injection's templates are
-// rendered from (injectFiles adds to it). A secret that yields no usable
-// value refuses the request with ExitHostrunError and a message naming the
-// secret only; the reason, never the value, goes to the error for the log.
-// Ending ctx kills a command source that runs.
-func (src secretSources) obtain(ctx context.Context, secrets []rules.Secret) (map[string]string, *refusal) {
-	values := make(map[string]string, len(secrets))
+// trailing CR and LF trimmed, into a new map, which the caller owns, that
+// the injection's templates are rendered from (injectFiles adds to it, and
+// so does prepareAllowed). A secret that yields no usable value refuses
+// the request with ExitHostrunError and a message naming the secret only;
+// the reason, never the value, goes to the error for the log. Ending ctx
+// kills a command source that runs.
+func (src secretSources) obtain(ctx context.Context, secrets []rules.Secret) (map[rules.Ref]string, *refusal) {
+	values := make(map[rules.Ref]string, len(secrets))
 	for _, sec := range secrets {
 		value, err := src.read(ctx, sec)
 		if err != nil {
@@ -55,7 +56,7 @@ func (src secretSources) obtain(ctx context.Context, secrets []rules.Secret) (ma
 		case n < minSecretLength:
 			return nil, &refusal{protocol.ExitHostrunError, fmt.Sprintf("secret %q is too short to mask", sec.Name), fmt.Errorf("secret %q: the value has %d characters, fewer than %d", sec.Name, n, minSecretLength)}
 		}
-		values[sec.Name] = value
+		values[rules.SecretRef(sec.Name)] = value
 	}
 	return values, nil
 }
@@ -152,7 +153,7 @@ func (src secretSources) run(ctx context.Context, sec rules.Secret) (string, err
 // file's descriptor path to values under rules.FileRef, for the argv and
 // environment templates. On error the returned files still hold every
 // file created, for the caller to close.
-func injectFiles(injected []rules.File, values map[string]string, files []*os.File) ([]*os.File, error) {
+func injectFiles(injected []rules.File, values map[rules.Ref]string, files []*os.File) ([]*os.File, error) {
 	for _, inj := range injected {
 		f, err := injectedFile(inj.Name, inj.Content.Render(values))
 		if err != nil {
@@ -166,10 +167,10 @@ func injectFiles(injected []rules.File, values map[string]string, files []*os.Fi
 }
 
 // secretValues returns the values of secrets in values, to mask.
-func secretValues(secrets []rules.Secret, values map[string]string) []string {
+func secretValues(secrets []rules.Secret, values map[rules.Ref]string) []string {
 	masked := make([]string, len(secrets))
 	for i, sec := range secrets {
-		masked[i] = values[sec.Name]
+		masked[i] = values[rules.SecretRef(sec.Name)]
 	}
 	return masked
 }

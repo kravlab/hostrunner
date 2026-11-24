@@ -1062,10 +1062,18 @@ goes; the container cannot move it.
   sought in, and lives in memory only (a sealed memfd), never on a disk.
   Its content may refer to secrets, not to files.
 - Their strings are templates: `${token}` is the secret's value,
-  `${file.cfg}` an injected file's path, `$$` a literal `$`; any other `$`,
-  an unknown name, or a secret or file no template uses makes the rules
-  file invalid. A `path: open` argument is still replaced
+  `${file.cfg}` an injected file's path, `${host.workspace}` the
+  workspace's real path on the host (symlinks resolved), `$$` a literal
+  `$`; any other `$`, an unknown name (a `${host.…}` other than
+  `${host.workspace}` included), or a secret or file no template uses makes
+  the rules file invalid. A `path: open` argument is still replaced
   where it moved to.
+- `${host.workspace}` is plain text, not a secret: in `program_args`,
+  `command_args`, `trailing_args` and `env` values it is the workspace's
+  root whichever directory the command runs from, it is not masked, and a
+  rule that uses only it needs no strict lists. A secret named `workspace`
+  is still `${workspace}`. Secret sources (`command`, `env`, `file`) are
+  not templates: a `$` there is literal text.
 - The rule's lists check the container's arguments only, as without an
   injection; the added ones are not checked, so the rule need not allow the
   container the flags it adds itself.

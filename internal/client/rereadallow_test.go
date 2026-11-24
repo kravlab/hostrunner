@@ -2,6 +2,7 @@ package client_test
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"os"
@@ -191,6 +192,25 @@ func TestRereadKeepsTheOldRulesOfAnEditNotAllowed(t *testing.T) {
 	}
 	if got := h.run(t, containerRoot, "", "echo", "old"); got != (result{stdout: "old\n", stderr: notAllowedWarningLine(digest)}) {
 		t.Fatalf("a command of the old rules: got %+v, want it to run, with the warning", got)
+	}
+}
+
+// An edit that only starts using ${host.workspace} changes the content like
+// any other: it is not allowed by the allow of the content before, so the
+// old rules stay.
+func TestRereadKeepsTheOldRulesOfAnEditStartingToUseTheHostWorkspace(t *testing.T) {
+	const withRule = echoRules + "  - command: printenv\n    inject:\n      env: {WORKSPACE_DIR: %s}\n    args: any\n"
+	var log lockedBuffer
+	a := newAllowStore(t)
+	h := a.startDaemon(t, slog.New(slog.NewTextHandler(&log, nil)), fmt.Sprintf(withRule, "unset"))
+	s := h.startSession(t)
+	edited := fmt.Sprintf(withRule, `"${host.workspace}"`)
+	writeRules(t, h.rulesFile, edited)
+	digest := rules.ContentDigest([]byte(edited))
+	waitForLog(t, &log, notAllowedLog+h.rulesFile+" digest="+digest)
+	s.waitFor(t, notAllowedNotice(digest))
+	if got := h.run(t, containerRoot, "", "printenv", "WORKSPACE_DIR"); got != (result{stdout: "unset\n", stderr: notAllowedWarningLine(digest)}) {
+		t.Fatalf("a command of the old rules: got %+v, want it to run with the old value, and the warning", got)
 	}
 }
 

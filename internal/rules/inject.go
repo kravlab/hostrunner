@@ -87,27 +87,51 @@ func (in Injection) addsNoArgs() bool {
 }
 
 // Template is a string of an injection: literal text with references to
-// secrets (`${name}`) and injected files (`${file.name}`); `$$` is a
-// literal `$`.
+// secrets (`${name}`), injected files (`${file.name}`) and host values
+// (`${host.workspace}`); `$$` is a literal `$`.
 type Template struct {
 	parts []templatePart
 }
 
 // templatePart is literal text, or a reference when ref is set: a secret's
-// name, or FileRef of an injected file's.
+// name, FileRef of an injected file's, or HostWorkspace.
 type templatePart struct {
 	text string
-	ref  string
+	ref  Ref
 }
 
-// FileRef is the key under which Render looks up the descriptor path of
+// Ref is what a template's reference is looked up by when Render fills it
+// in: SecretRef of a secret's name, FileRef of an injected file's, or a
+// host value such as HostWorkspace. It is the reference as the rules file
+// writes it between `${` and `}`.
+type Ref string
+
+// The namespaces a reference's name can start with: an injected file's
+// (`${file.name}`) or a host value's (`${host.workspace}`). A secret's name
+// has none.
+const (
+	filePrefix = "file."
+	hostPrefix = "host."
+)
+
+// HostWorkspace is the Ref under which Render looks up the workspace's
+// real path on the host, which `${host.workspace}` renders to. It is plain
+// text, not a secret: no secret is used for it and nothing masks it.
+const HostWorkspace Ref = hostPrefix + "workspace"
+
+// FileRef is the Ref under which Render looks up the descriptor path of
 // the injected file name.
-func FileRef(name string) string { return "file." + name }
+func FileRef(name string) Ref { return Ref(filePrefix + name) }
+
+// SecretRef is the Ref under which Render looks up the value of the secret
+// name.
+func SecretRef(name string) Ref { return Ref(name) }
 
 // Render returns t with each reference replaced by what values holds for
-// it: a secret's value under its name, an injected file's descriptor path
-// under FileRef. Parse made sure every reference names one of the rule's.
-func (t Template) Render(values map[string]string) string {
+// it: a secret's value under SecretRef, an injected file's descriptor path
+// under FileRef, the workspace's host path under HostWorkspace. Parse made
+// sure every reference names one of the rule's, or a known host value.
+func (t Template) Render(values map[Ref]string) string {
 	var b strings.Builder
 	for _, p := range t.parts {
 		if p.ref != "" {
@@ -123,13 +147,16 @@ func (t Template) Render(values map[string]string) string {
 var envName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 // refName is the grammar of the names a template refers to: a secret's,
-// and an injected file's after `file.`; refNameRule says it in words.
+// and an injected file's or a host value's after `file.` or `host.`;
+// refNameRule says it in words.
 var refName = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
 
 // refNameRule describes refName for error messages.
 const refNameRule = "a name is lower-case letters, digits and _, starting with a letter"
 
-// parseTemplate parses s, a template as the rules file writes it.
+// parseTemplate parses s, a template as the rules file writes it. A
+// reference is a secret's name, `file.` and an injected file's name, or
+// `host.` and a host value's name; newTemplate checks that it exists.
 func parseTemplate(s string) (Template, error) {
 	var t Template
 	var text strings.Builder
@@ -154,11 +181,12 @@ func parseTemplate(s string) (Template, error) {
 				return Template{}, fmt.Errorf("%q: unterminated ${", s)
 			}
 			ref := s[i+2 : i+end]
-			if !refName.MatchString(strings.TrimPrefix(ref, "file.")) {
-				return Template{}, fmt.Errorf("%q: ${%s} is not a secret or file name", s, ref)
+			name := strings.TrimPrefix(strings.TrimPrefix(ref, filePrefix), hostPrefix)
+			if !refName.MatchString(name) {
+				return Template{}, fmt.Errorf("%q: ${%s} is not a secret, file or host value name", s, ref)
 			}
 			flush()
-			t.parts = append(t.parts, templatePart{ref: ref})
+			t.parts = append(t.parts, templatePart{ref: Ref(ref)})
 			i += end
 		default:
 			// A lone $ is more likely a typo than literal text.
@@ -170,8 +198,8 @@ func parseTemplate(s string) (Template, error) {
 }
 
 // references returns what t refers to, as Render looks it up.
-func (t Template) references() []string {
-	var refs []string
+func (t Template) references() []Ref {
+	var refs []Ref
 	for _, p := range t.parts {
 		if p.ref != "" {
 			refs = append(refs, p.ref)
@@ -264,7 +292,7 @@ func newSecret(name string, rs rawSecret) (Secret, error) {
 // source would be obtained for nothing.
 func newInjection(raw *rawInject, secrets []Secret) (Injection, error) {
 	var in Injection
-	used := make(map[string]bool)
+	used := make(map[Ref]bool)
 	if raw != nil {
 		var err error
 		// The files come first: the other templates refer to them.
@@ -316,7 +344,7 @@ func newInjection(raw *rawInject, secrets []Secret) (Injection, error) {
 		}
 	}
 	for _, sec := range secrets {
-		if !used[sec.Name] {
+		if !used[SecretRef(sec.Name)] {
 			return Injection{}, fmt.Errorf("secret %q is not used by inject", sec.Name)
 		}
 	}
@@ -326,7 +354,7 @@ func newInjection(raw *rawInject, secrets []Secret) (Injection, error) {
 // newFiles validates the files of an injection, a mapping from name to
 // content kept in the order the rules file writes it. A file's content
 // refers to secrets only: a descriptor path means nothing inside a file.
-func newFiles(node yaml.Node, secrets []Secret, used map[string]bool) ([]File, error) {
+func newFiles(node yaml.Node, secrets []Secret, used map[Ref]bool) ([]File, error) {
 	if node.Kind == 0 {
 		return nil, nil
 	}
@@ -354,19 +382,26 @@ func newFiles(node yaml.Node, secrets []Secret, used map[string]bool) ([]File, e
 	return files, nil
 }
 
-// newTemplate parses s and checks that it refers to secrets, or to the
-// injected files named in files, only, marking those in used.
-func newTemplate(s string, secrets []Secret, files []string, used map[string]bool) (Template, error) {
+// newTemplate parses s and checks that it refers to secrets, to the
+// injected files named in files, or to HostWorkspace only, marking the
+// secrets and files in used; a host value is no secret and marks nothing.
+func newTemplate(s string, secrets []Secret, files []string, used map[Ref]bool) (Template, error) {
 	t, err := parseTemplate(s)
 	if err != nil {
 		return Template{}, err
 	}
 	for _, ref := range t.references() {
-		if name, ok := strings.CutPrefix(ref, "file."); ok {
+		if strings.HasPrefix(string(ref), hostPrefix) {
+			if ref != HostWorkspace {
+				return Template{}, fmt.Errorf("%q refers to unknown host value %q", s, ref)
+			}
+			continue
+		}
+		if name, ok := strings.CutPrefix(string(ref), filePrefix); ok {
 			if !slices.Contains(files, name) {
 				return Template{}, fmt.Errorf("%q refers to unknown file %q", s, name)
 			}
-		} else if !slices.ContainsFunc(secrets, func(sec Secret) bool { return sec.Name == ref }) {
+		} else if !slices.ContainsFunc(secrets, func(sec Secret) bool { return SecretRef(sec.Name) == ref }) {
 			return Template{}, fmt.Errorf("%q refers to unknown secret %q", s, ref)
 		}
 		used[ref] = true
@@ -415,11 +450,11 @@ var errTrailingFlag = errors.New("an argument the rule adds after the container'
 
 // Assemble returns the argv to run for argv, the container's argv after
 // the caller's own replacements (path: open), with the allowing rule's
-// injection rendered from values, the secret values by name: program,
-// ProgramArgs, rest of the rule's command, CommandArgs, the container's
-// arguments, TrailingArgs. A rendered trailing argument starting with -
-// is errTrailingFlag.
-func (a Allowed) Assemble(argv []string, values map[string]string) ([]string, error) {
+// injection rendered from values, by Ref: program, ProgramArgs, rest of
+// the rule's command, CommandArgs, the container's arguments,
+// TrailingArgs. A rendered trailing argument starting with - is
+// errTrailingFlag.
+func (a Allowed) Assemble(argv []string, values map[Ref]string) ([]string, error) {
 	if a.Inject.addsNoArgs() {
 		return argv, nil
 	}
@@ -444,7 +479,7 @@ func (a Allowed) Assemble(argv []string, values map[string]string) ([]string, er
 // Environment returns the allowing rule's injected environment variables,
 // rendered from values, as NAME=value entries for the command; the caller
 // lets them override its own.
-func (a Allowed) Environment(values map[string]string) []string {
+func (a Allowed) Environment(values map[Ref]string) []string {
 	var env []string
 	for _, v := range a.Inject.Env {
 		env = append(env, v.Name+"="+v.Value.Render(values))

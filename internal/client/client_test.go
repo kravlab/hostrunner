@@ -77,23 +77,54 @@ func startDaemonWith(t *testing.T, log *slog.Logger, p daemon.Policy, opts ...da
 // socket.
 func startHarness(t *testing.T, log *slog.Logger, setup func(rulesFile string) (daemon.Policy, []daemon.Option)) harness {
 	t.Helper()
-	base, err := filepath.EvalSymlinks(t.TempDir())
+	return startHarnessAt(t, log, realTempDir(t), setup)
+}
+
+// realTempDir returns a new temporary directory, its path free of symlinks.
+func realTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	return startHarnessAt(t, log, base, setup)
+	return dir
 }
+
+// appRoot is the host workspace of a harness whose runtime directory is
+// base.
+func appRoot(base string) string { return filepath.Join(base, "app") }
 
 // startHarnessAt is startHarness with the daemon's runtime directory, its
 // socket's, at base, the host workspace in it: a daemon started again at
 // the same base serves the same sockets.
 func startHarnessAt(t *testing.T, log *slog.Logger, base string, setup func(rulesFile string) (daemon.Policy, []daemon.Option)) harness {
 	t.Helper()
-	hostRoot := filepath.Join(base, "app")
+	return startHarnessGiving(t, log, base, appRoot(base), setup)
+}
+
+// startSymlinkedDaemon starts a daemon serving policy p on a new host
+// workspace that it is handed through a symlink, base/link, to the
+// workspace's real path.
+func startSymlinkedDaemon(t *testing.T, p daemon.Policy) harness {
+	t.Helper()
+	base := realTempDir(t)
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(appRoot(base), link); err != nil {
+		t.Fatal(err)
+	}
+	return startHarnessGiving(t, slog.New(slog.DiscardHandler), base, link, func(string) (daemon.Policy, []daemon.Option) { return p, nil })
+}
+
+// startHarnessGiving is startHarnessAt with the workspace, appRoot(base),
+// handed to the daemon as given, which may be a path leading to it
+// through a symlink.
+func startHarnessGiving(t *testing.T, log *slog.Logger, base, given string, setup func(rulesFile string) (daemon.Policy, []daemon.Option)) harness {
+	t.Helper()
+	hostRoot := appRoot(base)
 	if err := os.MkdirAll(filepath.Join(hostRoot, "sub"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	mapper, err := workspace.NewMapper(hostRoot, containerRoot)
+	mapper, err := workspace.NewMapper(given, containerRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
