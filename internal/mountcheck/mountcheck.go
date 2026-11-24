@@ -185,7 +185,7 @@ func hostMounts(id string, ms []watch.Mount) ([]mount, error) {
 			}
 			return nil, err
 		}
-		out = append(out, mount{source: source, dest: path.Clean(m.Destination), readOnly: m.ReadOnly})
+		out = append(out, mount{source: source, dest: m.Point(), readOnly: m.ReadOnly})
 	}
 	return out, nil
 }
