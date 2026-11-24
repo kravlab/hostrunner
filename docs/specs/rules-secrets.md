@@ -66,7 +66,8 @@ Each names the rule.
 - A `trailing_args` string starting with `-`.
 - An `env` name outside `[A-Za-z_][A-Za-z0-9_]*`, or `PWD`.
 - `files` that is not a mapping of names (`[a-z][a-z0-9_]*`, each once)
-  to strings; a file whose content refers to a file.
+  to strings; a file whose content refers to a file (`${file.<name>}`;
+  secrets and `${host.workspace}` are fine there).
 - A rule with `inject` but no `secrets` takes any lists.
 
 ## Behavior
@@ -83,15 +84,17 @@ the path checks of [rules-fixed-directory.md](rules-fixed-directory.md):
    directory, symlinks followed. Trailing CR and LF are trimmed.
 6. The injection is rendered and placed: program, `program_args`, rest of
    the rule's command, `command_args`, the container's arguments (with the
-   `path: open` replacements), `trailing_args`. `${host.workspace}`
-   renders to the workspace's real path wherever the request's working
-   directory is; it is no secret: it is not masked, makes no rule one
-   with secrets (strict lists), and a dry run does not name it.
+   `path: open` replacements), `trailing_args`. `${host.workspace}`,
+   in any of these and in a file's content, renders to the workspace's
+   real path wherever the request's working directory is; it is no secret:
+   it is not masked, makes no rule one with secrets (strict lists), and a
+   dry run does not name it.
 
 The injected files are created after the secrets are obtained: each is a
-memfd holding its rendered content, sealed against writing, growing and
-shrinking, and handed to the command as the next descriptor after the
-`path: open` files, in declaration order; `${file.name}` renders to
+memfd holding its rendered content (secrets and `${host.workspace}`
+rendered in), sealed against writing, growing and shrinking, and handed to
+the command as the next descriptor after the `path: open` files, in
+declaration order; `${file.name}` renders to
 `/proc/self/fd/N`. A file that cannot be created refuses the request with
 125 (`cannot create the files the rule hands the command`).
 

@@ -1060,7 +1060,7 @@ goes; the container cannot move it.
   variable is its path (`curl -K ${file.cfg}` runs as
   `curl -K /proc/self/fd/4`). The file is read-only, can be read again and
   sought in, and lives in memory only (a sealed memfd), never on a disk.
-  Its content may refer to secrets, not to files.
+  Its content may refer to secrets and `${host.workspace}`, not to files.
 - Their strings are templates: `${token}` is the secret's value,
   `${file.cfg}` an injected file's path, `${host.workspace}` the
   workspace's real path on the host (symlinks resolved), `$$` a literal
@@ -1069,9 +1069,10 @@ goes; the container cannot move it.
   the rules file invalid. A `path: open` argument is still replaced
   where it moved to.
 - `${host.workspace}` is plain text, not a secret: in `program_args`,
-  `command_args`, `trailing_args` and `env` values it is the workspace's
-  root whichever directory the command runs from, it is not masked, and a
-  rule that uses only it needs no strict lists. A secret named `workspace`
+  `command_args`, `trailing_args`, `env` values and the content of
+  `inject.files` it is the workspace's root whichever directory the
+  command runs from, it is not masked, and a rule that uses only it needs
+  no strict lists. A secret named `workspace`
   is still `${workspace}`. Secret sources (`command`, `env`, `file`) are
   not templates: a `$` there is literal text.
 - The rule's lists check the container's arguments only, as without an

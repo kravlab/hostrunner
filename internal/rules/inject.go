@@ -72,7 +72,7 @@ type Injection struct {
 // program finds through the descriptor path `${file.name}` renders to.
 type File struct {
 	Name    string
-	Content Template // refers to secrets only
+	Content Template // refers to secrets and ${host.workspace}, not files
 }
 
 // EnvVar is an environment variable an injection sets.
@@ -353,7 +353,8 @@ func newInjection(raw *rawInject, secrets []Secret) (Injection, error) {
 
 // newFiles validates the files of an injection, a mapping from name to
 // content kept in the order the rules file writes it. A file's content
-// refers to secrets only: a descriptor path means nothing inside a file.
+// refers to secrets and ${host.workspace}, not to files: a descriptor path
+// means nothing inside a file.
 func newFiles(node yaml.Node, secrets []Secret, used map[Ref]bool) ([]File, error) {
 	if node.Kind == 0 {
 		return nil, nil

@@ -27,6 +27,17 @@ rules:
 `
 }
 
+// hostWorkspaceFileRules lets sh record the contents of an injected file
+// that holds ${host.workspace}.
+const hostWorkspaceFileRules = `
+rules:
+  - command: sh
+    inject:
+      command_args: ["-c", 'cat "$$0" > "$$RECORD"', "${file.cfg}"]
+      files: {cfg: "root = ${host.workspace}\n"}
+    args: none
+`
+
 // ${host.workspace} in an env value reaches the program as the
 // workspace's host path, which is the working directory at the root.
 func TestRunSetsTheHostWorkspaceInTheEnvironment(t *testing.T) {
@@ -137,6 +148,48 @@ rules:
 		t.Fatalf("the program got %q, want %q", rec, want)
 	}
 	if want := (result{stdout: h.hostRoot + ":***"}); got != want {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+}
+
+// ${host.workspace} in an injected file's contents reaches the program as
+// the workspace's host path.
+func TestRunRendersTheHostWorkspaceInAnInjectedFile(t *testing.T) {
+	h := startDaemon(t, policy(t, hostWorkspaceFileRules))
+	got, rec := h.recorded(t, "sh")
+	expectRecorded(t, got, rec, "root = "+h.hostRoot+"\n")
+}
+
+// With the workspace given through a symlink, ${host.workspace} in an
+// injected file's contents is the real path, not the link.
+func TestRunRendersTheRealPathOfASymlinkedWorkspaceInAnInjectedFile(t *testing.T) {
+	h := startSymlinkedDaemon(t, policy(t, hostWorkspaceFileRules))
+	got, rec := h.recorded(t, "sh")
+	expectRecorded(t, got, rec, "root = "+h.hostRoot+"\n")
+}
+
+// ${host.workspace} and a secret in one file's contents both render, and
+// the secret, unlike the path, is still masked in what the command prints.
+func TestRunRendersTheHostWorkspaceAndASecretInOneInjectedFile(t *testing.T) {
+	t.Setenv("TOKEN", testToken)
+	h := startDaemon(t, policy(t, `
+rules:
+  - command: sh
+    secrets:
+      token: {env: TOKEN}
+    inject:
+      command_args: ["-c", 'cat "$$0" > "$$RECORD"; cat "$$0"', "${file.cfg}"]
+      files: {cfg: "${host.workspace}:${token}\n"}
+    flags:
+      allow: []
+    positional:
+      allow: ["*"]
+`))
+	got, rec := h.recorded(t, "sh")
+	if want := h.hostRoot + ":" + testToken + "\n"; rec != want {
+		t.Fatalf("the program got %q, want %q", rec, want)
+	}
+	if want := (result{stdout: h.hostRoot + ":***\n"}); got != want {
 		t.Fatalf("got %+v, want %+v", got, want)
 	}
 }

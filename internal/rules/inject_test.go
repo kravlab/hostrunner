@@ -303,21 +303,36 @@ func TestEnvironmentRendersTheInjectedVariablesByName(t *testing.T) {
 }
 
 // A file needs a name, string content and a template that uses its path;
-// its content refers to secrets only, as a descriptor path means nothing
-// inside a file.
+// its content refers to secrets and ${host.workspace}, not to files, as a
+// descriptor path means nothing inside a file.
 func TestParseRefusesABadInjectedFile(t *testing.T) {
 	for name, tc := range map[string]struct{ inject, want string }{
-		"unknown file":      {`command_args: ["${file.cfg}"]`, `unknown file "cfg"`},
-		"unused file":       {`files: {cfg: x}`, `"cfg" is not used`},
-		"path inside file":  {"command_args: [\"${file.cfg}\"]\n      files: {cfg: \"${file.cfg}\"}", `unknown file "cfg"`},
-		"bad name":          {"command_args: [\"${file.Cfg}\"]\n      files: {Cfg: x}", `"Cfg": a name is lower-case`},
-		"not a string":      {"command_args: [\"${file.cfg}\"]\n      files: {cfg: [x]}", "the content must be a string"},
-		"not a mapping":     {"files: [x]", "inject.files must map names to contents"},
-		"secret in content": {"command_args: [\"${file.cfg}\"]\n      files: {cfg: \"${token}\"}", `unknown secret "token"`},
+		"unknown file":          {`command_args: ["${file.cfg}"]`, `unknown file "cfg"`},
+		"unused file":           {`files: {cfg: x}`, `"cfg" is not used`},
+		"path inside file":      {"command_args: [\"${file.cfg}\"]\n      files: {cfg: \"${file.cfg}\"}", `unknown file "cfg"`},
+		"path beside workspace": {"command_args: [\"${file.cfg}\"]\n      files: {cfg: \"${host.workspace}/${file.cfg}\"}", `unknown file "cfg"`},
+		"bad name":              {"command_args: [\"${file.Cfg}\"]\n      files: {Cfg: x}", `"Cfg": a name is lower-case`},
+		"not a string":          {"command_args: [\"${file.cfg}\"]\n      files: {cfg: [x]}", "the content must be a string"},
+		"not a mapping":         {"files: [x]", "inject.files must map names to contents"},
+		"secret in content":     {"command_args: [\"${file.cfg}\"]\n      files: {cfg: \"${token}\"}", `unknown secret "token"`},
 	} {
 		t.Run(name, func(t *testing.T) {
 			expectParseError(t, "rules:\n  - command: curl\n    inject:\n      "+tc.inject+"\n    args: any\n", tc.want)
 		})
+	}
+}
+
+// ${host.workspace} in a file's contents parses and renders the host path;
+// ${file.<name>} there stays refused (see "path inside file" above).
+func TestParseAcceptsTheHostWorkspaceInAnInjectedFileContent(t *testing.T) {
+	p := mustParse(t, "rules:\n  - command: curl\n    inject:\n      command_args: [\"${file.cfg}\"]\n      files: {cfg: \"root = ${host.workspace}\\n\"}\n    args: any\n")
+	allowed, err := p.Check([]string{"curl"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := allowed.Inject.Files[0].Content.Render(map[Ref]string{HostWorkspace: "/x"})
+	if want := "root = /x\n"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
 	}
 }
 
