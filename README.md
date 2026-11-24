@@ -13,10 +13,22 @@ container stops. Linux hosts; Docker and Podman.
 > **Rules restrict argv only.** A host tool that reads configuration or
 > hooks from the workspace — git (`.git/config`, `.git/hooks`), fakehost
 > (`fakehost.json` predeploy scripts), … — can be steered by the container,
-> which can write the workspace. Read-only mounts of such files do not help
-> (the container can rename the directory around them or create a nested
-> repository). Allowing such a tool against an agent you do not trust is a
-> conscious risk of code execution on the host.
+> which can write the workspace. A rule's mount requirements (`mounts:`, see
+> [Rules](#rules)) promise only that the devcontainer's protection is in
+> place. For git, as in [the example](examples/devcontainer/.devcontainer),
+> that is `.git` a mount of its own and `.git/config` and `.git/hooks`
+> read-only, checked before every request (see [Mount check](#mount-check)).
+> A host command that replaces such a file removes the container's
+> read-only mount of it: host git writes `.git/config.lock` and renames it
+> over `.git/config`. From then on the container can write the file, and
+> the check refuses the rule's commands.
+>
+> A requirement does not make the tool safe. It names paths from the
+> workspace root, so a nested repository the container creates
+> (`git init sub`, then `hostrun git …` from `sub/`) passes it while git
+> reads that repository's config and hooks. hostrunner does not touch a
+> tool's config or hooks either. Allowing such a tool against an agent you
+> do not trust stays a conscious risk of code execution on the host.
 
 ## Install
 
@@ -126,10 +138,23 @@ Add to `.devcontainer/devcontainer.json`
 ],
 "mounts": [
   "source=${localEnv:XDG_RUNTIME_DIR}/hostrunner/${devcontainerId},target=/run/hostrunner,type=bind,readonly",
-  "source=${localWorkspaceFolder}/.devcontainer,target=${containerWorkspaceFolder}/.devcontainer,type=bind,readonly"
+  "source=${localWorkspaceFolder}/.devcontainer,target=${containerWorkspaceFolder}/.devcontainer,type=bind,readonly",
+  "source=${localWorkspaceFolder}/.git,target=${containerWorkspaceFolder}/.git,type=bind",
+  "source=${localWorkspaceFolder}/.git/config,target=${containerWorkspaceFolder}/.git/config,type=bind,readonly",
+  "source=${localWorkspaceFolder}/.git/hooks,target=${containerWorkspaceFolder}/.git/hooks,type=bind,readonly"
 ],
 "remoteEnv": { "PATH": "${containerEnv:PATH}:/run/hostrunner" }
 ```
+
+The last three mounts are what the example's git rules require (their
+`mounts:`, see [Rules](#rules)): `.git` mounted onto itself, so the
+container cannot rename it away, with `.git/config` and `.git/hooks`
+read-only inside it. Without them the daemon refuses git and still runs
+the other commands. They need a workspace whose `.git` is a directory
+holding `hooks/`, not a worktree's `.git` file. The example's `git push`
+takes no `-u`/`--set-upstream` and runs with
+`-c push.autoSetupRemote=false`, so the container cannot make host git
+rewrite `.git/config` during a request.
 
 Keep `initializeCommand` in the array form: it runs without a shell, so
 workspace paths with spaces work. `XDG_RUNTIME_DIR` must be set for the
@@ -223,9 +248,13 @@ The mounts come from `docker inspect` (`podman inspect`), which can be
 stale: a mount can be unmounted, mounted over or remounted after the
 container started. So for a running container the daemon also reads the
 live mount table of its init process (`/proc/<pid>/mountinfo` on the
-host). A mount from the inspection counts only when the live table has a
-mount at its destination, and its read-only flag is that of the topmost
-live entry there. Host sources are still compared from the inspection, so
+host): a host command that replaces a file under a read-only bind mount
+of it (an editor's atomic save, host git renaming `config.lock` over
+`.git/config`) removes that mount from the container, while the
+inspection still lists it. A mount from the inspection counts only when
+the live table has a mount at its destination, and its read-only flag is
+that of the topmost live entry there. Host sources are still compared
+from the inspection, so
 a second read-write mount of a protected directory elsewhere is refused
 too. A container that is stopped when the daemon attaches is judged by
 the inspection alone.
@@ -873,7 +902,7 @@ rules:
     args: none                 # the bare command only
   - command: git push
     flags:
-      allow: [-u, --set-upstream, --tags]   # or deny: [...], never both
+      allow: [--tags, --follow-tags]   # or deny: [...], never both
       values:                  # flags that take a value, with a value filter
         -o: { allow: [ci.skip] }
         --repo: {}             # any value
@@ -972,7 +1001,10 @@ rules:
   that is absolute, has a `..` component, is not clean (`.`, `.git/`,
   `./.git`), is given twice, or a mode other than the two, makes the
   file invalid, with the line, and so does `mounts:` with no value
-  (null); `mounts: {}` means none. `hostrunner
+  (null); `mounts: {}` means none. Rules can share one block through a
+  YAML anchor: `mounts: &git-mounts {…}` on one rule and
+  `mounts: *git-mounts` on the others, as in the example; an alias is
+  checked as the map it refers to. `hostrunner
   test` and the dry run report them (`, requires mounts: …`) without
   checking them. They are part of the rules file: its digest, allow and
   reread cover them.
@@ -1161,7 +1193,7 @@ To see whether a rules file allows a command before restarting the
 container, run the Rules test on the host, in the project root:
 
 ```sh
-hostrunner test git push -u origin main   # hostrunner: allowed by rule "git push"
+hostrunner test git push origin main      # hostrunner: allowed by rule "git push"
 hostrunner test git push --force          # hostrunner: denied by rule "git push": flag --force is not allowed (approvable)
 hostrunner test --rules-file draft.yaml -- tix pr list
 ```

@@ -130,20 +130,33 @@ const testRules = `
 // it.
 var readOnlyMount = regexp.MustCompile(`,\s*//[^\n]*\n\s*"source=\$\{localWorkspaceFolder\}/\.devcontainer,[^"]*"`)
 
+// gitMounts are the example's three mounts that the git rules require (.git,
+// then .git/config and .git/hooks read-only inside it), with the comment block
+// that precedes them and the comma that separates them from the mount before
+// them. They follow the .devcontainer mount and end the mounts list, so
+// dropping them leaves the list valid.
+var gitMounts = regexp.MustCompile(`,(?:\s*//[^\n]*)+\s*"source=\$\{localWorkspaceFolder\}/\.git,[^"]*",\s*"source=\$\{localWorkspaceFolder\}/\.git/config,[^"]*",\s*"source=\$\{localWorkspaceFolder\}/\.git/hooks,[^"]*"`)
+
 // newWorkspace copies the example devcontainer into a fresh git workspace
 // whose path contains a space, adding testRules to the example rules. With
-// writable false it switches the example from a prebuilt image to a slow
-// build; with writable true it drops the read-only .devcontainer mount, so
-// the container can write the daemon's configuration.
+// writable false it is the example with a slow image build; with writable
+// true it is the example with the prebuilt image and without the read-only
+// .devcontainer mount, so the container can write the daemon's
+// configuration.
 func newWorkspace(t *testing.T, writable bool) string {
 	t.Helper()
-	return newWorkspaceWith(t, writable, nil)
+	if writable {
+		return newWorkspaceWith(t, false, withoutReadOnlyMount(t))
+	}
+	return newWorkspaceWith(t, true, nil)
 }
 
-// newWorkspaceWith is newWorkspace whose writable variant, with edit not
-// nil, has its devcontainer.json edited by edit, given the workspace,
-// instead of the read-only .devcontainer mount dropped.
-func newWorkspaceWith(t *testing.T, writable bool, edit func(ws string, cfg []byte) []byte) string {
+// newWorkspaceWith copies the example devcontainer into a fresh git workspace
+// whose path contains a space, adding testRules to the example rules. With
+// slow it switches the example from its prebuilt image to a slow build; with
+// slow false it keeps the prebuilt image, so the workspace is the example as
+// it is. A non-nil edit then changes devcontainer.json, given the workspace.
+func newWorkspaceWith(t *testing.T, slow bool, edit func(ws string, cfg []byte) []byte) string {
 	t.Helper()
 	ws := filepath.Join(shortTemp(t, "hrws"), "my app")
 	if err := os.MkdirAll(filepath.Join(ws, ".devcontainer"), 0o755); err != nil {
@@ -162,22 +175,16 @@ func newWorkspaceWith(t *testing.T, writable bool, edit func(ws string, cfg []by
 		t.Fatal(err)
 	}
 	files := map[string][]byte{"hostrunner-rules.yaml": rules}
-	if writable {
-		if !readOnlyMount.Match(cfg) {
-			t.Fatal("example devcontainer.json no longer contains the read-only .devcontainer mount")
-		}
-		if edit != nil {
-			cfg = edit(ws, cfg)
-		} else if cfg = readOnlyMount.ReplaceAll(cfg, nil); bytes.Contains(cfg, []byte("/.devcontainer,")) {
-			t.Fatal("the variant still mounts .devcontainer")
-		}
-	} else {
+	if slow {
 		const image = `"image": "docker.io/library/alpine:3",`
 		if !bytes.Contains(cfg, []byte(image)) {
 			t.Fatalf("example devcontainer.json no longer contains %s", image)
 		}
 		cfg = bytes.Replace(cfg, []byte(image), []byte(`"build": { "dockerfile": "Dockerfile" },`), 1)
 		files["Dockerfile"] = []byte(slowBuild)
+	}
+	if edit != nil {
+		cfg = edit(ws, cfg)
 	}
 	files["devcontainer.json"] = cfg
 	for name, data := range files {
@@ -186,6 +193,45 @@ func newWorkspaceWith(t *testing.T, writable bool, edit func(ws string, cfg []by
 		}
 	}
 	return ws
+}
+
+// requireReadOnlyMount fails the test unless the example's cfg still
+// contains the read-only .devcontainer mount (see readOnlyMount), which the
+// variants that replace or drop it rely on.
+func requireReadOnlyMount(t *testing.T, cfg []byte) {
+	t.Helper()
+	if !readOnlyMount.Match(cfg) {
+		t.Fatal("example devcontainer.json no longer contains the read-only .devcontainer mount")
+	}
+}
+
+// withoutReadOnlyMount returns the edit of a devcontainer.json that drops the
+// read-only .devcontainer mount (see readOnlyMount), for newWorkspaceWith.
+func withoutReadOnlyMount(t *testing.T) func(ws string, cfg []byte) []byte {
+	return func(_ string, cfg []byte) []byte {
+		t.Helper()
+		requireReadOnlyMount(t, cfg)
+		if cfg = readOnlyMount.ReplaceAll(cfg, nil); bytes.Contains(cfg, []byte("/.devcontainer,")) {
+			t.Fatal("the variant still mounts .devcontainer")
+		}
+		return cfg
+	}
+}
+
+// withoutGitMounts returns the edit of a devcontainer.json that drops the
+// git mounts (see gitMounts), for newWorkspaceWith.
+func withoutGitMounts(t *testing.T) func(ws string, cfg []byte) []byte {
+	return func(_ string, cfg []byte) []byte {
+		t.Helper()
+		if !gitMounts.Match(cfg) {
+			t.Fatal("example devcontainer.json no longer contains the git mounts")
+		}
+		cfg = gitMounts.ReplaceAll(cfg, nil)
+		if bytes.Contains(cfg, []byte("${localWorkspaceFolder}/.git")) {
+			t.Fatal("the variant still mounts .git")
+		}
+		return cfg
+	}
 }
 
 // run executes a command with a timeout and returns its stdout; stderr is
@@ -236,6 +282,13 @@ func (e env) vars() []string {
 	path := filepath.Dir(e.runtime) + sep + e.bin + sep + os.Getenv("PATH")
 	out := append(os.Environ(), "PATH="+path, "XDG_DATA_HOME="+e.data)
 	return append(out, e.extra...)
+}
+
+// containerPath returns the path in the container of rel inside the
+// workspace. devcontainer's default workspace mount puts the workspace at
+// /workspaces/<its directory name>.
+func (e env) containerPath(rel ...string) string {
+	return path.Join(append([]string{"/workspaces", filepath.Base(e.ws)}, rel...)...)
 }
 
 // allowPoll and allowWait bound the retry of `hostrunner allow` while a
@@ -349,6 +402,27 @@ func (e env) expectHostrunWorks(t *testing.T) {
 	}
 	if strings.TrimSpace(got) != e.ws {
 		t.Fatalf("hostrun pwd = %q, want %q", strings.TrimSpace(got), e.ws)
+	}
+}
+
+// expectMountRefused checks that `hostrun args…` is refused by the daemon's
+// mount check: exit 126 with a message that contains want, names no host
+// path (the workspace's temp directory), and says how to turn the check off.
+func (e env) expectMountRefused(t *testing.T, want string, args ...string) {
+	t.Helper()
+	_, err := e.exec(t, append([]string{"hostrun"}, args...)...)
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 126 {
+		t.Fatalf("hostrun %v = %v, want exit 126", args, err)
+	}
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("hostrun %v = %v, want a refusal containing %q", args, err, want)
+	}
+	if strings.Contains(err.Error(), filepath.Dir(e.ws)) {
+		t.Fatalf("hostrun %v = %v, want no host path", args, err)
+	}
+	if off := "mount_check: false in the host settings file, HOSTRUNNER_MOUNT_CHECK=false or --no-mount-check"; !strings.Contains(err.Error(), off) {
+		t.Fatalf("hostrun %v = %v, want a refusal saying how to turn the check off", args, err)
 	}
 }
 
@@ -479,7 +553,7 @@ func TestDevcontainerWritableMount(t *testing.T) {
 // daemon's configuration, so the daemon must tell it from the volume's
 // options and refuse every command as for a writable bind mount.
 func TestDevcontainerWritableVolumeMount(t *testing.T) {
-	eachRuntime(t, func(t *testing.T) string { return newWorkspaceWith(t, true, volumeConfig(t)) }, func(t *testing.T, e env) {
+	eachRuntime(t, func(t *testing.T) string { return newWorkspaceWith(t, false, volumeConfig(t)) }, func(t *testing.T, e env) {
 		vol := volumeName(e.ws)
 		// In the storage devcontainer runs the runtime with, the host's:
 		// rootless podman keeps its volumes under XDG_DATA_HOME, and would
@@ -506,6 +580,7 @@ func TestDevcontainerWritableVolumeMount(t *testing.T) {
 // /workspaces/<its directory name>.
 func volumeConfig(t *testing.T) func(ws string, cfg []byte) []byte {
 	return func(ws string, cfg []byte) []byte {
+		requireReadOnlyMount(t, cfg)
 		mount := "source=" + volumeName(ws) + ",target=${containerWorkspaceFolder}/.devcontainer,type=volume"
 		cfg = readOnlyMount.ReplaceAllLiteral(cfg, []byte(",\n    "+strconv.Quote(mount)))
 		const mounts = `"mounts": [`
@@ -537,6 +612,22 @@ func TestDevcontainerWritableMountWithTheCheckOff(t *testing.T) {
 		e.extra = []string{"HOSTRUNNER_MOUNT_CHECK=false", "HOSTRUNNER_PROCESS=own"}
 		testWritableMountWithTheCheckOff(t, e)
 	})
+}
+
+// TestDevcontainerGitMounts brings up the example with its git mounts: git
+// runs while they hold, and the daemon refuses it, naming the container path
+// only, once the host replaces .git/config by a rename (as git itself does
+// to write its configuration), which removes the container's read-only mount
+// of it. Commands of rules without mount requirements keep running.
+func TestDevcontainerGitMounts(t *testing.T) {
+	eachRuntime(t, func(t *testing.T) string { return newWorkspaceWith(t, false, nil) }, testGitMounts)
+}
+
+// TestDevcontainerWithoutGitMounts brings up the example without its git
+// mounts: the daemon refuses git, naming the container path only, and keeps
+// running the commands of rules without mount requirements.
+func TestDevcontainerWithoutGitMounts(t *testing.T) {
+	eachRuntime(t, func(t *testing.T) string { return newWorkspaceWith(t, false, withoutGitMounts(t)) }, testWithoutGitMounts)
 }
 
 // cleanUp removes everything a run left behind for the workspace, whether
@@ -799,28 +890,11 @@ func testWritableMount(t *testing.T, e env) {
 	e.allowAfterRefusedUp(t)
 	container := e.up(t)
 
-	// devcontainer's default workspace mount puts the workspace at
-	// /workspaces/<its directory name>.
-	want := "the container can write " + path.Join("/workspaces", filepath.Base(e.ws), ".devcontainer") + ","
+	want := "the container can write " + e.containerPath(".devcontainer") + ","
 	// --ask is refused by the same mount gate, before the daemon looks for an
 	// approval session.
 	for _, args := range [][]string{{"pwd"}, {"--dry-run", "pwd"}, {"--ask", "pwd"}} {
-		_, err := e.exec(t, append([]string{"hostrun"}, args...)...)
-		var exitErr *exec.ExitError
-		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 126 {
-			t.Fatalf("hostrun %v = %v, want exit 126", args, err)
-		}
-		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("hostrun %v = %v, want a refusal containing %q", args, err, want)
-		}
-		// The refusal names container paths only: nothing of the host's
-		// workspace path, which holds the test's temp directory.
-		if strings.Contains(err.Error(), filepath.Dir(e.ws)) {
-			t.Fatalf("hostrun %v = %v, want no host path", args, err)
-		}
-		if off := "mount_check: false in the host settings file, HOSTRUNNER_MOUNT_CHECK=false or --no-mount-check"; !strings.Contains(err.Error(), off) {
-			t.Fatalf("hostrun %v = %v, want a refusal saying how to turn the check off", args, err)
-		}
+		e.expectMountRefused(t, want, args...)
 	}
 	expectServedBy(t, filepath.Join(e.runtimeDirOf(t, container), "hostrunner.sock"), sharedSubcommand)
 }
@@ -846,6 +920,51 @@ func testWritableMountWithTheCheckOff(t *testing.T, e env) {
 	e.up(t)
 	e.expectHostrunWorks(t)
 	expectServedBy(t, socket, sharedSubcommand)
+}
+
+// testGitMounts brings the container up with the example's git mounts and
+// checks that `hostrun git status` runs, then replaces .git/config on the
+// host the way git does, by writing .git/config.lock and renaming it over
+// config: the rename removes the container's read-only mount of the file, so
+// .git/config is writable through the .git mount and the daemon must refuse
+// git from then on, while `hostrun pwd` (a rule without requirements) works.
+func testGitMounts(t *testing.T, e env) {
+	t.Cleanup(func() { e.cleanUp(t) })
+	e.allowAfterRefusedUp(t)
+	e.up(t)
+
+	if _, err := e.exec(t, "hostrun", "git", "status"); err != nil {
+		t.Fatalf("hostrun git status with the git mounts: %v", err)
+	}
+
+	config := filepath.Join(e.ws, ".git", "config")
+	data, err := os.ReadFile(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(config+".lock", data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(config+".lock", config); err != nil {
+		t.Fatal(err)
+	}
+
+	e.expectMountRefused(t, e.containerPath(".git", "config"), "git", "status")
+	e.expectHostrunWorks(t)
+}
+
+// testWithoutGitMounts brings the container up without the git mounts and
+// checks that the daemon refuses `hostrun git status` because .git is not a
+// mount point of its own, while `hostrun pwd` (a rule without requirements)
+// works.
+func testWithoutGitMounts(t *testing.T, e env) {
+	t.Cleanup(func() { e.cleanUp(t) })
+	e.allowAfterRefusedUp(t)
+	e.up(t)
+
+	want := "the container does not have " + e.containerPath(".git") + " as a mount point of its own"
+	e.expectMountRefused(t, want, "git", "status")
+	e.expectHostrunWorks(t)
 }
 
 // stopAndExpectDaemonExit stops the container and waits for the daemon

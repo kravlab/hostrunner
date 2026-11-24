@@ -31,7 +31,7 @@ rules:
   - command: git push          # argv prefix, split on whitespace; required
     args: any | none           # exclusive with flags/positional
     flags:
-      allow: [-u, --tags]      # or deny: [...], never both
+      allow: [--tags]          # or deny: [...], never both
       values:                  # flags that take a value; value filter:
         -o: { allow: [ci.skip] }   # allow or deny list of globs
         --only: {}                 # any value
@@ -52,8 +52,11 @@ with `deny` (in `flags`, `positional`, or a value filter); a flag name in
 (`command` only) ★ — it must say `args: any` explicitly.
 
 `mounts` is a map from a path relative to the workspace root to a mode,
-`mounted` or `read-only`; it combines with any `args`, `flags` and
-`positional` (it restricts no argument), and `mounts: {}` means none.
+`mounted` or `read-only`, or a YAML alias (`mounts: *name`) of the map
+another rule anchors (`mounts: &name`), so rules can share one block (an
+alias is validated as the map it refers to); it combines with any
+`args`, `flags` and `positional` (it restricts no argument), and
+`mounts: {}` means none.
 Further validation errors, each with the YAML line of the entry: `mounts`
 not a mapping, null (`mounts:` with no value) included; a path that is not a string, is absolute, has a `..`
 component, is not clean (`.git/`, `./.git`, `a//b`, `.` and the empty

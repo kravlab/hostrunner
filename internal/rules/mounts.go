@@ -71,16 +71,22 @@ func (a Allowed) MountRequirementsReport() []protocol.MountRequirement {
 // newMounts validates the `mounts` value of a rule.
 //
 // A failure names the line of the entry, as the yaml package counts it.
+// `mounts: *name` stands for the anchored map it refers to, so rules can
+// share one block; a value that is not a map names the line of the alias.
 func newMounts(n yaml.Node) ([]MountRequirement, error) {
 	if n.Kind == 0 {
 		return nil, nil // no mounts key
 	}
-	if n.Kind != yaml.MappingNode {
+	entries := &n
+	if n.Kind == yaml.AliasNode {
+		entries = n.Alias
+	}
+	if entries.Kind != yaml.MappingNode {
 		return nil, fmt.Errorf("mounts: not a mapping of workspace paths to modes (line %d)", n.Line)
 	}
 	var reqs []MountRequirement
-	for i := 0; i+1 < len(n.Content); i += 2 {
-		key, val := n.Content[i], n.Content[i+1]
+	for i := 0; i+1 < len(entries.Content); i += 2 {
+		key, val := entries.Content[i], entries.Content[i+1]
 		if key.Kind != yaml.ScalarNode || key.ShortTag() != "!!str" {
 			return nil, fmt.Errorf("mounts: path must be a string (line %d)", key.Line)
 		}
