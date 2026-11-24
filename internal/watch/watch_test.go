@@ -961,8 +961,8 @@ func TestAttachedGetsTheArmedContainerWithItsMounts(t *testing.T) {
 	_, done := startWatcherWith(context.Background(), cfg, nil, rt)
 	time.Sleep(testConfig.PollInterval)
 	want := []watch.Mount{{Source: "/home/u/app", Destination: "/workspace"}, {Destination: "/tmp", ReadOnly: true}}
-	rt.Start("c")
 	rt.SetMounts("c", want...)
+	rt.Start("c")
 	eventually(t, func() bool { return rec.count() > 0 }, "Attached was not called")
 	got := rec.snapshot()[0]
 	if len(got) != 1 || got[0].ID != "c" || !got[0].Running || !slices.Equal(got[0].Mounts, want) {
@@ -1015,15 +1015,15 @@ func TestAttachedIsCalledAgainAfterRearmAndNewContainer(t *testing.T) {
 	cfg := testConfig
 	cfg.Attached = rec.attached
 	w, done := startWatcherWith(context.Background(), cfg, nil, rt)
-	rt.Start("old")
 	rt.SetMounts("old", watch.Mount{Destination: "/old"})
+	rt.Start("old")
 	eventually(t, func() bool { return rec.count() == 1 }, "Attached was not called for the first container")
 
 	// A rebuild: the old container stops, `up` arms, a new one starts.
 	rt.Stop("old")
 	w.Arm()
-	rt.Start("new")
 	rt.SetMounts("new", watch.Mount{Destination: "/new"})
+	rt.Start("new")
 	eventually(t, func() bool { return rec.count() == 2 }, "Attached was not called again for the new container")
 	got := rec.snapshot()[1]
 	if len(got) != 1 || got[0].ID != "new" || !slices.Equal(got[0].Mounts, []watch.Mount{{Destination: "/new"}}) {
