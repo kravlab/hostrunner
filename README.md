@@ -26,9 +26,30 @@ container stops. Linux hosts; Docker and Podman.
 > A requirement does not make the tool safe. It names paths from the
 > workspace root, so a nested repository the container creates
 > (`git init sub`, then `hostrun git …` from `sub/`) passes it while git
-> reads that repository's config and hooks. hostrunner does not touch a
-> tool's config or hooks either. Allowing such a tool against an agent you
-> do not trust stays a conscious risk of code execution on the host.
+> reads that repository's config and hooks. For git, a rule can pin the
+> common directory to the workspace's own `.git`, so that git takes its
+> config, hooks and `info/` from there whatever a nested repository, a
+> `.git` file or a `commondir` file says:
+>
+> ```yaml
+> rules:
+>   - command: git
+>     args: any
+>     inject:
+>       env:
+>         GIT_COMMON_DIR: "${host.workspace}/.git"
+>     mounts:
+>       .git: mounted
+>       .git/config: read-only
+>       .git/hooks: read-only
+> ```
+>
+> The recipe protects only together with those mounts, checked before
+> every request (see [Mount check](#mount-check)). `args: any` only keeps
+> it short: restrict git's flags with `allow` lists, as the example does.
+> hostrunner does not touch a tool's config or hooks either. Allowing
+> such a tool against an agent you do not trust stays a conscious risk of
+> code execution on the host.
 
 ## Install
 
@@ -1191,7 +1212,9 @@ goes; the container cannot move it.
   command runs from, it is not masked, and a rule that uses only it needs
   no strict lists. A secret named `workspace`
   is still `${workspace}`. Secret sources (`command`, `env`, `file`) are
-  not templates: a `$` there is literal text.
+  not templates: a `$` there is literal text. The note at the
+  [top](#hostrunner) gives a recipe with it: git pinned to the
+  workspace's own `.git` through `GIT_COMMON_DIR`.
 - The rule's lists check the container's arguments only, as without an
   injection; the added ones are not checked, so the rule need not allow the
   container the flags it adds itself.

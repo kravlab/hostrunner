@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # The workspace's host path in inject templates
