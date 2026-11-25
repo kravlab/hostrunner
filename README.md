@@ -26,9 +26,30 @@ container stops. Linux hosts; Docker and Podman.
 > A requirement does not make the tool safe. It names paths from the
 > workspace root, so a nested repository the container creates
 > (`git init sub`, then `hostrun git …` from `sub/`) passes it while git
-> reads that repository's config and hooks. hostrunner does not touch a
-> tool's config or hooks either. Allowing such a tool against an agent you
-> do not trust stays a conscious risk of code execution on the host.
+> reads that repository's config and hooks. For git, a rule can pin the
+> common directory to the workspace's own `.git`, so that git takes its
+> config, hooks and `info/` from there whatever a nested repository, a
+> `.git` file or a `commondir` file says:
+>
+> ```yaml
+> rules:
+>   - command: git
+>     args: any
+>     inject:
+>       env:
+>         GIT_COMMON_DIR: "${host.workspace}/.git"
+>     mounts:
+>       .git: mounted
+>       .git/config: read-only
+>       .git/hooks: read-only
+> ```
+>
+> The recipe protects only together with those mounts, checked before
+> every request (see [Mount check](#mount-check)). `args: any` only keeps
+> it short: restrict git's flags with `allow` lists, as the example does.
+> hostrunner does not touch a tool's config or hooks either. Allowing
+> such a tool against an agent you do not trust stays a conscious risk of
+> code execution on the host.
 
 ## Install
 
@@ -1177,12 +1198,23 @@ goes; the container cannot move it.
   variable is its path (`curl -K ${file.cfg}` runs as
   `curl -K /proc/self/fd/4`). The file is read-only, can be read again and
   sought in, and lives in memory only (a sealed memfd), never on a disk.
-  Its content may refer to secrets, not to files.
+  Its content may refer to secrets and `${host.workspace}`, not to files.
 - Their strings are templates: `${token}` is the secret's value,
-  `${file.cfg}` an injected file's path, `$$` a literal `$`; any other `$`,
-  an unknown name, or a secret or file no template uses makes the rules
-  file invalid. A `path: open` argument is still replaced
+  `${file.cfg}` an injected file's path, `${host.workspace}` the
+  workspace's real path on the host (symlinks resolved), `$$` a literal
+  `$`; any other `$`, an unknown name (a `${host.…}` other than
+  `${host.workspace}` included), or a secret or file no template uses makes
+  the rules file invalid. A `path: open` argument is still replaced
   where it moved to.
+- `${host.workspace}` is plain text, not a secret: in `program_args`,
+  `command_args`, `trailing_args`, `env` values and the content of
+  `inject.files` it is the workspace's root whichever directory the
+  command runs from, it is not masked, and a rule that uses only it needs
+  no strict lists. A secret named `workspace`
+  is still `${workspace}`. Secret sources (`command`, `env`, `file`) are
+  not templates: a `$` there is literal text. The note at the
+  [top](#hostrunner) gives a recipe with it: git pinned to the
+  workspace's own `.git` through `GIT_COMMON_DIR`.
 - The rule's lists check the container's arguments only, as without an
   injection; the added ones are not checked, so the rule need not allow the
   container the flags it adds itself.

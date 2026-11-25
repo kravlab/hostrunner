@@ -41,6 +41,10 @@ func NewMapper(hostRoot, containerRoot string) (*Mapper, error) {
 // container.
 func (m *Mapper) Roots() (host, container string) { return m.hostRoot, m.containerRoot }
 
+// HostRoot returns the workspace's real path on the host, with symlinks
+// resolved once by NewMapper: the root the mirrored directory lies under.
+func (m *Mapper) HostRoot() string { return m.hostRoot }
+
 // Open opens the host directory for containerCwd and returns it with its
 // real host path. The caller must close it.
 //

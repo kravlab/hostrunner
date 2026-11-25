@@ -21,14 +21,30 @@ const testToken = "tok-0123456789"
 // would mask.
 func (h harness) recorded(t *testing.T, argv ...string) (result, string) {
 	t.Helper()
+	return h.recordedIn(t, containerRoot, argv...)
+}
+
+// recordedIn is recorded with the command run from the container
+// directory cwd.
+func (h harness) recordedIn(t *testing.T, cwd string, argv ...string) (result, string) {
+	t.Helper()
 	path := filepath.Join(t.TempDir(), "record")
 	t.Setenv("RECORD", path)
-	got := h.run(t, containerRoot, "", argv...)
+	got := h.run(t, cwd, "", argv...)
 	data, err := os.ReadFile(path)
 	if err != nil && !os.IsNotExist(err) {
 		t.Fatal(err)
 	}
 	return got, string(data)
+}
+
+// expectRecorded fails the test unless got is a clean exit and rec, what
+// recorded returned, is want.
+func expectRecorded(t *testing.T, got result, rec, want string) {
+	t.Helper()
+	if got != (result{}) || rec != want {
+		t.Fatalf("got %+v, the program got %q; want %q", got, rec, want)
+	}
 }
 
 // recordRules allows sh with any positional arguments and no flags, adding

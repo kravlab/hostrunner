@@ -85,12 +85,67 @@ func TestParseAcceptsAnInjectionWithoutSecretsAndLooseLists(t *testing.T) {
 	mustParse(t, "rules:\n  - command: curl\n    inject:\n      command_args: [--silent]\n    args: any\n")
 }
 
+// ${host.workspace} is plain text, not a secret: a rule that uses only it
+// needs no strict lists, and the host path renders into an env value.
+func TestParseAcceptsTheHostWorkspaceWithoutSecretsAndLooseLists(t *testing.T) {
+	p := mustParse(t, "rules:\n  - command: curl\n    inject:\n      env: {WORKSPACE_DIR: \"${host.workspace}/.git\"}\n    args: any\n")
+	allowed, err := p.Check([]string{"curl"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := allowed.Environment(Values{HostWorkspace: "/x"})
+	if want := "WORKSPACE_DIR=/x/.git"; strings.Join(got, "|") != want {
+		t.Fatalf("got %q, want %s", got, want)
+	}
+}
+
+// Any other `host.` name is refused at parse time, naming it in full.
+func TestParseRefusesAnUnknownHostValue(t *testing.T) {
+	expectParseError(t, "rules:\n  - command: curl\n    inject:\n      env: {ROOT: \"${host.root}\"}\n    args: any\n", "host.root")
+}
+
+// A namespace is decoded once: `${file.host.workspace}` is no file named
+// `host.workspace`, it is no reference at all.
+func TestParseRefusesAChainedNamespace(t *testing.T) {
+	expectParseError(t, "rules:\n  - command: curl\n    inject:\n      env: {CFG: \"${file.host.workspace}\"}\n      files: {cfg: x}\n    args: any\n", "${file.host.workspace} is not a secret, file or host value name")
+}
+
+// A secret may still be named workspace: `${workspace}` is that secret,
+// and `${host.workspace}` is the path.
+func TestParseKeepsASecretNamedWorkspace(t *testing.T) {
+	p := mustParse(t, "rules:\n  - command: curl\n    secrets:\n      workspace: {env: TOKEN}\n    inject:\n      env: {API_TOKEN: \"${workspace}\", DIR: \"${host.workspace}\"}\n"+strictLists)
+	allowed, err := p.Check([]string{"curl", "-s", "https://api.example.com/v1/items/42"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := allowed.Environment(Values{SecretRef("workspace"): "tok-0123456789", HostWorkspace: "/x"})
+	if want := "API_TOKEN=tok-0123456789|DIR=/x"; strings.Join(got, "|") != want {
+		t.Fatalf("got %q, want %s", got, want)
+	}
+}
+
+// `$$` next to a host value stays a literal `$`: `$${host.workspace}` is
+// the text `${host.workspace}`, and `$$${host.workspace}` a `$` before the
+// path.
+func TestParseKeepsADoubledDollarNextToTheHostWorkspace(t *testing.T) {
+	p := mustParse(t, "rules:\n  - command: curl\n    inject:\n      env: {LITERAL: \"$${host.workspace}\", AFTER_DOLLAR: \"$$${host.workspace}\"}\n    args: any\n")
+	allowed, err := p.Check([]string{"curl"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := allowed.Environment(Values{HostWorkspace: "/x"})
+	if want := "AFTER_DOLLAR=$/x|LITERAL=${host.workspace}"; strings.Join(got, "|") != want {
+		t.Fatalf("got %q, want %s", got, want)
+	}
+}
+
 // Template mistakes are caught before any request reaches a server.
 func TestParseRefusesABadTemplate(t *testing.T) {
 	for name, tc := range map[string]struct{ arg, want string }{
 		"lone dollar":    {"cost: 5$", "lone $"},
 		"unterminated":   {"Bearer ${token", "unterminated"},
-		"bad name":       {"Bearer ${Token}", "is not a secret or file name"},
+		"bad name":       {"Bearer ${Token}", "is not a secret, file or host value name"},
+		"bad host name":  {"${host.Root}", "is not a secret, file or host value name"},
 		"unknown secret": {"Bearer ${other}", `unknown secret "other"`},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -145,7 +200,7 @@ func TestAssemblePlacesCommandArgsAfterTheRuleCommand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assembled, err := allowed.Assemble(argv, map[string]string{"token": "tok-0123456789"})
+	assembled, err := allowed.Assemble(argv, Values{SecretRef("token"): "tok-0123456789"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -247,28 +302,60 @@ func TestEnvironmentRendersTheInjectedVariablesByName(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := allowed.Environment(map[string]string{"token": "tok-0123456789"})
+	got := allowed.Environment(Values{SecretRef("token"): "tok-0123456789"})
 	if want := "API_TOKEN=Bearer tok-0123456789|NO_COLOR=1"; strings.Join(got, "|") != want {
 		t.Fatalf("got %q, want %s", got, want)
 	}
 }
 
 // A file needs a name, string content and a template that uses its path;
-// its content refers to secrets only, as a descriptor path means nothing
-// inside a file.
+// its content refers to secrets and ${host.workspace}, not to files, as a
+// descriptor path means nothing inside a file.
 func TestParseRefusesABadInjectedFile(t *testing.T) {
 	for name, tc := range map[string]struct{ inject, want string }{
-		"unknown file":      {`command_args: ["${file.cfg}"]`, `unknown file "cfg"`},
-		"unused file":       {`files: {cfg: x}`, `"cfg" is not used`},
-		"path inside file":  {"command_args: [\"${file.cfg}\"]\n      files: {cfg: \"${file.cfg}\"}", `unknown file "cfg"`},
-		"bad name":          {"command_args: [\"${file.Cfg}\"]\n      files: {Cfg: x}", `"Cfg": a name is lower-case`},
-		"not a string":      {"command_args: [\"${file.cfg}\"]\n      files: {cfg: [x]}", "the content must be a string"},
-		"not a mapping":     {"files: [x]", "inject.files must map names to contents"},
-		"secret in content": {"command_args: [\"${file.cfg}\"]\n      files: {cfg: \"${token}\"}", `unknown secret "token"`},
+		"unknown file":          {`command_args: ["${file.cfg}"]`, `unknown file "cfg"`},
+		"unused file":           {`files: {cfg: x}`, `"cfg" is not used`},
+		"path inside file":      {"command_args: [\"${file.cfg}\"]\n      files: {cfg: \"${file.cfg}\"}", `unknown file "cfg"`},
+		"path beside workspace": {"command_args: [\"${file.cfg}\"]\n      files: {cfg: \"${host.workspace}/${file.cfg}\"}", `unknown file "cfg"`},
+		"bad name":              {"command_args: [\"${file.Cfg}\"]\n      files: {Cfg: x}", `"Cfg": a name is lower-case`},
+		"not a string":          {"command_args: [\"${file.cfg}\"]\n      files: {cfg: [x]}", "the content must be a string"},
+		"not a mapping":         {"files: [x]", "inject.files must map names to contents"},
+		"secret in content":     {"command_args: [\"${file.cfg}\"]\n      files: {cfg: \"${token}\"}", `unknown secret "token"`},
 	} {
 		t.Run(name, func(t *testing.T) {
 			expectParseError(t, "rules:\n  - command: curl\n    inject:\n      "+tc.inject+"\n    args: any\n", tc.want)
 		})
+	}
+}
+
+// ${host.workspace} in a file's contents parses and renders the host path;
+// ${file.<name>} there stays refused (see "path inside file" above).
+func TestParseAcceptsTheHostWorkspaceInAnInjectedFileContent(t *testing.T) {
+	p := mustParse(t, "rules:\n  - command: curl\n    inject:\n      command_args: [\"${file.cfg}\"]\n      files: {cfg: \"root = ${host.workspace}\\n\"}\n    args: any\n")
+	allowed, err := p.Check([]string{"curl"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := allowed.Inject.Files[0].Content.Render(Values{HostWorkspace: "/x"})
+	if want := "root = /x\n"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+// A file used only through a template that also uses ${host.workspace}
+// counts as used, and the template renders both.
+func TestParseCountsAFileUsedTogetherWithTheHostWorkspaceAsUsed(t *testing.T) {
+	p := mustParse(t, "rules:\n  - command: curl\n    inject:\n      command_args: [\"${host.workspace}/${file.cfg}\"]\n      files: {cfg: x}\n    args: any\n")
+	allowed, err := p.Check([]string{"curl"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := allowed.Assemble([]string{"curl"}, Values{HostWorkspace: "/x", FileRef("cfg"): "/proc/self/fd/3"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "curl /x//proc/self/fd/3"; strings.Join(got, " ") != want {
+		t.Fatalf("got %q, want %s", got, want)
 	}
 }
 
