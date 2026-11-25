@@ -13,10 +13,22 @@ container stops. Linux hosts; Docker and Podman.
 > **Rules restrict argv only.** A host tool that reads configuration or
 > hooks from the workspace — git (`.git/config`, `.git/hooks`), fakehost
 > (`fakehost.json` predeploy scripts), … — can be steered by the container,
-> which can write the workspace. Read-only mounts of such files do not help
-> (the container can rename the directory around them or create a nested
-> repository). Allowing such a tool against an agent you do not trust is a
-> conscious risk of code execution on the host.
+> which can write the workspace. A rule's mount requirements (`mounts:`, see
+> [Rules](#rules)) promise only that the devcontainer's protection is in
+> place. For git, as in [the example](examples/devcontainer/.devcontainer),
+> that is `.git` a mount of its own and `.git/config` and `.git/hooks`
+> read-only, checked before every request (see [Mount check](#mount-check)).
+> A host command that replaces such a file removes the container's
+> read-only mount of it: host git writes `.git/config.lock` and renames it
+> over `.git/config`. From then on the container can write the file, and
+> the check refuses the rule's commands.
+>
+> A requirement does not make the tool safe. It names paths from the
+> workspace root, so a nested repository the container creates
+> (`git init sub`, then `hostrun git …` from `sub/`) passes it while git
+> reads that repository's config and hooks. hostrunner does not touch a
+> tool's config or hooks either. Allowing such a tool against an agent you
+> do not trust stays a conscious risk of code execution on the host.
 
 ## Install
 
@@ -126,10 +138,23 @@ Add to `.devcontainer/devcontainer.json`
 ],
 "mounts": [
   "source=${localEnv:XDG_RUNTIME_DIR}/hostrunner/${devcontainerId},target=/run/hostrunner,type=bind,readonly",
-  "source=${localWorkspaceFolder}/.devcontainer,target=${containerWorkspaceFolder}/.devcontainer,type=bind,readonly"
+  "source=${localWorkspaceFolder}/.devcontainer,target=${containerWorkspaceFolder}/.devcontainer,type=bind,readonly",
+  "source=${localWorkspaceFolder}/.git,target=${containerWorkspaceFolder}/.git,type=bind",
+  "source=${localWorkspaceFolder}/.git/config,target=${containerWorkspaceFolder}/.git/config,type=bind,readonly",
+  "source=${localWorkspaceFolder}/.git/hooks,target=${containerWorkspaceFolder}/.git/hooks,type=bind,readonly"
 ],
 "remoteEnv": { "PATH": "${containerEnv:PATH}:/run/hostrunner" }
 ```
+
+The last three mounts are what the example's git rules require (their
+`mounts:`, see [Rules](#rules)): `.git` mounted onto itself, so the
+container cannot rename it away, with `.git/config` and `.git/hooks`
+read-only inside it. Without them the daemon refuses git and still runs
+the other commands. They need a workspace whose `.git` is a directory
+holding `hooks/`, not a worktree's `.git` file. The example's `git push`
+takes no `-u`/`--set-upstream` and runs with
+`-c push.autoSetupRemote=false`, so the container cannot make host git
+rewrite `.git/config` during a request.
 
 Keep `initializeCommand` in the array form: it runs without a shell, so
 workspace paths with spaces work. `XDG_RUNTIME_DIR` must be set for the
@@ -176,8 +201,11 @@ rules, the working directory and the path checks, then looks the program
 up as starting it would (127 when the host lacks it, 126 when it cannot
 execute it) and answers. It exits 0
 with the allowing rule, the rule's `dir` when it has one
-(`allowed by rule "tix issues", runs in /`) and the names of the secrets
-it would inject (`, injects secrets: token`), or with the code and
+(`allowed by rule "tix issues", runs in /`), the names of the secrets
+it would inject (`, injects secrets: token`) and the mounts the rule
+requires, those of the shorter rules it inherits included, sorted by path
+(`, requires mounts: .git mounted, .git/config read-only`; one of a
+shorter rule names it: `.git mounted (rule "git")`), or with the code and
 message the run would get. It checks a secret's source without obtaining
 the value: a `command` source's program is looked up but not run, an
 `env` variable must be set, a `file` must open.
@@ -210,11 +238,28 @@ pointing to it.
 A daemon that watches its container (`hostrunner up`, that is
 `serve --watch`) checks the container's mounts, so that the container
 cannot rewrite the configuration it is served by. Once the daemon attaches
-to the armed container, and again whenever a new container joins the armed
-ones (a Compose recreate, say), it checks that the container cannot write
-`.devcontainer/`, the rules file or the workspace settings file. These are
-host paths with symlinks followed, and a deeper mount shadows a shallower
-one, so the read-only `.devcontainer` mount in the example above passes.
+to the armed container, again whenever a new container joins the armed
+ones (a Compose recreate, say), and before every request, it checks that
+the container cannot write `.devcontainer/`, the rules file or the
+workspace settings file. These are host paths with symlinks followed, and
+a deeper mount shadows a shallower one, so the read-only `.devcontainer`
+mount in the example above passes.
+
+The mounts come from `docker inspect` (`podman inspect`), which can be
+stale: a mount can be unmounted, mounted over or remounted after the
+container started. So for a running container the daemon also reads the
+live mount table of its init process (`/proc/<pid>/mountinfo` on the
+host): a host command that replaces a file under a read-only bind mount
+of it (an editor's atomic save, host git renaming `config.lock` over
+`.git/config`) removes that mount from the container, while the
+inspection still lists it. A mount from the inspection counts only when
+the live table has a mount at its destination, and its read-only flag is
+that of the topmost live entry there. Host sources are still compared
+from the inspection, so
+a second read-write mount of a protected directory elsewhere is refused
+too. A container that is stopped when the daemon attaches is judged by
+the inspection alone.
+
 A named volume is judged by what `docker volume inspect` (`podman volume
 inspect`) reports of it: a `local` volume whose `device` option is an
 absolute path (one created with `--opt type=none --opt o=bind --opt
@@ -239,6 +284,51 @@ check as unreadable mounts do.
   only, never a host path. Waiting `--ask` requests are withdrawn. The
   daemon log and the approval session report the failure, the log with the
   host path.
+- The check before a request makes the same refusal, but does not
+  withdraw waiting `--ask` requests, and the approval session is told of
+  a failure once, again only when the failure changes or after a check
+  passed. A live mount table that cannot be read refuses every command. A
+  table whose process is gone is read again after one more inspection, at
+  once. An armed container that did not run at its last inspection cannot
+  write and is skipped; it is inspected again at most once per
+  `stopped_inspection_max_age` (by default the poll interval), and the
+  daemon's own polls refresh what the check sees. Each armed container
+  is checked against its own table.
+- A run is checked when it arrives and again right before the process
+  starts, after the other checks and the secrets. A dry run starts
+  nothing and is checked like a run: when it arrives, before the rules'
+  checks, so a failure refuses even a dry run the rules would refuse,
+  and again after the rules' checks, right before it answers. An
+  `--ask` is checked when it arrives, before it is queued, and once more
+  after the human's answer, right before the approved run starts; a
+  standing or session approval is granted only once that check has
+  passed. A repeat under a standing or session approval is checked like
+  any run.
+- A rule may require mounts of the workspace (`mounts:`, see
+  [Rules](#rules)), such as `.git` for git. The check before a request
+  adds the requirements of every rule whose command starts that request's
+  argv, allowing or refusing it (a longer rule inherits those of the
+  shorter ones), in every armed container, at the same two points as the
+  rest of it, not at attach. `mounted` holds when, for every mount of
+  the container that reaches the path (the mount of the workspace root,
+  of a parent of it or of a directory between the root and the path),
+  the live mount table has a mount point at exactly the container path
+  the path is reached at, read-only or not; a mount that a deeper mount
+  of the same container covers there does not reach it, and a container
+  with no mount that reaches the path passes. A container that mounts a
+  parent of the workspace without a mount of `.git` onto itself
+  therefore fails `.git: mounted`. `read-only` is judged as a protected
+  path is: any writable mount reaching the path fails it, a writable
+  mount of an ancestor of the workspace included, and a container that
+  does not mount the workspace root can still fail it that way. A failed
+  requirement refuses only the commands of the rule that declares it,
+  those it starts, with 126 and no approval to get past it; the refusal
+  names the container path and that rule, which is a shorter rule when a
+  longer one selects the command (`git commit amend` is refused for a
+  requirement of `git`). The approval session's notice and the daemon's
+  log name that rule too.
+- A request checked as the daemon stops is refused with 125 `the
+  hostrunner daemon is stopping`, not as a failed check.
 - The next check that passes serves requests again.
 
 A devcontainer that cannot mount `.devcontainer/` read-only can have
@@ -246,7 +336,8 @@ the check turned off by a human on the host: `mount_check: false` in
 the host settings file (its common part or the workspace's section),
 `HOSTRUNNER_MOUNT_CHECK=false` or `--no-mount-check` for `up`,
 `restart` and `serve` (see [Settings](#settings)). The refusals of a
-failed check say so. The container cannot turn it off: the workspace
+failed check say so; it turns the requirements of rules off too. The
+container cannot turn it off: the workspace
 settings file refuses `mount_check`. Like the other daemon settings it
 is part of what an allow covers and what an arm compares, so turning it
 off needs a new `hostrunner allow` and applies on the next `up`. With
@@ -395,6 +486,7 @@ Besides its rules, a daemon has settings:
 | `grace` | `HOSTRUNNER_GRACE` | `--grace` | `15s` | how long its container may be gone before it exits |
 | `reread` | `HOSTRUNNER_REREAD` | `--reread`, `--no-reread` | `true` | whether it rereads the rules file by itself once it changes |
 | `poll_interval` | `HOSTRUNNER_POLL_INTERVAL` | `--poll-interval` | `2s` | how often it asks the container runtimes about its container and looks at the rules file |
+| `stopped_inspection_max_age` | `HOSTRUNNER_STOPPED_INSPECTION_MAX_AGE` | `--stopped-inspection-max-age` | `0` | with the mount check, how old an inspection that found its container stopped may be before the check of a request inspects it again; `0` (also unset) means `poll_interval` |
 | `ask_timeout` | `HOSTRUNNER_ASK_TIMEOUT` | `--ask-timeout` | `10m` | how long an `--ask` request waits for an answer when hostrun sets no limit |
 | `request_timeout` | `HOSTRUNNER_REQUEST_TIMEOUT` | `--request-timeout` | `10s` | how long a new connection may take to send its request |
 | `mount_check` | `HOSTRUNNER_MOUNT_CHECK` | `--mount-check`, `--no-mount-check` | `true` | whether it checks that its container cannot write its configuration (see [Mount check](#mount-check)); not in the workspace settings file |
@@ -825,7 +917,7 @@ rules:
     args: none                 # the bare command only
   - command: git push
     flags:
-      allow: [-u, --set-upstream, --tags]   # or deny: [...], never both
+      allow: [--tags, --follow-tags]   # or deny: [...], never both
       values:                  # flags that take a value, with a value filter
         -o: { allow: [ci.skip] }
         --repo: {}             # any value
@@ -852,6 +944,12 @@ rules:
   - command: tix issues
     dir: /                     # run in / on the host, not where the container stands
     args: any
+  - command: git commit
+    args: any
+    mounts:                    # the container must have these mounted
+      .git: mounted            # a mount point of its own
+      .git/config: read-only   # not writable
+      .git/hooks: read-only
 ```
 
 - A command no rule matches is denied, and so is everything when the file
@@ -907,6 +1005,25 @@ rules:
   shorter rule whose command starts the same way (`tix issues` for
   `tix issues list`), following further `inherit`s; it is an error when
   there is no such rule or it has no `dir`.
+- `mounts:` makes a rule require mounts of the container: a map from a
+  path relative to the workspace root to `mounted` (a mount point of its
+  own) or `read-only` (not writable), checked before each request (see
+  [Mount check](#mount-check)). Every rule whose command starts the
+  request's argv contributes, whether the rules allow or refuse it, so a
+  longer rule inherits the requirements of the shorter ones (a `git`
+  rule's `mounts:` also bind `git commit amend` when a longer `git commit
+  amend` rule selects it); a path two rules name with different modes
+  must meet both, and an argv no rule starts is held to the protected
+  paths alone. A path that is absolute, has a `..` component, is not
+  clean (`.`, `.git/`, `./.git`), is given twice, or a mode other than
+  the two, makes the file invalid, with the line, and so does `mounts:`
+  with no value (null); `mounts: {}` means none. Rules can share one
+  block through a YAML anchor: `mounts: &git-mounts {…}` on one rule and
+  `mounts: *git-mounts` on the others, as in the example; an alias is
+  checked as the map it refers to. `hostrunner
+  test` and the dry run report them (`, requires mounts: …`) without
+  checking them. They are part of the rules file: its digest, allow and
+  reread cover them.
 - Arguments are parsed like getopt, unless the rule says `flag_style: go`
   (below): `--flag=value`, `--flag value`, `-abc` (= `-a -b -c`),
   `-ovalue`, and `--` ending the flags. Only flags
@@ -1101,7 +1218,7 @@ To see whether a rules file allows a command before restarting the
 container, run the Rules test on the host, in the project root:
 
 ```sh
-hostrunner test git push -u origin main   # hostrunner: allowed by rule "git push"
+hostrunner test git push origin main      # hostrunner: allowed by rule "git push"
 hostrunner test git push --force          # hostrunner: denied by rule "git push": flag --force is not allowed (approvable)
 hostrunner test --rules-file draft.yaml -- tix pr list
 ```
@@ -1174,8 +1291,8 @@ How it works:
 | command's own | the command ran |
 | 0 | `--dry-run`: the command would run |
 | 128+N | the command was killed by signal N |
-| 125 | hostrun failed: daemon unreachable, protocol error, no command given, `--dry-run` and `--ask` combined, or an argument or the current directory not valid UTF-8; also, the [mount check](#mount-check) has not run yet (retry) |
-| 126 | refused: denied by the rules, an argument not a workspace file, current directory outside the workspace, a rule's `dir` missing, not a directory or inside the workspace, or not executable; every command while the [mount check](#mount-check) finds the container able to write the configuration or cannot read its mounts; with `--ask`, not approved on the host (refused, unanswered, no approval session, too large to show, the daemon stopping) |
+| 125 | hostrun failed: daemon unreachable, protocol error, no command given, `--dry-run` and `--ask` combined, or an argument or the current directory not valid UTF-8; also, the [mount check](#mount-check) has not run yet (retry), or the daemon is stopping (`the hostrunner daemon is stopping`) |
+| 126 | refused: denied by the rules, an argument not a workspace file, current directory outside the workspace, a rule's `dir` missing, not a directory or inside the workspace, or not executable; every command while the [mount check](#mount-check) finds the container able to write the configuration or cannot read its mounts; the commands of a rule whose mount requirements the container does not meet; with `--ask`, not approved on the host (refused, unanswered, no approval session, too large to show, the daemon stopping) |
 | 127 | command not found on the host |
 | 130 | interrupted (Ctrl+C); the host command is killed |
 

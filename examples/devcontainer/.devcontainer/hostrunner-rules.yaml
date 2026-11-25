@@ -7,15 +7,34 @@
 # would have to know them all.
 #
 # Rules restrict argv only. git also reads .git/config and hooks from the
-# workspace, which the container can write, so allowing git against a
-# hostile agent is a conscious risk of host code execution.
+# workspace, which the container can write. Each git rule below requires
+# the devcontainer's git mounts (see devcontainer.json: .git a mount of its
+# own, .git/config and .git/hooks read-only), so git runs on the host only
+# while that protection is in place. That does not make git safe: a nested
+# repository the container creates (`git init sub`, then `hostrun git ...`
+# from sub/) has neither mount. Allowing git against a hostile agent stays
+# a conscious risk of host code execution.
+#
+# A host command that replaces .git/config (git writes config.lock and
+# renames it over) removes the container's read-only mount of it, and the
+# mount check refuses git from then on. So no rule lets the container make
+# host git rewrite its config: git push takes no -u/--set-upstream and runs
+# with push.autoSetupRemote off.
 rules:
   - command: git status
     args: any
+    # The anchor gives every git rule the same requirements: a longer rule
+    # does not inherit a shorter one's.
+    mounts: &git-mounts
+      .git: mounted
+      .git/config: read-only
+      .git/hooks: read-only
   - command: git rev-parse
     args: any
+    mounts: *git-mounts
 
   - command: git fetch
+    mounts: *git-mounts
     flags:
       allow: [--prune, -p, --tags, --all, --quiet, -q, --verbose, -v]
     positional:
@@ -23,14 +42,18 @@ rules:
       deny: ["*://*", "*@*:*", "/*", ".*", "~*", "ext::*", "file:*"]
 
   - command: git pull
+    mounts: *git-mounts
     flags:
       allow: [--ff-only, --rebase, -r, --no-rebase, --prune, -p, --tags, --quiet, -q, --verbose, -v]
     positional:
       deny: ["*://*", "*@*:*", "/*", ".*", "~*", "ext::*", "file:*"]
 
   - command: git push
+    mounts: *git-mounts
+    inject:
+      program_args: [-c, push.autoSetupRemote=false]
     flags:
-      allow: [-u, --set-upstream, --tags, --follow-tags, --dry-run, -n, --quiet, -q, --verbose, -v]
+      allow: [--tags, --follow-tags, --dry-run, -n, --quiet, -q, --verbose, -v]
     positional:
       # force refspecs (+ref), deletions (:ref), and remotes other than by name
       deny: ["+*", ":*", "*://*", "*@*:*", "/*", ".*", "~*", "ext::*", "file:*"]

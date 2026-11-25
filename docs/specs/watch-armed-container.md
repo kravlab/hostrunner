@@ -17,14 +17,21 @@ daemon now follows its armed container, recognised by start time.
 ## Runtime
 
 - `Runtime.Containers(ctx, workspace) ([]Container, error)`: the
-  workspace's containers in every state; `Container{ID, Running,
+  workspace's containers in every state; `Container{ID, Running, Pid,
   StartedAt}`. An empty list is an answer (absent); an error means the
   runtime did not answer (unknown).
 - The CLI runtime runs `<rt> ps -aq --filter
   label=devcontainer.local_folder=<workspace>` and, only when that lists
   something, `<rt> inspect --type container --format '{{.Id}}
-  {{.State.Running}} {{json .State.StartedAt}}' <ids…>`. `json` renders
-  docker's string and podman's `time.Time` alike, in RFC 3339.
+  {{.State.Running}} {{.State.Pid}} {{json .State.StartedAt}} {{json
+  .Mounts}}' <ids…>`. `json` renders docker's string and podman's
+  `time.Time` alike, in RFC 3339. `Pid` is the host process ID of the
+  container's init process, 0 when it does not run.
+- `Runtime.MountTable(ctx, pid) ([]MountPoint, error)`: the live mount
+  table of process `pid`, read from `/proc/<pid>/mountinfo` on the host
+  (docker and podman alike), in file order; `MountPoint{Path, ReadOnly}`,
+  read-only by the per-mount options. A process that is gone fails with
+  `ErrProcessGone`.
 - A container removed between the listing and the inspection fails the
   inspection with "no such container" on stderr while the others are still
   printed: it is absent. Any other failure is the runtime's.
@@ -53,6 +60,35 @@ daemon now follows its armed container, recognised by start time.
   the attach at the earliest, so also a grace after a first poll that saw
   the armed container already stopped. Unknown resets the observed
   absence.
+- On each attach or join, before `Attached`, every armed container that
+  runs (`Running`, `Pid` > 0) gets `Live`, its table read through the
+  runtime that reported it. A process gone meanwhile: one fresh query of
+  every runtime, then the fresh data, read once more if it runs.
+  One that runs without a process id gets no `Live` there, as one that
+  does not run; the first `Live` call judges it.
+- `Live(ctx)`: copies of the latest attach's armed containers, each as
+  the newest inspection of it reported (the attach's, a later poll's or a
+  `Live` call's); `ErrNotAttached` from an arm until its attach. Each that
+  runs has its table read now. A gone process is inspected again at once.
+  One that runs without a process id (`Running`, `Pid` 0: restarting) is
+  not taken as stopped: it is inspected again once, whatever the age of its
+  inspection, and when it still has no process id its `Live.Err` is
+  `ErrNoProcessID` (`container runs but reports no process id`), so the
+  check refuses until a later inspection finds its process. One that did
+  not run is left out: it is inspected again only when its inspection is
+  at least `StoppedInspectionMaxAge` old (zero: `PollInterval`; reported
+  as it runs now, or left out if it does not; one no runtime could
+  inspect carries the error), otherwise left out without a query. The
+  fresh data is kept for the next call, unless an entry holds a newer
+  inspection.
+- `Run`'s polls that change no armed set refresh the cache (`takePoll`):
+  each armed container of the latest attach takes what the poll reported,
+  so `Live` follows the runtimes without inspecting a container that
+  stopped more than once per `PollInterval`. One the poll no longer
+  reports keeps its data, inspected at the poll's time. An entry with a
+  newer inspection, a `Live` call's that started after the poll, is kept
+  as it is; a poll for an earlier arm changes nothing. Safe alongside
+  `Run`.
 - Unchanged: the startup timeout from the last arm while waiting, the
   runtime-unavailable exit while attached, the flags and their defaults.
 - Logs: `armed: waiting for the armed container`, `attached to the armed

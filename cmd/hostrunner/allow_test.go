@@ -181,7 +181,8 @@ func TestAllowRecordsTheCurrentDirectoryAndPrintsWhatItAllowed(t *testing.T) {
 		"    request_timeout: 10s\n" +
 		"    reread: true\n" +
 		"    rules_file: " + filepath.Join(dir, "hostrunner-rules.yaml") + "\n" +
-		"    startup_timeout: 30m0s\n"
+		"    startup_timeout: 30m0s\n" +
+		"    stopped_inspection_max_age: 0s\n"
 	if stdout != want {
 		t.Errorf("stdout:\n%s\nwant:\n%s", stdout, want)
 	}
@@ -370,7 +371,8 @@ func TestAllowMarksTheSettingsThatDifferFromTheirDefaults(t *testing.T) {
 		"    request_timeout: 10s\n" +
 		"    reread: false (default true)\n" +
 		"    rules_file: " + other + " (default " + filepath.Join(dir, "hostrunner-rules.yaml") + ")\n" +
-		"    startup_timeout: 30m0s\n"
+		"    startup_timeout: 30m0s\n" +
+		"    stopped_inspection_max_age: 0s\n"
 	if !strings.HasSuffix(stdout, want) {
 		t.Errorf("stdout:\n%s\nwant it to end with:\n%s", stdout, want)
 	}
@@ -844,7 +846,7 @@ func TestAllowAllowsTheRequestOfEveryRuntimeDir(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	blocks := strings.SplitAfter(stdout, "    startup_timeout: 30m0s\n")
+	blocks := strings.SplitAfter(stdout, "    stopped_inspection_max_age: 0s\n")
 	if len(blocks) != 3 || blocks[2] != "" {
 		t.Fatalf("stdout holds %d blocks, want 2:\n%s", len(blocks)-1, stdout)
 	}

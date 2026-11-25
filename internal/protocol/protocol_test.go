@@ -197,6 +197,30 @@ func TestMountCheckWireFormat(t *testing.T) {
 	}
 }
 
+// The rule of a failed mount requirement is written under "rule" in the
+// frame of a failed check, and left out for a failure that refuses every
+// command, so a session that predates the field reads either as before.
+func TestMountCheckFailedRuleWireFormat(t *testing.T) {
+	var m MountCheckFailed
+	if err := DecodeJSON(Frame{Type: FrameMountCheckFailed, Payload: []byte(`{"error":"e","rule":"git"}`)}, &m); err != nil {
+		t.Fatal(err)
+	}
+	if want := (MountCheckFailed{Error: "e", Rule: "git"}); m != want {
+		t.Fatalf("got %+v, want %+v", m, want)
+	}
+	var buf bytes.Buffer
+	if err := WriteJSON(&buf, FrameMountCheckFailed, MountCheckFailed{Error: "e"}); err != nil {
+		t.Fatal(err)
+	}
+	f, err := ReadFrame(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `{"error":"e"}`; string(f.Payload) != want {
+		t.Errorf("payload %s, want %s", f.Payload, want)
+	}
+}
+
 // The JSON names of a change not allowed are the contract between
 // versions: a session's Serve and the frame that reports the change.
 func TestRulesNotAllowedWireFormat(t *testing.T) {
@@ -238,6 +262,88 @@ func TestRulesNotAllowedText(t *testing.T) {
 				t.Errorf("got %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+// The description of an allowed dry run names the mounts the rule requires,
+// in the order given, after the other parts.
+func TestAllowedTextNamesTheRequiredMounts(t *testing.T) {
+	a := Allowed{Rule: "git", Mounts: []MountRequirement{{Path: ".git", Mode: "mounted"}, {Path: ".git/config", Mode: "read-only"}}}
+	want := `allowed by rule "git", requires mounts: .git mounted, .git/config read-only`
+	if got := a.String(); got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// A requirement of another rule than the one that allows the command, one
+// that names its rule, is told with it.
+func TestAllowedTextNamesTheRuleOfAMountOfAnotherRule(t *testing.T) {
+	a := Allowed{Rule: "git commit", Mounts: []MountRequirement{{Path: ".git", Mode: "mounted", Rule: "git"}, {Path: ".git/config", Mode: "read-only"}}}
+	want := `allowed by rule "git commit", requires mounts: .git mounted (rule "git"), .git/config read-only`
+	if got := a.String(); got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// The mounts come after the directory and the secrets, and a rule without
+// mounts adds nothing to the description.
+func TestAllowedTextOrdersTheMountsAfterTheOtherParts(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		a    Allowed
+		want string
+	}{
+		{"no mounts", Allowed{Rule: "git", Dir: "/w", Secrets: []string{"a"}},
+			`allowed by rule "git", runs in /w, injects secrets: a`},
+		{"all parts", Allowed{Rule: "git", Dir: "/w", Secrets: []string{"a", "b"}, Mounts: []MountRequirement{{Path: ".git", Mode: "mounted"}}},
+			`allowed by rule "git", runs in /w, injects secrets: a, b, requires mounts: .git mounted`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.a.String(); got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// The mounts of an Allowed are written under "mounts" with a path and a
+// mode each, and left out when there are none.
+func TestAllowedMountsWireFormat(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteJSON(&buf, FrameAllowed, Allowed{Rule: "git", Mounts: []MountRequirement{{Path: ".git", Mode: "read-only"}}}); err != nil {
+		t.Fatal(err)
+	}
+	f, err := ReadFrame(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `{"rule":"git","mounts":[{"path":".git","mode":"read-only"}]}`; string(f.Payload) != want {
+		t.Errorf("payload %s, want %s", f.Payload, want)
+	}
+	buf.Reset()
+	if err := WriteJSON(&buf, FrameAllowed, Allowed{Rule: "git"}); err != nil {
+		t.Fatal(err)
+	}
+	if f, err = ReadFrame(&buf); err != nil {
+		t.Fatal(err)
+	}
+	if want := `{"rule":"git"}`; string(f.Payload) != want {
+		t.Errorf("payload %s, want %s", f.Payload, want)
+	}
+}
+
+// A requirement of another rule is written with that rule under "rule".
+func TestAllowedMountRuleWireFormat(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteJSON(&buf, FrameAllowed, Allowed{Rule: "git commit", Mounts: []MountRequirement{{Path: ".git", Mode: "mounted", Rule: "git"}}}); err != nil {
+		t.Fatal(err)
+	}
+	f, err := ReadFrame(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `{"rule":"git commit","mounts":[{"path":".git","mode":"mounted","rule":"git"}]}`; string(f.Payload) != want {
+		t.Errorf("payload %s, want %s", f.Payload, want)
 	}
 }
 

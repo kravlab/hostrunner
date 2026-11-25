@@ -48,6 +48,11 @@ type Settings struct {
 	// PollInterval (poll_interval) is how often the runtimes are asked
 	// (with --watch) and the rules file is looked at.
 	PollInterval time.Duration
+	// StoppedInspectionMaxAge (stopped_inspection_max_age) is, with
+	// --watch, how old an inspection that found an armed container stopped
+	// may be before the check of a request inspects it again; zero (the
+	// default) means PollInterval.
+	StoppedInspectionMaxAge time.Duration
 	// AskTimeout (ask_timeout) is how long an approval request waits when
 	// its client sets no limit.
 	AskTimeout time.Duration
@@ -222,12 +227,13 @@ type layer map[string]any
 type kind int
 
 const (
-	kindDuration kind = iota // a time.Duration above zero, written like 1m30s
-	kindBool                 // a bool
-	kindPath                 // a file path, not empty; a relative one is read against the workspace
-	kindAbsPath              // a directory path, not empty; a relative one is an error
-	kindCount                // a non-negative int, written in decimal
-	kindChoice               // one of the strings its key lists (values)
+	kindDuration         kind = iota // a time.Duration above zero, written like 1m30s
+	kindOptionalDuration             // a time.Duration not below zero, written like 1m30s; zero is the key's own default
+	kindBool                         // a bool
+	kindPath                         // a file path, not empty; a relative one is read against the workspace
+	kindAbsPath                      // a directory path, not empty; a relative one is an error
+	kindCount                        // a non-negative int, written in decimal
+	kindChoice                       // one of the strings its key lists (values)
 )
 
 // String names the kind in errors ("invalid duration") and usages.
@@ -352,6 +358,11 @@ var keys = []key{
 		name: "poll_interval", kind: kindDuration, scope: scopeDaemon,
 		usage: "how often to ask the runtimes (with --watch) and look at the rules file",
 		field: func(s *Settings) any { return &s.PollInterval },
+	},
+	{
+		name: "stopped_inspection_max_age", kind: kindOptionalDuration, scope: scopeDaemon,
+		usage: "with --watch: how old a stopped container's inspection may be before a request repeats it (0: poll_interval)",
+		field: func(s *Settings) any { return &s.StoppedInspectionMaxAge },
 	},
 	{
 		name: "ask_timeout", kind: kindDuration, scope: scopeDaemon,
@@ -550,8 +561,8 @@ var errNotPositive = errors.New("must be positive")
 // errEmptyPath is the problem with an empty path, which names no file.
 var errEmptyPath = errors.New("empty path")
 
-// errNegative is the problem with an integer below zero, which no
-// setting can mean.
+// errNegative is the problem with an integer or an optional duration below
+// zero, which no setting can mean.
 var errNegative = errors.New("must not be negative")
 
 // parse reads raw, the text a variable or a file gives, as a value of
@@ -564,12 +575,17 @@ func (k key) parse(raw string) (any, error) {
 
 // check returns the problem with v, a value of kind k, that no setting
 // can mean whatever its source: errNotPositive for a duration at or
-// below zero, errNegative for an integer below zero; nil otherwise.
+// below zero, errNegative for an integer or an optional duration below
+// zero; nil otherwise.
 func (k kind) check(v any) error {
 	switch k {
 	case kindDuration:
 		if v.(time.Duration) <= 0 {
 			return errNotPositive
+		}
+	case kindOptionalDuration:
+		if v.(time.Duration) < 0 {
+			return errNegative
 		}
 	case kindCount:
 		if v.(int) < 0 {
@@ -627,7 +643,7 @@ func (k kind) checked(v any, raw string) (any, error) {
 // `1m30s`, `true`, a path, `3`.
 func (k kind) format(v any) string {
 	switch k {
-	case kindDuration:
+	case kindDuration, kindOptionalDuration:
 		return v.(time.Duration).String()
 	case kindBool:
 		return strconv.FormatBool(v.(bool))

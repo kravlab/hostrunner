@@ -54,9 +54,10 @@ func parseTest(args []string, getenv func(string) string, output io.Writer) (tes
 }
 
 // rulesTest runs the Rules test: it tests cfg.argv against the rules file
-// alone, with no daemon or container, and reports the allowing rule and
-// its fixed directory on stderr, after a warning of an older default
-// rules file left unread (see hostterm.WarnIgnoredRules). A denied
+// alone, with no daemon or container, and reports the allowing rule, its
+// fixed directory, its secrets' names and the mounts it requires (not
+// checked: no container is involved) on stderr, after a warning of an older
+// default rules file left unread (see hostterm.WarnIgnoredRules). A denied
 // command is an exitError with protocol.ExitRejected, as hostrun exits
 // when the daemon denies it; its message lists every reason, not only the
 // first a refusal reports, and the class an approval session would put it
@@ -77,7 +78,7 @@ func rulesTest(cfg testConfig, stderr io.Writer) error {
 	}
 	// The report a dry run gets, without checking the fixed directory or
 	// the secrets' sources: those need the workspace and the host.
-	_, err = fmt.Fprintf(stderr, "hostrunner: %s\n", protocol.Allowed{Rule: allowed.Rule, Dir: allowed.Dir, Secrets: allowed.SecretNames()})
+	_, err = fmt.Fprintf(stderr, "hostrunner: %s\n", protocol.Allowed{Rule: allowed.Rule, Dir: allowed.Dir, Secrets: allowed.SecretNames(), Mounts: allowed.MountRequirementsReport()})
 	return err
 }
 

@@ -315,7 +315,8 @@ func TestARunWhoseRequestIsCancelledAsItStartsEndsCancelled(t *testing.T) {
 	x := exchange{cancel: func() {}, conn: daemonEnd, out: &frameWriter{conn: daemonEnd}}
 	next := func() (protocol.Frame, error) { return protocol.Frame{}, io.EOF }
 	req := protocol.Request{Argv: []string{"true"}, Cwd: "/workspaces/app"}
-	s.start(ctx, x, req, &prepared{dir: dir, hostPath: dir.Name(), argv: []string{"true"}}, next, run)
+	p := &prepared{dir: dir, hostPath: dir.Name(), argv: []string{"true"}}
+	s.start(ctx, x, startArgs{req: req, p: p, next: next, run: run})
 	daemonEnd.Close()
 
 	if got := <-result; len(got) != 1 || got[0].Type != protocol.FrameError {

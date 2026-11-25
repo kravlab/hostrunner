@@ -135,7 +135,7 @@ const (
 	FrameRunStarted       // daemon → session, JSON RunStarted: an approved run began, to a session that asked for runs (Serve.Runs)
 	FrameRunOutput        // daemon → session, JSON RunOutput: a chunk of an approved run's output, likewise
 	FrameRunEnded         // daemon → session, JSON RunEnded: an approved run ended, likewise
-	FrameMountCheckFailed // daemon → session, JSON MountCheckFailed: the check of the armed container's mounts failed, to a session that said it reads this (Serve.MountCheck)
+	FrameMountCheckFailed // daemon → session, JSON MountCheckFailed: the check of the armed container's mounts failed, for every command or for the commands of one rule (MountCheckFailed.Rule), to a session that said it reads this (Serve.MountCheck)
 	FrameRulesNotAllowed  // daemon → session, JSON RulesNotAllowed: the rules or the daemon settings changed to ones not allowed, to a session that said it reads this (Serve.RulesNotAllowed)
 
 	// Frames of the control socket of a shared process, between
@@ -226,13 +226,30 @@ type Armed struct {
 // client that predates them ignores the field. Approval is ScopeStanding
 // or ScopeSession when a standing or session approval lets the command
 // through, which runs it as the rule that refused it would (Dir,
-// Secrets). Warning is described on Credit.
+// Secrets). Mounts are the mount requirements of every rule that starts
+// the command, the allowing rule's and those of shorter rules, in the order
+// the daemon reports them, omitted when there are none; a client that
+// predates them ignores the field. Warning is described on Credit.
 type Allowed struct {
-	Rule     string   `json:"rule"`
-	Dir      string   `json:"dir,omitempty"`
-	Secrets  []string `json:"secrets,omitempty"`
-	Approval Scope    `json:"approval,omitempty"`
-	Warning  string   `json:"warning,omitempty"`
+	Rule     string             `json:"rule"`
+	Dir      string             `json:"dir,omitempty"`
+	Secrets  []string           `json:"secrets,omitempty"`
+	Mounts   []MountRequirement `json:"mounts,omitempty"`
+	Approval Scope              `json:"approval,omitempty"`
+	Warning  string             `json:"warning,omitempty"`
+}
+
+// MountRequirement is one mount a rule requires of the container. Path is
+// relative to the workspace root, in forward-slash form; Mode is how it has
+// to be mounted, as the rules file spells it: "mounted" or "read-only".
+// Rule is the command of the rule that declares it, omitted when that is
+// the rule that allows the command (Allowed.Rule): the requirements of a
+// shorter rule that also start the command name their rule. A client that
+// predates Rule ignores it.
+type MountRequirement struct {
+	Path string `json:"path"`
+	Mode string `json:"mode"`
+	Rule string `json:"rule,omitempty"`
 }
 
 // String describes a, as the dry run and the Rules test report it.
@@ -246,6 +263,16 @@ func (a Allowed) String() string {
 	}
 	if len(a.Secrets) > 0 {
 		s += ", injects secrets: " + strings.Join(a.Secrets, ", ")
+	}
+	if len(a.Mounts) > 0 {
+		reqs := make([]string, len(a.Mounts))
+		for i, m := range a.Mounts {
+			reqs[i] = m.Path + " " + m.Mode
+			if m.Rule != "" {
+				reqs[i] += fmt.Sprintf(" (rule %q)", m.Rule)
+			}
+		}
+		s += ", requires mounts: " + strings.Join(reqs, ", ")
 	}
 	return s
 }
@@ -455,11 +482,16 @@ func (n RulesNotAllowed) Text() string {
 }
 
 // MountCheckFailed tells the session serving the daemon that the check of
-// the mounts of the container the daemon attached to failed, so the daemon
-// refuses every command until a later check passes: Error says why, in
-// host terms (it may name host paths).
+// the mounts of the container the daemon attached to failed: Error says
+// why, in host terms (it may name host paths). Rule is empty for a failure
+// that makes the daemon refuse every command until a later check passes;
+// for a failed mount requirement of a rule, or mount requirements the
+// daemon cannot check, it is that rule's command, and the daemon refuses
+// only the commands of that rule until a later check of them passes, Error
+// then not naming the rule. A session that predates Rule ignores it.
 type MountCheckFailed struct {
 	Error string `json:"error"`
+	Rule  string `json:"rule,omitempty"`
 }
 
 // ServedRefusal is the message of the error a daemon refuses Serve with
@@ -497,7 +529,9 @@ type Hello struct {
 // it not, and a session then gets no run output.
 // MountCheckFailed is why the check of the armed container's mounts
 // failed, when it has, as the session says Hello: the daemon refuses
-// every command until a later check passes (see FrameMountCheckFailed); a
+// every command until a later check passes (see FrameMountCheckFailed);
+// a failed mount requirement of one rule, which refuses only that rule's
+// commands, is told with FrameMountCheckFailed alone, never here; a
 // daemon older than the field, or one that does not check, reports none,
 // and an older session ignores it.
 // Settings are the daemon settings the daemon runs with that the allow
