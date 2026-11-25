@@ -86,6 +86,7 @@ startup_timeout: 1h
 grace: 1m30s
 reread: false
 poll_interval: 5s
+stopped_inspection_max_age: 7s
 ask_timeout: 20m
 request_timeout: 30s
 ready_timeout: 1m
@@ -103,6 +104,7 @@ mount_check: false
 		ReadyTimeout:   time.Minute,
 		Process:        settings.ProcessShared,
 	}
+	want.StoppedInspectionMaxAge = 7 * time.Second
 	if err != nil || got.Settings != want {
 		t.Fatalf("got %+v, %v; want %+v", got, err, want)
 	}

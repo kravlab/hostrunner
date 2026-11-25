@@ -35,6 +35,20 @@ container must not tamper with the daemon's files), which matches the
 client's default socket path. The array form of `initializeCommand` runs
 without a shell, so paths with spaces survive.
 
+The [example](../../examples/devcontainer/.devcontainer/devcontainer.json)
+also mounts `.git` onto itself and `.git/config` and `.git/hooks`
+read-only inside it, the mounts its git rules require (`mounts:`, see
+[ADR 0011](../adr/0011-mount-requirements-on-the-live-mount-table.md)).
+A read-only bind mount of a file does not survive the host replacing the
+file: host git writes `.git/config.lock` and renames it over
+`.git/config`, which removes the container's mount of it at once, and the
+container can then write the file through the `.git` mount. The
+per-request mount check sees that in the container's live mount table and
+refuses git from then on; the example's rules therefore give the
+container no way to make host git rewrite its config (no
+`git push -u`/`--set-upstream`, `-c push.autoSetupRemote=false`
+injected).
+
 ## `hostrunner up --dir <dir> --workspace <host> --container-workspace <path>`
 
 Synchronous, fast, idempotent (it runs on every `devcontainer up`):

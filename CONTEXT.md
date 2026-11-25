@@ -235,11 +235,28 @@ file, its digest and the daemon settings but `process`, for
 _Avoid_: approval request (one command waiting for a human's answer)
 
 **Mount check**:
-The daemon's check that its armed container cannot write the files that
-configure the workspace's devcontainer and daemon, through a bind mount
-or a volume that binds a host directory. A human on the host
-may turn it off for a workspace (`mount_check`); the container cannot.
+The daemon's check, on attach and again before each request, that its
+armed container cannot write the files that configure the workspace's
+devcontainer and daemon, through a bind mount or a volume that binds a
+host directory, and that it meets the mount requirements of the rules
+that start the request. A human on the host may turn it off for a
+workspace (`mount_check`); the container cannot.
 _Avoid_: read-only check, writable warning
+
+**Live mount table**:
+The mount table of an armed container's init process as the kernel shows
+it now (`/proc/<pid>/mountinfo` on the host): which of the mounts
+`inspect` reports are still mounted in the container, and whether each is
+read-only.
+_Avoid_: mount snapshot, inspected mounts
+
+**Mount requirement**:
+A path in the workspace that a rule requires every armed container to
+have as a mount point of its own (`mounted`) or to be unable to write
+(`read-only`) before a request for a command that starts with the rule's
+command runs, a longer rule's included. It says the devcontainer's
+protection is in place, not that the rule's tool is safe.
+_Avoid_: mount-check profile, required mount, protected path
 
 ### Approvals
 
@@ -300,7 +317,7 @@ let through. Runs the rules allow are not approved runs.
 What the daemon tells an approval session of its own accord, not
 as the outcome of what the human typed: an approved run's start
 line or summary, a reread of the rules, rules or daemon settings
-changed but not allowed.
+changed but not allowed, a mount check that starts failing.
 _Avoid_: message, event
 
 **Approval socket**:

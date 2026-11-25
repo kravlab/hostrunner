@@ -205,3 +205,27 @@ func TestNoticesHeldArePrintedWhenTheSessionStopsServing(t *testing.T) {
 
 // idlePromptText is the idle prompt.
 const idlePromptText = "> "
+
+// A failed mount check is noticed as refusing the commands of its rule
+// when the frame names one (a failed mount requirement), and as refusing
+// every command otherwise.
+func TestMountCheckFailedNoticeNamesTheRuleRefused(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		sent protocol.MountCheckFailed
+		want string
+	}{
+		{"a rule", protocol.MountCheckFailed{Error: "c: .git is not a mount of its own", Rule: "git status"},
+			"the mount check failed, so the daemon refuses the commands of rule \"git status\": c: .git is not a mount of its own\n"},
+		{"no rule", protocol.MountCheckFailed{Error: "c can write /w/.devcontainer"},
+			"the mount check failed, so the daemon refuses every command: c can write /w/.devcontainer\n"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s, conn := startRunsFake(t)
+			sendFrame(t, conn, protocol.FrameWithdrawn, protocol.Withdrawn{ID: 1, Reason: protocol.WithdrawnByClient})
+			s.waitFor(t, "request 1 withdrawn\n"+idlePromptText)
+			sendFrame(t, conn, protocol.FrameMountCheckFailed, tt.sent)
+			s.waitFor(t, tt.want)
+		})
+	}
+}

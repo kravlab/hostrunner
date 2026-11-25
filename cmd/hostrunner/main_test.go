@@ -175,6 +175,33 @@ func TestParseServeAcceptsWatchSettings(t *testing.T) {
 	}
 }
 
+// The watcher of a serve --watch is configured with the workspace and the
+// settings that tune it, among them the age at which the check of a
+// request inspects a stopped armed container again.
+func TestWatcherConfigTakesTheWatchSettingsOfTheServeConfig(t *testing.T) {
+	cfg := serveConfig{Settings: settings.Settings{
+		StartupTimeout: time.Hour, Grace: time.Minute, PollInterval: 2 * time.Second,
+		StoppedInspectionMaxAge: 7 * time.Second,
+	}}
+	cfg.workspace = "/w"
+	got := watcherConfig(cfg)
+	for _, tt := range []struct {
+		name      string
+		got, want any
+	}{
+		{"Workspace", got.Workspace, "/w"},
+		{"PollInterval", got.PollInterval, 2 * time.Second},
+		{"StoppedInspectionMaxAge", got.StoppedInspectionMaxAge, 7 * time.Second},
+		{"QueryTimeout", got.QueryTimeout, queryTimeout},
+		{"StartupTimeout", got.StartupTimeout, time.Hour},
+		{"Grace", got.Grace, time.Minute},
+	} {
+		if tt.got != tt.want {
+			t.Errorf("%s: got %v, want %v", tt.name, tt.got, tt.want)
+		}
+	}
+}
+
 func TestParseServeRequiresEveryFlag(t *testing.T) {
 	full := map[string]string{"--socket": "/run/h.sock", "--workspace": "/home/u/app", "--container-workspace": "/workspaces/app"}
 	for missing := range full {
@@ -468,10 +495,11 @@ func TestServeGivenEverySettingReadsNoOtherSource(t *testing.T) {
 		t.Errorf("read %s", name)
 		return ""
 	}
-	flags := []string{"--settings", settingsFile(t, "grase: [\n"), "--workspace-settings", settingsFile(t, "grase: [\n"), "--rules-file", "/r.yaml", "--startup-timeout", "1h", "--grace", "1m", "--reread", "--poll-interval", "1s", "--ask-timeout", "1m", "--request-timeout", "1s", "--mount-check", "--process", string(settingstest.GivenProcess)}
+	flags := []string{"--settings", settingsFile(t, "grase: [\n"), "--workspace-settings", settingsFile(t, "grase: [\n"), "--rules-file", "/r.yaml", "--startup-timeout", "1h", "--grace", "1m", "--reread", "--poll-interval", "1s", "--stopped-inspection-max-age", "3s", "--ask-timeout", "1m", "--request-timeout", "1s", "--mount-check", "--process", string(settingstest.GivenProcess)}
 	got, err := resolveServe(flags, getenv)
 	want := tuned("/r.yaml", time.Hour, time.Minute, true)
 	want.PollInterval, want.AskTimeout, want.RequestTimeout = time.Second, time.Minute, time.Second
+	want.StoppedInspectionMaxAge = 3 * time.Second
 	want.Process = settingstest.GivenProcess
 	if err != nil || got != want {
 		t.Fatalf("got %+v, %v; want %+v", got, err, want)
@@ -637,7 +665,7 @@ func TestUpGivenEverySettingStillReadsEverySource(t *testing.T) {
 // The usages name the settings' flags.
 func TestUsagesNameTheSettingsFlags(t *testing.T) {
 	for name, u := range map[string]string{"up": upUsage, "serve": serveUsage} {
-		for _, f := range []string{"[--settings <path>]", "[--workspace-settings <path>]", "[--startup-timeout <duration>]", "[--grace <duration>]", "[--reread | --no-reread]", "[--poll-interval <duration>]", "[--ask-timeout <duration>]", "[--request-timeout <duration>]"} {
+		for _, f := range []string{"[--settings <path>]", "[--workspace-settings <path>]", "[--startup-timeout <duration>]", "[--grace <duration>]", "[--reread | --no-reread]", "[--poll-interval <duration>]", "[--stopped-inspection-max-age <duration>]", "[--ask-timeout <duration>]", "[--request-timeout <duration>]"} {
 			if !strings.Contains(u, f) {
 				t.Errorf("%s usage %q lacks %s", name, u, f)
 			}

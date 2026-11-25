@@ -31,12 +31,18 @@ rules:
   - command: git push          # argv prefix, split on whitespace; required
     args: any | none           # exclusive with flags/positional
     flags:
-      allow: [-u, --tags]      # or deny: [...], never both
+      allow: [--tags]          # or deny: [...], never both
       values:                  # flags that take a value; value filter:
         -o: { allow: [ci.skip] }   # allow or deny list of globs
         --only: {}                 # any value
     positional:
       deny: ["+*"]             # or allow: [...], never both
+  - command: git commit
+    args: any
+    mounts:                    # paths below the workspace root the
+      .git: mounted            # container has to mount: a mount point of
+      .git/config: read-only   # its own, or not writable
+      .git/hooks: read-only
 ```
 
 Validation errors: empty or duplicate `command`; `args` other than
@@ -44,6 +50,43 @@ Validation errors: empty or duplicate `command`; `args` other than
 with `deny` (in `flags`, `positional`, or a value filter); a flag name in
 `allow`/`deny`/`values` that does not start with `-`; empty rule
 (`command` only) ★ — it must say `args: any` explicitly.
+
+`mounts` is a map from a path relative to the workspace root to a mode,
+`mounted` or `read-only`, or a YAML alias (`mounts: *name`) of the map
+another rule anchors (`mounts: &name`), so rules can share one block (an
+alias is validated as the map it refers to); it combines with any
+`args`, `flags` and `positional` (it restricts no argument), and
+`mounts: {}` means none.
+`mounted` holds in a container when, for every mount of it that reaches
+the path (a mount of the workspace root, of a parent of it or of a
+directory between the root and the path, unless a deeper mount of the
+same container covers the container path it is reached at), the live
+mount table has a mount point of its own at the container path the path
+is reached at; a container with no mount that reaches the path passes.
+Further validation errors, each with the YAML line of the entry: `mounts`
+not a mapping, null (`mounts:` with no value) included; a path that is not a string, is absolute, has a `..`
+component, is not clean (`.git/`, `./.git`, `a//b`, `.` and the empty
+path included) or is given twice; a mode that is not the string `mounted`
+or `read-only`.
+
+The mounts are the requirements of every rule whose `command` is a
+prefix of the request's argv, whether the rules allow or refuse it: a
+longer rule inherits the requirements of the shorter ones (a `git` rule's
+`mounts` also bind `git commit amend` when a longer `git commit amend`
+rule selects it), and an argv no rule starts has only the protected paths
+of the mount check. A path two rules name with different modes must meet
+both. `Allowed.Mounts` (and the `Approved` of a `Denial`) hold this union
+sorted by path, then mode, each requirement naming the rule that declares
+it (`MountRequirement.Rule`). A failed requirement refuses the commands of
+the rule that declares it, and its refusal, log line and notice name that
+rule. Checking them against the armed containers, the
+refusal (126, not approvable), the approval session notice and the
+`, requires mounts: …` part of the dry run and `hostrunner test` answer
+(each requirement with its rule when that is not the selecting rule)
+belong to the daemon: see the README (Mount check) and
+[ADR 0011](../adr/0011-mount-requirements-on-the-live-mount-table.md).
+`mounts` is part of the rules file, so its digest, allow and reread
+cover it.
 
 ## Matching
 
@@ -202,6 +245,8 @@ name container paths anyway, so only relative symlinks are followed.
 
 ## Out of scope
 
-Raw-command input, mount-check profiles.
+Raw-command input. A separate file of mount-check profiles: mount
+requirements live in the rules file (`mounts`, see
+[ADR 0011](../adr/0011-mount-requirements-on-the-live-mount-table.md)).
 
 Rereading the rules file once it changes: [rules-reread.md](rules-reread.md).

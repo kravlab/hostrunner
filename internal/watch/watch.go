@@ -16,7 +16,9 @@ import (
 	"log/slog"
 	"maps"
 	"os/exec"
+	"path"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -31,14 +33,43 @@ var (
 	ErrRuntimeUnavailable = errors.New("no container runtime answered within the startup timeout")
 )
 
+// ErrNotAttached is why Live has no armed containers to read: the watcher
+// has not attached since the last arm.
+var ErrNotAttached = errors.New("not attached to the armed container since the last arm")
+
 // Container is what a runtime reports about one container of the
 // workspace.
 type Container struct {
-	ID        string
-	Running   bool
+	ID      string
+	Running bool
+	// Pid is the host process ID of the container's init process as the
+	// runtime reports it; 0 when it does not run, and while it restarts.
+	Pid       int
 	StartedAt time.Time // last start; zero if never started
 	Mounts    []Mount   // meaningful only if MountsErr is nil
 	MountsErr error     // why the mounts could not be read; nil when they were
+	// Live is the live mount table of the container's init process, read
+	// when the container runs (Runtime.MountTable); nil when it was not
+	// read, as for a container that does not run.
+	Live *LiveMounts
+}
+
+// Runs reports whether c runs, as the inspection that reported it found it,
+// with an init process the daemon can read: Running, and Pid > 0. A
+// container the runtime reports Running with Pid 0 is restarting: it does
+// not run in this sense, yet it is not stopped (see Live).
+func (c Container) Runs() bool { return c.Running && c.Pid > 0 }
+
+// LiveMounts is the live mount table of a container's init process, as the
+// host kernel holds it, which the runtime's inspection of the container may
+// no longer match: a mount can be unmounted, mounted over or remounted
+// after the container started.
+type LiveMounts struct {
+	// Points is the table in mountinfo order: a later point at the same
+	// Path is mounted over an earlier one. Meaningful only if Err is nil.
+	Points []MountPoint
+	// Err is why the table could not be read; nil when it was.
+	Err error
 }
 
 // The Mount.Type of a volume mount, the Volume.Driver of the runtime's
@@ -69,6 +100,10 @@ type Mount struct {
 	VolumeErr error
 }
 
+// PointPath returns the mount point in the container a live mount table lists
+// the mount at: its cleaned Destination.
+func (m Mount) PointPath() string { return path.Clean(m.Destination) }
+
 // Volume is a volume as its runtime's inspection reports it: its driver
 // (DriverLocal for the runtime's own) and the options it was created with,
 // such as a local volume's type, o and device (VolumeOptionDevice); nil
@@ -83,26 +118,36 @@ type Volume struct {
 // still seen. An error means the runtime did not answer.
 type Runtime interface {
 	Containers(ctx context.Context, workspace string) ([]Container, error)
+	// MountTable returns the live mount table of the process pid, in the
+	// order of mountinfo: a later entry is mounted over an earlier one at
+	// the same point. The error wraps ErrProcessGone when the process does
+	// not exist (any more).
+	MountTable(ctx context.Context, pid int) ([]MountPoint, error)
 }
 
 // Config tunes a Watcher.
 type Config struct {
-	Workspace      string        // host workspace folder (the label value)
-	PollInterval   time.Duration // how often runtimes are asked
-	QueryTimeout   time.Duration // how long one runtime query may take
-	StartupTimeout time.Duration // how long to wait for the armed container (covers image builds)
-	Grace          time.Duration // how long the armed container must be seen absent
+	Workspace    string        // host workspace folder (the label value)
+	PollInterval time.Duration // how often runtimes are queried
+	// StoppedInspectionMaxAge is how old an inspection that found an armed
+	// container stopped may be before Live inspects it again; zero means
+	// PollInterval.
+	StoppedInspectionMaxAge time.Duration
+	QueryTimeout            time.Duration // how long one runtime query may take
+	StartupTimeout          time.Duration // how long to wait for the armed container (covers image builds)
+	Grace                   time.Duration // how long the armed container must be seen absent
 
 	// Attached, when set, is called on each attach to an armed container,
 	// and again whenever a container that started after the arm joins an
-	// attached arm (e.g. one a Compose devcontainer recreated), so its
-	// mounts are seen too. It gets all armed containers, the new one
-	// included, as the runtimes reported them in the poll that changed the
-	// armed set, mounts included; Run calls it before it polls again.
-	// Polls that bring no new armed container do not call it. The
-	// containers are copies the callback may keep. armedAt is the time of
-	// the arm it attached for (see Armed): a call may come after a later
-	// arm, from a poll that was under way when it came.
+	// attached arm (e.g. one a Compose devcontainer recreated), so its mounts
+	// are seen too. It gets all armed containers, the new one included, as
+	// the runtimes reported them in the poll that changed the armed set,
+	// mounts included, each that runs with its live mount table (Live) read
+	// then; Run calls it before it polls again. Polls that bring no new armed
+	// container do not call it; they update the armed containers Live reads
+	// instead. The containers are copies the callback may keep. armedAt is
+	// the time of the arm it attached for (see Armed): a call may come after
+	// a later arm, from a poll that was under way when it came.
 	Attached func(armedAt time.Time, armed []Container)
 
 	// Armed, when set, is called by each Arm that the watcher follows, with
@@ -138,6 +183,19 @@ type Watcher struct {
 	armedAt time.Time // time of the last arm
 	ended   error     // why the watch ended; nil while it runs
 	stopped bool      // see ContainerStopped
+	// latest is the armed containers of the latest arm's latest attach,
+	// which Live reads; nil until the latest arm has attached. Each attach
+	// replaces it with a new one, so a Live call can tell whether the one
+	// it read is still the latest; Run's later polls and Live calls update
+	// its entries.
+	latest *attachment
+}
+
+// attachment is the armed containers of one attach, each with the
+// runtime that reported it, as the newest inspection of it reported it: the
+// attach's, a later poll's (see takePoll) or a Live call's.
+type attachment struct {
+	armed []tracked
 }
 
 // ContainerStopped reports whether the watcher is attached and the last
@@ -201,6 +259,7 @@ func (w *Watcher) arm() (time.Time, error) {
 	}
 	w.armedAt = time.Now()
 	w.stopped = false // waiting from the arm on
+	w.latest = nil    // the arm has not attached yet
 	select {
 	case w.armSignal <- struct{}{}:
 	default: // an arm is already pending; it reads the latest time
@@ -271,18 +330,23 @@ func (w *Watcher) Run(ctx context.Context) error {
 	)
 	for {
 		now := time.Now()
-		containers, answered := w.query(ctx)
-		if answered {
+		inspected := w.query(ctx)
+		if inspected.answered {
 			lastAnswer = now
-			if justAttached, changed := arm.observe(containers, now, w.cfg.Grace); changed {
+			if justAttached, changed := arm.observe(inspected.containers, now, w.cfg.Grace); changed {
 				if justAttached {
 					w.log.Info("attached to the armed container", "workspace", w.cfg.Workspace)
 				} else {
 					w.log.Info("a container joined the armed containers", "workspace", w.cfg.Workspace)
 				}
+				armed := arm.armed(inspected)
+				w.readAttached(ctx, armed)
+				w.setAttachment(arm.at, armed)
 				if w.cfg.Attached != nil {
-					w.cfg.Attached(arm.at, arm.armed(containers))
+					w.cfg.Attached(arm.at, containersOf(armed))
 				}
+			} else if arm.attached() {
+				w.takePoll(arm.at, inspected)
 			}
 			w.setStopped(arm.at, arm.attached() && !arm.absentSince.IsZero())
 		} else {
@@ -317,6 +381,73 @@ func (w *Watcher) Run(ctx context.Context) error {
 		case <-w.armSignal:
 			arm = w.waitFor(w.lastArm())
 		case <-ticker.C:
+		}
+	}
+}
+
+// setAttachment makes copies of armed, the armed containers of an attach
+// for the arm at armedAt, what Live reads; an attach for an arm before the
+// latest, from a poll in flight during an arm, is dropped.
+func (w *Watcher) setAttachment(armedAt time.Time, armed []tracked) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if armedAt.Equal(w.armedAt) {
+		w.latest = &attachment{armed: copyTracked(armed)}
+	}
+}
+
+// takePoll makes the reports in inspected, a poll for the arm at armedAt
+// that changed no armed set, about the armed containers of the latest attach
+// what Live reads, so that Live follows the runtimes without inspecting them
+// itself (see readRequested). A container that inspected does not report
+// any more keeps its data, as inspected at inspected.at. An entry that
+// holds a newer inspection, a Live call's that started after the poll, is
+// kept as it is; a poll for an arm before the latest, in flight during an
+// arm, changes nothing.
+func (w *Watcher) takePoll(armedAt time.Time, inspected inspection) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !armedAt.Equal(w.armedAt) || w.latest == nil {
+		return
+	}
+	for i := range w.latest.armed {
+		t := &w.latest.armed[i]
+		if t.inspectedAt.After(inspected.at) {
+			continue
+		}
+		if j := inspected.index(t.ID); j >= 0 {
+			*t = inspected.tracked(j)
+		} else {
+			t.inspectedAt = inspected.at
+		}
+	}
+}
+
+// copyTracked returns copies of ts that share nothing with them but their
+// runtimes.
+func copyTracked(ts []tracked) []tracked {
+	out := make([]tracked, 0, len(ts))
+	for _, t := range ts {
+		out = append(out, t.copy())
+	}
+	return out
+}
+
+// updateAttachment makes copies of armed, read again since Live copied them
+// from a, the containers of a, so that the next Live call reads the
+// processes they name now. Each replaces its entry only if that entry holds
+// no newer inspection: a concurrent Live call or poll that inspected later
+// and wrote first keeps what it found. a no longer the latest, as after an
+// arm or another attach meanwhile, is left as it is.
+func (w *Watcher) updateAttachment(a *attachment, armed []tracked) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.latest != a {
+		return
+	}
+	for i, t := range armed {
+		if !a.armed[i].inspectedAt.After(t.inspectedAt) {
+			a.armed[i] = t.copy()
 		}
 	}
 }
@@ -369,24 +500,104 @@ func (a *arming) observe(containers []Container, now time.Time, grace time.Durat
 	return justAttached, changed
 }
 
-// armed returns copies of the armed containers among containers, in their
-// order, their mounts' volumes copied too.
-func (a *arming) armed(containers []Container) []Container {
-	var out []Container
-	for _, c := range containers {
+// armed returns copies of the armed containers among those in inspected,
+// in their order, each with the runtime that reported it.
+func (a *arming) armed(inspected inspection) []tracked {
+	var out []tracked
+	for i, c := range inspected.containers {
 		if a.ids[c.ID] {
-			c.Mounts = slices.Clone(c.Mounts)
-			for i, m := range c.Mounts {
-				if m.Volume != nil {
-					v := *m.Volume
-					v.Options = maps.Clone(v.Options)
-					c.Mounts[i].Volume = &v
-				}
-			}
-			out = append(out, c)
+			out = append(out, inspected.tracked(i))
 		}
 	}
 	return out
+}
+
+// copyContainer returns a copy of c that shares nothing with it: its
+// mounts, their volumes and its live mount points are copied too.
+func copyContainer(c Container) Container {
+	c.Mounts = slices.Clone(c.Mounts)
+	for i, m := range c.Mounts {
+		if m.Volume != nil {
+			v := *m.Volume
+			v.Options = maps.Clone(v.Options)
+			c.Mounts[i].Volume = &v
+		}
+	}
+	if c.Live != nil {
+		l := *c.Live
+		l.Points = slices.Clone(l.Points)
+		c.Live = &l
+	}
+	return c
+}
+
+// tracked is a container together with the runtime that reported it, the
+// one that can read its live mount table, and when the inspection that
+// reported it started.
+type tracked struct {
+	Container
+	rt          Runtime
+	inspectedAt time.Time
+}
+
+// copy returns a copy of t that shares nothing with it but its runtime.
+func (t tracked) copy() tracked {
+	t.Container = copyContainer(t.Container)
+	return t
+}
+
+// containersOf returns the containers of ts, in their order.
+func containersOf(ts []tracked) []Container {
+	out := make([]Container, 0, len(ts))
+	for _, t := range ts {
+		out = append(out, t.Container)
+	}
+	return out
+}
+
+// refresh inspects every runtime once more and, for each of armed at the
+// indexes stale, takes the container as its runtime reports it now, with
+// that runtime and the inspection's time, and its live mount table read
+// once more if it runs (any failure is its Live.Err, a process gone again
+// included). One that runs without a process ID (Running, Pid 0) gets
+// ErrNoProcessID as its Live.Err if noProcessID is set, and no Live
+// otherwise. One that does not run gets no Live; one no runtime reports any
+// more keeps its data, inspected at the inspection's time, and gets no Live
+// either. If no runtime answers, each keeps its data and gets why as its
+// Live.Err.
+func (w *Watcher) refresh(ctx context.Context, armed []tracked, stale []int, noProcessID bool) {
+	inspected := merge(time.Now(), w.pollRuntimes(ctx))
+	for _, i := range stale {
+		if !inspected.answered {
+			armed[i].Live = &LiveMounts{Err: inspected.err}
+			continue
+		}
+		armed[i].Live = nil
+		j := inspected.index(armed[i].ID)
+		if j < 0 {
+			armed[i].inspectedAt = inspected.at
+			continue
+		}
+		armed[i] = inspected.tracked(j)
+		switch {
+		case armed[i].Runs():
+			armed[i].Live = w.mountTable(ctx, armed[i])
+		case noProcessID && armed[i].Running:
+			armed[i].Live = &LiveMounts{Err: ErrNoProcessID}
+		}
+	}
+}
+
+// mountTable reads the live mount table of t's process through t's
+// runtime, within QueryTimeout.
+func (w *Watcher) mountTable(ctx context.Context, t tracked) *LiveMounts {
+	qctx, cancel := context.WithTimeout(ctx, w.cfg.QueryTimeout)
+	defer cancel()
+	points, err := t.rt.MountTable(qctx, t.Pid)
+	if err != nil {
+		return &LiveMounts{Err: err}
+	}
+	return &LiveMounts{Points: points}
 }
 
 // findArmed returns the IDs of the armed container among containers, or
@@ -417,28 +628,98 @@ func findArmed(containers []Container, armedAt, now time.Time, grace time.Durati
 	return armed
 }
 
-// query asks every runtime, each within QueryTimeout, and merges the
-// containers of those that answered. A failing runtime is logged when it
-// starts and stops failing, not on every poll.
-func (w *Watcher) query(ctx context.Context) (containers []Container, answered bool) {
+// inspection is what one query of every runtime found: the containers of
+// those that answered, merged in the order of the runtimes.
+type inspection struct {
+	containers []Container
+	runtimes   []Runtime // runtimes[i] reported containers[i]
+	answered   bool      // whether any runtime answered
+	err        error     // why none answered; nil when one did
+	at         time.Time // when the query started
+}
+
+// index returns the index of the container id among the containers of in,
+// or -1 if in holds none with that id.
+func (in inspection) index(id string) int {
+	return slices.IndexFunc(in.containers, func(c Container) bool { return c.ID == id })
+}
+
+// tracked returns a copy of the container of in at i, with the runtime
+// that reported it and the time the query of in started.
+func (in inspection) tracked(i int) tracked {
+	return tracked{Container: copyContainer(in.containers[i]), rt: in.runtimes[i], inspectedAt: in.at}
+}
+
+// runtimeAnswer is one runtime's answer to a query: its containers, or why
+// it did not answer.
+type runtimeAnswer struct {
+	rt         Runtime     // the runtime queried
+	containers []Container // the workspace's containers it reported; nil when err is set
+	err        error       // why it did not answer; nil when it did
+}
+
+// pollRuntimes queries every runtime, each within QueryTimeout, and returns
+// their answers in the order of the runtimes. It keeps no state, so it is
+// safe for concurrent use.
+func (w *Watcher) pollRuntimes(ctx context.Context) []runtimeAnswer {
+	answers := make([]runtimeAnswer, 0, len(w.runtimes))
 	for _, rt := range w.runtimes {
 		qctx, cancel := context.WithTimeout(ctx, w.cfg.QueryTimeout)
 		found, err := rt.Containers(qctx, w.cfg.Workspace)
 		cancel()
-		if err != nil {
-			if !w.failing[rt] && ctx.Err() == nil {
-				w.log.Warn("container runtime query failed", "runtime", rt, "error", err)
-				w.failing[rt] = true
+		answers = append(answers, runtimeAnswer{rt: rt, containers: found, err: err})
+	}
+	return answers
+}
+
+// merge merges the containers of the answers that came, each with the
+// runtime that reported it, of a query that started at at.
+func merge(at time.Time, answers []runtimeAnswer) inspection {
+	var (
+		inspected = inspection{at: at}
+		errs      []error
+	)
+	for _, a := range answers {
+		if a.err != nil {
+			errs = append(errs, a.err)
+			continue
+		}
+		inspected.containers = append(inspected.containers, a.containers...)
+		for range a.containers {
+			inspected.runtimes = append(inspected.runtimes, a.rt)
+		}
+		inspected.answered = true
+	}
+	switch {
+	case inspected.answered:
+	case len(errs) == 0:
+		inspected.err = errors.New("no container runtime to ask")
+	default:
+		inspected.err = fmt.Errorf("no container runtime answered: %w", errors.Join(errs...))
+	}
+	return inspected
+}
+
+// query is pollRuntimes and merge for Run's polls. A failing runtime is
+// logged when it starts and stops failing, not on every poll; w.failing
+// makes it Run's goroutine's own.
+func (w *Watcher) query(ctx context.Context) inspection {
+	at := time.Now()
+	answers := w.pollRuntimes(ctx)
+	for _, a := range answers {
+		if a.err != nil {
+			if !w.failing[a.rt] && ctx.Err() == nil {
+				w.log.Warn("container runtime query failed", "runtime", a.rt, "error", a.err)
+				w.failing[a.rt] = true
 			}
 			continue
 		}
-		if w.failing[rt] {
-			w.log.Info("container runtime answers again", "runtime", rt)
-			w.failing[rt] = false
+		if w.failing[a.rt] {
+			w.log.Info("container runtime answers again", "runtime", a.rt)
+			w.failing[a.rt] = false
 		}
-		containers, answered = append(containers, found...), true
 	}
-	return containers, answered
+	return merge(at, answers)
 }
 
 // Environment is the environment a runtime's command line runs in, as a
@@ -473,7 +754,7 @@ func (c CLI) Containers(ctx context.Context, workspace string) ([]Container, err
 	}
 	// json renders docker's string and podman's time.Time alike, as RFC 3339.
 	args := append([]string{"inspect", "--type", "container", "--format",
-		"{{.Id}} {{.State.Running}} {{json .State.StartedAt}} {{json .Mounts}}"}, ids...)
+		"{{.Id}} {{.State.Running}} {{.State.Pid}} {{json .State.StartedAt}} {{json .Mounts}}"}, ids...)
 	out, stderr, err := c.run(ctx, args...)
 	// A container removed since the listing fails the inspection but not
 	// the others: it is absent. Any other failure is the runtime's.
@@ -483,17 +764,21 @@ func (c CLI) Containers(ctx context.Context, workspace string) ([]Container, err
 	var found []Container
 	for line := range strings.Lines(out) {
 		// The mounts are JSON and may hold spaces, so they are the rest of the line.
-		fields := strings.SplitN(strings.TrimRight(line, "\r\n"), " ", 4)
-		if len(fields) < 3 {
+		fields := strings.SplitN(strings.TrimRight(line, "\r\n"), " ", 5)
+		if len(fields) < 4 {
 			return nil, fmt.Errorf("%s inspect: unexpected line %q", c.Binary, line)
 		}
-		started, perr := parseStartedAt(fields[2])
+		pid, perr := strconv.Atoi(fields[2])
+		if perr != nil {
+			return nil, fmt.Errorf("%s inspect: pid %s: %w", c.Binary, fields[2], perr)
+		}
+		started, perr := parseStartedAt(fields[3])
 		if perr != nil {
 			return nil, fmt.Errorf("%s inspect: %w", c.Binary, perr)
 		}
-		container := Container{ID: fields[0], Running: fields[1] == "true", StartedAt: started}
-		if len(fields) == 4 {
-			container.Mounts, container.MountsErr = parseMounts(fields[3])
+		container := Container{ID: fields[0], Running: fields[1] == "true", Pid: pid, StartedAt: started}
+		if len(fields) == 5 {
+			container.Mounts, container.MountsErr = parseMounts(fields[4])
 		} else {
 			container.MountsErr = errors.New("no mounts reported")
 		}

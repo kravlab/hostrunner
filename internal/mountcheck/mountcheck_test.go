@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/kravlab/hostrunner/internal/mountcheck"
+	"github.com/kravlab/hostrunner/internal/rules"
 	"github.com/kravlab/hostrunner/internal/watch"
 )
 
@@ -98,7 +99,7 @@ func TestCheckPassesWhenProtectedPathsAreShadowedReadOnly(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := mountcheck.Check([]watch.Container{container("c1", tt.mounts...)}, []string{tr.dc, tr.dcRules})
+			err := mountcheck.Read([]watch.Container{container("c1", tt.mounts...)}).Check([]string{tr.dc, tr.dcRules})
 			if err != nil {
 				t.Fatalf("Check = %v, want nil", err)
 			}
@@ -108,7 +109,7 @@ func TestCheckPassesWhenProtectedPathsAreShadowedReadOnly(t *testing.T) {
 
 func TestCheckFailsWritableWorkspace(t *testing.T) {
 	tr := newTree(t)
-	err := mountcheck.Check([]watch.Container{container("c1", rw(tr.ws, "/workspaces/ws"))}, []string{tr.dc})
+	err := mountcheck.Read([]watch.Container{container("c1", rw(tr.ws, "/workspaces/ws"))}).Check([]string{tr.dc})
 	wantWritable(t, err, mountcheck.WritableError{
 		Container: "c1", Path: tr.dc, Source: tr.ws, ContainerPath: "/workspaces/ws/.devcontainer",
 	})
@@ -127,7 +128,7 @@ func TestCheckFailsWritableAncestor(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := mountcheck.Check([]watch.Container{container("c1", tt.mount)}, []string{tr.dc})
+			err := mountcheck.Read([]watch.Container{container("c1", tt.mount)}).Check([]string{tr.dc})
 			wantWritable(t, err, mountcheck.WritableError{
 				Container: "c1", Path: tr.dc, Source: tt.mount.Source, ContainerPath: tt.containerPath,
 			})
@@ -159,7 +160,7 @@ func TestCheckFailsWritableMountInsideProtectedPath(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := mountcheck.Check([]watch.Container{container("c1", tt.mounts...)}, []string{tr.dc})
+			err := mountcheck.Read([]watch.Container{container("c1", tt.mounts...)}).Check([]string{tr.dc})
 			wantWritable(t, err, mountcheck.WritableError{
 				Container: "c1", Path: tr.dc, Source: tt.source, ContainerPath: tt.dest,
 			})
@@ -171,20 +172,20 @@ func TestCheckRulesFileOutsideDevcontainer(t *testing.T) {
 	tr := newTree(t)
 	paths := []string{tr.dc, tr.rules}
 
-	err := mountcheck.Check([]watch.Container{container("c1",
+	err := mountcheck.Read([]watch.Container{container("c1",
 		ro(tr.ws, "/workspaces/ws"),
 		rw(tr.rules, "/etc/hostrunner/rules.yaml"),
-	)}, paths)
+	)}).Check(paths)
 	wantWritable(t, err, mountcheck.WritableError{
 		Container: "c1", Path: tr.rules, Source: tr.rules, ContainerPath: "/etc/hostrunner/rules.yaml",
 	})
 
-	err = mountcheck.Check([]watch.Container{container("c1",
+	err = mountcheck.Read([]watch.Container{container("c1",
 		rw(tr.ws, "/workspaces/ws"),
 		ro(tr.dc, "/workspaces/ws/.devcontainer"),
 		ro(tr.base, "/hostbase"),
 		ro(tr.rules, "/etc/hostrunner/rules.yaml"),
-	)}, paths)
+	)}).Check(paths)
 	if err != nil {
 		t.Fatalf("rules file only read-only: Check = %v, want nil", err)
 	}
@@ -197,7 +198,8 @@ func TestCheckPrefixesAreComponentWise(t *testing.T) {
 		rw(tr.dc+"2", "/workspaces/dc2"),
 		rw(tr.rules+".bak", "/rules.bak"),
 	}
-	if err := mountcheck.Check([]watch.Container{container("c1", mounts...)}, []string{tr.dc, tr.rules}); err != nil {
+	if err := mountcheck.Read([]watch.Container{container("c1", mounts...)}).Check(
+		[]string{tr.dc, tr.rules}); err != nil {
 		t.Fatalf("Check = %v, want nil", err)
 	}
 }
@@ -210,23 +212,23 @@ func TestCheckFollowsSymlinks(t *testing.T) {
 	}
 
 	t.Run("mount source", func(t *testing.T) {
-		err := mountcheck.Check([]watch.Container{container("c1", rw(link, "/workspaces/ws"))}, []string{tr.dc})
+		err := mountcheck.Read([]watch.Container{container("c1", rw(link, "/workspaces/ws"))}).Check([]string{tr.dc})
 		wantWritable(t, err, mountcheck.WritableError{
 			Container: "c1", Path: tr.dc, Source: tr.ws, ContainerPath: "/workspaces/ws/.devcontainer",
 		})
 	})
 	t.Run("protected path", func(t *testing.T) {
-		err := mountcheck.Check([]watch.Container{container("c1", rw(tr.ws, "/workspaces/ws"))},
+		err := mountcheck.Read([]watch.Container{container("c1", rw(tr.ws, "/workspaces/ws"))}).Check(
 			[]string{filepath.Join(link, ".devcontainer")})
 		wantWritable(t, err, mountcheck.WritableError{
 			Container: "c1", Path: tr.dc, Source: tr.ws, ContainerPath: "/workspaces/ws/.devcontainer",
 		})
 	})
 	t.Run("protected path read-only through its link target", func(t *testing.T) {
-		err := mountcheck.Check([]watch.Container{container("c1",
+		err := mountcheck.Read([]watch.Container{container("c1",
 			rw(tr.ws, "/workspaces/ws"),
 			ro(tr.dc, "/workspaces/ws/.devcontainer"),
-		)}, []string{filepath.Join(link, ".devcontainer")})
+		)}).Check([]string{filepath.Join(link, ".devcontainer")})
 		if err != nil {
 			t.Fatalf("Check = %v, want nil", err)
 		}
@@ -248,10 +250,10 @@ func TestCheckFailsMissingFileUnderWritableDirectory(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := mountcheck.Check([]watch.Container{container("c1",
+			err := mountcheck.Read([]watch.Container{container("c1",
 				rw(tr.ws, "/workspaces/ws"),
 				ro(tr.dc, "/workspaces/ws/.devcontainer"),
-			)}, []string{tr.dc, tt.path})
+			)}).Check([]string{tr.dc, tt.path})
 			wantWritable(t, err, mountcheck.WritableError{
 				Container: "c1", Path: settings, Source: tr.ws, ContainerPath: "/workspaces/ws/.vscode/settings.json",
 			})
@@ -266,7 +268,7 @@ func TestCheckIgnoresMountsWithoutHostSource(t *testing.T) {
 		rw("", "/workspaces/ws/.devcontainer"),
 		rw("relative/ws", "/ws"),
 	}
-	if err := mountcheck.Check([]watch.Container{container("c1", mounts...)}, []string{tr.dc}); err != nil {
+	if err := mountcheck.Read([]watch.Container{container("c1", mounts...)}).Check([]string{tr.dc}); err != nil {
 		t.Fatalf("Check = %v, want nil", err)
 	}
 }
@@ -319,7 +321,8 @@ func TestCheckFailsAWritableVolumeOfAProtectedDevice(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			wantWritable(t, mountcheck.Check([]watch.Container{container("c1", tt.mounts...)}, []string{tr.dc}), tt.want)
+			wantWritable(t, mountcheck.Read([]watch.Container{container("c1", tt.mounts...)}).Check([]string{tr.dc}),
+				tt.want)
 		})
 	}
 }
@@ -334,7 +337,7 @@ func TestCheckPassesAVolumeOfAProtectedDeviceMountedReadOnly(t *testing.T) {
 		"read-only": {readOnly},
 		"shadowed":  {bindVolume("local", tr.ws, "/workspaces/ws"), ro(tr.dc, "/workspaces/ws/.devcontainer")},
 	} {
-		if err := mountcheck.Check([]watch.Container{container("c1", mounts...)}, []string{tr.dc}); err != nil {
+		if err := mountcheck.Read([]watch.Container{container("c1", mounts...)}).Check([]string{tr.dc}); err != nil {
 			t.Errorf("%s: Check = %v, want nil", name, err)
 		}
 	}
@@ -352,7 +355,7 @@ func TestCheckIgnoresVolumesWithoutAHostDevice(t *testing.T) {
 		"another driver":      {Driver: "example", Options: map[string]string{"size": "1G"}},
 	} {
 		m := watch.Mount{Type: "volume", Name: "v", Source: tr.ws, Destination: "/workspaces/ws", Volume: &v}
-		if err := mountcheck.Check([]watch.Container{container("c1", m)}, []string{tr.dc}); err != nil {
+		if err := mountcheck.Read([]watch.Container{container("c1", m)}).Check([]string{tr.dc}); err != nil {
 			t.Errorf("%s: Check = %v, want nil", name, err)
 		}
 	}
@@ -376,7 +379,7 @@ func TestCheckFailsVolumesItCannotTell(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			fine := container("c1", ro(tr.ws, "/workspaces/ws"))
-			err := mountcheck.Check([]watch.Container{fine, container("c2", tt.mount)}, []string{tr.dc})
+			err := mountcheck.Read([]watch.Container{fine, container("c2", tt.mount)}).Check([]string{tr.dc})
 			got, ok := errors.AsType[*mountcheck.UnreadableError](err)
 			if !ok {
 				t.Fatalf("Check = %v, want an *UnreadableError", err)
@@ -396,7 +399,8 @@ func TestCheckFailsVolumesItCannotTell(t *testing.T) {
 func TestCheckFailsOnAnUnresolvableDevice(t *testing.T) {
 	tr := newTree(t)
 	device := filepath.Join(tr.dcRules, "sub")
-	err := mountcheck.Check([]watch.Container{container("c1", bindVolume("local", device, "/data"))}, []string{tr.dc})
+	err := mountcheck.Read([]watch.Container{container("c1", bindVolume("local", device, "/data"))}).Check(
+		[]string{tr.dc})
 	wantUnresolvable(t, err, "c1", device, syscall.ENOTDIR)
 }
 
@@ -404,11 +408,11 @@ func TestCheckIgnoresVolumeMounts(t *testing.T) {
 	tr := newTree(t)
 	// The volume's source lies over the workspace, so a bind mount of it
 	// would be writable there; the volume is not looked at.
-	err := mountcheck.Check([]watch.Container{container("c1", volume(tr.ws, "/workspaces/ws"))}, []string{tr.dc})
+	err := mountcheck.Read([]watch.Container{container("c1", volume(tr.ws, "/workspaces/ws"))}).Check([]string{tr.dc})
 	if err != nil {
 		t.Fatalf("Check = %v, want nil", err)
 	}
-	err = mountcheck.Check([]watch.Container{container("c1", rw(tr.ws, "/workspaces/ws"))}, []string{tr.dc})
+	err = mountcheck.Read([]watch.Container{container("c1", rw(tr.ws, "/workspaces/ws"))}).Check([]string{tr.dc})
 	if _, ok := errors.AsType[*mountcheck.WritableError](err); !ok {
 		t.Fatalf("a bind mount of the same source: Check = %v, want a *WritableError", err)
 	}
@@ -419,11 +423,11 @@ func TestCheckIgnoresVolumeWithUnresolvableSource(t *testing.T) {
 	// A volume source the daemon cannot read, as under a runtime's storage
 	// owned by root, must not fail the check.
 	source := filepath.Join(tr.dcRules, "_data")
-	err := mountcheck.Check([]watch.Container{container("c1", volume(source, "/data"))}, []string{tr.dc})
+	err := mountcheck.Read([]watch.Container{container("c1", volume(source, "/data"))}).Check([]string{tr.dc})
 	if err != nil {
 		t.Fatalf("Check = %v, want nil", err)
 	}
-	err = mountcheck.Check([]watch.Container{container("c1", rw(source, "/data"))}, []string{tr.dc})
+	err = mountcheck.Read([]watch.Container{container("c1", rw(source, "/data"))}).Check([]string{tr.dc})
 	wantUnresolvable(t, err, "c1", source, syscall.ENOTDIR)
 }
 
@@ -433,7 +437,7 @@ func TestCheckReportsUnreadableMounts(t *testing.T) {
 	fine := container("c1", rw(tr.ws, "/workspaces/ws"), ro(tr.dc, "/workspaces/ws/.devcontainer"))
 	unreadable := watch.Container{ID: "c2", Running: true, MountsErr: cause}
 
-	err := mountcheck.Check([]watch.Container{fine, unreadable}, []string{tr.dc})
+	err := mountcheck.Read([]watch.Container{fine, unreadable}).Check([]string{tr.dc})
 	got, ok := errors.AsType[*mountcheck.UnreadableError](err)
 	if !ok {
 		t.Fatalf("Check = %v, want an *UnreadableError", err)
@@ -456,17 +460,17 @@ func TestCheckReportsFirstFailure(t *testing.T) {
 	unreadable := watch.Container{ID: "c2", MountsErr: cause}
 	paths := []string{tr.dc, tr.dcRules}
 
-	err := mountcheck.Check([]watch.Container{writable, unreadable}, paths)
+	err := mountcheck.Read([]watch.Container{writable, unreadable}).Check(paths)
 	wantWritable(t, err, mountcheck.WritableError{
 		Container: "c1", Path: tr.dc, Source: tr.ws, ContainerPath: "/workspaces/ws/.devcontainer",
 	})
 
-	err = mountcheck.Check([]watch.Container{unreadable, writable}, paths)
+	err = mountcheck.Read([]watch.Container{unreadable, writable}).Check(paths)
 	if _, ok := errors.AsType[*mountcheck.UnreadableError](err); !ok {
 		t.Fatalf("unreadable first: Check = %v, want an *UnreadableError", err)
 	}
 
-	err = mountcheck.Check([]watch.Container{writable}, []string{tr.dcRules, tr.dc})
+	err = mountcheck.Read([]watch.Container{writable}).Check([]string{tr.dcRules, tr.dc})
 	wantWritable(t, err, mountcheck.WritableError{
 		Container: "c1", Path: tr.dcRules, Source: tr.ws, ContainerPath: "/workspaces/ws/.devcontainer/hostrunner-rules.yaml",
 	})
@@ -474,10 +478,10 @@ func TestCheckReportsFirstFailure(t *testing.T) {
 
 func TestCheckPassesWithNothingToCheck(t *testing.T) {
 	tr := newTree(t)
-	if err := mountcheck.Check(nil, []string{tr.dc}); err != nil {
+	if err := mountcheck.Read(nil).Check([]string{tr.dc}); err != nil {
 		t.Errorf("no containers: Check = %v, want nil", err)
 	}
-	if err := mountcheck.Check([]watch.Container{container("c1", rw("/", "/host"))}, nil); err != nil {
+	if err := mountcheck.Read([]watch.Container{container("c1", rw("/", "/host"))}).Check(nil); err != nil {
 		t.Errorf("no paths: Check = %v, want nil", err)
 	}
 }
@@ -515,14 +519,15 @@ func TestCheckFollowsDanglingSymlinks(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name+", target writable", func(t *testing.T) {
 			mounts := append(workspace[:len(workspace):len(workspace)], rw(out, "/out"))
-			err := mountcheck.Check([]watch.Container{container("c1", mounts...)}, []string{tt.path})
+			err := mountcheck.Read([]watch.Container{container("c1", mounts...)}).Check([]string{tt.path})
 			wantWritable(t, err, mountcheck.WritableError{
 				Container: "c1", Path: tt.target, Source: out, ContainerPath: tt.containerPath,
 			})
 		})
 		t.Run(tt.name+", target read-only", func(t *testing.T) {
 			mounts := append(workspace[:len(workspace):len(workspace)], ro(out, "/out"))
-			if err := mountcheck.Check([]watch.Container{container("c1", mounts...)}, []string{tt.path}); err != nil {
+			if err := mountcheck.Read([]watch.Container{container("c1", mounts...)}).Check(
+				[]string{tt.path}); err != nil {
 				t.Fatalf("Check = %v, want nil", err)
 			}
 		})
@@ -534,11 +539,11 @@ func TestCheckFollowsDanglingMountSource(t *testing.T) {
 	link := filepath.Join(tr.base, "new-link")
 	target := filepath.Join(tr.dc, "new")
 	symlink(t, target, link)
-	err := mountcheck.Check([]watch.Container{container("c1",
+	err := mountcheck.Read([]watch.Container{container("c1",
 		rw(tr.ws, "/workspaces/ws"),
 		ro(tr.dc, "/workspaces/ws/.devcontainer"),
 		rw(link, "/new"),
-	)}, []string{tr.dc})
+	)}).Check([]string{tr.dc})
 	wantWritable(t, err, mountcheck.WritableError{
 		Container: "c1", Path: tr.dc, Source: target, ContainerPath: "/new",
 	})
@@ -582,17 +587,17 @@ func TestCheckFailsOnSymlinkLoop(t *testing.T) {
 	fineContainer := container("c1", fine...)
 
 	t.Run("protected path", func(t *testing.T) {
-		err := mountcheck.Check([]watch.Container{container("c1", fine...)}, []string{tr.dc, a})
+		err := mountcheck.Read([]watch.Container{container("c1", fine...)}).Check([]string{tr.dc, a})
 		wantUnresolvable(t, err, "", a, syscall.ELOOP)
 	})
 	t.Run("protected path through the loop", func(t *testing.T) {
 		p := filepath.Join(a, "settings.json")
-		err := mountcheck.Check([]watch.Container{container("c1", fine...)}, []string{p})
+		err := mountcheck.Read([]watch.Container{container("c1", fine...)}).Check([]string{p})
 		wantUnresolvable(t, err, "", p, syscall.ELOOP)
 	})
 	t.Run("mount source", func(t *testing.T) {
 		mounts := append(fine[:len(fine):len(fine)], ro(a, "/loop"))
-		err := mountcheck.Check([]watch.Container{fineContainer, container("c2", mounts...)}, []string{tr.dc})
+		err := mountcheck.Read([]watch.Container{fineContainer, container("c2", mounts...)}).Check([]string{tr.dc})
 		wantUnresolvable(t, err, "c2", a, syscall.ELOOP)
 	})
 }
@@ -613,12 +618,12 @@ func TestCheckFollowsAtMost40Links(t *testing.T) {
 	}
 	mounts := []watch.Mount{rw(tr.ws, "/workspaces/ws"), ro(tr.dc, "/workspaces/ws/.devcontainer"), rw(out, "/out")}
 
-	err := mountcheck.Check([]watch.Container{container("c1", mounts...)}, []string{link(1)})
+	err := mountcheck.Read([]watch.Container{container("c1", mounts...)}).Check([]string{link(1)})
 	wantWritable(t, err, mountcheck.WritableError{
 		Container: "c1", Path: filepath.Join(out, "f.json"), Source: out, ContainerPath: "/out/f.json",
 	})
 
-	err = mountcheck.Check([]watch.Container{container("c1", mounts...)}, []string{link(0)})
+	err = mountcheck.Read([]watch.Container{container("c1", mounts...)}).Check([]string{link(0)})
 	wantUnresolvable(t, err, "", link(0), syscall.ELOOP)
 }
 
@@ -630,12 +635,12 @@ func TestCheckFailsWhenAPathComponentCannotBeRead(t *testing.T) {
 	underFile := filepath.Join(tr.dcRules, "link")
 
 	t.Run("protected path", func(t *testing.T) {
-		err := mountcheck.Check([]watch.Container{container("c1", fine...)}, []string{underFile})
+		err := mountcheck.Read([]watch.Container{container("c1", fine...)}).Check([]string{underFile})
 		wantUnresolvable(t, err, "", underFile, syscall.ENOTDIR)
 	})
 	t.Run("mount source", func(t *testing.T) {
 		mounts := append(fine[:len(fine):len(fine)], rw(underFile, "/x"))
-		err := mountcheck.Check([]watch.Container{container("c1", mounts...)}, []string{tr.dc})
+		err := mountcheck.Read([]watch.Container{container("c1", mounts...)}).Check([]string{tr.dc})
 		wantUnresolvable(t, err, "c1", underFile, syscall.ENOTDIR)
 	})
 }
@@ -659,10 +664,314 @@ func TestCheckFailsThroughAnUnsearchableDirectory(t *testing.T) {
 	t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
 
 	fine := []watch.Mount{rw(tr.ws, "/workspaces/ws"), ro(tr.dc, "/workspaces/ws/.devcontainer")}
-	err := mountcheck.Check([]watch.Container{container("c1", fine...)}, []string{link})
+	err := mountcheck.Read([]watch.Container{container("c1", fine...)}).Check([]string{link})
 	wantUnresolvable(t, err, "", link, syscall.EACCES)
 
 	mounts := append(fine[:len(fine):len(fine)], rw(link, "/x"))
-	err = mountcheck.Check([]watch.Container{container("c1", mounts...)}, []string{tr.dc})
+	err = mountcheck.Read([]watch.Container{container("c1", mounts...)}).Check([]string{tr.dc})
 	wantUnresolvable(t, err, "c1", link, syscall.EACCES)
+}
+
+// live is the live mount table of a container as the host reads it, the
+// points in the order given.
+func live(points ...watch.MountPoint) *watch.LiveMounts {
+	return &watch.LiveMounts{Points: points}
+}
+
+func point(path string) watch.MountPoint { return watch.MountPoint{Path: path} }
+
+func roPoint(path string) watch.MountPoint { return watch.MountPoint{Path: path, ReadOnly: true} }
+
+// withLive is c with the live mount table l.
+func withLive(c watch.Container, l *watch.LiveMounts) watch.Container {
+	c.Live = l
+	return c
+}
+
+// A read-only mount that inspection reports but the live table no longer
+// holds, as one unmounted inside the container, shadows nothing: the
+// writable workspace mount shows the protected path.
+func TestCheckDropsMountsThatVanishedFromTheLiveTable(t *testing.T) {
+	tr := newTree(t)
+	c := withLive(
+		container("c1", rw(tr.ws, "/workspaces/ws"), ro(tr.dc, "/workspaces/ws/.devcontainer")),
+		live(point("/workspaces/ws")),
+	)
+	err := mountcheck.Read([]watch.Container{c}).Check([]string{tr.dc})
+	wantWritable(t, err, mountcheck.WritableError{
+		Container: "c1", Path: tr.dc, Source: tr.ws, ContainerPath: "/workspaces/ws/.devcontainer",
+	})
+}
+
+// A mount that the live table holds read-write counts as writable, whatever
+// inspection says.
+func TestCheckTrustsTheLiveReadOnlyFlag(t *testing.T) {
+	tr := newTree(t)
+	paths := []string{tr.dc}
+	mounts := []watch.Mount{rw(tr.ws, "/workspaces/ws"), ro(tr.dc, "/workspaces/ws/.devcontainer")}
+
+	turnedWritable := withLive(container("c1", mounts...), live(point("/workspaces/ws"), point("/workspaces/ws/.devcontainer")))
+	wantWritable(t, mountcheck.Read([]watch.Container{turnedWritable}).Check(paths), mountcheck.WritableError{
+		Container: "c1", Path: tr.dc, Source: tr.dc, ContainerPath: "/workspaces/ws/.devcontainer",
+	})
+}
+
+// A mount that the live table holds read-only is read-only, whatever
+// inspection says.
+func TestCheckPassesAMountTheLiveTableHoldsReadOnly(t *testing.T) {
+	tr := newTree(t)
+	c := withLive(
+		container("c1", rw(tr.ws, "/workspaces/ws"), rw(tr.dc, "/workspaces/ws/.devcontainer")),
+		live(point("/workspaces/ws"), roPoint("/workspaces/ws/.devcontainer")),
+	)
+	if err := mountcheck.Read([]watch.Container{c}).Check([]string{tr.dc}); err != nil {
+		t.Fatalf("Check = %v, want nil", err)
+	}
+}
+
+// Of several points at one path, the last is mounted over the others, so it
+// decides.
+func TestCheckTakesTheLastOfStackedLivePoints(t *testing.T) {
+	tr := newTree(t)
+	mounts := []watch.Mount{rw(tr.ws, "/workspaces/ws"), rw(tr.dc, "/workspaces/ws/.devcontainer")}
+	dcPath := "/workspaces/ws/.devcontainer"
+	tests := []struct {
+		name   string
+		points []watch.MountPoint
+		want   bool // whether the check fails
+	}{
+		{"read-only over read-write", []watch.MountPoint{point("/workspaces/ws"), point(dcPath), roPoint(dcPath)}, false},
+		{"read-write over read-only", []watch.MountPoint{point("/workspaces/ws"), roPoint(dcPath), point(dcPath)}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := mountcheck.Read([]watch.Container{withLive(container("c1", mounts...), live(tt.points...))}).Check(
+				[]string{tr.dc})
+			if (err != nil) != tt.want {
+				t.Fatalf("Check = %v, want failure: %v", err, tt.want)
+			}
+		})
+	}
+}
+
+// A container whose live table could not be read is unreadable, whatever
+// its inspection says.
+func TestCheckReportsAnUnreadableLiveTable(t *testing.T) {
+	tr := newTree(t)
+	cause := errors.New("process gone")
+	c := withLive(
+		container("c1", rw(tr.ws, "/workspaces/ws"), ro(tr.dc, "/workspaces/ws/.devcontainer")),
+		&watch.LiveMounts{Points: []watch.MountPoint{point("/workspaces/ws"), roPoint("/workspaces/ws/.devcontainer")}, Err: cause},
+	)
+	err := mountcheck.Read([]watch.Container{c}).Check([]string{tr.dc})
+	got, ok := errors.AsType[*mountcheck.UnreadableError](err)
+	if !ok {
+		t.Fatalf("Check = %v, want an *UnreadableError", err)
+	}
+	if got.Container != "c1" || got.Err != cause {
+		t.Errorf("Check = %+v, want container c1 and the cause", *got)
+	}
+	if !errors.Is(err, cause) {
+		t.Errorf("errors.Is(%v, cause) = false, want true", err)
+	}
+}
+
+// A container that runs without a process ID, which Live reports with
+// watch.ErrNoProcessID, is unreadable too: the check refuses and says why.
+func TestCheckReportsAContainerThatRunsWithoutAProcessID(t *testing.T) {
+	tr := newTree(t)
+	c := withLive(
+		container("c1", rw(tr.ws, "/workspaces/ws"), ro(tr.dc, "/workspaces/ws/.devcontainer")),
+		&watch.LiveMounts{Err: watch.ErrNoProcessID},
+	)
+	c.Running, c.Pid = true, 0
+	err := mountcheck.Read([]watch.Container{c}).Check([]string{tr.dc})
+	got, ok := errors.AsType[*mountcheck.UnreadableError](err)
+	if !ok {
+		t.Fatalf("Check = %v, want an *UnreadableError", err)
+	}
+	if got.Container != "c1" || !errors.Is(err, watch.ErrNoProcessID) {
+		t.Errorf("Check = %+v, want container c1 and watch.ErrNoProcessID", *got)
+	}
+	if !strings.Contains(err.Error(), "container runs but reports no process id") {
+		t.Errorf("message %q does not say why", err.Error())
+	}
+}
+
+// Without a live table, inspection alone decides, as it always did.
+func TestCheckWithoutALiveTableTrustsInspection(t *testing.T) {
+	tr := newTree(t)
+	mounts := []watch.Mount{rw(tr.ws, "/workspaces/ws"), ro(tr.dc, "/workspaces/ws/.devcontainer")}
+	if err := mountcheck.Read([]watch.Container{container("c1", mounts...)}).Check([]string{tr.dc}); err != nil {
+		t.Fatalf("Check = %v, want nil", err)
+	}
+	// An empty table is a table: it holds none of the mounts.
+	err := mountcheck.Read([]watch.Container{withLive(container("c1", mounts...), live())}).Check([]string{tr.dc})
+	if err != nil {
+		t.Fatalf("with an empty live table: Check = %v, want nil: no mount is left", err)
+	}
+}
+
+// Points of the live table that inspection does not report hold no host
+// source, so they cannot make a protected path writable.
+func TestCheckIgnoresLivePointsWithoutAnInspectedMount(t *testing.T) {
+	tr := newTree(t)
+	c := withLive(
+		container("c1", rw(tr.ws, "/workspaces/ws"), ro(tr.dc, "/workspaces/ws/.devcontainer")),
+		live(point("/"), point("/proc"), point("/workspaces/ws"), roPoint("/workspaces/ws/.devcontainer"), point("/workspaces/ws/extra")),
+	)
+	if err := mountcheck.Read([]watch.Container{c}).Check([]string{tr.dc}); err != nil {
+		t.Fatalf("Check = %v, want nil", err)
+	}
+}
+
+// A second writable mount of a protected directory elsewhere in the
+// container is refused when the live table holds it: its host source is
+// compared as for any mount.
+func TestCheckFailsASecondWritableMountOfAProtectedDirectoryInTheLiveTable(t *testing.T) {
+	tr := newTree(t)
+	c := withLive(
+		container("c1", rw(tr.ws, "/workspaces/ws"), ro(tr.dc, "/workspaces/ws/.devcontainer"), rw(tr.dc, "/elsewhere")),
+		live(point("/workspaces/ws"), roPoint("/workspaces/ws/.devcontainer"), point("/elsewhere")),
+	)
+	wantWritable(t, mountcheck.Read([]watch.Container{c}).Check([]string{tr.dc}), mountcheck.WritableError{
+		Container: "c1", Path: tr.dc, Source: tr.dc, ContainerPath: "/elsewhere",
+	})
+}
+
+// A volume's device is judged as before; only its presence and read-only
+// flag come from the live table.
+func TestCheckTakesAVolumesPresenceAndReadOnlyFlagFromTheLiveTable(t *testing.T) {
+	tr := newTree(t)
+	vol := bindVolume(watch.DriverLocal, tr.dc, "/data")
+	tests := []struct {
+		name    string
+		live    *watch.LiveMounts
+		wantErr bool
+	}{
+		{"read-write", live(point("/data")), true},
+		{"turned read-only", live(roPoint("/data")), false},
+		{"vanished", live(), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := mountcheck.Read([]watch.Container{withLive(container("c1", vol), tt.live)}).Check([]string{tr.dc})
+			if tt.wantErr {
+				wantWritable(t, err, mountcheck.WritableError{Container: "c1", Path: tr.dc, Source: tr.dc, ContainerPath: "/data"})
+			} else if err != nil {
+				t.Fatalf("Check = %v, want nil", err)
+			}
+		})
+	}
+	// Presence does not excuse a volume whose content is unknown.
+	uninspected := volume("/var/lib/example/volumes/v/_data", "/data")
+	uninspected.Volume = nil
+	err := mountcheck.Read([]watch.Container{withLive(container("c1", uninspected), live(point("/data")))}).Check(
+		[]string{tr.dc})
+	if _, ok := errors.AsType[*mountcheck.UnreadableError](err); !ok {
+		t.Fatalf("Check = %v, want an *UnreadableError", err)
+	}
+}
+
+// With several containers, the one that fails is reported; one whose live
+// table holds no workspace mount passes.
+func TestCheckJudgesEachContainerByItsOwnLiveTable(t *testing.T) {
+	tr := newTree(t)
+	good := withLive(container("good", rw(tr.ws, "/workspaces/ws"), ro(tr.dc, "/workspaces/ws/.devcontainer")),
+		live(point("/workspaces/ws"), roPoint("/workspaces/ws/.devcontainer")))
+	bad := withLive(container("bad", rw(tr.ws, "/workspaces/ws"), ro(tr.dc, "/workspaces/ws/.devcontainer")),
+		live(point("/workspaces/ws")))
+	other := withLive(container("other", rw(tr.ws, "/workspaces/ws")), live())
+	paths := []string{tr.dc}
+
+	wantWritable(t, mountcheck.Read([]watch.Container{good, bad, other}).Check(paths), mountcheck.WritableError{
+		Container: "bad", Path: tr.dc, Source: tr.ws, ContainerPath: "/workspaces/ws/.devcontainer",
+	})
+	if err := mountcheck.Read([]watch.Container{good, other}).Check(paths); err != nil {
+		t.Fatalf("Check = %v, want nil", err)
+	}
+}
+
+// The order of failures across containers: an unresolvable protected path
+// before any container, then each container in order, its unreadable
+// mounts or live table before its unresolvable mount sources.
+func TestCheckReportsFailuresInOrder(t *testing.T) {
+	tr := newTree(t)
+	loop := filepath.Join(tr.dc, "loop-a")
+	symlink(t, "loop-b", loop)
+	symlink(t, "loop-a", filepath.Join(tr.dc, "loop-b"))
+	cause := errors.New("inspect failed")
+	unreadable := watch.Container{ID: "c1", Running: true, MountsErr: cause}
+	unresolvable := container("c2", ro(loop, "/loop"))
+
+	err := mountcheck.Read([]watch.Container{unreadable, unresolvable}).Check([]string{loop})
+	wantUnresolvable(t, err, "", loop, syscall.ELOOP)
+
+	err = mountcheck.Read([]watch.Container{unreadable, unresolvable}).Check([]string{tr.dc})
+	if got, ok := errors.AsType[*mountcheck.UnreadableError](err); !ok || got.Container != "c1" {
+		t.Fatalf("unreadable first: Check = %v, want an *UnreadableError of c1", err)
+	}
+
+	err = mountcheck.Read([]watch.Container{unresolvable, unreadable}).Check([]string{tr.dc})
+	wantUnresolvable(t, err, "c2", loop, syscall.ELOOP)
+
+	// Inspection that failed comes before a live table that failed.
+	both := withLive(watch.Container{ID: "c3", Running: true, MountsErr: cause}, &watch.LiveMounts{Err: errors.New("no table")})
+	err = mountcheck.Read([]watch.Container{both}).Check([]string{tr.dc})
+	if got, ok := errors.AsType[*mountcheck.UnreadableError](err); !ok || got.Err != cause {
+		t.Fatalf("both unreadable: Check = %v, want the inspection's cause", err)
+	}
+}
+
+// A container whose mounts could not be read is kept by Read for both
+// stages to report: Check reports it even with no paths, as it does for
+// any container list, and CheckRequirements only with requirements.
+func TestReadKeepsAnUnreadableContainerForBothStages(t *testing.T) {
+	tr := newTree(t)
+	cause := errors.New("inspect failed")
+	m := mountcheck.Read([]watch.Container{
+		container("c1", rw(tr.ws, "/workspaces/ws"), ro(tr.dc, "/workspaces/ws/.devcontainer")),
+		{ID: "c2", Running: true, MountsErr: cause},
+	})
+
+	for name, err := range map[string]error{
+		"Check":             m.Check([]string{tr.dc}),
+		"CheckRequirements": m.CheckRequirements(tr.ws, requirements(rules.MountReadOnly, ".devcontainer")),
+	} {
+		if got, ok := errors.AsType[*mountcheck.UnreadableError](err); !ok || got.Container != "c2" || got.Err != cause {
+			t.Errorf("%s = %v, want an *UnreadableError of c2 with the cause", name, err)
+		}
+	}
+	if _, ok := errors.AsType[*mountcheck.UnreadableError](m.Check(nil)); !ok {
+		t.Errorf("no paths: Check = %v, want an *UnreadableError", m.Check(nil))
+	}
+	if err := m.CheckRequirements(tr.ws, nil); err != nil {
+		t.Errorf("no requirements: CheckRequirements = %v, want nil", err)
+	}
+}
+
+// Read resolves mount sources once: both stages judge the sources as Read
+// resolved them, even when a link among them is changed afterwards.
+func TestReadResolvesMountSourcesOnceForBothStages(t *testing.T) {
+	tr := newTree(t)
+	link := filepath.Join(tr.base, "ws-link")
+	symlink(t, tr.ws, link)
+	m := mountcheck.Read([]watch.Container{container("c1", rw(link, "/workspaces/ws"))})
+
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	symlink(t, filepath.Join(tr.base, "elsewhere"), link)
+
+	wantWritable(t, m.Check([]string{tr.dc}), mountcheck.WritableError{
+		Container: "c1", Path: tr.dc, Source: tr.ws, ContainerPath: "/workspaces/ws/.devcontainer",
+	})
+	wantReadOnlyRequirement(t, m.CheckRequirements(tr.ws, requirements(rules.MountReadOnly, ".devcontainer")),
+		mountcheck.ReadOnlyRequirementError{
+			RequirementFailure: mountcheck.RequirementFailure{Container: "c1", Path: ".devcontainer", ContainerPath: "/workspaces/ws/.devcontainer"}, Source: tr.ws,
+		})
+	if err := mountcheck.Read([]watch.Container{container("c1", rw(link, "/workspaces/ws"))}).Check(
+		[]string{tr.dc}); err != nil {
+		t.Fatalf("read again after the change: Check = %v, want nil", err)
+	}
 }
