@@ -104,6 +104,12 @@ func TestParseRefusesAnUnknownHostValue(t *testing.T) {
 	expectParseError(t, "rules:\n  - command: curl\n    inject:\n      env: {ROOT: \"${host.root}\"}\n    args: any\n", "host.root")
 }
 
+// A namespace is decoded once: `${file.host.workspace}` is no file named
+// `host.workspace`, it is no reference at all.
+func TestParseRefusesAChainedNamespace(t *testing.T) {
+	expectParseError(t, "rules:\n  - command: curl\n    inject:\n      env: {CFG: \"${file.host.workspace}\"}\n      files: {cfg: x}\n    args: any\n", "${file.host.workspace} is not a secret, file or host value name")
+}
+
 // A secret may still be named workspace: `${workspace}` is that secret,
 // and `${host.workspace}` is the path.
 func TestParseKeepsASecretNamedWorkspace(t *testing.T) {

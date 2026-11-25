@@ -119,6 +119,19 @@ const (
 	hostPrefix = "host."
 )
 
+// split returns the namespace prefix r starts with, filePrefix or
+// hostPrefix, and the name after it; a secret's Ref has no namespace, so
+// its namespace is empty and its name is r itself. Only one prefix is
+// removed, so the name of `file.host.workspace` is `host.workspace`.
+func (r Ref) split() (namespace, name string) {
+	for _, prefix := range []string{filePrefix, hostPrefix} {
+		if name, ok := strings.CutPrefix(string(r), prefix); ok {
+			return prefix, name
+		}
+	}
+	return "", string(r)
+}
+
 // HostWorkspace is the Ref under which Render looks up the workspace's
 // real path on the host, which `${host.workspace}` renders to. It is plain
 // text, not a secret: no secret is used for it and nothing masks it.
@@ -186,7 +199,7 @@ func parseTemplate(s string) (Template, error) {
 				return Template{}, fmt.Errorf("%q: unterminated ${", s)
 			}
 			ref := s[i+2 : i+end]
-			name := strings.TrimPrefix(strings.TrimPrefix(ref, filePrefix), hostPrefix)
+			_, name := Ref(ref).split()
 			if !refName.MatchString(name) {
 				return Template{}, fmt.Errorf("%q: ${%s} is not a secret, file or host value name", s, ref)
 			}
@@ -397,17 +410,18 @@ func newTemplate(s string, secrets []Secret, files []string, used map[Ref]bool) 
 		return Template{}, err
 	}
 	for _, ref := range t.references() {
-		if strings.HasPrefix(string(ref), hostPrefix) {
+		namespace, name := ref.split()
+		switch {
+		case namespace == hostPrefix:
 			if ref != HostWorkspace {
 				return Template{}, fmt.Errorf("%q refers to unknown host value %q", s, ref)
 			}
 			continue
-		}
-		if name, ok := strings.CutPrefix(string(ref), filePrefix); ok {
+		case namespace == filePrefix:
 			if !slices.Contains(files, name) {
 				return Template{}, fmt.Errorf("%q refers to unknown file %q", s, name)
 			}
-		} else if !slices.ContainsFunc(secrets, func(sec Secret) bool { return SecretRef(sec.Name) == ref }) {
+		case !slices.ContainsFunc(secrets, func(sec Secret) bool { return SecretRef(sec.Name) == ref }):
 			return Template{}, fmt.Errorf("%q refers to unknown secret %q", s, ref)
 		}
 		used[ref] = true
