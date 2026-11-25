@@ -39,6 +39,21 @@ func open(t *testing.T, m *Mapper, cwd string) (string, error) {
 	return path, err
 }
 
+func TestHostRootIsTheResolvedWorkspacePath(t *testing.T) {
+	root, _ := newHostWorkspace(t)
+	link := filepath.Join(filepath.Dir(root), "link")
+	if err := os.Symlink(root, link); err != nil {
+		t.Fatal(err)
+	}
+	m, err := NewMapper(link, containerRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := m.HostRoot(); got != root {
+		t.Errorf("HostRoot() = %q, want %q", got, root)
+	}
+}
+
 func TestOpenMirrorsCwdInsideWorkspace(t *testing.T) {
 	root, _ := newHostWorkspace(t)
 	// A name beginning with ".." is inside, not a way out.

@@ -93,7 +93,7 @@ func TestParseAcceptsTheHostWorkspaceWithoutSecretsAndLooseLists(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := allowed.Environment(map[Ref]string{HostWorkspace: "/x"})
+	got := allowed.Environment(Values{HostWorkspace: "/x"})
 	if want := "WORKSPACE_DIR=/x/.git"; strings.Join(got, "|") != want {
 		t.Fatalf("got %q, want %s", got, want)
 	}
@@ -112,7 +112,7 @@ func TestParseKeepsASecretNamedWorkspace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := allowed.Environment(map[Ref]string{SecretRef("workspace"): "tok-0123456789", HostWorkspace: "/x"})
+	got := allowed.Environment(Values{SecretRef("workspace"): "tok-0123456789", HostWorkspace: "/x"})
 	if want := "API_TOKEN=tok-0123456789|DIR=/x"; strings.Join(got, "|") != want {
 		t.Fatalf("got %q, want %s", got, want)
 	}
@@ -127,7 +127,7 @@ func TestParseKeepsADoubledDollarNextToTheHostWorkspace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := allowed.Environment(map[Ref]string{HostWorkspace: "/x"})
+	got := allowed.Environment(Values{HostWorkspace: "/x"})
 	if want := "AFTER_DOLLAR=$/x|LITERAL=${host.workspace}"; strings.Join(got, "|") != want {
 		t.Fatalf("got %q, want %s", got, want)
 	}
@@ -194,7 +194,7 @@ func TestAssemblePlacesCommandArgsAfterTheRuleCommand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assembled, err := allowed.Assemble(argv, map[Ref]string{SecretRef("token"): "tok-0123456789"})
+	assembled, err := allowed.Assemble(argv, Values{SecretRef("token"): "tok-0123456789"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -296,7 +296,7 @@ func TestEnvironmentRendersTheInjectedVariablesByName(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := allowed.Environment(map[Ref]string{SecretRef("token"): "tok-0123456789"})
+	got := allowed.Environment(Values{SecretRef("token"): "tok-0123456789"})
 	if want := "API_TOKEN=Bearer tok-0123456789|NO_COLOR=1"; strings.Join(got, "|") != want {
 		t.Fatalf("got %q, want %s", got, want)
 	}
@@ -330,7 +330,7 @@ func TestParseAcceptsTheHostWorkspaceInAnInjectedFileContent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := allowed.Inject.Files[0].Content.Render(map[Ref]string{HostWorkspace: "/x"})
+	got := allowed.Inject.Files[0].Content.Render(Values{HostWorkspace: "/x"})
 	if want := "root = /x\n"; got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}
@@ -344,7 +344,7 @@ func TestParseCountsAFileUsedTogetherWithTheHostWorkspaceAsUsed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := allowed.Assemble([]string{"curl"}, map[Ref]string{HostWorkspace: "/x", FileRef("cfg"): "/proc/self/fd/3"})
+	got, err := allowed.Assemble([]string{"curl"}, Values{HostWorkspace: "/x", FileRef("cfg"): "/proc/self/fd/3"})
 	if err != nil {
 		t.Fatal(err)
 	}

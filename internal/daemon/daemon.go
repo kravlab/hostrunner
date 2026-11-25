@@ -630,14 +630,12 @@ func (s *Server) prepareAllowed(ctx context.Context, req protocol.Request, allow
 		}
 		return p, nil
 	}
-	values, r := sources.obtain(ctx, allowed.Secrets)
-	if r != nil {
+	// The workspace's path is plain text, not a secret: secretValues masks
+	// the secrets only.
+	values := rules.Values{rules.HostWorkspace: s.mapper.HostRoot()}
+	if r := sources.obtain(ctx, allowed.Secrets, values); r != nil {
 		return refuse(r.code, r.message, r.err)
 	}
-	// obtain returns a fresh map the caller owns, so adding the workspace's
-	// path to it is safe. The path is plain text, not a secret: obtain made
-	// values for the secrets, and secretValues masks those only.
-	values[rules.HostWorkspace], _ = s.mapper.Roots()
 	if p.files, err = injectFiles(allowed.Inject.Files, values, p.files); err != nil {
 		return refuse(protocol.ExitHostrunError, "cannot create the files the rule hands the command", err)
 	}

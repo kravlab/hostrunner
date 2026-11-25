@@ -48,7 +48,7 @@ type Secret struct {
 }
 
 // Injection is what a rule adds to its command. Each field holds
-// templates the caller renders with the request's secret values.
+// templates the caller renders with the request's secret and host values.
 type Injection struct {
 	// ProgramArgs go right after the program, before the rest of the
 	// rule's command (global flags such as git -c).
@@ -93,8 +93,8 @@ type Template struct {
 	parts []templatePart
 }
 
-// templatePart is literal text, or a reference when ref is set: a secret's
-// name, FileRef of an injected file's, or HostWorkspace.
+// templatePart is literal text, or a reference when ref is set: SecretRef
+// of a secret's name, FileRef of an injected file's, or HostWorkspace.
 type templatePart struct {
 	text string
 	ref  Ref
@@ -105,6 +105,11 @@ type templatePart struct {
 // host value such as HostWorkspace. It is the reference as the rules file
 // writes it between `${` and `}`.
 type Ref string
+
+// Values holds what Render fills a template's references in with, keyed
+// by Ref: secret values under SecretRef, injected files' descriptor paths
+// under FileRef and host values such as HostWorkspace.
+type Values map[Ref]string
 
 // The namespaces a reference's name can start with: an injected file's
 // (`${file.name}`) or a host value's (`${host.workspace}`). A secret's name
@@ -131,7 +136,7 @@ func SecretRef(name string) Ref { return Ref(name) }
 // it: a secret's value under SecretRef, an injected file's descriptor path
 // under FileRef, the workspace's host path under HostWorkspace. Parse made
 // sure every reference names one of the rule's, or a known host value.
-func (t Template) Render(values map[Ref]string) string {
+func (t Template) Render(values Values) string {
 	var b strings.Builder
 	for _, p := range t.parts {
 		if p.ref != "" {
@@ -455,7 +460,7 @@ var errTrailingFlag = errors.New("an argument the rule adds after the container'
 // the rule's command, CommandArgs, the container's arguments,
 // TrailingArgs. A rendered trailing argument starting with - is
 // errTrailingFlag.
-func (a Allowed) Assemble(argv []string, values map[Ref]string) ([]string, error) {
+func (a Allowed) Assemble(argv []string, values Values) ([]string, error) {
 	if a.Inject.addsNoArgs() {
 		return argv, nil
 	}
@@ -480,7 +485,7 @@ func (a Allowed) Assemble(argv []string, values map[Ref]string) ([]string, error
 // Environment returns the allowing rule's injected environment variables,
 // rendered from values, as NAME=value entries for the command; the caller
 // lets them override its own.
-func (a Allowed) Environment(values map[Ref]string) []string {
+func (a Allowed) Environment(values Values) []string {
 	var env []string
 	for _, v := range a.Inject.Env {
 		env = append(env, v.Name+"="+v.Value.Render(values))

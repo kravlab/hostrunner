@@ -2,6 +2,9 @@ package client_test
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -13,30 +16,38 @@ const recordWorkspaceAndPwd = `printf "%s\n" "$$WORKSPACE_DIR" "$$PWD" > "$$RECO
 // ${host.workspace}.
 const printWorkspace = `printf "%s" "$$WORKSPACE_DIR"`
 
+// shRule returns the rules YAML of a single rule for sh. Each element of
+// inject is one entry of the rule's inject block, and each element of fields
+// is one further line of the rule (a nested line starts with its own
+// indentation); the helper indents both to their place in the rule.
+func shRule(inject, fields []string) string {
+	var b strings.Builder
+	b.WriteString("\nrules:\n  - command: sh\n    inject:\n")
+	for _, line := range inject {
+		b.WriteString("      " + line + "\n")
+	}
+	for _, line := range fields {
+		b.WriteString("    " + line + "\n")
+	}
+	return b.String()
+}
+
 // hostWorkspaceRules lets sh run script, a single-quote-free shell script
 // that reads $WORKSPACE_DIR, set from ${host.workspace}; the rule has no
 // secrets, so no lists.
 func hostWorkspaceRules(script string) string {
-	return `
-rules:
-  - command: sh
-    inject:
-      command_args: ["-c", '` + script + `']
-      env: {WORKSPACE_DIR: "${host.workspace}"}
-    args: none
-`
+	return shRule([]string{
+		`command_args: ["-c", '` + script + `']`,
+		`env: {WORKSPACE_DIR: "${host.workspace}"}`,
+	}, []string{"args: none"})
 }
 
 // hostWorkspaceFileRules lets sh record the contents of an injected file
 // that holds ${host.workspace}.
-const hostWorkspaceFileRules = `
-rules:
-  - command: sh
-    inject:
-      command_args: ["-c", 'cat "$$0" > "$$RECORD"', "${file.cfg}"]
-      files: {cfg: "root = ${host.workspace}\n"}
-    args: none
-`
+var hostWorkspaceFileRules = shRule([]string{
+	`command_args: ["-c", 'cat "$$0" > "$$RECORD"', "${file.cfg}"]`,
+	`files: {cfg: "root = ${host.workspace}\n"}`,
+}, []string{"args: none"})
 
 // ${host.workspace} in an env value reaches the program as the
 // workspace's host path, which is the working directory at the root.
@@ -109,19 +120,44 @@ func TestRunLeavesTheHostWorkspaceLiteralInASecretSource(t *testing.T) {
 	expectRecorded(t, got, rec, literal+"\n")
 }
 
+// A secret source is not a template: an env source's name is looked up as
+// written, so the variable literally named ${host.workspace} is the one
+// read. Were the name rendered, it would be the workspace's host path, no
+// variable of that name is set, and the request would be refused.
+func TestRunLeavesTheHostWorkspaceLiteralInAnEnvSecretSource(t *testing.T) {
+	const literal = "${host.workspace}"
+	t.Setenv(literal, testToken)
+	h := startDaemon(t, policy(t, commandRules(`{env: '`+literal+`'}`)))
+	got, rec := h.recorded(t, "sh")
+	expectRecorded(t, got, rec, testToken+"\n")
+}
+
+// A secret source is not a template: ${host.workspace} in a file source's
+// path stays literal text, so the file in the directory literally named
+// ${host.workspace} is the one read, not a file under the workspace's host
+// path.
+func TestRunLeavesTheHostWorkspaceLiteralInAFileSecretSource(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "${host.workspace}")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "token")
+	if err := os.WriteFile(path, []byte(testToken+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h := startDaemon(t, policy(t, commandRules(`{file: '`+path+`'}`)))
+	got, rec := h.recorded(t, "sh")
+	expectRecorded(t, got, rec, testToken+"\n")
+}
+
 // A rule with a fixed directory runs its command there, while
 // ${host.workspace} is still the workspace's host path.
 func TestRunKeepsTheHostWorkspaceForARuleWithAFixedDirectory(t *testing.T) {
 	dir := fixedDir(t)
-	config := fmt.Sprintf(`
-rules:
-  - command: sh
-    dir: %s
-    inject:
-      command_args: ["-c", '%s']
-      env: {WORKSPACE_DIR: "${host.workspace}"}
-    args: none
-`, dir, recordWorkspaceAndPwd)
+	config := shRule([]string{
+		`command_args: ["-c", '` + recordWorkspaceAndPwd + `']`,
+		`env: {WORKSPACE_DIR: "${host.workspace}"}`,
+	}, []string{"dir: " + dir, "args: none"})
 	h := startDaemon(t, policy(t, config))
 	got, rec := h.recorded(t, "sh")
 	expectRecorded(t, got, rec, h.hostRoot+"\n"+dir+"\n")
@@ -131,18 +167,16 @@ rules:
 // secret, unlike the path, is still masked in what the command prints.
 func TestRunRendersTheHostWorkspaceAndASecretInOneTemplate(t *testing.T) {
 	t.Setenv("TOKEN", testToken)
-	h := startDaemon(t, policy(t, `
-rules:
-  - command: sh
-    secrets:
-      token: {env: TOKEN}
-    inject:
-      command_args: ["-c", 'printf "%s\n" "$$0" > "$$RECORD"; printf "%s" "$$0"', "${host.workspace}:${token}"]
-    flags:
-      allow: []
-    positional:
-      allow: ["*"]
-`))
+	h := startDaemon(t, policy(t, shRule([]string{
+		`command_args: ["-c", 'printf "%s\n" "$$0" > "$$RECORD"; printf "%s" "$$0"', "${host.workspace}:${token}"]`,
+	}, []string{
+		"secrets:",
+		"  token: {env: TOKEN}",
+		"flags:",
+		"  allow: []",
+		"positional:",
+		`  allow: ["*"]`,
+	})))
 	got, rec := h.recorded(t, "sh")
 	if want := h.hostRoot + ":" + testToken + "\n"; rec != want {
 		t.Fatalf("the program got %q, want %q", rec, want)
@@ -172,19 +206,17 @@ func TestRunRendersTheRealPathOfASymlinkedWorkspaceInAnInjectedFile(t *testing.T
 // the secret, unlike the path, is still masked in what the command prints.
 func TestRunRendersTheHostWorkspaceAndASecretInOneInjectedFile(t *testing.T) {
 	t.Setenv("TOKEN", testToken)
-	h := startDaemon(t, policy(t, `
-rules:
-  - command: sh
-    secrets:
-      token: {env: TOKEN}
-    inject:
-      command_args: ["-c", 'cat "$$0" > "$$RECORD"; cat "$$0"', "${file.cfg}"]
-      files: {cfg: "${host.workspace}:${token}\n"}
-    flags:
-      allow: []
-    positional:
-      allow: ["*"]
-`))
+	h := startDaemon(t, policy(t, shRule([]string{
+		`command_args: ["-c", 'cat "$$0" > "$$RECORD"; cat "$$0"', "${file.cfg}"]`,
+		`files: {cfg: "${host.workspace}:${token}\n"}`,
+	}, []string{
+		"secrets:",
+		"  token: {env: TOKEN}",
+		"flags:",
+		"  allow: []",
+		"positional:",
+		`  allow: ["*"]`,
+	})))
 	got, rec := h.recorded(t, "sh")
 	if want := h.hostRoot + ":" + testToken + "\n"; rec != want {
 		t.Fatalf("the program got %q, want %q", rec, want)

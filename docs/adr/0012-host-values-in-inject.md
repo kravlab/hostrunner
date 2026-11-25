@@ -6,10 +6,12 @@ status: accepted
 
 A rule could not name the workspace's path on the host, which differs per
 clone, so it could not pin a tool to the workspace's own files, e.g. git
-to the workspace's `.git` through `GIT_COMMON_DIR` (#180). Every
+to the workspace's `.git` through `GIT_COMMON_DIR`
+([#180](https://github.com/kravlab/hostrunner/issues/180)). Every
 `inject` template now accepts `${host.workspace}`: the workspace's real
-path on the host. hostrunner still neutralises no tool on its own (#7);
-it only hands the rules author a path it already knows.
+path on the host. hostrunner still neutralises no tool on its own
+([#7](https://github.com/kravlab/hostrunner/issues/7)); it only hands
+the rules author a path it already knows.
 
 ## Considered Options
 
@@ -36,7 +38,8 @@ it only hands the rules author a path it already knows.
   `trailing_args`, `env` values and `files` contents. An unknown
   `${host.…}` name is a parse error, so a hostrunner without this change
   refuses a rules file that uses it.
-- It lands only after the per-request mount check (#181): without that
-  check's `.git` mount, the container can rename `.git` and put its own
-  in its place, at the very path the injected variable names.
+- It lands only after the per-request mount check
+  ([#181](https://github.com/kravlab/hostrunner/issues/181)): without
+  that check's `.git` mount, the container can rename `.git` and put its
+  own in its place, at the very path the injected variable names.
 - Dry runs and the rules test do not name it; they name secrets only.
